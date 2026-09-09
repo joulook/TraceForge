@@ -149,7 +149,6 @@ fn s_r_s() {
     }
 }
 
-/* CE
 #[test]
 fn r_s_s() {
     for _i in 0..TEST_RUNS {
@@ -175,7 +174,7 @@ fn r_s_s() {
         });
         assert_eq!(stats.execs, 2 * 2 + 2 * 2 + 1);
     }
-}*/
+}
 
 #[test]
 fn r_ss() {
@@ -230,7 +229,6 @@ fn r_ss_assm() {
     }
 }
 
-/* CE
 #[test]
 fn r_ns_assm() {
     for _i in 0..TEST_RUNS {
@@ -253,7 +251,7 @@ fn r_ns_assm() {
         assert_eq!(stats.execs, 5040);
         assert_eq!(stats.block, 22359);
     }
-}*/
+}
 
 #[test]
 fn r_s_blk() {
