@@ -266,6 +266,16 @@ impl ExecutionGraph {
         self.stamp
     }
 
+    /// Give back the stamp most recently handed out.
+    ///
+    /// Only valid immediately after removing the label that took it, which is
+    /// what the conformance preflight does: it installs a receive to ask the
+    /// checker what that receive could read, then removes it again. Without
+    /// this the counter would drift upward on every question asked.
+    pub(crate) fn release_last_stamp(&mut self) {
+        self.stamp -= 1;
+    }
+
     pub(crate) fn next_stamp(&mut self) -> usize {
         self.stamp += 1;
         self.stamp

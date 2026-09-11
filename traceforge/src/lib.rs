@@ -1,5 +1,6 @@
 // #![doc = include_str!("../../README.md")]
 pub mod channel;
+pub(crate) mod conformance;
 mod cons;
 pub mod coverage;
 pub use coverage::{CoverageInfo, ExecutionId};
@@ -1034,6 +1035,23 @@ fn send_msg_with_tag<T: Message + 'static>(
     send_msg_with_vec_tag(v, tag.map(|t| vec![t]), loc, comm, lossy);
 }
 
+/// Suspend a thread whose choice point a probe has just recorded.
+///
+/// The handler recorded the label instead of installing it and returned a
+/// placeholder; this gives the position back and yields, permanently — the
+/// scheduler will not run a parked thread again during the probe. It therefore
+/// never returns, and **no user code after the choice point runs**, which is
+/// what makes a probe's offers correspond to what the program could do next
+/// rather than to what it did after being handed a fabricated value.
+fn probe_park() -> ! {
+    ExecutionState::with(|s| {
+        s.prev_pos();
+    });
+    loop {
+        switch();
+    }
+}
+
 /// Helper for vector tagged message sending
 fn send_msg_with_vec_tag<T: Message + 'static>(
     v: T,
@@ -1044,7 +1062,7 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
 ) {
     let tag = normalize_vec_tag(tag);
     switch();
-    ExecutionState::with(|s| {
+    let parked = ExecutionState::with(|s| {
         // creating the send label for the system send
         let pos = s.next_pos();
         let sender_tid = pos.thread;
@@ -1081,6 +1099,9 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
         );
 
         let maybe_stuck = s.must.borrow_mut().handle_send(slab);
+        if s.must.borrow_mut().probe_take_just_parked() {
+            return true;
+        }
         maybe_stuck.iter().for_each(|r| {
             let task = match s.must.borrow().to_task_id(r.thread) {
                 Some(task) => task,
@@ -1096,7 +1117,11 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
                 task.unstuck();
             }
         });
+        false
     });
+    if parked {
+        probe_park();
+    }
 }
 
 /// Returns a message from the thread queue or times out
@@ -1160,6 +1185,9 @@ fn recv_val_with_tag<'a>(
                 false,
             )
         });
+        if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
+            probe_park();
+        }
         if val.as_ref().is_some_and(Val::is_pending) {
             // The sender thread hasn't been executed far enough to reach the send label.
             // Block this thread and let the other threads run until the send is reached.
@@ -1235,6 +1263,9 @@ fn recv_val_block_with_tag<'a>(
                 true,
             )
         });
+        if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
+            probe_park();
+        }
         if let Some(box_msg) = val {
             if box_msg.is_pending() {
                 // The joined thread has not finished executing yet,
@@ -1345,11 +1376,15 @@ fn inbox_internal(tag: Option<PredicateType>, min: usize, max: Option<usize>) ->
 /// #[deprecated(since="0.2", note="please use `<bool>::nondet()` instead")]
 pub fn nondet() -> bool {
     switch();
-    ExecutionState::with(|s| {
+    let toss = ExecutionState::with(|s| {
         let pos = s.next_pos();
         let toss = s.must.borrow_mut().gen_bool();
         s.must.borrow_mut().handle_ctoss(CToss::new(pos, toss))
-    })
+    });
+    if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
+        probe_park();
+    }
+    toss
 }
 #[deprecated(
     since = "0.2.0",
@@ -1398,7 +1433,7 @@ pub fn coin_toss() -> bool {
 /// ```
 pub fn named_nondet(name: &str) -> bool {
     switch();
-    ExecutionState::with(|s| {
+    let toss = ExecutionState::with(|s| {
         let pos = s.next_pos();
 
         let mut must = s.must.borrow_mut();
@@ -1559,7 +1594,11 @@ pub fn named_nondet(name: &str) -> bool {
         drop(must);
         let toss = s.must.borrow_mut().gen_bool();
         s.must.borrow_mut().handle_ctoss(CToss::new(pos, toss).with_name(name.to_string()))
-    })
+    });
+    if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
+        probe_park();
+    }
+    toss
 }
 
 use crate::monitor_types::{Monitor, MonitorResult};
@@ -1573,11 +1612,15 @@ pub trait TypeNondet {
 impl TypeNondet for bool {
     fn nondet() -> Self {
         switch();
-        ExecutionState::with(|s| {
+        let toss = ExecutionState::with(|s| {
             let pos = s.next_pos();
             let toss = s.must.borrow_mut().gen_bool();
             s.must.borrow_mut().handle_ctoss(CToss::new(pos, toss))
-        })
+        });
+        if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
+            probe_park();
+        }
+        toss
     }
 }
 
@@ -1594,28 +1637,36 @@ pub trait Nondet<T> {
 impl Nondet<usize> for RangeInclusive<usize> {
     fn nondet(&self) -> usize {
         switch();
-        ExecutionState::with(|s| {
+        let choice = ExecutionState::with(|s| {
             let pos = s.next_pos();
             if self.start() > self.end() {
                 panic!("Range {:?} is not well-formed", self)
             }
             let mut r = RangeInclusive::new(*self.start(), *self.end());
             s.must.borrow_mut().handle_choice(Choice::new(pos, &mut r))
-        })
+        });
+        if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
+            probe_park();
+        }
+        choice
     }
 }
 
 impl Nondet<usize> for Range<usize> {
     fn nondet(&self) -> usize {
         switch();
-        ExecutionState::with(|s| {
+        let choice = ExecutionState::with(|s| {
             let pos = s.next_pos();
             if self.start >= self.end {
                 panic!("Range {:?} is not well-formed", self)
             }
             let mut r = RangeInclusive::new(self.start, self.end - 1);
             s.must.borrow_mut().handle_choice(Choice::new(pos, &mut r))
-        })
+        });
+        if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
+            probe_park();
+        }
+        choice
     }
 }
 

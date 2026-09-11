@@ -1,10 +1,11 @@
+use crate::conformance::probe::{Offer, ProbeCtx};
 use crate::cons::Consistency;
 use crate::event::Event;
 use crate::exec_graph::{ExecutionGraph, RecvLike};
 use crate::exec_pool::ExecutionPool;
 use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::future::PollerMsg;
-use crate::loc::{Loc, WakeMsg};
+use crate::loc::{CommunicationModel, Loc, WakeMsg};
 use crate::runtime::failure::init_panic_hook;
 use crate::runtime::task::TaskId;
 use crate::telemetry::{Recorder, Telemetry};
@@ -148,6 +149,10 @@ pub(crate) struct Must {
     pub(crate) global_named_choices: HashMap<String, bool>,
     // Maximum number of events across all complete (non-blocked) execution graphs
     max_graph_events: usize,
+    // Probe mode (conformance): when set, choice points are recorded as offers
+    // and their threads parked instead of the choice being committed. `None`
+    // for every ordinary verification run, which leaves all probe hooks inert.
+    probe: Option<ProbeCtx>,
 }
 
 impl Must {
@@ -185,7 +190,177 @@ impl Must {
             symbolic_solver: SymbolicSolver::new(),
             global_named_choices: HashMap::new(),
             max_graph_events: 0,
+            probe: None,
         }
+    }
+
+    /// A `Must` whose graph is `graph` rather than empty.
+    ///
+    /// Re-executing the program against it replays the events it already
+    /// contains (handlers detect this by graph containment) and takes fresh
+    /// decisions past its frontier — the same lifecycle an execution follows
+    /// after a backward revisit.
+    pub(crate) fn with_initial_graph(conf: Config, graph: ExecutionGraph) -> Self {
+        let mut must = Self::new(conf, false);
+        must.current.graph = graph;
+        must
+    }
+
+    /// Put this `Must` into probe mode (conformance). See
+    /// [`crate::conformance::probe`].
+    pub(crate) fn enable_probe(&mut self) {
+        // conf-plan.md §9 calls the constructor-side assertion "the
+        // guarantee": a `Config` can reach a `Must` without passing the
+        // builder's validation, so the scope predicate is checked here rather
+        // than trusted from outside.
+        assert_ne!(
+            crate::channel::cons_to_model(self.config.cons_type),
+            CommunicationModel::TotalOrder,
+            "conformance is scoped to asyn/p2p/cd (conf-plan.md §1/§9); \
+             mailbox is out of scope. Note this is checked on the *model*, \
+             so the deprecated `MO` spelling is caught as well as `Mailbox`."
+        );
+        assert_eq!(
+            self.config.schedule_policy,
+            SchedulePolicy::LTR,
+            "conformance requires the LTR schedule policy (conf-plan.md §9)"
+        );
+        assert_eq!(
+            self.config.mode,
+            ExplorationMode::Verification,
+            "conformance does not run in estimation mode (conf-plan.md §9)"
+        );
+        assert_eq!(
+            self.config.lossy_budget, 0,
+            "conformance excludes lossy sends (conf-plan.md §9)"
+        );
+        self.probe = Some(ProbeCtx::new());
+    }
+
+    /// Take the current graph out of this `Must`, leaving it empty.
+    pub(crate) fn take_graph(&mut self) -> ExecutionGraph {
+        std::mem::take(&mut self.current.graph)
+    }
+
+    /// Reject an operation that conformance mode does not support.
+    ///
+    /// Conformance v1 is scoped to the fragment the paper proves things about
+    /// (`conf-plan.md` §1/§9); `inbox`, `sample`, predetermined named choices
+    /// and symbolic evaluation are outside it. Meeting one during a probe
+    /// means the specification program is not a valid input, and continuing
+    /// would silently commit a choice the search never sees.
+    pub(crate) fn probe_reject(&self, what: &str) {
+        if self.probe.is_some() {
+            panic!(
+                "probe: `{what}` is outside conformance scope (conf-plan.md §9); \
+                 the program under probe may not use it"
+            );
+        }
+    }
+
+    /// The sends a recorded receive could read, in the checker's own order.
+    ///
+    /// The receive is installed into `self` first, because the rf enumeration
+    /// is defined over a receive that is in the graph; callers therefore pass
+    /// a scratch `Must` holding a *copy* of the graph, so the live graph is
+    /// untouched.
+    ///
+    /// For a **non-monitor** receive the result is exactly what an ordinary
+    /// execution would consider — the search does not get its own notion of
+    /// which sends are available. It is *not* faithful for a monitor receive:
+    /// the scratch `Must` has no monitors registered, so `is_monitor` is false
+    /// there and the `porf_override` an ordinary execution would pass is lost.
+    /// Monitors are outside conformance scope and probing a program that
+    /// registers one is rejected, so that case is unreachable; the limitation
+    /// is stated rather than relied upon.
+    pub(crate) fn probe_recv_sources(&mut self, label: LabelEnum) -> Vec<Event> {
+        let pos = self.probe_install(label);
+        let mut rfs = self.checker.rfs(
+            &self.current.graph,
+            self.current.graph.recv_label(pos).unwrap(),
+            self.is_monitor(&pos),
+        );
+        self.filter_symmetric_rfs(&mut rfs, pos);
+        rfs
+    }
+
+    /// Point an installed receive at one of its sources.
+    pub(crate) fn probe_set_rf(&mut self, pos: Event, rf: Option<Event>) {
+        self.current.graph.change_rf(pos, rf);
+    }
+
+    /// Install a label the probe recorded but did not add.
+    ///
+    /// This is the frontier operation the conformance search uses to extend a
+    /// specification graph by one chosen event. It adds the label through the
+    /// normal path, so stamps and views are computed exactly as an execution
+    /// would compute them, and registers a send in the per-location caches so
+    /// later receives can read it.
+    ///
+    /// What it deliberately does **not** do, and why that is safe here:
+    ///
+    /// - **no backward revisits** (`calc_revisits`): the inner search explores
+    ///   by trying offers, never by revisiting, so the revisit queue would
+    ///   never be read;
+    /// - **no receive bookkeeping** (`register_recv`) and no rf choice: a
+    ///   receive is installed by `probe_set_rf`'s caller, which decides what
+    ///   it reads;
+    /// - **no monitor delivery**: monitors are outside conformance scope.
+    ///
+    /// The label must sit at its thread's frontier — the search extends a
+    /// graph, it does not patch holes in one — which is asserted rather than
+    /// assumed, because a stale offer installed against a graph that has since
+    /// grown would otherwise corrupt the row silently.
+    pub(crate) fn probe_install(&mut self, label: LabelEnum) -> Event {
+        let at = label.pos();
+        assert_eq!(
+            at.index as usize,
+            self.current.graph.thread_size(at.thread),
+            "probe: offer for {at} is not at its thread's frontier ({} events); \
+             it was recorded against an older graph",
+            self.current.graph.thread_size(at.thread)
+        );
+        let is_send = matches!(label, LabelEnum::SendMsg(_));
+        let pos = self.add_to_graph(label);
+        if is_send {
+            self.current.graph.register_send(&pos);
+        }
+        pos
+    }
+
+    pub(crate) fn probe_active(&self) -> bool {
+        self.probe.is_some()
+    }
+
+    /// Record a choice point and park its thread. Only called from a handler's
+    /// handle-mode path, before anything has been added to the graph.
+    fn probe_record(&mut self, offer: Offer) {
+        info!("| Probe: offer {} at {}", offer.kind(), offer.pos());
+        self.probe
+            .as_mut()
+            .expect("probe_record outside probe mode")
+            .record(offer);
+    }
+
+    /// True iff a handler has just parked its thread, in which case the value
+    /// it returned is a placeholder that must not reach user code.
+    pub(crate) fn probe_take_just_parked(&mut self) -> bool {
+        self.probe
+            .as_mut()
+            .and_then(ProbeCtx::take_just_parked)
+            .is_some()
+    }
+
+    /// True iff a recorded park has not yet been consumed by the API layer.
+    pub(crate) fn probe_park_pending(&self) -> bool {
+        self.probe.as_ref().is_some_and(ProbeCtx::park_pending)
+    }
+
+    pub(crate) fn probe_take_offers(&mut self) -> Vec<Offer> {
+        self.probe
+            .as_mut()
+            .map(ProbeCtx::take_offers)
+            .unwrap_or_default()
     }
 
     /// Resets the Must instance for a new sample exploration.
@@ -394,6 +569,18 @@ impl Must {
 
     /// Extract the replay information from a failing execution
     pub(crate) fn store_replay_information(&mut self, pos: Option<Event>) {
+        // A probe is not an execution anyone can replay: it deliberately stops
+        // threads at positions whose labels were never installed, so sorting
+        // the graph "up to" the failing position indexes past the end of a
+        // thread's row. The resulting index panic then *replaces* the original
+        // one, which silently destroys the two diagnostics probe mode exists
+        // to raise -- the out-of-scope rejection and the unconsumed-park
+        // tripwire. A probe reports failures to its caller instead
+        // (conf-plan.md §5.1), so there is nothing to persist here.
+        if self.probe_active() {
+            return;
+        }
+
         println!("Random schedule seed: {:?}.", self.config().seed);
 
         if !self.replay_info.error_found() {
@@ -457,6 +644,7 @@ impl Must {
     }
 
     pub(crate) fn handle_register_mon(&mut self, monitor_info: MonitorInfo) {
+        self.probe_reject("monitor registration");
         self.monitors.insert(monitor_info.thread_id, monitor_info);
     }
 
@@ -467,6 +655,12 @@ impl Must {
         rlab: RecvMsg,
         blocking: bool,
     ) -> (Option<Val>, Option<usize>) {
+        // See `handle_send`: the channel's own model is invisible to any
+        // config check, and the guard sits at entry rather than inside the
+        // probe branch.
+        if rlab.comm() == CommunicationModel::TotalOrder {
+            self.probe_reject("a TotalOrder (mailbox) receive");
+        }
         if self.is_replay(rlab.pos()) {
             info!("| Replay Mode for receive {}", rlab);
             // Try to see if the `current_event` matches `rlab`
@@ -478,7 +672,13 @@ impl Must {
             // If the send that R reads from has a different reader R', assert that
             // R' is in a cancelled async receive, then fix up the reader.
             let g = &mut self.current.graph;
-            let rlab = g.recv_label(pos).unwrap();
+            // `process_event` above put a `RecvMsg` at `pos`. It could only be
+            // something else — a `Block` — if a blocked thread had been
+            // rescheduled past its blocked index, which the `Block` arm of
+            // `is_thread_runnable` exists to prevent.
+            let rlab = g
+                .recv_label(pos)
+                .expect("replay installed a receive here; a Block would mean a blocked thread ran on");
             if let Some(send_pos) = rlab.rf() {
                 let slab = g.send_label(send_pos).unwrap();
                 if let Some(reader) = slab.reader() {
@@ -534,6 +734,52 @@ impl Must {
         }
         info!("| Handle Mode for {}", rlab);
 
+        if self.probe_active() {
+            // Probe: a receive is only a choice point if it is *enabled*. The
+            // design (conf-plan.md §5.1) requires deciding that before
+            // parking, because a blocking receive with nothing to read is not
+            // a choice the specification can make — its thread is not enabled,
+            // and the graph must record that with a `Block` so the status of
+            // that thread is right.
+            //
+            // Deciding it needs the rf enumeration, which is defined over an
+            // installed receive. So install, enumerate, and un-install again
+            // if we are going to park: `remove_last` puts the graph back
+            // exactly as it was, the label having had no other effect.
+            let pos = self.add_to_graph(LabelEnum::RecvMsg(rlab.clone()));
+            let mut sources = self.checker.rfs(
+                &self.current.graph,
+                self.current.graph.recv_label(pos).unwrap(),
+                self.is_monitor(&pos),
+            );
+            self.filter_symmetric_rfs(&mut sources, pos);
+
+            if !sources.is_empty() || !blocking {
+                self.current.graph.remove_last(pos.thread);
+                // The question is asked, the label is gone: give its stamp
+                // back too, so asking leaves no trace at all.
+                self.current.graph.release_last_stamp();
+                // A non-blocking receive may also read nothing.
+                self.probe_record(Offer::recv(LabelEnum::RecvMsg(rlab), sources, !blocking));
+                return (None, None);
+            }
+
+            // Blocking with nothing to read: not enabled. Fall through to the
+            // ordinary path, which replaces the receive with a `Block`, and do
+            // not offer it. `visit_rfs` enumerates again rather than taking
+            // the `sources` computed above; that is deliberate — the graph has
+            // not changed between the two calls, so the answers necessarily
+            // agree, and threading a precomputed list into `visit_rfs` would
+            // add a probe-only parameter to a function every execution uses.
+            let val = self.visit_rfs(pos, blocking);
+            self.current.graph.register_recv(&pos);
+            let g = &self.current.graph;
+            return (
+                val,
+                g.recv_label(pos).and_then(|r| g.get_receiving_index(r)),
+            );
+        }
+
         let pos = self.add_to_graph(LabelEnum::RecvMsg(rlab));
         let val = self.visit_rfs(pos, blocking);
         self.current.graph.register_recv(&pos);
@@ -548,6 +794,7 @@ impl Must {
         &mut self,
         ilab: Inbox,
     ) -> (Vec<Option<Val>>, Vec<Option<usize>>, bool) {
+        self.probe_reject("inbox");
         if self.is_replay(ilab.pos()) {
             info!("| Replay Mode for receive {}", ilab);
             let mut ilab = ilab;
@@ -584,6 +831,14 @@ impl Must {
     // Returns the events that *might* be stuck waiting for the send,
     // in case this is a replay.
     pub(crate) fn handle_send(&mut self, slab: SendMsg) -> Vec<Event> {
+        // A channel carries its own communication model, which no config check
+        // can see -- exactly why conf-plan.md §9 asks for a handler-entry
+        // guard as well as the constructor assertion. Checked before the
+        // replay branch so every guard sits at entry and the placement needs
+        // no invariant to justify it.
+        if slab.comm() == CommunicationModel::TotalOrder {
+            self.probe_reject("a TotalOrder (mailbox) send");
+        }
         let spos = slab.pos();
         let mut stuck: Vec<Event> = Vec::new();
         if self.is_replay(spos) {
@@ -606,6 +861,14 @@ impl Must {
             return stuck;
         }
         info!("| Handle Mode for {}", slab);
+
+        if self.probe_active() {
+            // Probe: record what this send would be and park the thread. The
+            // returned vector is a placeholder; the API layer suspends the
+            // thread before it can be observed.
+            self.probe_record(Offer::new(LabelEnum::SendMsg(slab)));
+            return stuck;
+        }
 
         trace!("[must.rs] Handling send at position {}", slab.pos());
 
@@ -807,6 +1070,12 @@ impl Must {
             panic!();
         }
         info!("| Handle Mode for {}", ctlab);
+
+        if self.probe_active() {
+            self.probe_record(Offer::new(LabelEnum::CToss(ctlab)));
+            return false;
+        }
+
         let maximal = ctlab.maximal();
 
         let pos = self.add_to_graph(LabelEnum::CToss(ctlab));
@@ -826,6 +1095,7 @@ impl Must {
 
     /// Handle a CToss with a predetermined value. Similar to handle_ctoss but does not add revisits.
     pub(crate) fn handle_ctoss_predetermined(&mut self, mut ctlab: CToss, value: bool) -> bool {
+        self.probe_reject("predetermined named choice");
         if self.is_replay(ctlab.pos()) {
             info!(
                 "| Replay Mode for {} with predetermined value {}",
@@ -871,6 +1141,11 @@ impl Must {
         }
         info!("| Handle Mode for {}", chlab);
 
+        if self.probe_active() {
+            self.probe_record(Offer::new(LabelEnum::Choice(chlab)));
+            return 0;
+        }
+
         let pos = self.add_to_graph(LabelEnum::Choice(chlab));
         let stamp = self.current.graph.label(pos).stamp();
 
@@ -908,6 +1183,7 @@ impl Must {
         distr: D,
         max_samples: usize,
     ) -> T {
+        self.probe_reject("sample");
         if self.is_replay(pos) {
             info!("| Replay mode for sample");
             let l = self.current.graph.label(pos);
@@ -953,6 +1229,11 @@ impl Must {
         first
     }
 
+    /// Symbolic variable creation is forced bookkeeping, not a choice point:
+    /// it installs a label and offers nothing to decide, so a probe installs it
+    /// like any other forced event. The *branch* on a symbolic constraint is
+    /// the choice point, and `handle_constraint_eval` rejects it under probe
+    /// because symbolic execution is outside conformance scope.
     #[cfg(feature = "symbolic")]
     pub(crate) fn handle_symbolic_var(&mut self, lab: SymbolicVar) {
         if self.is_replay(lab.pos()) {
@@ -967,6 +1248,7 @@ impl Must {
 
     #[cfg(feature = "symbolic")]
     pub(crate) fn handle_constraint_eval(&mut self, mut lab: ConstraintEval) -> bool {
+        self.probe_reject("symbolic constraint evaluation");
         if self.is_replay(lab.pos()) {
             let pos = lab.pos();
 
@@ -1117,19 +1399,45 @@ impl Must {
                 .map(|(t, _)| t.to_owned()),
         };
         if next.is_some() {
-            next
-        } else {
-            self.unblock_ready(runnable)
+            return next;
         }
+
+        // Nothing is runnable as things stand. A thread blocked on a join or
+        // on a receive may have become enabled since — `unblock_ready` is the
+        // only thing that notices, and it is safe during a probe because both
+        // of its predicates require the thread's *last label* to be a `Block`,
+        // which a parked thread's never is (its choice-point label was never
+        // installed).
+        let unblocked = self.unblock_ready(runnable);
+
+        // If that freed nobody, the probe is over: every thread is parked,
+        // genuinely blocked, or finished. Stop cleanly rather than letting the
+        // runtime treat a graph full of parked threads as a deadlock.
+        if unblocked.is_none() && self.probe.is_some() {
+            self.stop();
+        }
+        unblocked
     }
 
     fn is_thread_runnable(&self, t: &TaskId, i: &usize) -> bool {
         let thread_id = self.to_thread_id(*t);
+
+        // A thread parked at a choice point is done for this probe: its label
+        // was never installed, so the graph cannot say it is waiting.
+        if let Some(p) = &self.probe {
+            if p.is_parked(&thread_id) {
+                return false;
+            }
+        }
+
         let g = &self.current.graph;
 
         // runnable when:
         match g.thread_last(thread_id).unwrap() {
             // Either the last event is Block and
+            // A parked thread never reaches this arm: parking installs no
+            // label, so its last label is whatever preceded the choice point,
+            // and the probe check above has already returned false for it.
             LabelEnum::Block(blab) => match blab.btype() {
                 // it's an internal blocking and the instruction points
                 // at least *2* instructions before it (see event_label::Block)
@@ -1159,6 +1467,15 @@ impl Must {
     }
 
     fn is_waiting_on_written(&self, t: ThreadId) -> bool {
+        // Known limitation under probe (backlog F32): this counts
+        // `matching_stores` rather than running `Consistency::rfs`, and is
+        // *stricter* than it on the cancelled-async-receive clause — a thread
+        // blocked on a receive that could read a cancelled reader's send stays
+        // asleep, and the probe loses that offer. It cannot be fixed by
+        // rebuilding a `RecvMsg` here: a `Block` does not record the receive's
+        // communication model, so the rebuilt label would be *laxer* instead.
+        // Async/futures are outside conformance scope (conf-plan.md §1), which
+        // is what makes the case unreachable for a valid specification.
         let g = &self.current.graph;
         if let LabelEnum::Block(blab) = g.thread_last(t).unwrap() {
             if let BlockType::Value(loc, min) = blab.btype() {
