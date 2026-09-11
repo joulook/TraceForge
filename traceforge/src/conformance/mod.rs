@@ -25,4 +25,6 @@ pub(crate) mod probe;
 pub(crate) mod prober;
 
 #[cfg(test)]
+pub(crate) mod adversarial;
+#[cfg(test)]
 pub(crate) mod testing;

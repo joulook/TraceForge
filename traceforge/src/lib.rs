@@ -1044,6 +1044,14 @@ fn send_msg_with_tag<T: Message + 'static>(
 /// what makes a probe's offers correspond to what the program could do next
 /// rather than to what it did after being handed a fabricated value.
 fn probe_park() -> ! {
+    // Give the position back. This is a defensive invariant rather than a
+    // load-bearing one *today*: `prev_pos` moves the runtime's instruction
+    // counter, not the graph, and a parked thread never runs again inside the
+    // probe — deleting this line leaves the whole conformance suite green
+    // (developer finding F-3). It is kept because it would become observable
+    // the moment a parked continuation were resumable, and because leaving the
+    // counter advanced past a label that was never installed is wrong on its
+    // own terms.
     ExecutionState::with(|s| {
         s.prev_pos();
     });
