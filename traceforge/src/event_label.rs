@@ -324,6 +324,22 @@ impl LabelEnum {
             // If ever needed, return true since we can compare neither locations
             // (they are lost during deserialization) nor tags (they are predicates)
             (BlockType::Value(_, _), BlockType::Value(_, _)) => unreachable!(),
+            // A pruned execution is abandoned, never replayed, so a
+            // `ConfPrune` reaching replay validation at all means conformance
+            // installed a block at a position a thread then ran past. Falling
+            // into the catch-all below answered `false`, and the caller turns
+            // `false` into "Incorrect TraceForge Program … must be
+            // deterministic" — a conformance-internal defect reported as a
+            // defect in the user's program (gate-4 review, B1, whose proximate
+            // cause was this arm's absence). Say what it is instead.
+            (BlockType::ConfPrune, BlockType::ConfPrune) => true,
+            (BlockType::ConfPrune, _) | (_, BlockType::ConfPrune) => panic!(
+                "conformance: internal invariant violation — replay validation \
+                 compared a `Block(ConfPrune)` against a different label, which \
+                 means a thread ran past a prune and installed an event where \
+                 `conf_prune` had written one. This is not program \
+                 nondeterminism (conf-plan.md §4.2)."
+            ),
             _ => false,
         }
     }
@@ -1263,6 +1279,11 @@ pub(crate) enum BlockType {
     // Internal blocking
     Value(RecvLoc, usize),
     Join(ThreadId),
+    /// Conformance pruned this execution (`conf-plan.md` §4.2). Added by
+    /// `Must::conf_prune` to every thread, so the execution ends here and the
+    /// engine moves on to the next revisit. Only ever appears on a graph
+    /// whose `Must` has `conf.is_some()`.
+    ConfPrune,
 }
 
 // Block events are used in two different ways:

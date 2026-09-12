@@ -735,7 +735,7 @@ where
     estimate_sum / (num_samples as f64)
 }
 
-fn explore<F>(must: &Rc<RefCell<must::Must>>, f: &Arc<F>)
+pub(crate) fn explore<F>(must: &Rc<RefCell<must::Must>>, f: &Arc<F>)
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -1794,6 +1794,19 @@ pub fn assert(cond: bool) {
             let pos = s.next_pos();
 
             let mut must = s.must.borrow_mut();
+            if must.conf_active() {
+                // §4.4. Conformance forces `keep_going_after_error`, so this
+                // branch is taken ahead of the flag test below rather than
+                // inside it, and it does not reach `persist_task_failure`.
+                let name = if let Some(task) = s.try_current() {
+                    task.name()
+                        .unwrap_or_else(|| format!("task-{:?}", task.id().0))
+                } else {
+                    "<unknown>".into()
+                };
+                must.conf_assert_failure(name, pos);
+                return;
+            }
             if must.config().keep_going_after_error {
                 let name = if let Some(task) = s.try_current() {
                     task.name()

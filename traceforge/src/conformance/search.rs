@@ -163,11 +163,20 @@ impl Search {
     /// - `outer_complete` must be true only when the outer execution really
     ///   has finished. Passing it wrongly does **not** give a wrong answer —
     ///   `done` calls `assume_finished_at_gate`, which **panics** if `g1` has
-    ///   a running spawned thread. The better of the two failures, but a
-    ///   constraint on S4's gate all the same.
-    /// - `install` and its siblings build a **non-probe** `Must`, so the eight
-    ///   `probe_reject` scope guards are inert on those paths. Scope is
-    ///   enforced when the offer is *produced*, not when it is installed.
+    ///   a running spawned thread. S4 discharges this positionally: only the
+    ///   completion gate passes `true` (`conformance::ctx::Gate`).
+    /// - Scope is enforced when the offer is **produced**, not when it is
+    ///   installed. `probe_install` bypasses handler entry entirely, so the
+    ///   `reject_out_of_scope` guards are not on the install path in any
+    ///   configuration — this is a property of *where* the guards sit, not of
+    ///   which `Must` the installs build, as an earlier version of this
+    ///   comment claimed. (Their count is also build-conditional: eight with
+    ///   `--features symbolic`, seven without.)
+    /// - This must run on a **dedicated OS thread**. `probe_from` sets the
+    ///   thread-local current `Must` and runs the specification on the calling
+    ///   thread, so calling `cover` from inside an outer execution would nest
+    ///   two runtimes in one thread's scoped state. `ConfCtx` owns that
+    ///   thread; nothing else may call this from within an execution.
     pub(crate) fn cover(
         &self,
         g1: &ExecutionGraph,

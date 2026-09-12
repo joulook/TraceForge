@@ -188,6 +188,17 @@ impl Wobs {
 /// §8 requires each declared visible name to be spawned exactly once, and
 /// `"main"` is reserved, so a second thread carrying a declared name means the
 /// program has broken the precondition positional matching rests on.
+///
+/// Exposed to S4 under the name `resolve_visible`, which is the only thing
+/// §8's spawn-order guard needs from this module — it must not grow a second
+/// name-resolution path of its own (S2's one-path rule).
+pub(crate) fn resolve_visible(
+    graph: &ExecutionGraph,
+    name: &str,
+) -> Result<Option<ThreadId>, ObsError> {
+    resolve(graph, name)
+}
+
 fn resolve(graph: &ExecutionGraph, name: &str) -> Result<Option<ThreadId>, ObsError> {
     let mut found = None;
     for tid in graph.thread_ids() {

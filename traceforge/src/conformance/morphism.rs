@@ -324,13 +324,44 @@ fn status_of(graph: &ExecutionGraph, tid: ThreadId) -> Status {
     let size = graph.thread_size(tid) as u32;
     for index in 0..size {
         if let LabelEnum::Block(blab) = graph.label(Event::new(tid, index)) {
+            // A `BlockType` discriminator the compiler does not flag, and one
+            // criterion 3's list of four does not name (gate-4 round 3, m3).
+            // `ConfPrune` is not `Assert`, so it falls through — right, and
+            // load-bearing in both directions: a prune must not make a clean
+            // thread look errored, and the blanket `ConfPrune` appended over a
+            // §4.4 `Assert` must not hide it, which is why this scans every
+            // index instead of reading the last label.
             if matches!(blab.btype(), BlockType::Assert) {
                 return Status::Errored;
             }
         }
     }
     match graph.thread_last(tid) {
-        Some(LabelEnum::Block(_)) => Status::Blocked,
+        Some(LabelEnum::Block(blab)) => match blab.btype() {
+            BlockType::Assume | BlockType::Assert | BlockType::Value(_, _) | BlockType::Join(_) => {
+                Status::Blocked
+            }
+            // §6.3 puts a pruned graph outside (M3)'s domain, and this is
+            // where the restriction is *checked* rather than assumed: every
+            // thread of a pruned graph rests at `Block(ConfPrune)`, so
+            // classifying it would report the whole execution `Blocked` — a
+            // wrong answer, quietly. S4's gate must not fire on a pruned
+            // execution (`conf-plan.md` §4.2, criterion 11).
+            //
+            // **It is not a complete backstop, and an earlier version of this
+            // comment overstated it** (gate-4 round 3, m3). The `Assert` scan
+            // above runs over *all* indices and returns `Status::Errored`
+            // before this match is reached — so for a thread carrying both a
+            // `Block(Assert)` and the blanket `Block(ConfPrune)`, which is
+            // exactly §4.4's visible-error case, this arm is pre-empted and
+            // stays silent. It fires for any visible thread without an
+            // `Assert`, which is the common case, but a §4.4 prune with a
+            // single declared visible thread would slip past it.
+            BlockType::ConfPrune => unreachable!(
+                "conformance: (M3) status extraction reached a pruned graph; \
+                 the gate fired on an execution it had already pruned"
+            ),
+        },
         _ => Status::Done,
     }
 }
@@ -359,16 +390,22 @@ fn is_complete(graph: &ExecutionGraph) -> bool {
             match graph.thread_last(t) {
                 Some(LabelEnum::End(_)) => true,
                 Some(LabelEnum::Block(blab)) => match blab.btype() {
-                    // Every current `BlockType` is a resting state. Matched
-                    // explicitly so that S4's `Block(ConfPrune)` — which §6.3
-                    // puts *outside* this function's domain, since status
-                    // extraction must never run on a pruned graph — is a
-                    // compile error here rather than a silently accepted
-                    // fifth case.
+                    // Every `BlockType` is a resting state, `ConfPrune`
+                    // included: a thread carrying one cannot take another
+                    // step, which is the only question this function asks.
+                    //
+                    // The domain restriction §6.3 puts on (M3) — status
+                    // extraction must never run on a **pruned** graph — is a
+                    // different claim, and answering it `false` here would be
+                    // the project's recurring defect: a domain error turned
+                    // into an answer ("not complete") that a caller would act
+                    // on. It is enforced where it can be stated, in
+                    // [`status_of`], which panics rather than classifying.
                     BlockType::Assume
                     | BlockType::Assert
                     | BlockType::Value(_, _)
-                    | BlockType::Join(_) => true,
+                    | BlockType::Join(_)
+                    | BlockType::ConfPrune => true,
                 },
                 _ => false,
             }

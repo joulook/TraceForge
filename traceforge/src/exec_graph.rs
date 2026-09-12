@@ -124,6 +124,16 @@ impl ExecutionGraph {
                 if let LabelEnum::Block(b) = lab {
                     match b.btype() {
                         BlockType::Value(..) | BlockType::Join(_) => continue,
+                        // `Assume`/`Assert`/`ConfPrune` fall through and are
+                        // counted as unreplayed. For `ConfPrune` that is
+                        // harmless and deliberate: `unreplayed_events` is
+                        // debug bookkeeping printed by
+                        // `record_ending_telemetry`, and a pruned execution is
+                        // abandoned rather than replayed, so the entries are
+                        // never consulted. (conf-plan.md §3 item 3 asks S4 to
+                        // say what each `BlockType` site does with the new
+                        // variant; this is one of the four the compiler does
+                        // not flag.)
                         _ => {}
                     }
                 }
@@ -448,6 +458,18 @@ impl ExecutionGraph {
                                 ret = Some(BlockType::Value(loc.clone(), *min));
                             }
                         }
+                        // A `Block(ConfPrune)` last label reaches this arm,
+                        // and that is conformance's intended answer: the
+                        // execution ends classified as pruned. Note it
+                        // **masks** an `Assert` on the thread §4.4 had already
+                        // blocked — `conf_prune` appends to every thread — so
+                        // the `Assert` arm's early return above never fires
+                        // for that thread. The ending's identity is carried by
+                        // the conformance report, recorded before the prune,
+                        // not by this classification; and `status_of` is
+                        // unaffected, since it scans *all* indices for an
+                        // `Assert` rather than reading the last label.
+                        // (conf-plan.md §3 item 3, §4.2.)
                         block => {
                             ret = Some(block.clone());
                         }

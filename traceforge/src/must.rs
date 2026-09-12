@@ -153,6 +153,13 @@ pub(crate) struct Must {
     // and their threads parked instead of the choice being committed. `None`
     // for every ordinary verification run, which leaves all probe hooks inert.
     probe: Option<ProbeCtx>,
+    // Conformance mode (conf-plan.md §3 item 1, §4): the outer run's gate
+    // state — the specification program, the carried `H`, the report sink.
+    // `None` for every ordinary verification run, which leaves every gate
+    // inert. Boxed because `ConfCtx` holds a whole `ExecutionGraph` as `H`,
+    // and an inline `Option<ConfCtx>` would grow `Must` by that much for
+    // every existing TraceForge user.
+    conf: Option<Box<crate::conformance::ctx::ConfCtx>>,
 }
 
 impl Must {
@@ -191,6 +198,7 @@ impl Must {
             global_named_choices: HashMap::new(),
             max_graph_events: 0,
             probe: None,
+            conf: None,
         }
     }
 
@@ -209,32 +217,30 @@ impl Must {
     /// Put this `Must` into probe mode (conformance). See
     /// [`crate::conformance::probe`].
     pub(crate) fn enable_probe(&mut self) {
-        // conf-plan.md §9 calls the constructor-side assertion "the
-        // guarantee": a `Config` can reach a `Must` without passing the
-        // builder's validation, so the scope predicate is checked here rather
-        // than trusted from outside.
-        assert_ne!(
-            crate::channel::cons_to_model(self.config.cons_type),
-            CommunicationModel::TotalOrder,
-            "conformance is scoped to asyn/p2p/cd (conf-plan.md §1/§9); \
-             mailbox is out of scope. Note this is checked on the *model*, \
-             so the deprecated `MO` spelling is caught as well as `Mailbox`."
-        );
-        assert_eq!(
-            self.config.schedule_policy,
-            SchedulePolicy::LTR,
-            "conformance requires the LTR schedule policy (conf-plan.md §9)"
-        );
-        assert_eq!(
-            self.config.mode,
-            ExplorationMode::Verification,
-            "conformance does not run in estimation mode (conf-plan.md §9)"
-        );
-        assert_eq!(
-            self.config.lossy_budget, 0,
-            "conformance excludes lossy sends (conf-plan.md §9)"
-        );
+        // §9's predicate, through the shared function. This call site used to
+        // write out four of the seven exclusions by hand; the missing three —
+        // symbolic, both parallel modes, and the two predetermined maps — went
+        // unnoticed until review round 1 of S4 counted them against §9.
+        crate::conformance::assert_config_in_scope(&self.config, "probe");
         self.probe = Some(ProbeCtx::new());
+    }
+
+    /// Put this `Must` into conformance mode: this is the **outer** run, the
+    /// one that explores the implementation and calls the gate.
+    ///
+    /// §3 item 8 words this as "`Must::new`: re-assert the §9 config predicate
+    /// when `conf.is_some()`". `conf` cannot be set at `new` time — the
+    /// context owns the specification program and a probe worker — so the
+    /// assertion lives at the point conformance is actually switched on, which
+    /// is the same shape `enable_probe` uses and gives the same guarantee: no
+    /// `Must` ever has `conf` set without the predicate having run.
+    pub(crate) fn enable_conformance(&mut self, ctx: crate::conformance::ctx::ConfCtx) {
+        crate::conformance::assert_config_in_scope(&self.config, "conformance");
+        // §3 item 4: conformance sets this internally. A visible error must not
+        // end the run — the search has to carry on and report every
+        // non-conforming execution, not just the first.
+        self.config.keep_going_after_error = true;
+        self.conf = Some(Box::new(ctx));
     }
 
     /// Take the current graph out of this `Must`, leaving it empty.
@@ -246,14 +252,30 @@ impl Must {
     ///
     /// Conformance v1 is scoped to the fragment the paper proves things about
     /// (`conf-plan.md` §1/§9); `inbox`, `sample`, predetermined named choices
-    /// and symbolic evaluation are outside it. Meeting one during a probe
-    /// means the specification program is not a valid input, and continuing
-    /// would silently commit a choice the search never sees.
-    pub(crate) fn probe_reject(&self, what: &str) {
-        if self.probe.is_some() {
+    /// and symbolic evaluation are outside it. Meeting one means the program
+    /// is not a valid input, and continuing would silently commit a choice the
+    /// search never sees — or, on the implementation side, explore behaviour
+    /// the theorem says nothing about.
+    ///
+    /// **This fires on both engines, and used to fire on only one.** It was
+    /// `probe_reject`, testing `probe.is_some()`, which left §9's "primary"
+    /// layer inert on the **outer conformance run** — the very layer §9
+    /// describes as "these arrive through API calls no config can see".
+    /// Renamed and widened, because a guard that only watches the
+    /// specification lets an implementation program use an inbox, `sample`, a
+    /// `TotalOrder` channel or a monitor and still receive a conformance
+    /// verdict.
+    ///
+    /// It stays inert on the `install*` paths regardless of this change:
+    /// `probe_install` bypasses handler entry entirely, so these guards are
+    /// not on its path in any configuration. Scope there is enforced when the
+    /// offer is *produced*.
+    pub(crate) fn reject_out_of_scope(&self, what: &str) {
+        if self.probe.is_some() || self.conf.is_some() {
+            let engine = if self.probe.is_some() { "probe" } else { "conformance" };
             panic!(
-                "probe: `{what}` is outside conformance scope (conf-plan.md §9); \
-                 the program under probe may not use it"
+                "{engine}: `{what}` is outside conformance scope (conf-plan.md §9); \
+                 the program may not use it"
             );
         }
     }
@@ -479,6 +501,13 @@ impl Must {
         must.current.graph.initialize_for_execution();
         must.telemetry.coverage.new_eid();
 
+        // A prune latches for the rest of its execution — that is what keeps
+        // the completion gate off a pruned graph. Clearing it here is what
+        // keeps one pruned execution from silencing every gate in the next.
+        if let Some(conf) = must.conf.as_mut() {
+            conf.begin_execution();
+        }
+
         // Reset per-execution state for named choices
         // Initialize frozen mapping if not yet created (first execution)
         if must.frozen_thread_index_map.is_none() {
@@ -638,15 +667,23 @@ impl Must {
 
     /// Extract the replay information from a failing execution
     pub(crate) fn store_replay_information(&mut self, pos: Option<Event>) {
-        // A probe is not an execution anyone can replay: it deliberately stops
-        // threads at positions whose labels were never installed, so sorting
-        // the graph "up to" the failing position indexes past the end of a
-        // thread's row. The resulting index panic then *replaces* the original
-        // one, which silently destroys the two diagnostics probe mode exists
-        // to raise -- the out-of-scope rejection and the unconsumed-park
-        // tripwire. A probe reports failures to its caller instead
-        // (conf-plan.md §5.1), so there is nothing to persist here.
-        if self.probe_active() {
+        // Neither a probe nor a conformance run is an execution anyone can
+        // replay: both deliberately stop threads at positions whose labels were
+        // never installed, so sorting the graph "up to" the failing position
+        // indexes past the end of a thread's row. The resulting index panic
+        // then *replaces* the original one, which silently destroys the
+        // diagnostics these modes exist to raise -- the out-of-scope
+        // rejection, the unconsumed-park tripwire, and §8's guards. Failures
+        // are reported to the caller instead (conf-plan.md §5.1, §4.2), so
+        // there is nothing to persist here.
+        //
+        // **The conformance half was missing and cost six of the eight
+        // outer-run scope guards their message** (developer's gate-3 report,
+        // F-C): S4 widened `probe_reject` to `reject_out_of_scope` so the
+        // guards fire on the outer run, and did not widen this exemption
+        // three lines below it. The guard fired; the caller saw "index out of
+        // bounds".
+        if self.probe_active() || self.conf.is_some() {
             return;
         }
 
@@ -713,7 +750,7 @@ impl Must {
     }
 
     pub(crate) fn handle_register_mon(&mut self, monitor_info: MonitorInfo) {
-        self.probe_reject("monitor registration");
+        self.reject_out_of_scope("monitor registration");
         self.monitors.insert(monitor_info.thread_id, monitor_info);
     }
 
@@ -728,7 +765,7 @@ impl Must {
         // config check, and the guard sits at entry rather than inside the
         // probe branch.
         if rlab.comm() == CommunicationModel::TotalOrder {
-            self.probe_reject("a TotalOrder (mailbox) receive");
+            self.reject_out_of_scope("a TotalOrder (mailbox) receive");
         }
         if self.is_replay(rlab.pos()) {
             info!("| Replay Mode for receive {}", rlab);
@@ -863,7 +900,7 @@ impl Must {
         &mut self,
         ilab: Inbox,
     ) -> (Vec<Option<Val>>, Vec<Option<usize>>, bool) {
-        self.probe_reject("inbox");
+        self.reject_out_of_scope("inbox");
         if self.is_replay(ilab.pos()) {
             info!("| Replay Mode for receive {}", ilab);
             let mut ilab = ilab;
@@ -906,7 +943,7 @@ impl Must {
         // replay branch so every guard sits at entry and the placement needs
         // no invariant to justify it.
         if slab.comm() == CommunicationModel::TotalOrder {
-            self.probe_reject("a TotalOrder (mailbox) send");
+            self.reject_out_of_scope("a TotalOrder (mailbox) send");
         }
         let spos = slab.pos();
         let mut stuck: Vec<Event> = Vec::new();
@@ -966,6 +1003,17 @@ impl Must {
 
         self.calc_revisits(pos);
         self.current.graph.register_send(&spos);
+
+        // §4.1's fresh-add gate for a send. It follows **both** `calc_revisits`
+        // and `register_send`: the first so this send's backward revisits are
+        // already queued when a prune happens (§4.1's "sibling semantics
+        // preserved for free" — the siblings survive the prune), the second so
+        // the graph the gate sees is the graph `Step` sees, with the send in
+        // `ExecutionGraph::sends`.
+        //
+        // The replay branch returned far above, so a replayed send never
+        // reaches here — one logical event, one gate call.
+        self.conf_gate(crate::conformance::ctx::Gate::FreshSend);
 
         // stuck is only used during replay
         assert!(stuck.is_empty());
@@ -1045,7 +1093,23 @@ impl Must {
         // scope guards — a probe replays, so a guard inside the probe branch
         // would be skipped for anything already in the prefix.
         if sym_cid.is_some() {
-            self.probe_reject("symmetric thread spawning");
+            self.reject_out_of_scope("symmetric thread spawning");
+        }
+        // §3 item 5's other rule: `"main"` is the reserved declared name for
+        // each program's own main thread, so it may not also be a `Builder`
+        // name. Without this the collision is still caught — `resolve` sees
+        // two threads carrying the name and raises `AmbiguousName` — but only
+        // at extraction, inside a gate, blamed on whichever program the
+        // classifier picks. Here it is caught at the declaration that caused
+        // it. Gated on the engine, so an ordinary `verify` is unaffected.
+        // (Gate-4 review, M3: the ban was required by criterion 9 and existed
+        // in neither the code nor the record.)
+        if (self.conf.is_some() || self.probe.is_some()) && name.as_deref() == Some("main") {
+            panic!(
+                "conformance: `\"main\"` is reserved for each program's own main \
+                 thread (conf-plan.md §8) and may not be used as a `Builder` \
+                 thread name"
+            );
         }
         let parent_tclab: TCreate = self.current.graph.get_thread_tclab(pos.thread);
         let mut origination_vec = parent_tclab.origination_vec();
@@ -1182,7 +1246,7 @@ impl Must {
 
     /// Handle a CToss with a predetermined value. Similar to handle_ctoss but does not add revisits.
     pub(crate) fn handle_ctoss_predetermined(&mut self, mut ctlab: CToss, value: bool) -> bool {
-        self.probe_reject("predetermined named choice");
+        self.reject_out_of_scope("predetermined named choice");
         if self.is_replay(ctlab.pos()) {
             info!(
                 "| Replay Mode for {} with predetermined value {}",
@@ -1270,7 +1334,7 @@ impl Must {
         distr: D,
         max_samples: usize,
     ) -> T {
-        self.probe_reject("sample");
+        self.reject_out_of_scope("sample");
         if self.is_replay(pos) {
             info!("| Replay mode for sample");
             let l = self.current.graph.label(pos);
@@ -1335,7 +1399,7 @@ impl Must {
 
     #[cfg(feature = "symbolic")]
     pub(crate) fn handle_constraint_eval(&mut self, mut lab: ConstraintEval) -> bool {
-        self.probe_reject("symbolic constraint evaluation");
+        self.reject_out_of_scope("symbolic constraint evaluation");
         if self.is_replay(lab.pos()) {
             let pos = lab.pos();
 
@@ -1530,7 +1594,12 @@ impl Must {
                 // at least *2* instructions before it (see event_label::Block)
                 BlockType::Join(_) | BlockType::Value(_, _) => (*i as u32) < blab.pos().index - 1,
                 // it's a user blocking and the instruction points before it
-                BlockType::Assume | BlockType::Assert => (*i as u32) < blab.pos().index,
+                // A pruned execution is abandoned like a failed assume
+                // (`conf-plan.md` §3 item 3): the instruction pointer points
+                // at the blocked instruction, not before it.
+                BlockType::Assume | BlockType::Assert | BlockType::ConfPrune => {
+                    (*i as u32) < blab.pos().index
+                }
             },
             // or the last event is not Block
             _ => true,
@@ -1593,6 +1662,14 @@ impl Must {
         if let LabelEnum::Block(blab) = self.current.graph.thread_last(t).unwrap() {
             match blab.btype() {
                 BlockType::Join(jlab) => self.current.graph.finished_threads.contains(jlab),
+                // `ConfPrune` answers `false`, which is required rather than
+                // merely acceptable: a `true` here would let `unblock_ready`
+                // `remove_last` the `Block(ConfPrune)` and put the thread back
+                // into handle mode, undoing the prune on that thread. Same for
+                // `is_waiting_on_written` above. (conf-plan.md §3 item 3 — one
+                // of the `BlockType` sites the compiler does not flag; found
+                // by gate-4 round 2, m2, and not in criterion 3's list of
+                // four.)
                 _ => false,
             }
         } else {
@@ -1611,6 +1688,187 @@ impl Must {
 
     fn stop(&mut self) {
         self.stop = true;
+    }
+
+    /// One conformance gate (`conf-plan.md` §4.1). Inert unless `conf` is set.
+    ///
+    /// The context is taken out of `self` for the call and put back: the gate
+    /// needs `&mut ConfCtx` and `&ExecutionGraph` at the same time, and both
+    /// live on `self`. Taking it also means a gate cannot re-enter itself —
+    /// during the call `self.conf` is `None`, so any nested hook is inert.
+    fn conf_gate(&mut self, gate: crate::conformance::ctx::Gate) {
+        use crate::conformance::ctx::GateOutcome;
+        let Some(mut ctx) = self.conf.take() else {
+            return;
+        };
+        let outcome = ctx.gate(gate, &self.current.graph);
+        self.conf = Some(ctx);
+        if outcome == GateOutcome::Prune {
+            self.conf_prune();
+        }
+    }
+
+    pub(crate) fn conf_active(&self) -> bool {
+        self.conf.is_some()
+    }
+
+    pub(crate) fn conf_ctx(&self) -> Option<&crate::conformance::ctx::ConfCtx> {
+        self.conf.as_deref()
+    }
+
+    /// End the conformance run's probe worker. See `ConfCtx::shutdown`.
+    pub(crate) fn conf_shutdown(&mut self) {
+        if let Some(conf) = self.conf.as_mut() {
+            conf.shutdown();
+        }
+    }
+
+    /// Which declared visible name, if any, a thread carries.
+    ///
+    /// Resolution goes through `obs::resolve_visible` — the one name path S2
+    /// approved — rather than comparing the runtime task name, which is a
+    /// different string and is absent for main.
+    fn conf_visible_name(&self, tid: ThreadId) -> Option<String> {
+        let conf = self.conf.as_ref()?;
+        conf.visible()
+            .iter()
+            .find(|name| {
+                matches!(
+                    crate::conformance::obs::resolve_visible(&self.current.graph, name),
+                    Ok(Some(t)) if t == tid
+                )
+            })
+            .cloned()
+    }
+
+    /// §4.4: a failed `traceforge::assert` under conformance.
+    ///
+    /// **The split is by visibility, and only one side is a report.** A
+    /// visible thread's failed assertion is a conformance report and prunes;
+    /// an invisible one is neither, because the theorem does not speak about
+    /// it — reporting it would claim a violation of something never promised,
+    /// and pruning on it would cut a subtree for a reason the morphism cannot
+    /// see.
+    ///
+    /// **The `Block(Assert)` goes in first**, before any prune, so that the
+    /// blanket `Block(ConfPrune)` cannot hide it: `status_of` scans *all* of a
+    /// thread's indices for an `Assert` rather than reading the last label, so
+    /// the errored status survives the trailing block. (`check_blocked` does
+    /// read the last label, so the *ending* is classified `ConfPrune` — which
+    /// is accurate, pruning being what ended the execution, and the error's
+    /// identity is carried by the report rather than by that classification.)
+    ///
+    /// **No counterexample file, and the report is not behind
+    /// `is_consistent`.** Conformance replaces the persistence sink rather
+    /// than writing one file per report; and F38 records that the consistency
+    /// checker contributes nothing under this fragment, so filtering a
+    /// conformance report through it could silently drop a real visible error.
+    ///
+    /// Runs under the `borrow_mut` `traceforge::assert` already holds, and
+    /// takes no second borrow: re-entering through `Must::current()` or the
+    /// `Rc<RefCell<Must>>` here would panic, not degrade.
+    pub(crate) fn conf_assert_failure(&mut self, fallback_name: String, pos: Event) {
+        // **Visibility is resolved first, above the latch test** (gate-4
+        // round 2, M1). The previous order returned early with
+        // `fallback_name` — `lib.rs`'s *runtime task name* — which is a
+        // different string from the declared visible name and is absent for
+        // main, so the same thread appeared as `"main"` in the `Report` and as
+        // `"main-thread-ThreadId(2)"` in the `Diagnostic` three statements
+        // later, and S5 could not join the two. It also classified an
+        // invisible thread's post-prune failure as `AfterPrune`, discarding a
+        // distinction `Diagnostic`'s own doc says is two different claims.
+        // Resolving first installs nothing, so it cannot reintroduce B1.
+        let visible = self.conf_visible_name(pos.thread);
+
+        // Nothing is installed once this execution has been pruned, and this
+        // must come before `handle_block` (gate-4 round 1, B1 — a crash on
+        // this very path, reachable from two statements).
+        //
+        // `conf_prune` appends a `Block(ConfPrune)` to every thread at
+        // `thread_last(t).pos().next()`, which is exactly the position the
+        // pruning thread's next `next_pos()` hands out — and `assert`
+        // installs a label *without yielding first*. So `handle_block` found
+        // `is_replay(pos)` true, took the replay branch, and
+        // `validate_replay_event` compared expected `Block(ConfPrune)`
+        // against actual `Block(Assert)`. The result was an abort reading
+        // "Incorrect TraceForge Program … must be deterministic": a
+        // conformance-internal defect reported to the user as a defect in the
+        // user's own program.
+        //
+        // The failure is still *recorded*, as a diagnostic rather than a
+        // second report (gate-4 round 1, m3 — the previous version dropped it
+        // silently). The execution is already doomed and the report that
+        // pruned it already names the occasion, so a second `Report` would
+        // claim something about a graph that no longer exists; saying nothing
+        // at all was the wrong end of that.
+        if self.conf.as_ref().is_some_and(|c| c.is_pruned()) {
+            let name = visible.unwrap_or(fallback_name);
+            if let Some(conf) = self.conf.as_mut() {
+                conf.record_after_prune(name, pos);
+            }
+            return;
+        }
+
+        self.handle_block(Block::new(pos, BlockType::Assert));
+
+        let Some(name) = visible else {
+            if let Some(conf) = self.conf.as_mut() {
+                conf.record_invisible_error(fallback_name, pos);
+            }
+            return;
+        };
+
+        let events: usize = self
+            .current
+            .graph
+            .thread_ids()
+            .into_iter()
+            .map(|t| self.current.graph.thread_size(t))
+            .sum();
+        let Some(mut ctx) = self.conf.take() else {
+            return;
+        };
+        let outcome = ctx.report_visible_error(name, pos, events);
+        self.conf = Some(ctx);
+        if outcome == crate::conformance::ctx::GateOutcome::Prune {
+            self.conf_prune();
+        }
+    }
+
+    /// §4.2: the prune. The report was recorded before this ran.
+    ///
+    /// **It blocks the execution; it does not unwind it.** Already-queued
+    /// revisits at shallower stamps survive in `self.current.rqueue`, which is
+    /// what makes this the draft's DFS prune rather than a wholesale
+    /// abandonment — `block_exec` and `stop` touch neither the queue nor the
+    /// saved states.
+    ///
+    /// The thread that triggered the prune keeps running its own user code
+    /// until it next yields, exactly as it does after `pick_revisit`'s
+    /// `block_exec(Assume)` — `next_task` returns `None` once stopped, so the
+    /// execution ends at the next scheduling point. Labels added in that
+    /// window land after the `Block`s and are dropped with the graph, since
+    /// every surviving revisit rebuilds from a view that predates the prune.
+    /// The gate itself cannot fire again in that window: `ConfCtx` latches
+    /// `pruned`, which also keeps status extraction away from a pruned graph.
+    fn conf_prune(&mut self) {
+        // **The invariant that keeps B1's whole class closed, stated because
+        // nothing asserts it** (gate-4 round 2, m5): every in-scope construct
+        // yields to the scheduler before installing a label, and `next_task`
+        // returns `None` once `stop` is set, so no label is added on any
+        // thread after this returns. `traceforge::assert` is the one
+        // exception — it installs without yielding — and `conf_assert_failure`
+        // handles it explicitly.
+        //
+        // If that ever stops holding, the symptom is B1's: a label arriving at
+        // a position `block_exec` already wrote. `blocks_are_compatible` now
+        // names that honestly for a `Block` actual; a **non-`Block`** actual
+        // would still fall to `compare_for_replay`'s generic tail and render
+        // as "Incorrect TraceForge Program … must be deterministic". A sweep
+        // of thirteen in-scope constructs placed immediately after a prune
+        // found none that gets there today.
+        self.block_exec(BlockType::ConfPrune);
+        self.stop();
     }
 
     fn unstop(&mut self) {
@@ -1635,13 +1893,41 @@ impl Must {
     /// the ability to call into Must model code (the monitor on_stop) while
     /// not holding a reference to entire Must object.
     pub(crate) fn complete_execution(must: &Rc<RefCell<Must>>) -> bool {
+        // §4.1's completion gate — the draft's `e = ⊥` case, and the **only**
+        // gate that may pass `outer_complete = true` (§5.5, owner ruling
+        // 2026-09-12).
+        //
+        // **It runs before `check_blocked`, not after it.** §3 item 2 says
+        // "before counting", and the counting is `record_ending_telemetry`
+        // below — but placing the gate between the two would make a prune here
+        // invisible: `maybe_block` would already have been computed as `None`,
+        // so `record_ending_telemetry` would increment `EXECS` rather than
+        // `BLOCKED` (counting a pruned execution as *complete*, the opposite
+        // of §4.2), the `EndCondition` match would take `AllThreadsCompleted`
+        // and never reach the `ConfPrune` arm, and `stop()` would be undone by
+        // `unstop()` further down. Running first, the prune's `Block(ConfPrune)`
+        // labels are in the graph when `check_blocked` reads it, and all three
+        // follow correctly.
+        //
+        // The borrow is taken and released per statement, as everything else
+        // in this function does: nothing may be held across
+        // `call_on_stop_on_monitors`.
+        must.borrow_mut().conf_gate(crate::conformance::ctx::Gate::Completion);
         let maybe_block = must.borrow_mut().check_blocked();
         let exceeded_max_executions = must.borrow_mut().record_ending_telemetry(&maybe_block);
 
         let condition = match maybe_block {
             None => EndCondition::AllThreadsCompleted,
             Some(block) => match block {
-                BlockType::Assume | BlockType::Assert => EndCondition::FailedAssumption,
+                // `ConfPrune` is classified with the blocked arm per §3 item
+                // 3. It is **not** folded in silently: the conformance report
+                // that caused the prune was recorded before `conf_prune` ran,
+                // so the ending's identity is carried by the sink, not by this
+                // classification. Monitors are the only consumers that could
+                // observe the difference and §9 rejects them in scope.
+                BlockType::Assume | BlockType::Assert | BlockType::ConfPrune => {
+                    EndCondition::FailedAssumption
+                }
                 BlockType::Value(_, _) | BlockType::Join(_) => EndCondition::Deadlock,
             },
         };
@@ -1654,6 +1940,13 @@ impl Must {
             return true; // no more executions.
         }
 
+        // The execution is over. Clearing the prune latch here rather than
+        // only at `begin_execution` is what keeps the revisit-apply gate live
+        // for the first alternative popped after a prune (developer's F-B):
+        // `try_revisit` runs below, before any next execution begins.
+        if let Some(conf) = must.borrow_mut().conf.as_mut() {
+            conf.end_execution();
+        }
         must.borrow_mut().unstop();
         !must.borrow_mut().try_revisit()
     }
@@ -1871,6 +2164,9 @@ impl Must {
                 }
             }
             self.current.graph.change_rf(pos, None);
+            // §4.1's fresh-add gate for a receive, ⊥ case: the receive is
+            // installed and reads nothing.
+            self.conf_gate(crate::conformance::ctx::Gate::FreshRecv);
             return self.current.graph.val_copy(pos);
         }
 
@@ -1895,6 +2191,35 @@ impl Must {
                     );
                 });
             }
+            // §4.1's fresh-add gate for a receive, canonical-rf case.
+            //
+            // **Which of `visit_rfs`'s two callers this serves.**
+            // `handle_recv` calls it at two sites; the first is inside
+            // `if self.probe_active()`, and `probe_active()` is
+            // `self.probe.is_some()`, so that site is unreachable on the outer
+            // conformance run — which has `conf` set and `probe` unset. Gating
+            // inside `visit_rfs` therefore fires exactly once per fresh
+            // receive on the run that matters.
+            //
+            // **Why the gate is here and not at the caller.** The ⊥ case and
+            // the no-candidate blocked case are indistinguishable from the
+            // returned `Option<Val>` — both are `None` — and only the
+            // installed label separates them (`recv_label` is `Some` for ⊥ and
+            // `None` after the `Block(Value)` overwrite below). A caller-side
+            // gate keyed on `val.is_some()` would fire on a blocked receive or
+            // miss a real ⊥. Sitting on the two branches that install a
+            // receive makes the distinction structural.
+            //
+            // **It does precede `register_recv`**, unlike the send gate, which
+            // §4.1 places after `register_send` on the ground that otherwise
+            // "the graph it sees is not the graph `Step` sees" (gate-4 review,
+            // m4). Harmless today, and *contingently* so: nothing in
+            // `conformance/` reads `ExecutionGraph::recvs` — `Cover` consumes
+            // the graph through `wobs` and the morphism, which read labels and
+            // `porf`. The day anything downstream does, §7.3's triage being
+            // the obvious candidate, this gate hands it a graph missing the
+            // receive it just gated. Recorded for S5 rather than moved now.
+            self.conf_gate(crate::conformance::ctx::Gate::FreshRecv);
             self.current.graph.val_copy(pos)
         } else {
             // Overwrites RecvMsg
@@ -2381,9 +2706,114 @@ impl Must {
                 RevisitEnum::ForwardRevisit(r) => self.forward_revisit(r),
                 RevisitEnum::BackwardRevisit(r) => self.backward_revisit(r),
             } {
+                if self.conf_revisit_gate(&rev) {
+                    // Pruned before it ever ran: poll the worklist for the
+                    // next alternative rather than launching this one.
+                    continue;
+                }
                 return true;
             }
         }
+    }
+
+    /// §4.1's revisit-apply gate, plus §9's backstop assertion.
+    ///
+    /// Runs after the pop has mutated or installed the graph and **before**
+    /// the re-execution is launched, so the gate sees precisely the graph the
+    /// draft reports on (`SetRF(G|_{E∖D}, r, e)`) and a doomed re-execution is
+    /// skipped entirely rather than explored and then cut.
+    ///
+    /// **The label kind discriminates, and it does two jobs.** An rf re-point
+    /// or a backward install is a `Step` on the revisited graph and is gated.
+    /// A CToss/Choice flip is not: the draft's `SetND` is ungated, recursing
+    /// into `Visit` directly.
+    ///
+    /// The third arm is §9's second run-time layer — "the revisit-apply site's
+    /// label-kind discrimination (§4.1) is a **backstop assertion only** (it
+    /// can only ever see such a label if the primary guard already missed one;
+    /// it fires as an internal invariant violation, not a user error)". An
+    /// `Inbox` label here means a handler-entry guard did not fire, so this
+    /// says *that*, rather than reporting a conformance verdict about a
+    /// program conformance never had the right to explore.
+    /// Returns whether the alternative was pruned and must not be run.
+    ///
+    /// **A prune here skips; it does not `block_exec` and `stop`.** §4.2's
+    /// blanket wording says a prune records, blocks and stops, and that is
+    /// right at the three gates that fire *inside* a running execution. This
+    /// gate fires between executions, on a graph that has been prepared and
+    /// not yet launched, and §4.1's own statement of purpose is that gating
+    /// here "skips the doomed re-execution entirely". Blocking and stopping
+    /// instead left `stop` set with nothing to clear it — `unstop` runs
+    /// *before* `try_revisit` — so the next execution ran zero events and the
+    /// completion gate then fired on a graph that was both pruned and
+    /// unreplayed, which crashed in `wobs` on a blanked send value (the
+    /// developer's F-A). **A departure from §4.2's uniform wording, recorded
+    /// as one**, per criterion 13.
+    ///
+    /// **Why abandoning is safe — the derivation, not the conclusion**
+    /// (gate-4 round 2, m6; the previous version asserted the conclusion in
+    /// one sentence and the two premises it rests on were written nowhere).
+    ///
+    /// 1. `RQueue` is a `BTreeMap<usize, _>` and `pop_worklist` takes
+    ///    `next_back()`, the **largest** stamp, so after a pop at `s₁` every
+    ///    remaining entry has stamp `≤ s₁`.
+    /// 2. **Stamps are globally unique within a graph** — one monotone
+    ///    counter, `next_stamp`, applied once per label in `add`. A forward
+    ///    revisit is keyed by the stamp of the *receive*; a backward one by
+    ///    the stamp of the just-added *send*. So the two keys are never equal
+    ///    and a backward pop following a skipped forward pop is at a strictly
+    ///    smaller stamp `s₂ < s₁`.
+    /// 3. **Lossy sends are out of scope (§9)**, so `lossy_budget == 0` and a
+    ///    gated forward revisit is always at a `RecvMsg` — the `SendMsg` arm
+    ///    of `forward_revisit` is reachable only through the lossy path.
+    ///    After `cut_to_stamp(s₁)` that receive is the last label of its
+    ///    thread, and a `RecvMsg` is the source of no rf, `TCreate` or `TEnd`
+    ///    edge, so it has **no outgoing porf edge at all**.
+    /// 4. `revisit_view` is `view_from_stamp(stamp(rev.pos)) ∪ porf(send) ∪
+    ///    {Begin}`. The first component excludes the mutated event by (2),
+    ///    the second by (3), the third adds only index-0 labels. **So a
+    ///    skipped forward revisit's in-place mutation can never be copied
+    ///    into a later backward revisit's view.**
+    /// 5. A skipped *backward* revisit is undone exactly: `push_state` takes
+    ///    `current` wholesale, leaving `current.rqueue` empty, so the
+    ///    `continue` below falls into `try_pop_state` and restores graph and
+    ///    queue together.
+    ///
+    /// **Premise (3) is the fragile one.** If §9 ever admits lossy sends, the
+    /// mutated event can be a `SendMsg`, which *does* have an outgoing rf
+    /// edge, and step (4) fails. Recorded as obligation **O-skip** in
+    /// `backlog/algorithm-issues.md` so it has a name to be found by.
+    fn conf_revisit_gate(&mut self, rev: &RevisitEnum) -> bool {
+        if self.conf.is_none() {
+            return false;
+        }
+        let pos = rev.pos();
+        match self.current.graph.label(pos) {
+            // Not gated: the draft's `SetND`.
+            LabelEnum::CToss(_) | LabelEnum::Choice(_) => {}
+            // Gated: an rf re-point or a backward install.
+            LabelEnum::RecvMsg(_) | LabelEnum::SendMsg(_) | LabelEnum::Block(_) => {
+                let Some(mut ctx) = self.conf.take() else {
+                    return false;
+                };
+                let outcome = ctx.gate(
+                    crate::conformance::ctx::Gate::RevisitApply,
+                    &self.current.graph,
+                );
+                if outcome == crate::conformance::ctx::GateOutcome::Prune {
+                    ctx.abandon_revisit();
+                }
+                self.conf = Some(ctx);
+                return outcome == crate::conformance::ctx::GateOutcome::Prune;
+            }
+            lab => panic!(
+                "conformance: internal invariant violation — a revisit at {pos} \
+                 carries the label `{lab}`, which conformance's handler-entry \
+                 guards (conf-plan.md §9) should have rejected before it could \
+                 be installed. This is a backstop, not a user error."
+            ),
+        }
+        false
     }
 
     fn forward_revisit(&mut self, rev: &Revisit) -> bool {
