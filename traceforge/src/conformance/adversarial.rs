@@ -2670,8 +2670,7 @@ fn fifo_two_sends() {
 }
 
 /// The same program, recording what `main` observed, for the `verify` oracle.
-static FIFO_TWO_SENDS_SEEN: std::sync::Mutex<Vec<(u64, u64)>> =
-    std::sync::Mutex::new(Vec::new());
+static FIFO_TWO_SENDS_SEEN: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
 fn fifo_two_sends_recorded() {
     let m = main_thread_id();

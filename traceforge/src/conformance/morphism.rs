@@ -417,6 +417,7 @@ pub(crate) fn matches(
 mod tests {
     use super::*;
     use crate::conformance::obs::wobs;
+    use crate::conformance::prober::{install, probe_from};
     use crate::conformance::testing::{names, run_once};
     use crate::thread::main_thread_id;
     use crate::{recv_msg_block, send_msg, thread, Config};
@@ -614,13 +615,28 @@ mod tests {
     }
 
     /// The shape both early review rounds missed: a join in which **neither**
-    /// participant is visible still orders two visible events, because
-    /// `in_porf`'s `TJoin` arm pulls in the joined thread's entire prefix.
+    /// participant is visible still orders two visible events.
     ///
     /// Invisible `u` joins invisible `w`; `w` has received from visible main,
     /// and after the join `u` sends to visible `c`. So main's send is ordered
     /// before `c`'s receive even though the join touches no visible thread.
     /// This is why A7's resolution (b) has to be "no join at all".
+    ///
+    /// **The mechanism is `calc_views`, not `in_porf`'s `TJoin` arm**, and the
+    /// correction matters because the arm is the natural place to look. A
+    /// mutation audit settled it: deleting `in_porf`'s `TJoin` arm fails
+    /// nothing in the crate, while deleting `cons.rs::calc_views`'s TEnd fold
+    /// (`cons.rs:390`) fails this test and the one above it. `calc_views`
+    /// folds the joined thread's clock into the *successor* of the `TJoin`, so
+    /// by the time anything a visible event can reach is reached, the cached
+    /// clock already carries it. `in_porf`'s arm only fires when the queried
+    /// `second` **is** the `TJoin` event — and `vo` is called only on matched
+    /// pairs, which are `Obs::Send`/`Obs::Recv` events and never a `TJoin`. It
+    /// is therefore unreachable from this module, which is also why no test
+    /// here can pin it.
+    ///
+    /// To break it: make `vo` program-order-only, or drop that `calc_views`
+    /// fold.
     #[test]
     fn a_join_between_two_invisible_threads_still_orders_visible_events() {
         let vis = names(&["main", "c"]);
@@ -694,7 +710,20 @@ mod tests {
     /// (M3) is restricted to `Tvis`: an invisible thread left blocked on one
     /// side and finished on the other must not make the statuses disagree.
     ///
-    /// To break it: compare statuses over all threads. This test then fails.
+    /// Its only assertion is a *positive* one — that two things agree — which
+    /// is the shape that goes vacuous silently, so the difference it is
+    /// supposed to be ignoring is checked rather than assumed: asked over a
+    /// name list that includes the hidden threads, the two sides really do
+    /// disagree.
+    ///
+    /// **What actually breaks it, from the mutation audit**: only removing
+    /// `is_complete`'s `main` exemption, which breaks nearly every (M3) test
+    /// here. The restriction itself is enforced by `statuses`'s signature —
+    /// it iterates `visible` and can see nothing else — so "compare statuses
+    /// over all threads", which this comment used to name, is not a mutation
+    /// of this module at all. The non-vacuity control below is what gives the
+    /// test teeth; `adversarial::m3_ignores_invisible_threads` states the same
+    /// property on a different program.
     #[test]
     fn invisible_thread_statuses_do_not_affect_m3() {
         let vis = names(&["main"]);
@@ -725,6 +754,22 @@ mod tests {
             statuses_agree(&sa, &sb),
             "invisible threads must not enter (M3): {sa:?} vs {sb:?}"
         );
+
+        // Not vacuous: asked over a list that *does* name them, the two hidden
+        // threads really do have different statuses. Without this the test
+        // would still pass if they were both `Done` — that is, if there were
+        // nothing for the restriction to be excluding.
+        let hidden_status = |g: &ExecutionGraph, n: &str| {
+            let list = names(&[n]);
+            statuses(
+                CompleteExecution::assume_finished_at_gate(g),
+                &wobs(g, &list).unwrap(),
+                &list,
+            )
+            .unwrap()[n]
+        };
+        assert_eq!(hidden_status(&blocked_invisible, "stuck"), Status::Blocked);
+        assert_eq!(hidden_status(&finished_invisible, "fine"), Status::Done);
     }
 
     /// (M3)'s **failing** case — the draft's Ex. blocking, and the reason
@@ -794,14 +839,14 @@ mod tests {
         );
     }
 
-    /// (M3)'s completeness precondition is now a type, not an assertion.
+    /// A finished execution's graph, and the same graph with one *spawned*
+    /// thread's final label removed so its row ends mid-execution.
     ///
-    /// A graph with a spawned thread still running cannot produce a
-    /// `CompleteExecution`, so `statuses` is unreachable for it — the refusal
-    /// is a value the caller must handle rather than a panic it might not
-    /// provoke.
-    #[test]
-    fn a_graph_with_a_running_spawned_thread_yields_no_witness() {
+    /// Both halves are needed together: the first is the positive control that
+    /// this program really does produce a witness, so the second's refusal is
+    /// attributable to the missing label and not to anything else about the
+    /// program.
+    fn whole_and_running() -> (ExecutionGraph, ExecutionGraph) {
         let vis = names(&["main", "w"]);
         let g = run_once(cfg(), || {
             let sink = spawn_named("sink", || {
@@ -814,37 +859,94 @@ mod tests {
             let _ = w.join();
         });
         let w = wobs(&g, &vis).unwrap();
-        assert!(CompleteExecution::try_finished(&g).is_some());
-
-        // Drop w's End, leaving its row ending on a send: still running.
-        let mut partial = g.clone();
         let wid = w.of("w")[0].0.thread;
+
+        // Drop w's End, leaving its row ending on its send: still running.
+        let mut partial = g.clone();
         partial.remove_last(wid);
+        assert!(
+            matches!(partial.thread_last(wid), Some(LabelEnum::SendMsg(_))),
+            "the premise: w's row must now end on a label that is neither End \
+             nor Block, or this fixture is testing nothing"
+        );
+        (g, partial)
+    }
+
+    /// (M3)'s completeness precondition is now a type, not an assertion.
+    ///
+    /// A graph with a spawned thread still running cannot produce a
+    /// `CompleteExecution`, so `statuses` is unreachable for it — the refusal
+    /// is a value the caller must handle rather than a panic it might not
+    /// provoke.
+    ///
+    /// To break it: make `is_complete` return `true` unconditionally, or drop
+    /// its `_ => false` arm. Removing the `main` exemption breaks it too, in
+    /// the other direction — the positive control then fails.
+    #[test]
+    fn a_graph_with_a_running_spawned_thread_yields_no_witness() {
+        let (whole, partial) = whole_and_running();
+        assert!(CompleteExecution::try_finished(&whole).is_some());
         assert!(
             CompleteExecution::try_finished(&partial).is_none(),
             "a running spawned thread must not witness completeness"
         );
     }
 
-    /// **F33, fixed.** A probe graph leaves main parked mid-execution, and no
-    /// graph can say so — main never gets an `End` label (A8). Before the
-    /// witness type, such a graph passed the completeness assertion and
-    /// `statuses` reported main as *done*.
+    /// The gate constructor's own half of the same refusal: it does not
+    /// silently accept what `try_finished` rejects.
     ///
-    /// Now the specification side has a real check rather than an assertion:
-    /// a probe that still has offers is by definition not exhausted, so
-    /// `from_exhausted_probe` refuses it. An empty offer set is exactly
-    /// `next_Spec(G) = ∅`, §5.5's own condition for `Done`.
+    /// `assume_finished_at_gate` names main's residual obligation as the
+    /// caller's, but it is not a blank cheque — the *checkable* half is still
+    /// enforced, by a panic, because at the completion gate a running spawned
+    /// thread is an internal inconsistency rather than a caller's choice to
+    /// handle.
     ///
-    /// To break it: drop the `!offers.is_empty()` guard. This test then
-    /// yields a witness for a graph whose main is parked, and F33 is back.
+    /// Written because a mutation audit found nothing anywhere in the crate
+    /// that fails when the `expect` is replaced by `unwrap_or(Self { graph })`:
+    /// every other call site passes a graph that really is finished, so the
+    /// panic was unreachable in testing and could have been deleted unnoticed.
+    /// The expected message is matched in full rather than merely asserting
+    /// *some* panic, since any assertion inside the fixture would otherwise
+    /// satisfy the test.
+    #[test]
+    #[should_panic(expected = "a finished execution has no running spawned thread")]
+    fn the_completion_gate_refuses_a_running_spawned_thread_loudly() {
+        let (_whole, partial) = whole_and_running();
+        let _ = CompleteExecution::assume_finished_at_gate(&partial);
+    }
+
+    /// main parks at its send; `w` is spawned with an empty body and finishes.
+    fn parks_main_at_a_send() {
+        let _w = spawn_named("w", || {});
+        send_msg(main_thread_id(), 1i32);
+    }
+
+    /// **F33, fixed** — and the A/B that says *what* fixed it.
+    ///
+    /// A probe graph leaves main parked mid-execution, and no graph can say so:
+    /// main never gets an `End` label (A8), so the spawned-thread check passes
+    /// on it. Before the witness type, such a graph passed the completeness
+    /// assertion and `statuses` reported main as *done*.
+    ///
+    /// The two halves run the **same program** and differ only in whether the
+    /// probe still has an offer outstanding:
+    ///
+    /// - parked at its send, one offer → `complete()` refuses, while
+    ///   `try_finished` on that same graph accepts. The refusal is therefore
+    ///   the offer set's doing, not the spawned-thread check's.
+    /// - install that offer, re-probe, no offers → `complete()` answers
+    ///   `Some`, and main is *done* for real this time.
+    ///
+    /// The second half is why this is not a restatement of
+    /// `adversarial::m3_no_longer_reports_a_parked_main_as_done`: without it,
+    /// `Probed::complete()` returning `None` unconditionally passes both.
+    ///
+    /// To break it: drop the `!offers.is_empty()` guard and the first half
+    /// fails (F33 is back); make `complete()` always answer `None` and the
+    /// second fails.
     #[test]
     fn a_probe_with_offers_outstanding_yields_no_witness() {
-        let probed =
-            crate::conformance::prober::probe_from(cfg(), ExecutionGraph::default(), || {
-                let _w = spawn_named("w", || {});
-                send_msg(main_thread_id(), 1i32);
-            });
+        let probed = probe_from(cfg(), ExecutionGraph::default(), parks_main_at_a_send);
         assert_eq!(
             probed.offers().len(),
             1,
@@ -852,16 +954,39 @@ mod tests {
         );
         assert_eq!(probed.offers()[0].pos().thread, main_thread_id());
 
-        assert!(
-            probed.complete().is_none(),
-            "a probe with offers outstanding is not a complete execution"
-        );
-        // And the checkable half alone would have let it through — which is
+        // The checkable half alone would have let it through — which is
         // precisely how F33 happened.
         assert!(
             CompleteExecution::try_finished(probed.graph()).is_some(),
             "the spawned-thread check passes, so it is not what saves us"
         );
+        assert!(
+            probed.complete().is_none(),
+            "a probe with offers outstanding is not a complete execution"
+        );
+
+        // The other side of the A/B: install the one offer and re-probe. Same
+        // program, same spawned-thread check, no offers left — and now the
+        // witness exists and main really is done.
+        let (offers, graph) = probed.into_parts();
+        let graph = install(cfg(), graph, &offers[0]);
+        let exhausted = probe_from(cfg(), graph, parks_main_at_a_send);
+        assert!(
+            exhausted.offers().is_empty(),
+            "main's send was installed, so nothing is left to decide: {:?}",
+            exhausted
+                .offers()
+                .iter()
+                .map(|o| o.kind())
+                .collect::<Vec<_>>()
+        );
+
+        let vis = names(&["main", "w"]);
+        let w = wobs(exhausted.graph(), &vis).unwrap();
+        let exec = exhausted
+            .complete()
+            .expect("an exhausted probe is a complete execution");
+        assert_eq!(statuses(exec, &w, &vis).unwrap()["main"], Status::Done);
     }
 
     /// Main extracts as *done*, which §6.3's literal rule would get wrong.
