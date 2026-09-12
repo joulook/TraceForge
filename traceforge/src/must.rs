@@ -1,4 +1,4 @@
-use crate::conformance::probe::{Offer, ProbeCtx};
+use crate::conformance::probe::{NondetValue, Offer, ProbeCtx};
 use crate::cons::Consistency;
 use crate::event::Event;
 use crate::exec_graph::{ExecutionGraph, RecvLike};
@@ -289,6 +289,53 @@ impl Must {
         self.current.graph.change_rf(pos, rf);
     }
 
+    /// Fix the value of an installed nondeterministic choice point.
+    ///
+    /// The second of the two decision operations `conf-plan.md` §5.2 names —
+    /// the counterpart of [`Self::probe_set_rf`] for a receive. S1 originally
+    /// shipped only the receive half, which left the search unable to install
+    /// a chosen value and so unable to branch on one at all (backlog F35);
+    /// the owner directed S1 be extended rather than have the search take
+    /// whatever value the probe happened to produce.
+    ///
+    /// This is the `forward_revisit`-style mutation **without the cut**: the
+    /// event is at the frontier, so nothing above it exists to delete, and a
+    /// choice point carries no rf edge, so no clock depends on its value.
+    /// Setting the result is therefore the whole operation — which is why it
+    /// needs no `change_rf`-style repair pass.
+    pub(crate) fn probe_set_value(&mut self, pos: Event, value: NondetValue) {
+        match (self.current.graph.label_mut(pos), value) {
+            (LabelEnum::CToss(ctlab), NondetValue::Toss(v)) => ctlab.set_result(v),
+            (LabelEnum::Choice(chlab), NondetValue::Choice(v)) => {
+                // Checked here rather than left to `set_result`'s bare
+                // `assert!`, which names neither the value, the range, the
+                // position, nor this function — developer finding O-1. A
+                // value outside the range is one the program could never have
+                // produced, so the message should say so.
+                assert!(
+                    chlab.range().contains(&v),
+                    "probe: cannot set choice {v} at {pos}; the label's range \
+                     is {:?} and a value outside it is one the program could \
+                     never have produced",
+                    chlab.range()
+                );
+                chlab.set_result(v)
+            }
+            // Two different mistakes, and the message has to tell them apart
+            // — developer finding O-2, where a `Choice` given a `Toss` was
+            // told "this is for CToss and Choice labels only".
+            (LabelEnum::CToss(_), v) | (LabelEnum::Choice(_), v) => panic!(
+                "probe: {v:?} is the wrong kind of value for the choice point \
+                 at {pos}; a CToss takes NondetValue::Toss and a Choice takes \
+                 NondetValue::Choice"
+            ),
+            (other, v) => panic!(
+                "probe: cannot set {v:?} on the {other} at {pos}; \
+                 probe_set_value is for CToss and Choice labels only"
+            ),
+        }
+    }
+
     /// Install a label the probe recorded but did not add.
     ///
     /// This is the frontier operation the conformance search uses to extend a
@@ -352,15 +399,37 @@ impl Must {
     }
 
     /// True iff a recorded park has not yet been consumed by the API layer.
+    /// True iff a park is still waiting to be consumed by the API layer.
+    ///
+    /// `expect` rather than `is_some_and` for the same reason as
+    /// `probe_take_offers`: with `is_some_and`, probe mode being off answers
+    /// `false`, which makes `prober::probe_from`'s end-of-probe assertion —
+    /// the tripwire for an API path that reached a handler without parking —
+    /// pass vacuously. A tripwire that cannot fire is worse than none, because
+    /// it is believed.
     pub(crate) fn probe_park_pending(&self) -> bool {
-        self.probe.as_ref().is_some_and(ProbeCtx::park_pending)
+        self.probe
+            .as_ref()
+            .map(ProbeCtx::park_pending)
+            .expect("probe_park_pending outside probe mode")
     }
 
+    /// Take the offers this probe recorded.
+    ///
+    /// `expect`, not `unwrap_or_default`, and the difference is the seventh
+    /// instance of a shape this work has hit six times already: a failure
+    /// quietly turned into an answer. An empty `Vec` here reads downstream as
+    /// "the specification can take no further step" — `prober` pairs it into a
+    /// `Probed`, and the search turns that into `Cover::NoCover`, which is a
+    /// **report**. So probe mode being off would surface as a conformance
+    /// violation rather than as an error. Its twin `probe_record`, twenty
+    /// lines above, already `expect`s the identical condition; the two simply
+    /// disagreed. Found by review round 7.
     pub(crate) fn probe_take_offers(&mut self) -> Vec<Offer> {
         self.probe
             .as_mut()
             .map(ProbeCtx::take_offers)
-            .unwrap_or_default()
+            .expect("probe_take_offers outside probe mode")
     }
 
     /// Resets the Must instance for a new sample exploration.
@@ -960,6 +1029,24 @@ impl Must {
         name: Option<String>,
         is_daemon: bool,
     ) {
+        // Symmetric spawning is outside conformance scope (conf-plan.md §1/§9),
+        // and the reason is specific rather than precautionary. A symmetric
+        // thread's `Begin` carries a `sym_id`, which is the only thing that
+        // makes `filter_symmetric_rfs` narrow anything — and that filter runs
+        // inside the receive preflight, so it would silently remove sources a
+        // receive *could* consistently read (`cons.rs` has no symmetry
+        // reasoning at all, so consistency is symmetry-blind and the filter is
+        // a pure post-narrowing). The search loops the sources it is offered,
+        // so a dropped source is a cover never found and a conformance
+        // violation reported that does not exist. Guarding here makes the
+        // filter provably inert on the probe path. Backlog A11.
+        //
+        // At handler entry, above the replay branch, like the other seven
+        // scope guards — a probe replays, so a guard inside the probe branch
+        // would be skipped for anything already in the prefix.
+        if sym_cid.is_some() {
+            self.probe_reject("symmetric thread spawning");
+        }
         let parent_tclab: TCreate = self.current.graph.get_thread_tclab(pos.thread);
         let mut origination_vec = parent_tclab.origination_vec();
         origination_vec.push(pos.index);

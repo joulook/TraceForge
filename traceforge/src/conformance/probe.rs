@@ -93,6 +93,41 @@ impl Offer {
     }
 }
 
+/// A value a nondeterministic choice point could take.
+///
+/// The two kinds the fragment admits: a coin toss (`nondet()`, `named_nondet`,
+/// `<bool>::nondet`) and a range choice (`Range`/`RangeInclusive::nondet`).
+/// They are separate because the engine stores them on different labels and
+/// `set_result` takes a different type for each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NondetValue {
+    Toss(bool),
+    Choice(usize),
+}
+
+impl Offer {
+    /// Every value this offer could take, in the order the search should try
+    /// them — empty when the offer is not a nondet.
+    ///
+    /// The search branches on each (`conf-plan.md` §5.5: "nondet → loop
+    /// values"), so this is the analogue of [`Offer::sources`] for a receive.
+    /// Computed from the label rather than recorded at park time, because it
+    /// is a pure function of the label and a second stored copy could drift.
+    ///
+    /// A `CToss` offers both booleans regardless of the value the probe
+    /// happened to produce: the probe's value is one option, not a
+    /// commitment. A `Choice` offers its whole inclusive range.
+    pub(crate) fn nondet_values(&self) -> Vec<NondetValue> {
+        match self.label() {
+            LabelEnum::CToss(_) => {
+                vec![NondetValue::Toss(false), NondetValue::Toss(true)]
+            }
+            LabelEnum::Choice(chlab) => chlab.range().clone().map(NondetValue::Choice).collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// State of one probe execution.
 ///
 /// What the `just_parked` tripwire does and does not catch, stated because an

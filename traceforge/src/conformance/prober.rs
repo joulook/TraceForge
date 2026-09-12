@@ -12,7 +12,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::conformance::probe::Offer;
+use crate::conformance::morphism::CompleteExecution;
+use crate::conformance::probe::{NondetValue, Offer};
 use crate::event::Event;
 use crate::exec_graph::ExecutionGraph;
 use crate::must::Must;
@@ -53,7 +54,9 @@ pub(crate) fn probe_once<F>(config: Config, f: F) -> Vec<Offer>
 where
     F: Fn() + Send + Sync + 'static,
 {
-    probe_from(config, ExecutionGraph::default(), f).0
+    probe_from(config, ExecutionGraph::default(), f)
+        .offers()
+        .to_vec()
 }
 
 /// Probe `f` against an existing partial graph.
@@ -65,11 +68,7 @@ where
 /// the threads performed on the way (thread creation, `Begin`/`End`, channel
 /// creation, a `Block` for a receive with nothing to read). Those are not
 /// choices, so installing them is not a decision.
-pub(crate) fn probe_from<F>(
-    config: Config,
-    graph: ExecutionGraph,
-    f: F,
-) -> (Vec<Offer>, ExecutionGraph)
+pub(crate) fn probe_from<F>(config: Config, graph: ExecutionGraph, f: F) -> Probed
 where
     F: Fn() + Send + Sync + 'static,
 {
@@ -95,7 +94,58 @@ where
     );
     let offers = must.borrow_mut().probe_take_offers();
     let graph = must.borrow_mut().take_graph();
-    (offers, graph)
+    Probed { offers, graph }
+}
+
+/// What one probe produced: the offers, and the graph the probe left behind.
+///
+/// The graph is the probe's **output** — the prefix it replayed plus whatever
+/// forced bookkeeping the threads performed, including the `End` and `Block`
+/// labels that (M3) reads. It is not the graph that went in.
+///
+/// The two are kept together deliberately. `CompleteExecution` is obtainable
+/// from a probe only when the probe offered nothing — an empty offer set is
+/// exactly `next_Spec(G) = ∅` — and if the offers could be supplied
+/// separately from the graph, an empty slice paired with any graph at all
+/// would reconstruct backlog F33 verbatim: a graph whose `main` is parked,
+/// witnessed complete, and reported *done*. A caller cannot fabricate the
+/// pairing because only `probe_from` builds one of these.
+pub(crate) struct Probed {
+    offers: Vec<Offer>,
+    graph: ExecutionGraph,
+}
+
+impl Probed {
+    pub(crate) fn offers(&self) -> &[Offer] {
+        &self.offers
+    }
+
+    pub(crate) fn graph(&self) -> &ExecutionGraph {
+        &self.graph
+    }
+
+    /// Witness this graph complete, if the probe is exhausted.
+    ///
+    /// `None` means the probe still had offers, so some thread of the program
+    /// can take another step and the execution is not over. This is a real
+    /// check rather than an assertion, and it is the specification side's
+    /// answer to F33 — `Done`'s own `next_Spec(G) = ∅` conjunct, computed
+    /// once, here, rather than a second time by different means.
+    pub(crate) fn complete(&self) -> Option<CompleteExecution<'_>> {
+        if !self.offers.is_empty() {
+            return None;
+        }
+        CompleteExecution::try_finished(&self.graph)
+    }
+
+    /// Split the pair. **Test-only**: the one non-test caller that wanted
+    /// this discards the graph, so nothing in the shipping path needs the two
+    /// halves apart, and keeping them together is what stops an empty offer
+    /// slice being paired with an arbitrary graph.
+    #[cfg(test)]
+    pub(crate) fn into_parts(self) -> (Vec<Offer>, ExecutionGraph) {
+        (self.offers, self.graph)
+    }
 }
 
 /// The concrete sends a receive offer could read.
@@ -114,12 +164,39 @@ pub(crate) fn recv_sources(config: Config, graph: &ExecutionGraph, offer: &Offer
     scratch.probe_recv_sources(offer.label().clone())
 }
 
-/// Extend a graph with one offer the search has chosen.
+/// Extend a graph with one **send** offer the search has chosen.
 ///
 /// The offer's label is installed at the position it would have occupied, so
 /// the next probe replays it as part of the prefix and the program continues
 /// from just after it.
+///
+/// A send is the only offer this is complete for, because a send carries no
+/// decision: §5.2's install is "the parked label, plus the decision as a
+/// frontier-event operation", and a send has none. A receive needs its source
+/// ([`install_recv`]) and a nondet needs its value ([`install_nondet`]).
+///
+/// **Both are refused rather than accepted-and-defaulted**, and the reason is
+/// worth stating. A nondet label carries the value the *probe* rolled, and
+/// that roll comes from the config's seed — which `ConfigBuilder` defaults to
+/// `rand::rng().next_u64()`. Installing a nondet through here would therefore
+/// take a **uniformly random** option, silently, and the conformance verdict
+/// would vary run to run. That is worse than the "always take the first
+/// option" failure F35 describes, because it presents as flakiness rather
+/// than as a readable bug. Found by the developer's adversarial pass (O-3),
+/// before any search existed to make the mistake.
 pub(crate) fn install(config: Config, graph: ExecutionGraph, offer: &Offer) -> ExecutionGraph {
+    assert_eq!(
+        offer.kind(),
+        "send",
+        "conformance: `install` takes a send offer; a {} offer carries a \
+         decision and must go through {} (conf-plan.md §5.2)",
+        offer.kind(),
+        match offer.kind() {
+            "recv" => "`install_recv`",
+            "nondet" | "choice" => "`install_nondet`",
+            _ => "the operation for its kind",
+        }
+    );
     let mut must = Must::with_initial_graph(config, graph);
     must.probe_install(offer.label().clone());
     must.take_graph()
@@ -135,9 +212,67 @@ pub(crate) fn install_recv(
     offer: &Offer,
     rf: Option<Event>,
 ) -> ExecutionGraph {
+    // The decision must be one the offer actually made available, and the two
+    // ways it can fail to be are both silent — developer finding O-4, the same
+    // species as O-3 and with a worse failure mode.
+    //
+    // `rf = None` on a *blocking* receive is ⊥ for a receive that cannot read
+    // nothing: the resulting graph shows `RECV() [TIMEOUT]`, a behaviour the
+    // program does not have, and re-probing it does not terminate (the
+    // developer killed a run at 600s). A hang is what a caller sees, with
+    // nothing pointing at the cause.
+    //
+    // A source the offer did not list is one the checker's own enumeration
+    // said this receive cannot consistently read — the analogue of a `Choice`
+    // value outside its range, which `probe_set_value` already refuses.
+    //
+    // `search.rs`'s `rf_options` builds exactly the admissible set, so no
+    // caller trips either today. That is the point: before this, the
+    // invariant lived only in the caller.
+    match rf {
+        None => assert!(
+            offer.may_read_nothing(),
+            "conformance: cannot install ⊥ on the blocking receive at {}; it \
+             must read one of its {} source(s), and a receive that reads \
+             nothing here is a behaviour the program does not have",
+            offer.pos(),
+            offer.sources().len()
+        ),
+        Some(src) => assert!(
+            offer.sources().contains(&src),
+            "conformance: {src} is not among the sources offered for the \
+             receive at {}; the checker's enumeration says this receive cannot \
+             consistently read it",
+            offer.pos()
+        ),
+    }
     let mut must = Must::with_initial_graph(config, graph);
     let pos = must.probe_install(offer.label().clone());
     must.probe_set_rf(pos, rf);
+    must.take_graph()
+}
+
+/// Extend a graph with a nondeterministic offer, taking `value`.
+///
+/// The third of `conf-plan.md` §5.2's install operations, and the one S1
+/// originally omitted (backlog F35). Without it the search cannot branch on a
+/// nondet's values at all: it would have to accept whatever value the probe
+/// happened to produce, which is "always take the first option" and loses
+/// completeness — a specification that conforms only on the second value
+/// would be reported as violating.
+///
+/// `value` must be one of [`Offer::nondet_values`]; installing anything else
+/// panics, since a value outside a `Choice`'s range is one the program could
+/// never have produced.
+pub(crate) fn install_nondet(
+    config: Config,
+    graph: ExecutionGraph,
+    offer: &Offer,
+    value: NondetValue,
+) -> ExecutionGraph {
+    let mut must = Must::with_initial_graph(config, graph);
+    let pos = must.probe_install(offer.label().clone());
+    must.probe_set_value(pos, value);
     must.take_graph()
 }
 
@@ -186,7 +321,8 @@ mod tests {
             Config::builder().build(),
             ExecutionGraph::default(),
             send_then_recv,
-        );
+        )
+        .into_parts();
         let kinds: Vec<_> = offers.iter().map(|o| o.kind()).collect();
         assert_eq!(kinds, vec!["send"], "offers: {offers:?}");
     }
@@ -265,12 +401,13 @@ mod tests {
     fn probe_install_probe_advances_the_program() {
         let config = Config::builder().build();
 
-        let (first, graph) = probe_from(config.clone(), ExecutionGraph::default(), two_sends);
+        let (first, graph) =
+            probe_from(config.clone(), ExecutionGraph::default(), two_sends).into_parts();
         assert_eq!(first.len(), 1, "only the first send is offered: {first:?}");
 
         let graph = install(config.clone(), graph, &first[0]);
 
-        let (second, _) = probe_from(config, graph, two_sends);
+        let (second, _) = probe_from(config, graph, two_sends).into_parts();
         assert_eq!(
             second.len(),
             1,
@@ -289,13 +426,14 @@ mod tests {
     fn installing_a_send_enables_the_receive_that_was_blocked() {
         let config = Config::builder().build();
 
-        let (first, graph) = probe_from(config.clone(), ExecutionGraph::default(), send_then_recv);
+        let (first, graph) =
+            probe_from(config.clone(), ExecutionGraph::default(), send_then_recv).into_parts();
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].kind(), "send");
 
         let graph = install(config.clone(), graph, &first[0]);
 
-        let (second, graph) = probe_from(config.clone(), graph, send_then_recv);
+        let (second, graph) = probe_from(config.clone(), graph, send_then_recv).into_parts();
         let kinds: Vec<_> = second.iter().map(|o| o.kind()).collect();
         assert_eq!(kinds, vec!["recv"], "offers: {second:?}");
         assert_eq!(second[0].sources().len(), 1, "the installed send");
@@ -304,7 +442,7 @@ mod tests {
         // Choosing it completes the program: nothing is left to decide.
         let rf = second[0].sources()[0];
         let graph = install_recv(config.clone(), graph, &second[0], Some(rf));
-        let (third, _) = probe_from(config, graph, send_then_recv);
+        let (third, _) = probe_from(config, graph, send_then_recv).into_parts();
         assert!(third.is_empty(), "offers: {third:?}");
     }
 
@@ -329,14 +467,15 @@ mod tests {
             config.clone(),
             ExecutionGraph::default(),
             two_senders_one_recv,
-        );
+        )
+        .into_parts();
         let kinds: Vec<_> = first.iter().map(|o| o.kind()).collect();
         assert_eq!(kinds, vec!["send", "send"], "offers: {first:?}");
 
         let graph = install(config.clone(), graph, &first[0]);
         let graph = install(config.clone(), graph, &first[1]);
 
-        let (second, graph) = probe_from(config.clone(), graph, two_senders_one_recv);
+        let (second, graph) = probe_from(config.clone(), graph, two_senders_one_recv).into_parts();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].kind(), "recv");
         assert_eq!(second[0].sources().len(), 2, "both sends are available");
@@ -409,11 +548,12 @@ mod tests {
     fn re_probing_an_unchanged_graph_is_idempotent() {
         let config = Config::builder().build();
 
-        let (first, graph) = probe_from(config.clone(), ExecutionGraph::default(), send_then_recv);
+        let (first, graph) =
+            probe_from(config.clone(), ExecutionGraph::default(), send_then_recv).into_parts();
         let first_kinds: Vec<_> = first.iter().map(|o| o.kind()).collect();
         let before = format!("{graph}");
 
-        let (second, graph2) = probe_from(config, graph, send_then_recv);
+        let (second, graph2) = probe_from(config, graph, send_then_recv).into_parts();
         let second_kinds: Vec<_> = second.iter().map(|o| o.kind()).collect();
         let after = format!("{graph2}");
 
