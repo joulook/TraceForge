@@ -13,11 +13,47 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use crate::conformance::obs::{resolve_visible, ObsError};
+use crate::conformance::report::SearchEnd;
 use crate::conformance::search::{Cover, Search};
 use crate::event::Event;
 use crate::event_label::{AsEventLabel, LabelEnum};
 use crate::exec_graph::ExecutionGraph;
+use crate::must::MustState;
 use crate::Config;
+
+/// Which of conformance's three engines this context belongs to.
+///
+/// §9 names three — "the outer conf run, the probe `Must`, and the err-freedom
+/// precheck" — and S5 adds triage as a fourth `Must` that is also *not* the
+/// probe. The probe has its own field on `Must` (`probe: Option<ProbeCtx>`);
+/// the other three all carry a `ConfCtx`, and until S5 they could not be told
+/// apart, which is why `reject_out_of_scope` had only two answers for three
+/// engines (blocked item **E**).
+///
+/// Only [`ConfMode::Outer`] has a gate. The other two exist so that
+/// `conf.is_some()` is true — which is what arms §9's handler-entry guards and
+/// keeps `store_replay_information`'s exemption (`store_replay_information`'s conformance early return) in force —
+/// without a probe worker or a `Cover` call behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfMode {
+    /// The run that explores the implementation and calls the gate.
+    Outer,
+    /// §5.4's specification err-freedom run. Gate off, guards on.
+    Precheck,
+    /// §7.3's per-report completion run. Gate off, guards on.
+    Triage,
+}
+
+impl ConfMode {
+    /// The name this engine uses in a §9 rejection.
+    pub(crate) fn engine_label(self) -> &'static str {
+        match self {
+            ConfMode::Outer => "conformance",
+            ConfMode::Precheck => "precheck",
+            ConfMode::Triage => "triage",
+        }
+    }
+}
 
 /// Which of §4.1's four gates fired.
 ///
@@ -80,7 +116,11 @@ pub(crate) enum ReportKind {
 ///
 /// The property that made the ruling the right one: a test can observe a
 /// report without anything being rendered.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is written out rather than derived: `MustState` has none, and
+/// deriving one for it would print a whole execution graph twice over at every
+/// `{:?}`.
+#[derive(Clone)]
 pub(crate) struct Report {
     /// Which of §4.1's gates fired — `None` for a `VisibleError`, which is
     /// not a gate firing at all and can happen at any point in an execution.
@@ -97,6 +137,50 @@ pub(crate) struct Report {
     /// two reports from the same run apart without holding a graph per
     /// report.
     pub(crate) events: usize,
+    /// **The in-memory clone captured at report time** (§7.3, criterion 3).
+    ///
+    /// S4's `Report` deliberately did not hold one; capturing it is S5's, and
+    /// it is compatible with S4's criterion 13, which bounded the sink's
+    /// *responsibilities* — no formatting, files, triage, dedup, ranking,
+    /// minimisation — and said in terms that S5 "builds the reporting product
+    /// on it and may replace the type".
+    ///
+    /// A clone, not a serialization: §7.3 chose the in-memory graph *because*
+    /// the serde round-trip loses predicates but for `recover_lost_data`.
+    ///
+    /// **The `recvs` index is stale on a `FreshRecv` capture**, and the
+    /// argument that this is harmless is pinned in
+    /// [`crate::conformance::triage`] rather than left to be re-derived.
+    pub(crate) graph: ExecutionGraph,
+    /// §7.1's serialized half, **built here rather than retained as state**.
+    ///
+    /// The first version of this held a `MustState` clone alongside `graph`
+    /// and serialized it later. That was wrong twice over, and the second way
+    /// is the one worth recording: `MustState` *contains* the graph, so the
+    /// report held **two** identical `ExecutionGraph`s — and it also held the
+    /// whole `RQueue`, whose size is not bounded by `|G₁|` at all. The
+    /// `O(reports × |G₁|)` figure in the criteria was written before S5 chose
+    /// to retain a `MustState`, and restating it afterwards was an error
+    /// rather than a measurement (gate-4 round 1, M3).
+    ///
+    /// So the serialization happens **at capture**, off the borrowed
+    /// `MustState`, which is cloned transiently for
+    /// `ReplayInformation::create`'s by-value argument and dropped as soon as
+    /// the JSON exists. What the report retains is one `ExecutionGraph` —
+    /// which triage and the diagnostics both need, and which cannot be
+    /// recovered from the JSON without the predicate loss §7.3 rejects — and
+    /// one `String`.
+    pub(crate) replay: crate::conformance::report::ReplaySnapshot,
+}
+
+impl std::fmt::Debug for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Report")
+            .field("gate", &self.gate)
+            .field("kind", &self.kind)
+            .field("events", &self.events)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Something that stopped the search from answering, which is **not** a
@@ -408,7 +492,15 @@ impl Drop for ProbeWorker {
 
 /// Conformance state on the outer `Must`.
 pub(crate) struct ConfCtx {
-    worker: ProbeWorker,
+    /// `None` on a **gate-disabled** context (§5.4's precheck, §7.3's triage).
+    ///
+    /// The gate is the probe worker: with no worker there is no `Cover` call,
+    /// so `gate` answers `Continue` without consulting anything. What is
+    /// *not* disabled is §9's guard arming or `store_replay_information`'s
+    /// exemption, both of which key off `conf.is_some()` — and keeping those
+    /// on is the entire reason these two engines carry a `ConfCtx` at all.
+    worker: Option<ProbeWorker>,
+    mode: ConfMode,
     visible: Vec<String>,
     /// §4.3: **one mutable `H`, and it is never snapshotted into `MustState`.**
     ///
@@ -439,6 +531,33 @@ pub(crate) struct ConfCtx {
     /// completion gate would fire on a pruned graph — where (M3) is outside
     /// its domain and `status_of` panics by design.
     pruned: bool,
+    /// §7.4, default false. Set from `ConfConfig`.
+    stop_at_first_report: bool,
+    /// §7.4's mechanism, and **blocked item G's ruling**: one flag, set by the
+    /// gate when a report is recorded, tested where `explore` decides to
+    /// continue.
+    ///
+    /// Not a drained `rqueue` — a drained queue is **indistinguishable from
+    /// an exhausted one**, which is exactly the distinction blocked item B
+    /// requires the verdict to carry. Not `config.max_iterations` set from the
+    /// gate either, for the same reason plus the collision: the verdict must
+    /// tell a bound the *user* set from one the *gate* set, and reusing the
+    /// field destroys that.
+    ///
+    /// Inert when `conf` is `None`, since it lives here.
+    stop_requested: bool,
+    /// **Why the outer loop stopped — a carried fact, never an inference.**
+    ///
+    /// Blocked item B's ruling: the "conforms" case is constructible only when
+    /// reports and exhaustions are both empty *and* the search completed, and
+    /// "the search completed" is a distinct carried fact. `complete_execution`
+    /// records it at each of the three sites where it decides the run is over,
+    /// so the three are told apart by construction.
+    end: SearchEnd,
+    /// Needed by §7.1's serialized snapshot, which is built at capture rather
+    /// than retained as state — `ReplayInformation::create` takes the run's
+    /// `Config` alongside the linearisation.
+    config: Config,
 }
 
 impl ConfCtx {
@@ -447,17 +566,95 @@ impl ConfCtx {
         spec: Arc<dyn Fn() + Send + Sync>,
         visible: Vec<String>,
         budget: usize,
+        stop_at_first_report: bool,
     ) -> Self {
-        let search = Search::new(config, spec, visible.clone(), budget);
+        let search = Search::new(config.clone(), spec, visible.clone(), budget);
         Self {
-            worker: ProbeWorker::new(search),
+            worker: Some(ProbeWorker::new(search)),
+            mode: ConfMode::Outer,
+            config,
             visible,
             h: ExecutionGraph::default(),
             reports: Vec::new(),
             exhaustions: Vec::new(),
             diagnostics: Vec::new(),
             pruned: false,
+            stop_at_first_report,
+            stop_requested: false,
+            end: SearchEnd::Unknown,
         }
+    }
+
+    /// A context with no gate: `conf.is_some()` without a probe worker.
+    ///
+    /// §5.4's precheck and §7.3's triage both need exactly this — "conformance's
+    /// *gate* is off in that run; its *guards* are not" — and neither has a
+    /// specification to probe. §8's spawn-order guard still runs, because a
+    /// declared visible name spawned late is a §8 violation in *whichever*
+    /// program commits it, and the precheck is the only engine that ever sees
+    /// the specification's own complete graphs from outside the search.
+    pub(crate) fn gate_disabled(config: Config, visible: Vec<String>, mode: ConfMode) -> Self {
+        assert!(
+            mode != ConfMode::Outer,
+            "conformance: the outer run is the engine that has a gate; a gate-disabled \
+             outer context would explore the implementation and check nothing"
+        );
+        Self {
+            worker: None,
+            mode,
+            config,
+            visible,
+            h: ExecutionGraph::default(),
+            reports: Vec::new(),
+            exhaustions: Vec::new(),
+            diagnostics: Vec::new(),
+            pruned: false,
+            stop_at_first_report: false,
+            stop_requested: false,
+            end: SearchEnd::Unknown,
+        }
+    }
+
+    pub(crate) fn mode(&self) -> ConfMode {
+        self.mode
+    }
+
+    /// §7.1's serialized half, at capture time.
+    ///
+    /// **Only the outer run's reports are ever rendered.** The precheck's and
+    /// triage's sinks are read for their *contents* — did anything assert? —
+    /// and then discarded, so serializing them would linearise a graph nobody
+    /// reads, on the two engines whose graphs are most likely to violate
+    /// `top_sort`'s precondition.
+    fn snapshot(
+        &self,
+        graph: &ExecutionGraph,
+        state: &MustState,
+        pos: Option<Event>,
+    ) -> crate::conformance::report::ReplaySnapshot {
+        use crate::conformance::report;
+        if self.mode != ConfMode::Outer {
+            return report::replay_not_produced();
+        }
+        report::replay_snapshot(graph, state, &self.config, pos)
+    }
+
+    /// §7.4: has a report asked the outer loop to stop?
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.stop_requested
+    }
+
+    /// Record why the outer loop stopped. First writer wins: the run ends
+    /// once, and a later overwrite would be a second opinion about a fact that
+    /// was already observed.
+    pub(crate) fn record_end(&mut self, end: SearchEnd) {
+        if self.end == SearchEnd::Unknown {
+            self.end = end;
+        }
+    }
+
+    pub(crate) fn end(&self) -> SearchEnd {
+        self.end
     }
 
     pub(crate) fn reports(&self) -> &[Report] {
@@ -475,7 +672,9 @@ impl ConfCtx {
     /// End the probe worker. Called where the conformance run ends; `Drop` is
     /// the backstop for every other way out.
     pub(crate) fn shutdown(&mut self) {
-        self.worker.shutdown();
+        if let Some(w) = self.worker.as_mut() {
+            w.shutdown();
+        }
     }
 
     pub(crate) fn is_pruned(&self) -> bool {
@@ -541,6 +740,8 @@ impl ConfCtx {
         thread: String,
         pos: Event,
         events: usize,
+        state: &MustState,
+        graph: &ExecutionGraph,
     ) -> GateOutcome {
         if self.pruned {
             return GateOutcome::Continue;
@@ -549,8 +750,13 @@ impl ConfCtx {
             gate: None,
             kind: ReportKind::VisibleError { thread, pos },
             events,
+            graph: graph.clone(),
+            replay: self.snapshot(graph, state, Some(pos)),
         });
         self.pruned = true;
+        if self.stop_at_first_report {
+            self.stop_requested = true;
+        }
         GateOutcome::Prune
     }
 
@@ -605,7 +811,12 @@ impl ConfCtx {
     }
 
     /// One gate. §4.1 fixes the four sites; this decides what happens at each.
-    pub(crate) fn gate(&mut self, gate: Gate, g1: &ExecutionGraph) -> GateOutcome {
+    pub(crate) fn gate(
+        &mut self,
+        gate: Gate,
+        g1: &ExecutionGraph,
+        state: &MustState,
+    ) -> GateOutcome {
         if self.pruned {
             return GateOutcome::Continue;
         }
@@ -626,6 +837,15 @@ impl ConfCtx {
             panic!("conformance: {e}");
         }
 
+        // **A gate-disabled context has nothing to ask.** §8's guard above
+        // still ran — a §8 violation is the user's error in whichever program
+        // commits it, and the precheck is the only engine that sees the
+        // specification's own graphs from outside the search — but there is no
+        // probe worker, no seed and no `Cover` call.
+        if self.worker.is_none() {
+            return GateOutcome::Continue;
+        }
+
         let events: usize = g1.thread_ids().into_iter().map(|t| g1.thread_size(t)).sum();
 
         // The seed is *cloned*, not taken. Taking it left `self.h` empty on
@@ -636,7 +856,12 @@ impl ConfCtx {
         // silently dropped whenever the search runs out of room" is not what
         // the field's rustdoc leads a reader to expect.
         let seed = self.h.clone();
-        match self.worker.cover(g1, gate.outer_complete(), seed) {
+        let answer = self
+            .worker
+            .as_ref()
+            .expect("conformance: the worker was checked present two statements ago")
+            .cover(g1, gate.outer_complete(), seed);
+        match answer {
             Ok(Cover::Found(h)) => {
                 self.h = h;
                 GateOutcome::Continue
@@ -646,8 +871,13 @@ impl ConfCtx {
                     gate: Some(gate),
                     kind: ReportKind::NoCover,
                     events,
+                    graph: g1.clone(),
+                    replay: self.snapshot(g1, state, None),
                 });
                 self.pruned = true;
+                if self.stop_at_first_report {
+                    self.stop_requested = true;
+                }
                 GateOutcome::Prune
             }
             // Exhaustion establishes nothing, so it neither reports nor

@@ -1,6 +1,11 @@
 // #![doc = include_str!("../../README.md")]
 pub mod channel;
-pub(crate) mod conformance;
+// §3 item 4's re-export, which S4 deferred because every item in the module
+// was `pub(crate)` and publishing then would have exported an empty namespace
+// while committing an unstable surface to semver. S5 lands it: see
+// `conformance`'s own "public surface" note for what is exported and why that
+// set.
+pub mod conformance;
 mod cons;
 pub mod coverage;
 pub use coverage::{CoverageInfo, ExecutionId};

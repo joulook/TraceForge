@@ -234,8 +234,12 @@ impl Must {
     /// assertion lives at the point conformance is actually switched on, which
     /// is the same shape `enable_probe` uses and gives the same guarantee: no
     /// `Must` ever has `conf` set without the predicate having run.
+    ///
+    /// The engine name comes from the context's mode, so §5.4's precheck and
+    /// §7.3's triage say what they are rather than all three claiming to be
+    /// "conformance" (S5, blocked item **E**).
     pub(crate) fn enable_conformance(&mut self, ctx: crate::conformance::ctx::ConfCtx) {
-        crate::conformance::assert_config_in_scope(&self.config, "conformance");
+        crate::conformance::assert_config_in_scope(&self.config, ctx.mode().engine_label());
         // §3 item 4: conformance sets this internally. A visible error must not
         // end the run — the search has to carry on and report every
         // non-conforming execution, not just the first.
@@ -270,9 +274,26 @@ impl Must {
     /// `probe_install` bypasses handler entry entirely, so these guards are
     /// not on its path in any configuration. Scope there is enforced when the
     /// offer is *produced*.
+    ///
+    /// **Three engines carry a `ConfCtx`, and the message used to know only
+    /// two of them** (S5, blocked item **E**). §9 names the err-freedom
+    /// precheck as a third engine the guards are armed in; §5.4 specified the
+    /// precheck with conformance off, which left them inert there. The
+    /// resolution gives the precheck a gate-disabled `ConfCtx`, so
+    /// `conf.is_some()` is already true and the *condition* above needs
+    /// nothing added — what it needed was the engine's own name, so that an
+    /// out-of-scope specification is rejected *here*, with §9's message,
+    /// rather than later by the probe with a different one.
     pub(crate) fn reject_out_of_scope(&self, what: &str) {
         if self.probe.is_some() || self.conf.is_some() {
-            let engine = if self.probe.is_some() { "probe" } else { "conformance" };
+            let engine = if self.probe.is_some() {
+                "probe"
+            } else {
+                self.conf
+                    .as_ref()
+                    .map(|c| c.mode().engine_label())
+                    .unwrap_or("conformance")
+            };
             panic!(
                 "{engine}: `{what}` is outside conformance scope (conf-plan.md §9); \
                  the program may not use it"
@@ -1701,7 +1722,12 @@ impl Must {
         let Some(mut ctx) = self.conf.take() else {
             return;
         };
-        let outcome = ctx.gate(gate, &self.current.graph);
+        // The `MustState` goes with the graph, because §7.1's serialized half
+        // is `ReplayInformation::create(sorted_graph, state, config)` and the
+        // state is what the engine itself passes at `must.rs:702`. It is
+        // borrowed here and cloned only on the reporting path, so a run that
+        // reports nothing pays nothing for it (S5, blocked item **H**).
+        let outcome = ctx.gate(gate, &self.current.graph, &self.current);
         self.conf = Some(ctx);
         if outcome == GateOutcome::Prune {
             self.conf_prune();
@@ -1710,6 +1736,25 @@ impl Must {
 
     pub(crate) fn conf_active(&self) -> bool {
         self.conf.is_some()
+    }
+
+    /// §7.4, blocked item **G**: has a conformance report asked the outer loop
+    /// to stop?
+    ///
+    /// **Inert when `conf` is `None`**, which is the whole of item H's first
+    /// condition: the flag lives on `ConfCtx`, so an ordinary TraceForge run
+    /// answers `false` through an `Option` test and nothing else.
+    pub(crate) fn conf_stop_requested(&self) -> bool {
+        self.conf.as_ref().is_some_and(|c| c.stop_requested())
+    }
+
+    /// Record why the outer loop stopped (blocked item **B**: "the search
+    /// completed" is a carried fact, never an inference). Inert when `conf` is
+    /// `None`.
+    pub(crate) fn conf_record_end(&mut self, end: crate::conformance::report::SearchEnd) {
+        if let Some(conf) = self.conf.as_mut() {
+            conf.record_end(end);
+        }
     }
 
     pub(crate) fn conf_ctx(&self) -> Option<&crate::conformance::ctx::ConfCtx> {
@@ -1828,7 +1873,12 @@ impl Must {
         let Some(mut ctx) = self.conf.take() else {
             return;
         };
-        let outcome = ctx.report_visible_error(name, pos, events);
+        // The graph and the state are captured **after** `handle_block`
+        // installed the `Block(Assert)` at `pos`, which is what makes
+        // `top_sort(Some(pos))` well defined for this report (§7.1's
+        // serialized half; see `report::ReplaySnapshot`). That ordering is
+        // load-bearing and is asserted in `s5_tests`.
+        let outcome = ctx.report_visible_error(name, pos, events, &self.current, &self.current.graph);
         self.conf = Some(ctx);
         if outcome == crate::conformance::ctx::GateOutcome::Prune {
             self.conf_prune();
@@ -1937,6 +1987,13 @@ impl Must {
         must.borrow_mut().call_telemetry_after(&condition);
 
         if exceeded_max_executions {
+            // Blocked item **B**: "the search completed" is a carried fact.
+            // This is one of the **three** places `complete_execution` decides
+            // the run is over, and it is the one a *user* asked for. Inert
+            // when `conf` is `None`.
+            let n = must.borrow().config().max_iterations.unwrap_or(0);
+            must.borrow_mut()
+                .conf_record_end(crate::conformance::report::SearchEnd::MaxIterations(n));
             return true; // no more executions.
         }
 
@@ -1948,7 +2005,33 @@ impl Must {
             conf.end_execution();
         }
         must.borrow_mut().unstop();
-        !must.borrow_mut().try_revisit()
+
+        // §7.4's stop-at-first, **blocked item G's ruling**: one flag, tested
+        // where the loop decides to continue.
+        //
+        // `explore` (`lib.rs:738-757`) is an unconditional loop with one exit,
+        // this function, which returned `true` in exactly two ways before S5 —
+        // `max_iterations` above, or `!try_revisit()` below. There was no hook
+        // by which a report could stop it; `stop()`/`is_stopped()` are
+        // per-execution and undone by `unstop()` two lines up.
+        //
+        // It is tested **before** `try_revisit`, not by draining the queue: a
+        // drained queue is indistinguishable from an exhausted one, and that
+        // is precisely the distinction the verdict has to carry.
+        if must.borrow().conf_stop_requested() {
+            must.borrow_mut()
+                .conf_record_end(crate::conformance::report::SearchEnd::StoppedAtFirstReport);
+            return true;
+        }
+
+        let more = must.borrow_mut().try_revisit();
+        if !more {
+            // The third site, and the only one that means "the search
+            // completed".
+            must.borrow_mut()
+                .conf_record_end(crate::conformance::report::SearchEnd::StateSpaceExhausted);
+        }
+        !more
     }
 
     fn record_ending_telemetry(&mut self, maybe_block: &Option<BlockType>) -> bool {
@@ -2799,6 +2882,7 @@ impl Must {
                 let outcome = ctx.gate(
                     crate::conformance::ctx::Gate::RevisitApply,
                     &self.current.graph,
+                    &self.current,
                 );
                 if outcome == crate::conformance::ctx::GateOutcome::Prune {
                     ctx.abandon_revisit();
