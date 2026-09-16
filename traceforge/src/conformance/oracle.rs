@@ -131,12 +131,12 @@ impl PartialEq for VisWord {
 /// exists to avoid. Membership is O(n·m).
 ///
 /// **What keeps that affordable is a bound on the generated corpus only.**
-/// `generator::MAX_VISIBLE_THREADS` and
-/// `generator::MAX_VISIBLE_EVENTS_PER_THREAD` bound the pairs *that module*
-/// emits, and the first is asserted on construction. They bound nothing here:
-/// this type is also reached from the hand-written suites and from
-/// `vis_of_program` on any caller's program, and it imposes no limit of its
-/// own. A caller enumerating a large program pays the O(n·m) directly.
+/// `generator::MAX_VISIBLE_THREADS` is asserted when a pair is built, and
+/// `generator::MAX_VISIBLE_EVENTS_PER_THREAD` is enforced as a runtime cap
+/// (see [`vis_of_graph`]) on every pair run through `Pair::compare`. This type
+/// itself imposes no limit: it is also reached from the hand-written suites and
+/// from uncapped `vis_of_program` calls on any caller's program, and such a
+/// caller pays the O(n·m) directly.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VisSet {
     words: Vec<VisWord>,
@@ -187,15 +187,39 @@ impl VisSet {
 /// "a graph that still admits an event has neither a status nor a set of
 /// visible traces". `CompleteExecution::try_finished` is the crate's own
 /// recognition of the same precondition.
+///
+/// `cap`, when set, is a **hard per-thread limit on visible observations**,
+/// checked after the observation walk and **before** the linear-extension
+/// enumeration below. That enumeration yields the multinomial
+/// `(Σₜnₜ)! / Πₜnₜ!` orderings when the threads' observations are mutually
+/// unordered — exponential in the per-thread count `nₜ` for a fixed number of
+/// threads (two threads of `k` give `C(2k, k)`), and exactly one ordering for a
+/// single visible thread. A thread over the cap returns
+/// [`OracleError::OverCap`] and **this graph** is not enumerated (criterion 13;
+/// `P3-gate4-fixes` round 1, M1). `None` imposes no limit.
 pub(crate) fn vis_of_graph(
     graph: &ExecutionGraph,
     visible: &[String],
-) -> Result<Option<VisSet>, ObsError> {
+    cap: Option<usize>,
+) -> Result<Option<VisSet>, OracleError> {
     let Some(exec) = CompleteExecution::try_finished(graph) else {
         return Ok(None);
     };
-    let w = wobs(graph, visible)?;
-    let st = statuses(exec, &w, visible)?;
+    let obs_err = |e: ObsError| OracleError::Obs(format!("{e}"));
+    let w = wobs(graph, visible).map_err(obs_err)?;
+    if let Some(cap) = cap {
+        for name in visible {
+            let observations = w.of(name).len();
+            if observations > cap {
+                return Err(OracleError::OverCap {
+                    thread: name.clone(),
+                    observations,
+                    cap,
+                });
+            }
+        }
+    }
+    let st = statuses(exec, &w, visible).map_err(obs_err)?;
 
     // The visible events, flattened out of the per-thread rows. Position in
     // this vector is the identity used by the extension enumerator below.
@@ -225,8 +249,27 @@ pub(crate) fn vis_of_graph(
     let mut set = VisSet::default();
     let mut chosen: Vec<usize> = Vec::with_capacity(n);
     let mut used = vec![false; n];
+    #[cfg(test)]
+    ENUMERATIONS_STARTED.with(|c| c.set(c.get() + 1));
     extend(&items, &before, &mut used, &mut chosen, &st, &mut set);
     Ok(Some(set))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// **Test-only**: how many times [`vis_of_graph`] has started a
+    /// linear-extension enumeration on this thread. Lets a test show
+    /// deterministically that an over-cap graph is refused *before*
+    /// enumeration (`P3-gate4-fixes` round 2, m1), rather than inferring it
+    /// from a wall-clock deadline. Thread-local because the oracle scores
+    /// graphs on the calling thread and tests run in parallel.
+    static ENUMERATIONS_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// **Test-only**: read and reset this thread's enumeration counter.
+#[cfg(test)]
+pub(crate) fn take_enumerations_started() -> usize {
+    ENUMERATIONS_STARTED.with(|c| c.replace(0))
 }
 
 /// Depth-first enumeration of the linear extensions of `before`.
@@ -292,6 +335,17 @@ pub(crate) enum OracleError {
     /// return; `ConfCtx::collect_errors()` is where the failures are observed.
     VisibleError { thread: String },
     Obs(String),
+    /// A visible thread in some graph produced more observations than the
+    /// caller's cap, so that graph's linear-extension enumeration was
+    /// **refused rather than started**. Returned only when a cap is passed;
+    /// `generator::Pair::compare` passes
+    /// `generator::MAX_VISIBLE_EVENTS_PER_THREAD` when it is called
+    /// (criterion 13).
+    OverCap {
+        thread: String,
+        observations: usize,
+        cap: usize,
+    },
 }
 
 /// Enumerate `Graphs(P)` and build `vis(P)`.
@@ -311,6 +365,26 @@ pub(crate) fn vis_of_program<F>(
     config: Config,
     visible: &[String],
     program: F,
+) -> Result<VisSet, OracleError>
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    vis_of_program_capped(config, visible, program, None)
+}
+
+/// [`vis_of_program`], with `cap` passed to every [`vis_of_graph`] call. See
+/// there for what the cap bounds and when it is checked.
+///
+/// **What it does not bound**: the exploration itself. `Graphs(P)` is still
+/// enumerated in full by the engine before any graph is scored; the cap stops
+/// the per-graph linear-extension enumeration, whose cost is exponential in the per-thread count of
+/// observations. Nor is it all-or-nothing across graphs: graphs scored before
+/// the first over-cap one have already been enumerated.
+pub(crate) fn vis_of_program_capped<F>(
+    config: Config,
+    visible: &[String],
+    program: F,
+    cap: Option<usize>,
 ) -> Result<VisSet, OracleError>
 where
     F: Fn() + Send + Sync + 'static,
@@ -357,13 +431,18 @@ where
     // same breath; applying that reasoning to one guard and not the other was
     // the inconsistency gate 3 caught.
     //
-    // **Where the obligation actually lives**: on the *tool* side, discharged
-    // by the certificate machinery rather than by a check here.
-    // `ConfVerdict::of` routes any run whose `not_a_certificate()` is
-    // non-empty — `SearchExhausted` among them — to `Inconclusive`, and
-    // `differential::Agreement` excludes `Inconclusive` from every ratio and
-    // gates its count. An exhausted run therefore can never be scored as a
-    // certificate, which is what F43 asks for.
+    // **Where the obligation actually lives**: on the *tool* side, and in two
+    // places, not one. A run that exhausted and did **not** report is routed
+    // by `ConfVerdict::of` to `Inconclusive` (`SearchExhausted` is in its
+    // `not_a_certificate()`), which `differential::Agreement` excludes from
+    // every ratio and gates — so it can never be scored as a certificate. But
+    // a run that exhausted **and** reported is `Reported`, never
+    // `Inconclusive`, and lands in the false-alarm denominator; the
+    // certificate machinery does not see it. That case is covered separately
+    // by `Agreement::of`'s `exhausted` reads and
+    // `Tally::reported_but_not_exhaustive` (gate 4's M2, F59). An earlier
+    // version of this comment named the certificate machinery alone, which is
+    // the claim M2 found false in `differential.rs`.
 
     // **A visible thread's failed assertion is enumerated, not refused** —
     // and this is what makes `ConfMode::Collect`'s branch load-bearing
@@ -393,8 +472,8 @@ where
 
     let mut set = VisSet::default();
     for g in ctx.collected() {
-        match vis_of_graph(g, visible) {
-            Err(e) => return Err(OracleError::Obs(format!("{e}"))),
+        match vis_of_graph(g, visible, cap) {
+            Err(e) => return Err(e),
             Ok(None) => return Err(OracleError::PartialGraph),
             Ok(Some(s)) => {
                 for w in s.iter() {
@@ -428,8 +507,24 @@ where
     I: Fn() + Send + Sync + 'static,
     S: Fn() + Send + Sync + 'static,
 {
-    let vi = vis_of_program(config.clone(), visible, implementation)?;
-    let vs = vis_of_program(config, visible, specification)?;
+    includes_capped(config, visible, implementation, specification, None)
+}
+
+/// [`includes`], with the same per-thread observation `cap` applied to both
+/// programs' enumerations. See [`vis_of_graph`].
+pub(crate) fn includes_capped<I, S>(
+    config: Config,
+    visible: &[String],
+    implementation: I,
+    specification: S,
+    cap: Option<usize>,
+) -> Result<Inclusion, OracleError>
+where
+    I: Fn() + Send + Sync + 'static,
+    S: Fn() + Send + Sync + 'static,
+{
+    let vi = vis_of_program_capped(config.clone(), visible, implementation, cap)?;
+    let vs = vis_of_program_capped(config, visible, specification, cap)?;
     Ok(match vi.subset_of(&vs) {
         Ok(()) => Inclusion::Holds,
         Err(witness) => Inclusion::Fails { witness },

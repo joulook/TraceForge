@@ -50,16 +50,14 @@ fn capable(m: Mode) -> bool {
     m.is_constructed() && m.can_false_alarm()
 }
 
+/// A generated pair, through the harness **with criterion 13's event cap**.
+///
+/// This goes through `Pair::compare`, the generator's own entry point, not
+/// through the uncapped `compare`, so that every corpus test also runs every
+/// shipped shape against `MAX_VISIBLE_EVENTS_PER_THREAD`. Before
+/// `P3-gate4-fixes` round 1 this called `compare`, which bypasses the cap.
 fn run(p: &Pair) -> Result<Agreement, crate::conformance::differential::DiffError> {
-    let impl_ = {
-        let a = p.implementation.clone();
-        move || a()
-    };
-    let spec = {
-        let a = p.specification.clone();
-        move || a()
-    };
-    compare(p.config.clone(), &p.visible, impl_, spec)
+    p.compare(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -90,8 +88,15 @@ fn every_generator_mode_matches_its_predicted_oracle_answer() {
             let a = p.specification.clone();
             move || a()
         };
-        let got = crate::conformance::oracle::includes(p.config.clone(), &p.visible, impl_, spec)
-            .unwrap_or_else(|e| panic!("oracle refused {:?}: {e:?}", m));
+        // Capped, like every other run of a generated pair.
+        let got = crate::conformance::oracle::includes_capped(
+            p.config.clone(),
+            &p.visible,
+            impl_,
+            spec,
+            Some(crate::conformance::generator::MAX_VISIBLE_EVENTS_PER_THREAD),
+        )
+        .unwrap_or_else(|e| panic!("oracle refused {:?}: {e:?}", m));
         let holds = matches!(got, crate::conformance::oracle::Inclusion::Holds);
         assert_eq!(
             holds, p.expect_inclusion,
@@ -1171,8 +1176,8 @@ fn a_real_reported_and_exhausted_verdict_scored_as_a_false_alarm_is_counted_and_
 ///
 /// What stays true, and is pinned here: `compare` runs the tool at
 /// `DEFAULT_SEARCH_BUDGET`, which is above every gate in this pair, so every
-/// caller of `compare` — the corpus test among them — sees `exhausted: false`
-/// on it. The same pair at `Some(12)` exhausts, in the same test, so this
+/// caller of `compare` sees `exhausted: false` on it. The corpus tests now go
+/// through `Pair::compare(None)`, which passes the same `None` budget. The same pair at `Some(12)` exhausts, in the same test, so this
 /// assertion is about the budget `compare` passes and not about the pair.
 ///
 /// Whether `compare` and `compare_with_budget(.., None)` can drift is
@@ -1238,12 +1243,13 @@ fn compare_runs_at_the_default_budget_and_this_pair_does_not_exhaust_there() {
 /// The per-visible-thread event counts of one emitted pair, as the oracle's
 /// enumerated words show them — implementation and specification.
 ///
-/// This is the definition `generator.rs` itself prescribes for
-/// [`MAX_VISIBLE_EVENTS_PER_THREAD`]: "checked against the oracle's enumerated
-/// words by the corpus test, which is the first place the count exists". A
-/// `vis` word is the visible events of one complete execution, so the number of
-/// elements carrying a given declared name **is** that thread's visible event
-/// count on that execution.
+/// A `vis` word is the visible events of one complete execution, so the number
+/// of elements carrying a given declared name **is** that thread's visible
+/// event count on that execution — the same quantity the oracle's cap reads
+/// off `wobs` before enumerating.
+///
+/// **Deliberately uncapped.** This is a measurement, and the tests built on it
+/// must not depend on the mechanism they are a second guard for.
 fn events_per_visible_thread(p: &Pair) -> Vec<(String, usize)> {
     use crate::conformance::oracle::vis_of_program;
     let mut worst: BTreeMap<String, usize> = BTreeMap::new();
@@ -1320,21 +1326,28 @@ fn every_emitted_pair_declares_exactly_max_visible_threads() {
     }
 }
 
-/// **Criterion 13's second bound, checked where the number first exists.**
+/// **Criterion 13's second bound, on every emitted shape — a regression guard,
+/// not the bound.**
 ///
-/// `generator.rs` declares `MAX_VISIBLE_EVENTS_PER_THREAD` and says in terms
-/// that it is "**not asserted in this module, and deliberately so** … The
-/// corpus test checks it against the oracle's enumerated words". Before this
-/// test that corpus test did not exist, so the constant was a declaration and
-/// not a bound — which is the distinction criterion 13's "hard grammar bounds,
-/// not conventions" is about. This is that check.
+/// Gate 4 wrote this as *the* check on `MAX_VISIBLE_EVENTS_PER_THREAD`.
+/// `P3-gate4-fixes` rejected that twice: round 1 because it checks only today's
+/// corpus, round 2 because a runtime cap alone runs after exploration. The
+/// bound is now each shape's **declaration**, asserted in `pair()`, and
+/// [`every_shapes_declared_observations_equal_the_measured_counts`] checks the
+/// declarations are true.
 ///
-/// It is written against the *oracle's* words rather than against the closures
-/// for the reason the generator gives: the count is a property of a run.
+/// Kept as a guard that depends on **neither** the declaration nor the
+/// runtime cap. It compares the uncapped measured count with the constant
+/// directly. It still catches a shape that really is over the bound in one
+/// case the other layers miss together: an honest over-bound declaration
+/// (so the equality test passes) with `pair()`'s bound assertion removed and
+/// the pair run uncapped.
 ///
-/// **Mutation, MEASURED**: change `MAX_VISIBLE_EVENTS_PER_THREAD` to 0.
-/// Applied — this test fails on every mode with
-/// `over MAX_VISIBLE_EVENTS_PER_THREAD (0)`.
+/// **Mutation, MEASURED** (gate 4): `MAX_VISIBLE_EVENTS_PER_THREAD = 0` failed
+/// this test with `over MAX_VISIBLE_EVENTS_PER_THREAD (0)`. Re-measured at the
+/// `P3-gate4-fixes` round-2 response: it still fails, now earlier, on `pair()`'s
+/// assertion (`generator: Identity declares 1 visible observations for \`main\`
+/// …`), because the bound is enforced at construction.
 #[test]
 fn no_emitted_pair_exceeds_max_visible_events_per_thread() {
     use crate::conformance::generator::MAX_VISIBLE_EVENTS_PER_THREAD;
@@ -1345,7 +1358,8 @@ fn no_emitted_pair_exceeds_max_visible_events_per_thread() {
                 n <= MAX_VISIBLE_EVENTS_PER_THREAD,
                 "{:?} seed={:#x}: visible thread {name:?} performs {n} visible events, over \
                  MAX_VISIBLE_EVENTS_PER_THREAD ({MAX_VISIBLE_EVENTS_PER_THREAD}). `vis` \
-                 enumeration is factorial in this parameter",
+                 enumeration grows exponentially in this parameter across two visible \
+                 threads",
                 p.mode,
                 p.seed
             );
@@ -1615,4 +1629,503 @@ fn a_visible_error_pair_is_enumerated_and_scores_rather_than_refusing() {
         "an implementation whose visible thread errors does not refine an err-free \
          specification, and the tool reports it; got {got:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// P3-gate4-fixes round 1, M1: the event cap as a runtime bound
+// ---------------------------------------------------------------------------
+
+/// **A pair over the event cap is refused through `Pair::compare`, and the
+/// refusal names the thread and the counts.**
+///
+/// Criterion 13 asks for a hard bound. The owner's route is a runtime cap:
+/// `Pair::compare` passes `MAX_VISIBLE_EVENTS_PER_THREAD` to the oracle, which
+/// refuses any graph whose visible thread exceeds it. No shipped shape exceeds
+/// it, so the pairs here are built by hand (`Pair`'s fields are `pub(crate)`).
+///
+/// Three placements, one per way the check could be too narrow:
+/// - over the cap on the **second** visible thread only, so a check that
+///   looked at one thread would pass it;
+/// - over the cap on the **first** thread, by exactly one;
+/// - over the cap in the **specification only**, so a cap applied to the
+///   implementation's enumeration alone would pass it.
+#[test]
+fn a_pair_over_the_event_cap_is_refused_through_pair_compare_naming_the_thread() {
+    use crate::conformance::differential::DiffError;
+    use crate::conformance::generator::MAX_VISIBLE_EVENTS_PER_THREAD as CAP;
+    use crate::conformance::oracle::OracleError;
+    use std::sync::Arc;
+
+    let expect = |p: &Pair, what: &str, thread: &str, observations: usize| match p.compare(None) {
+        Err(DiffError::Oracle(OracleError::OverCap {
+            thread: t,
+            observations: o,
+            cap,
+        })) => {
+            assert_eq!(
+                (t.as_str(), o, cap),
+                (thread, observations, CAP),
+                "{what}: the refusal must name the thread, its count and the cap"
+            );
+        }
+        other => panic!("{what}: expected OverCap on {thread:?}; got {other:?}"),
+    };
+
+    expect(
+        &two_chain_pair(1, CAP + 1),
+        "second thread over",
+        "d",
+        CAP + 1,
+    );
+    expect(
+        &two_chain_pair(CAP + 1, 1),
+        "first thread over",
+        "c",
+        CAP + 1,
+    );
+
+    let mut p = two_chain_pair(1, 1);
+    p.specification = Arc::new(|| {
+        receive_chain("c", "s", 1);
+        receive_chain("d", "t", CAP + 2);
+    });
+    expect(&p, "specification only", "d", CAP + 2);
+}
+
+/// **The cap does not fire at the bound, and it is the cap that refuses.**
+///
+/// - Exactly `MAX_VISIBLE_EVENTS_PER_THREAD` observations on both visible
+///   threads is **accepted** by `Pair::compare` and scores as usual (`BothClean`:
+///   implementation and specification are the same program). This separates
+///   `>` from `>=`.
+/// - The over-cap pair of
+///   [`a_pair_over_the_event_cap_is_refused_through_pair_compare_naming_the_thread`],
+///   run through the **uncapped** `compare`, is **not** refused. So the refusal
+///   there comes from the cap and not from the program. This also pins the
+///   bypass the generator's module doc states: the cap binds only pairs run
+///   through `Pair::compare`.
+#[test]
+fn the_event_cap_accepts_the_bound_and_uncapped_compare_bypasses_it() {
+    use crate::conformance::generator::MAX_VISIBLE_EVENTS_PER_THREAD as CAP;
+
+    let at = two_chain_pair(CAP, CAP);
+    let got = at.compare(None).unwrap_or_else(|e| {
+        panic!("exactly {CAP} observations per thread is within the bound: {e:?}")
+    });
+    assert!(
+        matches!(got, Agreement::BothClean),
+        "an identical pair at the bound scores as usual; got {got:?}"
+    );
+
+    let over = two_chain_pair(1, CAP + 1);
+    let (i, s) = (over.implementation.clone(), over.specification.clone());
+    let got = compare(over.config.clone(), &over.visible, move || i(), move || s())
+        .unwrap_or_else(|e| panic!("uncapped `compare` must not refuse an over-cap pair: {e:?}"));
+    assert!(
+        matches!(got, Agreement::BothClean),
+        "uncapped, the same pair is enumerated and scored; got {got:?}"
+    );
+}
+
+/// **An over-cap graph is refused before its enumeration starts.** This is
+/// shown with the oracle's test-only counter, not with a clock.
+///
+/// `oracle::take_enumerations_started()` counts, per OS thread, the times
+/// `vis_of_graph` reached `extend`. The oracle scores graphs on the calling
+/// thread, and the tool never calls `vis_of_graph`, so every count here comes
+/// from `Pair::compare`'s oracle calls. The test measures its own reference
+/// numbers rather than assuming them: each side's graph count is the counter
+/// after an **uncapped** `vis_of_program` of that side alone.
+///
+/// Three runs, one per way the counts can come out:
+/// - **At the bound** (`(2,2)`): `Pair::compare` enumerates exactly
+///   `graphs(impl) + graphs(spec)`. This also shows the counter is live and the
+///   tool adds nothing to it.
+/// - **Implementation over** (`(1,3)`): every graph of that program has `d` at
+///   3, so the first graph scored is over the cap. The result is `OverCap` with
+///   the counter at **0**, although the same program uncapped enumerates at
+///   least one graph.
+/// - **Specification only over**: the implementation is scored first and
+///   fully enumerated, then the specification's first graph is refused. So
+///   the count is **exactly** `graphs(impl)`: graphs scored before the refusal
+///   are counted, and the refused graph is not.
+///
+/// This replaces a 30-second wall-clock test (`P3-gate4-fixes` round 2, m1).
+/// That test depended on an unrun, extrapolated cost, and it left a worker
+/// running when it failed. It added nothing this test does not show
+/// deterministically, so it was removed rather than kept.
+///
+/// **Mutations, MEASURED at the round-2 response** (production file restored
+/// and md5-verified after each):
+/// - cap check moved after `extend` (round 1's N2) — fails on `the over-cap
+///   graph was refused before its enumeration started`. This is the only
+///   test that catches it;
+/// - counter increment moved before the cap check — fails on the same message;
+/// - counter increment deleted — fails on `each side enumerates at least one
+///   graph uncapped; got 0, 0`;
+/// - cap check removed, `Pair::compare` passing `None`, the cap checking only
+///   the first thread, or `compare_capped` dropping the cap — each fails on
+///   `expected OverCap; got Ok(BothClean)`;
+/// - specification enumerated uncapped — fails on `expected OverCap; got
+///   Ok(BothFail { .. })`;
+/// - `>=` for `>` — fails on `at the bound the pair is scored; got
+///   Err(Oracle(OverCap { .. }))`.
+///
+/// **Not distinguishable, and why**: moving the increment from just before
+/// `extend` to just after it changes no count. `extend` always returns, and a
+/// refused graph reaches neither point. What the test can observe is where the
+/// increment sits relative to the **cap check**, and that is pinned by the
+/// "moved before the cap check" mutation above.
+#[test]
+fn an_over_cap_graph_is_refused_before_its_enumeration_starts() {
+    use crate::conformance::differential::DiffError;
+    use crate::conformance::generator::MAX_VISIBLE_EVENTS_PER_THREAD as CAP;
+    use crate::conformance::oracle::{take_enumerations_started, vis_of_program, OracleError};
+    use std::sync::Arc;
+
+    // Graphs of one side, as the uncapped oracle enumerates them.
+    let graphs_of = |p: &Pair, side: &Arc<dyn Fn() + Send + Sync>| {
+        let f = side.clone();
+        let _ = take_enumerations_started();
+        vis_of_program(p.config.clone(), &p.visible, move || f())
+            .unwrap_or_else(|e| panic!("the uncapped oracle enumerates this side: {e:?}"));
+        take_enumerations_started()
+    };
+    let is_over_cap = |r: &Result<Agreement, DiffError>| {
+        matches!(r, Err(DiffError::Oracle(OracleError::OverCap { .. })))
+    };
+
+    // At the bound.
+    let at = two_chain_pair(CAP, CAP);
+    let (gi, gs) = (
+        graphs_of(&at, &at.implementation),
+        graphs_of(&at, &at.specification),
+    );
+    assert!(
+        gi >= 1 && gs >= 1,
+        "each side enumerates at least one graph uncapped; got {gi}, {gs}"
+    );
+    let _ = take_enumerations_started();
+    let r = at.compare(None);
+    assert!(r.is_ok(), "at the bound the pair is scored; got {r:?}");
+    assert_eq!(
+        take_enumerations_started(),
+        gi + gs,
+        "at the bound, Pair::compare enumerates every graph of both sides, once each"
+    );
+
+    // The implementation over the cap.
+    let over = two_chain_pair(1, CAP + 1);
+    let g_over = graphs_of(&over, &over.implementation);
+    assert!(
+        g_over >= 1,
+        "uncapped, this program's graphs are enumerated, so the counter is live on it"
+    );
+    let _ = take_enumerations_started();
+    let r = over.compare(None);
+    assert!(is_over_cap(&r), "expected OverCap; got {r:?}");
+    assert_eq!(
+        take_enumerations_started(),
+        0,
+        "the over-cap graph was refused before its enumeration started"
+    );
+
+    // Only the specification over the cap.
+    let mut spec_over = two_chain_pair(1, 1);
+    spec_over.specification = Arc::new(|| {
+        receive_chain("c", "s", 1);
+        receive_chain("d", "t", CAP + 2);
+    });
+    let gi = graphs_of(&spec_over, &spec_over.implementation);
+    let _ = take_enumerations_started();
+    let r = spec_over.compare(None);
+    assert!(is_over_cap(&r), "expected OverCap; got {r:?}");
+    assert_eq!(
+        take_enumerations_started(),
+        gi,
+        "exactly the implementation's {gi} graph(s) were enumerated before the \
+         specification's first graph was refused"
+    );
+}
+
+/// **`check_declaration` refuses a bad declaration on either side, and
+/// accepts a correct one and one exactly at the bound.**
+///
+/// `pair()` calls `generator::check_declaration` on every shape's declaration.
+/// Before the round-2 follow-up those checks were inline in `pair()`, and no
+/// test could feed them a bad declaration. Here each refusal is driven
+/// directly, and the panic **message** is asserted, not just that something
+/// panicked:
+/// - an entry over `MAX_VISIBLE_EVENTS_PER_THREAD`;
+/// - a declaration missing a visible thread;
+/// - a declaration naming a thread that is not visible.
+///
+/// Each is placed on the implementation side and, separately, on the
+/// specification side. The other side is always correct, so a check that
+/// looked at one side only would pass half the cases. Acceptance is asserted
+/// for the correct declaration and for one where **every** entry equals the
+/// bound, which separates `<=` from `<`.
+///
+/// **Mutations, MEASURED at the round-2 follow-up** (`generator.rs`, restored
+/// and md5-verified after each; each fails **only this test**):
+/// - bound assertion deleted — `over, implementation: check_declaration
+///   accepted it`;
+/// - name assertion deleted — `missing, implementation: check_declaration
+///   accepted it`;
+/// - `<=` changed to `<` — `every entry exactly at the bound is accepted`;
+/// - only the implementation side checked — `over, specification:
+///   check_declaration accepted it`.
+///
+/// **Not caught here: `pair()` no longer calling `check_declaration`.** With
+/// every shipped declaration correct, the call has no observable effect. A bad
+/// declaration would still be caught by
+/// [`every_shapes_declared_observations_equal_the_measured_counts`], as it was
+/// with the assertions deleted in the round-2 response.
+#[test]
+fn check_declaration_refuses_bad_declarations_on_either_side_and_accepts_the_bound() {
+    use crate::conformance::generator::{
+        check_declaration, DeclaredObservations, MAX_VISIBLE_EVENTS_PER_THREAD as CAP,
+    };
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    const OK: &[(&str, usize)] = &[("p", 1), ("c", 1)];
+    const AT_BOUND: &[(&str, usize)] = &[("p", CAP), ("c", CAP)];
+    const OVER: &[(&str, usize)] = &[("p", 1), ("c", CAP + 1)];
+    const MISSING: &[(&str, usize)] = &[("p", 1)];
+    const EXTRA: &[(&str, usize)] = &[("p", 1), ("c", 1), ("x", 1)];
+
+    let visible = vec!["p".to_string(), "c".to_string()];
+    let run = |implementation, specification| {
+        catch_unwind(AssertUnwindSafe(|| {
+            check_declaration(
+                Mode::DecoupleImpl,
+                &visible,
+                DeclaredObservations {
+                    implementation,
+                    specification,
+                },
+            )
+        }))
+        .err()
+        .map(|e| {
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "<non-string panic payload>".to_owned())
+        })
+    };
+
+    // Accepted.
+    assert_eq!(run(OK, OK), None, "a correct declaration is accepted");
+    assert_eq!(
+        run(AT_BOUND, AT_BOUND),
+        None,
+        "every entry exactly at the bound is accepted"
+    );
+
+    let over = |side: &str| {
+        format!(
+            "declares {} visible observations for `c` in its {side}, over \
+             MAX_VISIBLE_EVENTS_PER_THREAD ({CAP})",
+            CAP + 1
+        )
+    };
+    let names = |side: &str, got: &str| {
+        format!(
+            "DecoupleImpl's {side} declaration names {got} but the pair's visible threads \
+             are [\"c\", \"p\"]"
+        )
+    };
+    let cases = [
+        (
+            "over, implementation",
+            run(OVER, OK),
+            over("implementation"),
+        ),
+        ("over, specification", run(OK, OVER), over("specification")),
+        (
+            "missing, implementation",
+            run(MISSING, OK),
+            names("implementation", "[\"p\"]"),
+        ),
+        (
+            "missing, specification",
+            run(OK, MISSING),
+            names("specification", "[\"p\"]"),
+        ),
+        (
+            "extra, implementation",
+            run(EXTRA, OK),
+            names("implementation", "[\"c\", \"p\", \"x\"]"),
+        ),
+        (
+            "extra, specification",
+            run(OK, EXTRA),
+            names("specification", "[\"c\", \"p\", \"x\"]"),
+        ),
+    ];
+    for (what, got, want) in cases {
+        let msg = got.unwrap_or_else(|| panic!("{what}: check_declaration accepted it"));
+        assert!(
+            msg.contains(&want),
+            "{what}: refused, but with the wrong message.\n  want substring: {want}\n  got: {msg}"
+        );
+    }
+}
+
+/// **Every shape's declared observation counts equal the measured ones, per
+/// side, under every model.**
+///
+/// `Mode::declared_observations` is the construction-time bound
+/// (`P3-gate4-fixes` round 2, M1). `pair()` asserts it is within
+/// `MAX_VISIBLE_EVENTS_PER_THREAD`, but a declaration is written by hand and
+/// nothing in `pair()` can check that it is **true**. This test does, and it
+/// requires **equality**:
+/// - an under-declaration would defeat the bound;
+/// - an over-declaration would hide slack and let a shape drift silently.
+///
+/// "Measured" means: for each side, the most elements carrying each visible
+/// name in any word of the **uncapped** oracle's `vis`. The test does not use
+/// the cap it backs.
+///
+/// **Seeds.** One seed per mode is not enough: `pair()`'s seed picks the
+/// **model** (`rng.pick(models())`) as well as the value (`rng.val()`, 1 to 5),
+/// and those two draws are all the seed decides. So a mode has exactly 15
+/// distinct pairs, and this test checks **all 15**. It scans seeds `0..512`,
+/// keeps one seed per new (model, implementation word set) combination, and
+/// asserts it found 5 distinct word sets under each of the 3 models. The word
+/// set stands in for the value, which `Pair` does not expose. If some shape's
+/// words did not carry the value, coverage would come up short and the
+/// assertion would fail loudly, rather than the test quietly checking less.
+///
+/// **Mutations, MEASURED at the round-2 response** (`generator.rs`, restored
+/// and md5-verified after each):
+/// - `DecoupleImpl` and its siblings declare `c` as **2** (still within the
+///   bound, so `pair()` accepts it) — fails **only this test**, on
+///   `DecoupleImpl seed=0x0 (Bag): the implementation's measured per-thread
+///   observation maxima differ from its declaration`;
+/// - `pair()`'s bound assertion deleted **and** `c` declared as 3 — fails only
+///   this test, with the same message. Without the deletion, the same
+///   declaration panics in `pair()` (9 tests fail on `declares 3 visible
+///   observations for \`c\` … over MAX_VISIBLE_EVENTS_PER_THREAD`);
+/// - `pair()`'s name-equality assertion deleted **and** `c` left undeclared —
+///   fails only this test, with the same message. Without the deletion,
+///   `pair()` panics (9 tests fail on `declaration names ["p"] but the pair's
+///   visible threads are ["c", "p"]`).
+///
+/// So each construction check has a measured failing direction, and the test
+/// catches the same bad declaration when that check is removed. Deleting
+/// either check while **every** declaration is correct fails nothing
+/// (26/0). That is expected: the checks only fire on a bad declaration, and
+/// `Mode::declared_observations` is a fixed `match` that a test cannot feed
+/// one. See the round-2 response in `log/dev/P3-F59.report.md` for the hook
+/// that would allow it.
+#[test]
+fn every_shapes_declared_observations_equal_the_measured_counts() {
+    use crate::conformance::oracle::vis_of_program;
+    use std::collections::BTreeSet;
+
+    let measure = |p: &Pair, side: &std::sync::Arc<dyn Fn() + Send + Sync>| {
+        let f = side.clone();
+        let set = vis_of_program(p.config.clone(), &p.visible, move || f())
+            .unwrap_or_else(|e| panic!("{:?} seed={:#x}: {e:?}", p.mode, p.seed));
+        let mut worst: BTreeMap<String, usize> = p.visible.iter().map(|n| (n.clone(), 0)).collect();
+        for w in set.iter() {
+            for name in &p.visible {
+                let c = w.word.iter().filter(|e| &e.thread == name).count();
+                let slot = worst.get_mut(name).expect("a visible name");
+                *slot = (*slot).max(c);
+            }
+        }
+        worst
+    };
+    let as_map = |entries: &[(&str, usize)]| -> BTreeMap<String, usize> {
+        entries.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+    };
+
+    for m in Mode::all() {
+        let declared = m.declared_observations();
+        // (model, value) pairs seen so far, and per model the distinct values.
+        let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut used = 0;
+        for seed in 0..512u64 {
+            let covered = seen.len() == 3 && seen.values().all(|v| v.len() == 5);
+            if covered {
+                break;
+            }
+            let p = pair(*m, seed);
+            let model = format!("{:?}", p.config.cons_type);
+            // The value is not exposed on `Pair`; the implementation's words
+            // carry it, so the word set's rendering stands in for it.
+            let words = {
+                let f = p.implementation.clone();
+                let set = vis_of_program(p.config.clone(), &p.visible, move || f())
+                    .unwrap_or_else(|e| panic!("{m:?} seed={seed:#x}: {e:?}"));
+                format!("{:?}", set.iter().collect::<Vec<_>>())
+            };
+            if seen.get(&model).is_some_and(|v| v.contains(&words)) {
+                continue;
+            }
+            seen.entry(model.clone()).or_default().insert(words);
+            used += 1;
+
+            for (side, program, entries) in [
+                ("implementation", &p.implementation, declared.implementation),
+                ("specification", &p.specification, declared.specification),
+            ] {
+                assert_eq!(
+                    measure(&p, program),
+                    as_map(entries),
+                    "{m:?} seed={seed:#x} ({model}): the {side}'s measured per-thread \
+                     observation maxima differ from its declaration"
+                );
+            }
+        }
+        assert!(
+            seen.len() == 3 && seen.values().all(|v| v.len() == 5),
+            "{m:?}: seeds 0..512 did not cover all 15 (model, value) pairs ({used} used): \
+             {seen:?}"
+        );
+        assert_eq!(used, 15, "{m:?}: one seed per distinct pair");
+    }
+}
+
+/// A visible thread `name` that receives `k` messages, all from its own
+/// invisible sender `sender`, which sends `1..=k` in order.
+fn receive_chain(name: &'static str, sender: &'static str, k: usize) {
+    use crate::{recv_msg_block, send_msg};
+    let r = named_thread(name, move || {
+        for _ in 0..k {
+            let _v: i32 = recv_msg_block();
+        }
+    });
+    let rid = r.thread().id();
+    let _s = named_thread(sender, move || {
+        for v in 1..=k {
+            send_msg(rid, v as i32);
+        }
+    });
+}
+
+/// A hand-built `Pair`: visible `c` and `d` receive `kc` and `kd` messages
+/// from independent invisible senders, so no `vo` edge joins `c`'s
+/// observations to `d`'s. Implementation and specification are the same
+/// program. Under FIFO.
+fn two_chain_pair(kc: usize, kd: usize) -> Pair {
+    use std::sync::Arc;
+    let prog = Arc::new(move || {
+        receive_chain("c", "s", kc);
+        receive_chain("d", "t", kd);
+    }) as Arc<dyn Fn() + Send + Sync>;
+    Pair {
+        mode: Mode::Identity,
+        seed: 0,
+        visible: vec!["c".to_string(), "d".to_string()],
+        config: crate::Config::builder()
+            .with_cons_type(crate::ConsType::FIFO)
+            .build(),
+        implementation: prog.clone(),
+        specification: prog,
+        expect_inclusion: true,
+    }
 }

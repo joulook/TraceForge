@@ -61,7 +61,7 @@
 //! by the counter, not by this prose.
 
 use crate::conformance::config::ConfBuilder;
-use crate::conformance::oracle::{includes, Inclusion, OracleError, VisWord};
+use crate::conformance::oracle::{includes_capped, Inclusion, OracleError, VisWord};
 use crate::conformance::report::ConfVerdict;
 use crate::conformance::ConfError;
 use crate::Config;
@@ -235,11 +235,50 @@ where
     I: Fn() + Send + Sync + Clone + 'static,
     S: Fn() + Send + Sync + Clone + 'static,
 {
-    let oracle = includes(
+    compare_capped(
+        config,
+        visible,
+        implementation,
+        specification,
+        search_budget,
+        None,
+    )
+}
+
+/// The harness's single implementation: [`compare_with_budget`], plus a
+/// per-thread cap on the **oracle's** visible observations.
+///
+/// `event_cap` is passed to `oracle::includes_capped`, which refuses (with
+/// `OracleError::OverCap`, surfaced here as `DiffError::Oracle`) any graph
+/// whose visible thread exceeds it, **before** that graph's linear-extension
+/// enumeration starts. The check is per graph: graphs scored before an
+/// over-cap one have already been enumerated, and so has the whole
+/// implementation if only the specification goes over. It does not touch the tool, whose cost is bounded by
+/// `search_budget` instead.
+///
+/// [`compare`] and [`compare_with_budget`] pass `None` and are unchanged in
+/// behaviour. Generated pairs are run through `generator::Pair::compare`,
+/// which passes `Some(generator::MAX_VISIBLE_EVENTS_PER_THREAD)` — that is what
+/// makes criterion 13's event bound a checked runtime bound rather than a
+/// property of today's corpus (`P3-gate4-fixes` round 1, M1).
+pub(crate) fn compare_capped<I, S>(
+    config: Config,
+    visible: &[String],
+    implementation: I,
+    specification: S,
+    search_budget: Option<usize>,
+    event_cap: Option<usize>,
+) -> Result<Agreement, DiffError>
+where
+    I: Fn() + Send + Sync + Clone + 'static,
+    S: Fn() + Send + Sync + Clone + 'static,
+{
+    let oracle = includes_capped(
         config.clone(),
         visible,
         implementation.clone(),
         specification.clone(),
+        event_cap,
     )
     .map_err(DiffError::Oracle)?;
 

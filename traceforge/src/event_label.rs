@@ -244,9 +244,10 @@ impl LabelEnum {
                     // **Do not "fix" this by comparing results.** Review round 4
                     // established that it breaks the caller outright: `lib.rs` rolls a
                     // fresh `gen_bool()` before `handle_ctoss` *even on replay*, so a
-                    // result comparison would abort every replayed choice point whose
-                    // value the conformance search had changed — which is every one it
-                    // uses. The `Choice` arm below does compare, but only its *range*,
+                    // result comparison would abort a replayed choice point whenever
+                    // the fresh roll differs from the value conformance installed —
+                    // making valid probes fail at random rather than by design. The
+                    // `Choice` arm below does compare, but only its *range*,
                     // never its result; the two nondet kinds are deliberately
                     // asymmetric here.
                     return Ok(());

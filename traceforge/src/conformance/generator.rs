@@ -86,21 +86,49 @@
 //!
 //! # The size cap, and what enforces it
 //!
-//! Membership in `VisSet` is O(n·m) and enumeration is factorial in two
-//! independent parameters, so "affordable" is a claim about bounds. Criterion
+//! Membership in `VisSet` is O(n·m), and the number of orderings to enumerate
+//! grows with two independent parameters — faster than exponentially in the
+//! number of visible threads, exponentially in the observations per thread (see
+//! the two constants) — so "affordable" is a claim about bounds. Criterion
 //! 13 requires these to be **hard grammar bounds, not conventions**, and to say
-//! which of "cap it" / "bound the run" was chosen. Both were, at different
-//! levels, and they are enforced by different mechanisms — stated separately
-//! because only one of them is checked inside this module:
+//! which of "cap it" / "bound the run" was chosen. **Both bounds are capped at
+//! construction**, and the event bound has a runtime backstop as well:
 //!
-//! - [`MAX_VISIBLE_THREADS`] is **enforced here**, by an assertion in
-//!   [`pair()`] on every emitted pair. It is a property of the `visible` list,
-//!   which is data this module holds.
-//! - [`MAX_VISIBLE_EVENTS_PER_THREAD`] is **not checkable here** — how many
-//!   communication events a visible thread performs is a property of a *run*,
-//!   not of the closure this module builds. It is declared as a constant and
-//!   checked against the oracle's enumerated words by the corpus test, which
-//!   is the first place the count exists.
+//! - [`MAX_VISIBLE_THREADS`] is **asserted in [`pair()`]** on every emitted
+//!   pair. It is a property of the `visible` list, which is data this module
+//!   holds.
+//! - [`MAX_VISIBLE_EVENTS_PER_THREAD`] is **asserted in [`pair()`] against each
+//!   shape's declaration**, [`Mode::declared_observations`], so a pair whose
+//!   declared per-thread count is over the bound cannot be built. A shape's
+//!   closure is opaque, so the count has to be *declared*; a declaration can be
+//!   wrong, and two things stand behind it:
+//!   - a **test** measures every shape's per-thread count from the oracle's
+//!     words and requires it to **equal** the declaration;
+//!   - a **runtime cap**: [`Pair::compare`] passes the bound to the oracle, which
+//!     checks every visible thread of each collected graph **before** that
+//!     graph's linear-extension enumeration. It compares observed counts with
+//!     the **bound**, not with the declaration, so it catches a shape that
+//!     actually exceeds the bound whatever it declared — but not an
+//!     under-declaration that stays within it (declared 1, real 2), which only
+//!     the test above catches. It acts only after the engine has explored
+//!     `Graphs(P)`, and only per
+//!     graph: graphs scored before the first over-cap one, and the whole
+//!     implementation when only the specification is over, have already been
+//!     enumerated. It binds only pairs run through `Pair::compare`; the uncapped
+//!     `differential::compare`, `differential::compare_with_budget`,
+//!     `oracle::includes` and `oracle::vis_of_program` bypass it.
+//!
+//! History: round 1 of `P3-gate4-fixes` (M1) rejected a corpus test alone as a
+//! check of today's shapes; round 2 (M1) rejected the runtime cap alone because
+//! it runs after exploration. The construction-time declaration is the bound.
+//! The equality test checks that each declaration is true; the runtime cap
+//! checks only that no run exceeds the bound. Declarations are tested for the
+//! modes in `Mode::all()`. A mode missing from that list still has its
+//! declaration checked against the bound in `pair()`, but nothing checks that
+//! the declaration is true, and the runtime cap is then the only check on its
+//! real count. `Mode::all()` is a hand-written list while
+//! `declared_observations` is an exhaustive `match`, so a new variant can be
+//! declared and still be left out of the list.
 //!
 //! **F-18 on a corpus that reports.** F-18 is the report sink retaining a
 //! serialized graph per report, unbounded across reports. It does not
@@ -119,10 +147,11 @@ use crate::{recv_msg_block, send_msg, thread, ConsType, Config};
 /// Every shape in this module declares exactly two visible threads, so this is
 /// the bound the shapes already respect rather than a ceiling chosen to leave
 /// room. Raising it is a deliberate act that must be accompanied by a re-run
-/// of the corpus cost, because `vis` enumeration is factorial in this
-/// parameter: the linear extensions of `vo` over `t` visible threads of `k`
-/// events each number `(t·k)! / (k!)^t` in the worst case, which for `t = 3`,
-/// `k = 2` is already 90 against 6 at `t = 2`.
+/// of the corpus cost, because `vis` enumeration grows faster than
+/// exponentially in this parameter: the linear extensions of `vo` over `t` visible threads of `k`
+/// events each number `(t·k)! / (k!)^t` in the worst case, which at `k = 2`
+/// runs 6, 90, 2 520, 113 400 for `t = 2..=5` — each step multiplying by more
+/// than the last.
 ///
 /// Asserted in [`pair()`], which is the single construction point.
 pub(crate) const MAX_VISIBLE_THREADS: usize = 2;
@@ -130,17 +159,19 @@ pub(crate) const MAX_VISIBLE_THREADS: usize = 2;
 /// **Hard bound on visible *observations* per visible thread** (criterion 13).
 ///
 /// **The quantity is elements of a `vis` word**, not attempted communications.
-/// That is the definition the bound needs: enumeration cost is factorial in the
-/// number of visible events that actually appear in a word, and an attempt that
+/// That is the definition the bound needs: enumeration cost is exponential in the per-thread count of
+/// visible events that actually appear in a word (two threads of `k` give
+/// `C(2k, k)`: 2, 6, 20, 70, 252 for `k = 1..=5`), and an attempt that
 /// contributes no observation costs nothing to enumerate. It is also the only
 /// one the check can measure, since a blocked receive is invisible to `vis`.
 ///
-/// **Not asserted in this module, and deliberately so.** How many observations
-/// a thread produces is a property of a run, not of the closure built here —
-/// there is nothing in a `Pair` to count. The corpus test checks it against the
-/// oracle's enumerated words, which is the first point at which the number
-/// exists. It is recorded here as *declared, checked elsewhere* rather than
-/// implied to be enforced on construction.
+/// **Enforced when a pair is built, on its shape's declaration.** [`pair()`]
+/// asserts every entry of [`Mode::declared_observations`] against this
+/// constant. Because the count is declared rather than read off the closure, a
+/// test checks each declaration against the measured count, and
+/// [`Pair::compare`] also passes this constant to the oracle as a per-graph
+/// runtime cap. See the module doc for what each layer covers and what it does
+/// not.
 ///
 /// **The bound is slack by a factor of two, and that is recorded rather than
 /// tightened.** Measured over every mode and both sides, the worst case is
@@ -172,6 +203,41 @@ pub(crate) struct Pair {
     pub(crate) specification: Arc<dyn Fn() + Send + Sync>,
     /// What the **oracle** must say. Derived from the mode, never observed.
     pub(crate) expect_inclusion: bool,
+}
+
+impl Pair {
+    /// Run this pair through the differential harness, **with criterion 13's
+    /// event cap enforced**.
+    ///
+    /// This is the entry point for generated pairs. It calls
+    /// `differential::compare_capped` with
+    /// `Some(MAX_VISIBLE_EVENTS_PER_THREAD)`, so a shape whose visible thread
+    /// produces more observations than the bound has that graph refused before
+    /// the oracle enumerates its orderings, not after. The check is per graph;
+    /// see the module doc for what that leaves unbounded. `search_budget` is passed
+    /// through to the tool as for `differential::compare_with_budget`.
+    pub(crate) fn compare(
+        &self,
+        search_budget: Option<usize>,
+    ) -> Result<crate::conformance::differential::Agreement, crate::conformance::differential::DiffError>
+    {
+        let implementation = {
+            let f = self.implementation.clone();
+            move || f()
+        };
+        let specification = {
+            let f = self.specification.clone();
+            move || f()
+        };
+        crate::conformance::differential::compare_capped(
+            self.config.clone(),
+            &self.visible,
+            implementation,
+            specification,
+            search_budget,
+            Some(MAX_VISIBLE_EVENTS_PER_THREAD),
+        )
+    }
 }
 
 /// The pairing modes of criterion 7's stratification.
@@ -283,6 +349,50 @@ impl Mode {
             Mode::VisibleMutation | Mode::DecoupleImpl | Mode::SpecBlocks => false,
         }
     }
+
+    /// **Criterion 13's event bound, declared per shape** — for each side, the
+    /// most visible observations each declared visible thread produces in any
+    /// `vis` word of that program.
+    ///
+    /// Written by hand, because a shape is an opaque closure and the count
+    /// cannot be read off it. [`pair()`] asserts every entry against
+    /// [`MAX_VISIBLE_EVENTS_PER_THREAD`], so **a pair whose declaration is over
+    /// the bound cannot be built** — that is the construction-time grammar bound
+    /// (`P3-gate4-fixes` round 2, M1). What a declaration cannot guarantee is its
+    /// own truth. A test compares every entry with the count measured from the
+    /// oracle's words and requires them to be **equal** — that is the only check
+    /// of a declaration's truth. [`Pair::compare`] also passes the bound to the
+    /// oracle as a runtime cap, which refuses any graph that actually exceeds the
+    /// bound, whatever was declared; it does not detect an under-declaration
+    /// that stays within the bound.
+    ///
+    /// Derived by reading each shape below, not by running it. Every count is 1:
+    /// each visible thread sends or receives once. `SpecBlocks`' specification
+    /// has `c` *attempt* a second receive that can never complete, which adds no
+    /// observation.
+    pub(crate) fn declared_observations(self) -> DeclaredObservations {
+        const MAIN_C: &[(&str, usize)] = &[("main", 1), ("c", 1)];
+        const P_C: &[(&str, usize)] = &[("p", 1), ("c", 1)];
+        let both = |t: &'static [(&'static str, usize)]| DeclaredObservations {
+            implementation: t,
+            specification: t,
+        };
+        match self {
+            Mode::Identity
+            | Mode::InvisibleRefactor
+            | Mode::VisibleMutation
+            | Mode::SpecBlocks => both(MAIN_C),
+            Mode::DecoupleImpl | Mode::DecoupleSpec | Mode::UnionCovered => both(P_C),
+        }
+    }
+}
+
+/// Per-side declared maxima of visible observations per visible thread. See
+/// [`Mode::declared_observations`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeclaredObservations {
+    pub(crate) implementation: &'static [(&'static str, usize)],
+    pub(crate) specification: &'static [(&'static str, usize)],
 }
 
 /// A tiny deterministic PRNG. Reproducibility is criterion 10's obligation and
@@ -466,11 +576,13 @@ pub(crate) fn pair(mode: Mode, seed: u64) -> Pair {
     assert!(
         visible.len() <= MAX_VISIBLE_THREADS,
         "generator: {mode:?} declares {} visible threads, over MAX_VISIBLE_THREADS ({}). \
-         `vis` enumeration is factorial in this parameter; raising the bound means \
-         re-running the corpus cost, not editing the constant",
+         `vis` enumeration grows faster than exponentially in this parameter; raising \
+         the bound means re-running the corpus cost, not editing the constant",
         visible.len(),
         MAX_VISIBLE_THREADS
     );
+
+    check_declaration(mode, &visible, mode.declared_observations());
 
     Pair {
         mode,
@@ -480,6 +592,43 @@ pub(crate) fn pair(mode: Mode, seed: u64) -> Pair {
         implementation,
         specification,
         expect_inclusion: mode.expect_inclusion(),
+    }
+}
+
+/// **Criterion 13's event bound at construction**, on a shape's declaration.
+///
+/// Panics unless the declaration names exactly the pair's visible threads (so
+/// an added thread cannot go undeclared) and every entry is within
+/// [`MAX_VISIBLE_EVENTS_PER_THREAD`]. [`pair()`] calls it on every pair it
+/// builds.
+///
+/// A separate function only so a test can pass it a *bad* declaration:
+/// [`Mode::declared_observations`] is a fixed `match`, so from `pair()` alone
+/// no test could make either assertion fire (developer, `P3-gate4-fixes`
+/// round-2 response, finding 1). Behaviour is unchanged.
+pub(crate) fn check_declaration(mode: Mode, visible: &[String], declared: DeclaredObservations) {
+    for (side, entries) in [
+        ("implementation", declared.implementation),
+        ("specification", declared.specification),
+    ] {
+        let mut names: Vec<&str> = entries.iter().map(|(n, _)| *n).collect();
+        let mut want: Vec<&str> = visible.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(
+            names, want,
+            "generator: {mode:?}'s {side} declaration names {names:?} but the pair's \
+             visible threads are {want:?}; every visible thread needs a declared count"
+        );
+        for (thread, count) in entries {
+            assert!(
+                *count <= MAX_VISIBLE_EVENTS_PER_THREAD,
+                "generator: {mode:?} declares {count} visible observations for `{thread}` \
+                 in its {side}, over MAX_VISIBLE_EVENTS_PER_THREAD ({}); an over-bound pair \
+                 must not be constructible",
+                MAX_VISIBLE_EVENTS_PER_THREAD
+            );
+        }
     }
 }
 
