@@ -128,8 +128,15 @@ impl PartialEq for VisWord {
 /// A `Vec` with membership by `PartialEq`, **not** a `HashSet`: `Obs` has
 /// `PartialEq` but no `Eq`/`Hash`, and a rendered key would be a *second,
 /// different* equality relation — exactly the text comparison the alphabet
-/// exists to avoid. Membership is O(n·m); the generator's size cap is what
-/// keeps that affordable.
+/// exists to avoid. Membership is O(n·m).
+///
+/// **What keeps that affordable is a bound on the generated corpus only.**
+/// `generator::MAX_VISIBLE_THREADS` and
+/// `generator::MAX_VISIBLE_EVENTS_PER_THREAD` bound the pairs *that module*
+/// emits, and the first is asserted on construction. They bound nothing here:
+/// this type is also reached from the hand-written suites and from
+/// `vis_of_program` on any caller's program, and it imposes no limit of its
+/// own. A caller enumerating a large program pays the O(n·m) directly.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VisSet {
     words: Vec<VisWord>,

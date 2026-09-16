@@ -2714,6 +2714,27 @@ impl Must {
     /// Recover data that was Default'd either
     /// a) during (de)serialization (counterexample replay, look for `#[serde(skip)]`, or
     /// b) explicitly (revisit replay, look for `set_pending()`)
+    ///
+    /// # Do not add a `CToss` arm without reading this
+    ///
+    /// There is no `CToss` arm below, and **conformance depends on that absence**
+    /// (`plan/traceForge/backlog/flaws.md` **F36**). Adding one is exactly what an
+    /// editor would do to make replay more faithful, and it would silently break the
+    /// conformance search.
+    ///
+    /// The chain: `conformance::install_nondet` writes a chosen value into an installed
+    /// `CToss`; the next probe replays that prefix and re-executes the choice point,
+    /// rolling a **fresh** `gen_bool()`; `compare_for_replay`'s `CToss` arm accepts the
+    /// new label without comparing results; and the installed value then survives only
+    /// because nothing here overwrites it with the re-executed one. A `CToss` arm that
+    /// called `recover_lost` would take the fresh random value at every replayed choice
+    /// point, and the symptom would be **a conformance verdict that changes run to
+    /// run** rather than an error — the worst failure mode available, because it looks
+    /// like flakiness rather than like a bug.
+    ///
+    /// If a `CToss` arm is genuinely needed, the reliance has to be removed first:
+    /// conformance needs an explicit "this value is installed, do not re-roll" path,
+    /// not the current accident.
     fn recover_lost_data(&mut self, label: LabelEnum) {
         let g = &mut self.current.graph;
         let pos = label.pos();

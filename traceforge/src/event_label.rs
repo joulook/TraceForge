@@ -230,7 +230,26 @@ impl LabelEnum {
             }
             LabelEnum::CToss(_) => {
                 if let LabelEnum::CToss(_) = other {
-                    return Ok(()); // CToss has no parameters to vary.
+                    // **Conformance depends on this arm not comparing results.**
+                    // The old comment here read "CToss has no parameters to vary",
+                    // which was true before conformance and is not true now:
+                    // `conformance::install_nondet` writes a *chosen* value into an
+                    // installed `CToss`, and the next probe replays that prefix and
+                    // re-executes the choice point, building a fresh
+                    // `CToss::new(pos, gen_bool())` with a newly rolled value. This
+                    // arm accepts it, and the installed value survives because
+                    // `recover_lost_data` has no `CToss` arm to overwrite it with the
+                    // re-executed one. See `plan/traceForge/backlog/flaws.md` **F36**.
+                    //
+                    // **Do not "fix" this by comparing results.** Review round 4
+                    // established that it breaks the caller outright: `lib.rs` rolls a
+                    // fresh `gen_bool()` before `handle_ctoss` *even on replay*, so a
+                    // result comparison would abort every replayed choice point whose
+                    // value the conformance search had changed — which is every one it
+                    // uses. The `Choice` arm below does compare, but only its *range*,
+                    // never its result; the two nondet kinds are deliberately
+                    // asymmetric here.
+                    return Ok(());
                 }
             }
             LabelEnum::Choice(s) => {

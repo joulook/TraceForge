@@ -59,12 +59,108 @@
 //!   later threads so one program yields two visible words for one behaviour.
 //!   F-6 covers the visible case only.
 //! - `join` between visible threads, `nondet()` branches in a body, tagged and
-//!   vector-tagged sends, non-blocking receives, and any program with more than
-//!   the cap's visible events.
+//!   vector-tagged sends, non-blocking receives, and any program exceeding
+//!   [`MAX_VISIBLE_THREADS`] or [`MAX_VISIBLE_EVENTS_PER_THREAD`].
+//! - **cross-model sends within {asyn, p2p, cd}** (§11.5's third shape). A
+//!   `Pair` carries one `Config`, and `pair()` picks a *single global*
+//!   `ConsType` from [`models`] per pair — the shapes have no per-channel
+//!   model to vary, so no pair here mixes two. Criterion 9 names the global
+//!   pick as the "obvious wrong discharge" of the per-model obligation, and
+//!   this is that gap stated rather than left to be inferred from the absence
+//!   of a shape.
+//! - **visible-error pairs** (§11.5's fourth shape). No shape here has a
+//!   visible thread that fails an assertion. This is a **generator** gap and
+//!   nothing more. It was until recently a *joint* limit of generator and
+//!   oracle — `vis_of_program` returned `Err(OracleError::VisibleError)` above
+//!   its enumeration loop, so `compare()` yielded `DiffError::Oracle` and the
+//!   harness could not score such a pair at all — but S6 gate 4's M1 removed
+//!   that refusal (`oracle.rs:365`): `Status::Errored` is a value `vis` is
+//!   defined on, so the oracle now *enumerates* these programs. The obstacle
+//!   to emitting the shape is therefore no longer structural; it is that no
+//!   shape was written.
+//!
+//! Both absences are listed because criterion 9's rule is that an unstated gap
+//! in the generator reads as a tested region. §11.5's obligation itself is met
+//! — the hand-written `refinement_suite.rs` covers all five shapes — so what
+//! was missing was the *declaration*, not the coverage.
+//!
+//! # The size cap, and what enforces it
+//!
+//! Membership in `VisSet` is O(n·m) and enumeration is factorial in two
+//! independent parameters, so "affordable" is a claim about bounds. Criterion
+//! 13 requires these to be **hard grammar bounds, not conventions**, and to say
+//! which of "cap it" / "bound the run" was chosen. Both were, at different
+//! levels, and they are enforced by different mechanisms — stated separately
+//! because only one of them is checked inside this module:
+//!
+//! - [`MAX_VISIBLE_THREADS`] is **enforced here**, by an assertion in
+//!   [`pair()`] on every emitted pair. It is a property of the `visible` list,
+//!   which is data this module holds.
+//! - [`MAX_VISIBLE_EVENTS_PER_THREAD`] is **not checkable here** — how many
+//!   communication events a visible thread performs is a property of a *run*,
+//!   not of the closure this module builds. It is declared as a constant and
+//!   checked against the oracle's enumerated words by the corpus test, which
+//!   is the first place the count exists.
+//!
+//! **F-18 on a corpus that reports.** F-18 is the report sink retaining a
+//! serialized graph per report, unbounded across reports. It does not
+//! accumulate across a corpus: `compare()` scores each pair's `ConfVerdict`
+//! into an [`Agreement`](super::differential::Agreement) — which retains a
+//! witness word or a count, never a graph — and drops the outcome before the
+//! next pair runs. So the retention bound is *one pair's* report count, and
+//! `corpus()`'s size does not enter it.
 
 use std::sync::Arc;
 
 use crate::{recv_msg_block, send_msg, thread, ConsType, Config};
+
+/// **Hard bound on visible threads per emitted pair** (criterion 13).
+///
+/// Every shape in this module declares exactly two visible threads, so this is
+/// the bound the shapes already respect rather than a ceiling chosen to leave
+/// room. Raising it is a deliberate act that must be accompanied by a re-run
+/// of the corpus cost, because `vis` enumeration is factorial in this
+/// parameter: the linear extensions of `vo` over `t` visible threads of `k`
+/// events each number `(t·k)! / (k!)^t` in the worst case, which for `t = 3`,
+/// `k = 2` is already 90 against 6 at `t = 2`.
+///
+/// Asserted in [`pair()`], which is the single construction point.
+pub(crate) const MAX_VISIBLE_THREADS: usize = 2;
+
+/// **Hard bound on visible *observations* per visible thread** (criterion 13).
+///
+/// **The quantity is elements of a `vis` word**, not attempted communications.
+/// That is the definition the bound needs: enumeration cost is factorial in the
+/// number of visible events that actually appear in a word, and an attempt that
+/// contributes no observation costs nothing to enumerate. It is also the only
+/// one the check can measure, since a blocked receive is invisible to `vis`.
+///
+/// **Not asserted in this module, and deliberately so.** How many observations
+/// a thread produces is a property of a run, not of the closure built here —
+/// there is nothing in a `Pair` to count. The corpus test checks it against the
+/// oracle's enumerated words, which is the first point at which the number
+/// exists. It is recorded here as *declared, checked elsewhere* rather than
+/// implied to be enforced on construction.
+///
+/// **The bound is slack by a factor of two, and that is recorded rather than
+/// tightened.** Measured over every mode and both sides, the worst case is
+/// **1**, not 2 (developer, `P3-S6-gate4-fixes`, finding 2). An earlier version
+/// of this rustdoc claimed `Mode::SpecBlocks` reached the bound "because its
+/// specification has `c` receive twice" — **false under the definition this
+/// same rustdoc prescribes for the check**: `c`'s second `recv_msg_block()` can
+/// never be satisfied, so it contributes no observation, which is exactly what
+/// makes `SpecBlocks` an (M3) test rather than an (M1) one. The sentence used
+/// one definition for the claim and the other for the check, which is the
+/// defect shape the gate-4 fixes existed to remove.
+///
+/// The bound stays at 2 rather than dropping to the measured 1, so that a shape
+/// with a genuinely two-observation visible thread is not rejected on arrival.
+/// The cost of the slack is that a corpus check alone would also pass on a
+/// generator that had silently lost half its events;
+/// `the_events_per_thread_bound_is_not_attained_by_any_shape` is what notices
+/// that, and it is why the measured 1 is pinned as a fact rather than left as a
+/// margin.
+pub(crate) const MAX_VISIBLE_EVENTS_PER_THREAD: usize = 2;
 
 /// A pair, with the answer the mode fixes.
 pub(crate) struct Pair {
@@ -362,6 +458,19 @@ pub(crate) fn pair(mode: Mode, seed: u64) -> Pair {
 
         Mode::UnionCovered => (decoupled(v), decoupled(v), names(&["p", "c"])),
     };
+
+    // Criterion 13's bound, **checked rather than conventional**. This is the
+    // single construction point, so no pair escapes it. It fires on a shape
+    // added later that declares a third visible thread — which is exactly the
+    // reader the prose version of this sentence would have misled.
+    assert!(
+        visible.len() <= MAX_VISIBLE_THREADS,
+        "generator: {mode:?} declares {} visible threads, over MAX_VISIBLE_THREADS ({}). \
+         `vis` enumeration is factorial in this parameter; raising the bound means \
+         re-running the corpus cost, not editing the constant",
+        visible.len(),
+        MAX_VISIBLE_THREADS
+    );
 
     Pair {
         mode,
