@@ -103,7 +103,6 @@ pub(crate) mod triage;
 //   leave a programmatic caller with `to_string().contains(..)`.
 // - **the report and its parts** — `ConfReport`, `ReportGate`, `ReportCause`,
 //   `Diagnostics`, `UnavailableKind`, `Obligation`, `VisTrace`, `TriageOutcome`,
-//   `OracleOutcome`,
 //   `ReplaySnapshot`, `ConfExhaustion`, `ConfNote`.
 //
 // What is **not** exported, deliberately: `Gate`, `ReportKind`, `Report`,
@@ -126,7 +125,7 @@ pub(crate) mod triage;
 pub use config::{ConfBuilder, ConfConfig, ConfigError, ScopeField, DEFAULT_SEARCH_BUDGET};
 pub use report::{
     Certificate, ConfError, ConfExhaustion, ConfNote, ConfOutcome, ConfReport, ConfVerdict,
-    Diagnostics, NotACertificate, Obligation, OracleOutcome, ReplaySnapshot,
+    Diagnostics, NotACertificate, Obligation, ReplaySnapshot,
     ReportCause, ReportGate, SearchEnd, SpecErrFreedom, TriageFailure, TriageOutcome,
     UnavailableKind, VisTrace,
 };
@@ -205,6 +204,30 @@ pub(crate) fn assert_config_in_scope(config: &crate::Config, engine: &str) {
 
 #[cfg(test)]
 pub(crate) mod adversarial;
+/// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
+/// truth the differential harness measures the tool against, it is the naive
+/// exponential algorithm the paper's algorithm exists to avoid, and nothing
+/// in it is reachable from the public API (criterion 17).
+#[cfg(test)]
+pub(crate) mod oracle;
+#[cfg(test)]
+mod oracle_tests;
+/// §11.6's differential harness: the tool against the oracle. **Test-only.**
+#[cfg(test)]
+pub(crate) mod differential;
+/// §11.6's fragment program generator. **Test-only.**
+#[cfg(test)]
+pub(crate) mod generator;
+#[cfg(test)]
+mod differential_smoke;
+#[cfg(test)]
+mod paper_examples;
+#[cfg(test)]
+mod refinement_suite;
+/// S7's benchmark: two-phase commit, and what conformance costs. **Test-only**;
+/// the measurements are `#[ignore]`d because they are a table for a human.
+#[cfg(test)]
+mod bench;
 #[cfg(test)]
 mod gate_tests;
 #[cfg(test)]
@@ -307,9 +330,8 @@ pub(crate) fn verify_conformance_with(
 /// **The public entry point** (§8).
 ///
 /// Runs §5.4's specification err-freedom precheck (unless opted out), then the
-/// outer conformance exploration, then — per report — the §7.1 diagnostics,
-/// §7.3's triage if asked for, and the `--naive-oracle` cross-check if asked
-/// for. Returns a [`ConfVerdict`] whose "conforms" case is a certificate and
+/// outer conformance exploration, then — per report — the §7.1 diagnostics and
+/// §7.3's triage if asked for. Returns a [`ConfVerdict`] whose "conforms" case is a certificate and
 /// whose other cases say why they are not.
 ///
 /// # Panics
@@ -400,13 +422,6 @@ fn run(
         cc.search_budget,
         true,
     );
-    let un_phi = diagnose::Recompute::new(
-        cc.config.clone(),
-        Arc::clone(&specification),
-        cc.visible.clone(),
-        cc.search_budget,
-        false,
-    );
 
     let mut reports = Vec::with_capacity(raw.reports.len());
     for (i, r) in raw.reports.iter().enumerate() {
@@ -422,46 +437,26 @@ fn run(
         //
         // Round 2 fixed that and left a comment saying "one `match`" beside
         // two of them, which is the round-3 shape: a right fix with a wrong
-        // sentence beside it. There is now one, and it yields a pair, so a
-        // third consumer of this distinction cannot pick up one arm and miss
-        // the other. The real protection is still
-        // `c10_the_oracle_does_not_run_on_a_visible_error_report`; this is
-        // what makes the protection cheap to keep.
-        let (diagnostics, oracle) = match &r.kind {
+        // sentence beside it. The real protection is now
+        // `c10_a_visible_error_report_carries_no_inner_search_diagnostics`.
+        //
+        // **The `--naive-oracle` flag was deleted in S6** (night-run Poll 1,
+        // criterion 17). F-17 established that `Recompute` and `Search::cover`
+        // are two transcriptions of one algorithm, so their agreement carried
+        // no information; and the outcome type it rendered would have become a
+        // semver commitment the moment `pub mod conformance` shipped, on a
+        // crate at 0.2.1. §11.6's `vis(Impl) ⊆ vis(Spec)` checker is this
+        // project's first genuine oracle — it materialises word sets rather
+        // than re-running the morphism — and it is test-only, in
+        // `conformance::oracle`.
+        //
+        // The un-Φ traversal itself survives as `pub(crate)` test material,
+        // which is what Poll 1 ruled: `diagnose::Recompute` is still what §7.1
+        // uses, and only the *rendering* and the *flag* are gone.
+        let diagnostics = match &r.kind {
             // A §4.4 report is a failed assertion, not a `Cover` answer.
-            ctx::ReportKind::VisibleError { .. } => (Diagnostics::NotApplicable, None),
-            ctx::ReportKind::NoCover => (
-                phi.diagnose(&r.graph, complete),
-                cc.naive_oracle.then(|| {
-                    // **A departure, recorded** (round 1, m5). §7.3 words this
-                    // as "enumerate the **completed** graph's Spec-side
-                    // coverability", inside triage's own paragraph; this runs
-                    // it on the **reported** graph. The oracle must work with
-                    // `triage` off, which is the default and leaves no
-                    // completed graph to enumerate; and the reported graph is
-                    // the one the search answered ⊥ on, so it is the graph a
-                    // cross-check *of that answer* has to ask about.
-                    //
-                    // **What this actually compares** is finding F-17: not Φ
-                    // against un-Φ, which are the same traversal, but this
-                    // module's `Recompute` against S3's `Search::cover`. Two
-                    // transcriptions of one algorithm — real content, and less
-                    // than criterion 10 asked for.
-                    match un_phi.answer(&r.graph, complete) {
-                        Ok(diagnose::Answer::Found) => report::OracleOutcome::Disagrees,
-                        Ok(diagnose::Answer::NoCover) => report::OracleOutcome::Agrees,
-                        // Three-valued end to end (round 1, M2): an exhausted
-                        // traversal established nothing and must not render as
-                        // a confirmation.
-                        Ok(diagnose::Answer::Exhausted) => report::OracleOutcome::Inconclusive {
-                            budget: cc.search_budget,
-                        },
-                        Err(e) => report::OracleOutcome::Failed {
-                            detail: e.to_string(),
-                        },
-                    }
-                }),
-            ),
+            ctx::ReportKind::VisibleError { .. } => Diagnostics::NotApplicable,
+            ctx::ReportKind::NoCover => phi.diagnose(&r.graph, complete),
         };
 
         // §7.1's serialized half was built at capture time, off the live
@@ -474,7 +469,6 @@ fn run(
             r.replay.clone(),
             diagnostics,
         );
-        out.oracle = oracle;
 
         if cc.triage {
             match triage::triage_one(&cc, &implementation, &out, r.graph.clone()) {

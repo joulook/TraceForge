@@ -25,7 +25,7 @@ use crate::conformance::ctx::{ConfMode, Gate};
 use crate::conformance::diagnose::{canonical_vis, Recompute};
 use crate::conformance::morphism::CompleteExecution;
 use crate::conformance::report::{
-    self, ConfNote, ConfVerdict, Diagnostics, NotACertificate, Obligation, OracleOutcome,
+    self, ConfNote, ConfVerdict, Diagnostics, NotACertificate, Obligation,
     ReplaySnapshot, ReportCause, ReportGate, SearchEnd, SpecErrFreedom, TriageFailure,
     TriageOutcome,
 };
@@ -138,9 +138,20 @@ fn conformance_sources() -> Vec<(String, String)> {
 /// The test modules. They are `#[cfg(test)]`, so nothing they print is in a
 /// user's output at all, which is why they are out of criterion 1's domain
 /// rather than allowlisted within it.
-const TEST_ONLY_FILES: [&str; 5] = [
+const TEST_ONLY_FILES: [&str; 13] = [
     "adversarial.rs",
+    "bench.rs",
+    "differential.rs",
+    "differential_smoke.rs",
     "gate_tests.rs",
+    "generator.rs",
+    // §11.6's oracle and its examples. Both are `#[cfg(test)]` and neither is
+    // reachable from the public API (S6 criterion 17), so they are test-only
+    // in the same sense as the rest of this list.
+    "oracle.rs",
+    "oracle_tests.rs",
+    "paper_examples.rs",
+    "refinement_suite.rs",
     "s5_harden.rs",
     "s5_tests.rs",
     "testing.rs",
@@ -1937,7 +1948,8 @@ fn c9_the_canonical_failed_attempt_is_deterministic() {
 /// disagreement is the defect it exists to detect. It is the same content the
 /// `--naive-oracle` measures (F-17), arrived at from the other side: the
 /// diagnostics already cross-check the two implementations on every `NoCover`
-/// report, so `Diagnostics::Available` already implies `OracleOutcome::Agrees`.
+/// report, so `Diagnostics::Available` already implied what the deleted
+/// `--naive-oracle` cross-check reported (F-17; flag removed in S6).
 /// Both facts are findings rather than gaps, and both are routed.
 #[test]
 fn c9_a_recomputation_that_cannot_reproduce_the_verdict_says_so() {
@@ -1961,75 +1973,32 @@ fn c9_a_recomputation_that_cannot_reproduce_the_verdict_says_so() {
 }
 
 // ===========================================================================
-// Criterion 10 --- `--naive-oracle` must be an oracle.
+// Criterion 10 --- re-pointed. `--naive-oracle` was deleted in S6 (Poll 1);
+// what survives here is the property that never depended on it, plus F-17's
+// node-count evidence. The genuine oracle is `conformance::oracle`.
 // ===========================================================================
 
-/// The independent traversal confirms the report.
-///
-/// **What is being cross-checked, corrected** (gate-4 round 2, M2): not Φ
-/// against un-Φ, which are the same traversal, but `Recompute` against S3's
-/// `Search::cover`. The assertion is on `OracleOutcome::Agrees` **by variant**,
-/// not on the absence of the word "disagreement": the first version tested the
-/// latter, and an exhausted oracle passed it while having established nothing
-/// (gate-4 round 1, M2).
-///
-/// What would break it: a divergence between this module's traversal and S3's
-/// — which is the whole content of the check.
-#[test]
-fn c10_the_naive_oracle_agrees_with_the_phi_search() {
-    for (name, v) in [
-        (
-            "uncoverable",
-            verify(
-                base(&["main"]).naive_oracle(true).build().unwrap(),
-                two_senders,
-                uncoverable_spec,
-            )
-            .unwrap(),
-        ),
-        (
-            "ex-blocking",
-            verify(
-                base(&["main"]).naive_oracle(true).build().unwrap(),
-                || {
-                    let _: u64 = crate::recv_msg_block();
-                },
-                || {},
-            )
-            .unwrap(),
-        ),
-    ] {
-        let reports = v.outcome().reports();
-        assert!(!reports.is_empty(), "{name}: nothing to cross-check");
-        for r in reports {
-            match r.oracle() {
-                Some(OracleOutcome::Agrees) => {}
-                other => panic!(
-                    "{name}: the second traversal did not confirm the report: {other:?}\n{v}"
-                ),
-            }
-        }
-    }
-}
 
 /// **The oracle does not run where there is no `Cover` answer to check**
 /// (gate-4 round 2, M1).
 ///
 /// A §4.4 visible-error report is a failed assertion: `Report.gate` is `None`,
-/// nothing asked the specification anything, and every `OracleOutcome` variant
+/// nothing asked the specification anything, so no inner-search diagnostic
 /// is a false statement about it. Run there, the tool printed
 /// "**disagreement** … Φ lost a cover, which is a defect in Φ or in this
 /// report" one line below its own "inner-search diagnostics do not apply" — a
 /// manufactured defect report against its own algorithm, on a program whose
 /// only statement is `assert(false)`.
 ///
-/// The test is the reviewer's own reproduction. What would break it: the
-/// oracle drifting back outside the `match` on `ReportKind` that gates the
-/// diagnostics.
+/// The test is the reviewer's own reproduction. What would break it: folding
+/// the `VisibleError` arm into `phi.diagnose`, i.e. the diagnostics drifting
+/// outside the `match` on `ReportKind` that gates them. Measured at gate 3 —
+/// it is the **only** test that fails under that change, so it is the sole
+/// protection of that gate.
 #[test]
-fn c10_the_oracle_does_not_run_on_a_visible_error_report() {
+fn c10_a_visible_error_report_carries_no_inner_search_diagnostics() {
     let v = verify(
-        base(&["main"]).naive_oracle(true).build().unwrap(),
+        base(&["main"]).build().unwrap(),
         || crate::assert(false),
         || {},
     )
@@ -2042,78 +2011,13 @@ fn c10_the_oracle_does_not_run_on_a_visible_error_report() {
         &Diagnostics::NotApplicable,
         "the diagnostics gate moved"
     );
-    assert!(
-        reports[0].oracle().is_none(),
-        "the oracle ran on a report with no `Cover` answer and said {:?}",
-        reports[0].oracle()
-    );
     let text = v.to_string();
-    assert!(
-        !text.contains("naive oracle"),
-        "the rendering carried an oracle line for a failed assertion:\n{text}"
-    );
     assert!(
         text.contains("inner-search diagnostics do not apply"),
         "the diagnostics did not say they do not apply:\n{text}"
     );
 }
 
-/// **An oracle that established nothing says so, and is not read as
-/// agreement** — the mapping, tested where it is reachable (gate-4 round 1,
-/// M2).
-///
-/// `Inconclusive` is unreachable end to end, and the reason is F-17's missing
-/// step rather than anything about Φ: a report *means* `Search::cover`'s
-/// rebuild-from-empty completed inside one budget, and `Recompute` is the same
-/// traversal from the same start with the same budget, so it completes too.
-/// The mapping is therefore tested here and the reachability by
-/// `c10_the_two_traversals_visit_the_same_number_of_nodes`.
-///
-/// What would break it: any of the four variants rendering as agreement, or
-/// `Inconclusive`/`Failed` dropping the words that say they decided nothing.
-#[test]
-fn c10_an_oracle_that_established_nothing_does_not_render_as_agreement() {
-    let agrees = OracleOutcome::Agrees.to_string();
-    let disagrees = OracleOutcome::Disagrees.to_string();
-    let inconclusive = OracleOutcome::Inconclusive { budget: 7 }.to_string();
-    let failed = OracleOutcome::Failed {
-        detail: "two threads are named `w`".to_owned(),
-    }
-    .to_string();
-
-    assert!(agrees.contains("agrees"));
-    assert!(disagrees.contains("**disagreement**"));
-    // And it must not blame Φ, which visits the same graphs either way.
-    assert!(
-        !disagrees.contains("lost a cover"),
-        "a disagreement between two implementations was attributed to \u{3a6}:\n{disagrees}"
-    );
-
-    for (name, text) in [("inconclusive", &inconclusive), ("failed", &failed)] {
-        assert!(
-            text.contains("established nothing") || text.contains("could not run"),
-            "the {name} oracle did not say it decided nothing:\n{text}"
-        );
-        assert!(
-            !text.contains("agrees"),
-            "the {name} oracle rendered as agreement:\n{text}"
-        );
-        assert!(
-            !text.contains("ordinary outcome"),
-            "the {name} oracle still tells the user exhaustion is expected, which F-17 \
-             refutes:\n{text}"
-        );
-    }
-    assert!(
-        inconclusive.contains("7") && inconclusive.contains(report::BUDGET_KNOB),
-        "an inconclusive oracle named neither the budget it spent nor the knob:\n\
-         {inconclusive}"
-    );
-    let mut all = vec![agrees, disagrees, inconclusive, failed];
-    all.sort();
-    all.dedup();
-    assert_eq!(all.len(), 4);
-}
 
 /// **The two traversals visit the same number of nodes**, which is what
 /// "Φ filters offers, not nodes" means and what the previous version of this
@@ -2193,7 +2097,7 @@ fn c10_the_two_traversals_visit_the_same_number_of_nodes() {
                 phi, un_phi,
                 "{name}: at budget {budget} the two modes differed in answer or in nodes \
                  spent, so \u{3a6} *does* filter nodes --- F-17 must be re-derived and \
-                 `OracleOutcome::Inconclusive` may be reachable after all"
+                 an exhausted recomputation may be reachable after all"
             );
             match phi.0 {
                 Answer::Exhausted => saw.0 = true,
@@ -2209,20 +2113,6 @@ fn c10_the_two_traversals_visit_the_same_number_of_nodes() {
     );
 }
 
-/// The oracle is off by default.
-#[test]
-fn c10_the_naive_oracle_is_off_by_default() {
-    let v = verify(
-        base(&["main"]).build().unwrap(),
-        two_senders,
-        uncoverable_spec,
-    )
-    .unwrap();
-    assert!(
-        !v.to_string().contains("naive oracle"),
-        "the debug oracle ran without being asked for"
-    );
-}
 
 // ===========================================================================
 // Criteria 13 and 14 --- what a report contains, and what a user reads.

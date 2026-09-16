@@ -25,7 +25,7 @@ use crate::Config;
 /// Clears the thread's current-`Must` pointer on the way out, including on a
 /// panic — a test that runs a program which asserts false is an ordinary case
 /// here, not an accident.
-struct CurrentMustGuard;
+pub(crate) struct CurrentMustGuard;
 
 impl Drop for CurrentMustGuard {
     fn drop(&mut self) {

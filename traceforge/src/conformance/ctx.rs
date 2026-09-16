@@ -42,6 +42,22 @@ pub(crate) enum ConfMode {
     Precheck,
     /// §7.3's per-report completion run. Gate off, guards on.
     Triage,
+    /// §11.6's oracle enumeration run. Gate off, guards on, **and visible
+    /// assertion failures do not prune** — see [`ConfCtx::report_visible_error`].
+    ///
+    /// S6 criteria round 3, B1. The oracle must enumerate `Graphs(P)`
+    /// exhaustively, and an ungated context is *not* automatically prune-free:
+    /// `report_visible_error` needs only `conf.is_some()`, so a declared
+    /// visible thread's failed assertion would prune the oracle's own run,
+    /// truncate every other thread's row and under-approximate `vis(P)` — the
+    /// permissive direction on the specification side.
+    ///
+    /// **This mode can never inhabit a reporting engine.** [`ConfCtx::new`] is
+    /// the only constructor that builds a [`ProbeWorker`], and it hard-codes
+    /// `Outer` rather than taking a mode; [`ConfCtx::gate_disabled`] is the
+    /// only other constructor and sets `worker: None`. So no mirror assert is
+    /// needed to keep `Collect` out of the gate's path.
+    Collect,
 }
 
 impl ConfMode {
@@ -51,6 +67,7 @@ impl ConfMode {
             ConfMode::Outer => "conformance",
             ConfMode::Precheck => "precheck",
             ConfMode::Triage => "triage",
+            ConfMode::Collect => "oracle",
         }
     }
 }
@@ -558,6 +575,25 @@ pub(crate) struct ConfCtx {
     /// than retained as state — `ReplayInformation::create` takes the run's
     /// `Config` alongside the linearisation.
     config: Config,
+    /// §11.6's per-execution graph capture. `None` — the default in **both**
+    /// constructors — means the hook does not run at all.
+    ///
+    /// **Ungated, not `#[cfg(test)]`.** `cfg(test)` is false for
+    /// `traceforge/tests/*.rs`, benches and doctests, so gating this field
+    /// would compile `ConfCtx` to two different shapes and only one of them
+    /// would be exercised by `cargo build` — F-12's hazard. `pub(crate)` is
+    /// not a semver surface, so nothing here reaches the public API.
+    ///
+    /// No existing hook yields a per-execution graph: `ExecutionObserver::after`
+    /// receives an `EndCondition` and a `CoverageInfo` but no graph, `take_graph`
+    /// is destructive, and the report sink captures graphs only on reports.
+    collected: Option<Vec<ExecutionGraph>>,
+    /// Visible assertion failures seen under [`ConfMode::Collect`], which does
+    /// not prune (S6 round 3, B1). Always empty on every other mode.
+    ///
+    /// Kept out of `diagnostics` so the public `ConfNote` need not grow a
+    /// variant for a test-only engine.
+    collect_errors: Vec<(String, Event)>,
 }
 
 impl ConfCtx {
@@ -582,6 +618,8 @@ impl ConfCtx {
             stop_at_first_report,
             stop_requested: false,
             end: SearchEnd::Unknown,
+            collected: None,
+            collect_errors: Vec::new(),
         }
     }
 
@@ -612,6 +650,8 @@ impl ConfCtx {
             stop_at_first_report: false,
             stop_requested: false,
             end: SearchEnd::Unknown,
+            collected: None,
+            collect_errors: Vec::new(),
         }
     }
 
@@ -734,7 +774,39 @@ impl ConfCtx {
         self.pruned = false;
     }
 
+    /// Turn on §11.6's per-execution graph capture.
+    ///
+    /// Off by default in both constructors, so a run that does not ask for it
+    /// pays nothing and behaves identically.
+    pub(crate) fn collect_graphs(&mut self) {
+        self.collected = Some(Vec::new());
+    }
+
+    /// The graphs captured by [`Self::collect_graphs`], in completion order.
+    ///
+    /// Empty when capture was never turned on — the caller asked for the
+    /// graphs of a run that was not collecting, which is a caller bug, but
+    /// returning an empty slice keeps the read side total.
+    pub(crate) fn collected(&self) -> &[ExecutionGraph] {
+        self.collected.as_deref().unwrap_or(&[])
+    }
+
+    /// Visible assertion failures recorded by a [`ConfMode::Collect`] run.
+    pub(crate) fn collect_errors(&self) -> &[(String, Event)] {
+        &self.collect_errors
+    }
+
     /// §4.4: record a visible thread's failed assertion and prune.
+    ///
+    /// **Except under [`ConfMode::Collect`]** (S6 criteria round 3, B1). The
+    /// oracle's enumeration run reaches this the same way any gate-disabled
+    /// engine does — `conf_assert_failure` consults neither the probe, nor the
+    /// worker, nor the mode — and pruning there would append `Block(ConfPrune)`
+    /// to *every* thread, truncating each sibling visible thread's row and
+    /// ending the execution, so `vis(P)` would be under-approximated. The
+    /// failure is still recorded, as a diagnostic carrying the **declared**
+    /// visible name: a silent `Continue` is the failure mode a careless
+    /// implementation produces here, and it is the one to guard against.
     pub(crate) fn report_visible_error(
         &mut self,
         thread: String,
@@ -744,6 +816,20 @@ impl ConfCtx {
         graph: &ExecutionGraph,
     ) -> GateOutcome {
         if self.pruned {
+            return GateOutcome::Continue;
+        }
+        if self.mode == ConfMode::Collect {
+            // Recorded, never silent — a bare `Continue` here is the failure
+            // mode a careless implementation produces, and it would hide a
+            // visible error from the oracle entirely.
+            //
+            // Deliberately **not** a `Diagnostic`: `DiagnosticReason` is
+            // rendered by the publicly re-exported `ConfNote`, so a new variant
+            // there would grow the public surface for a test-only path, which
+            // §11.6's criterion 17 forbids. `pos` is a real event — the
+            // `Block(Assert)` is installed above `conf_assert_failure`'s
+            // visibility split — and `thread` is the **declared** visible name.
+            self.collect_errors.push((thread, pos));
             return GateOutcome::Continue;
         }
         self.reports.push(Report {
@@ -817,6 +903,23 @@ impl ConfCtx {
         g1: &ExecutionGraph,
         state: &MustState,
     ) -> GateOutcome {
+        // §11.6's capture, and it is the **first** statement deliberately.
+        //
+        // Placed above `if self.pruned` and above the `worker.is_none()`
+        // return below: anywhere lower and it is dead in exactly the mode the
+        // oracle runs in, which has no worker. It is **discriminated on
+        // `Gate::Completion`** because `gate` is the single entry point for all
+        // four `Gate` variants across five call sites in `must.rs`
+        // (`:1037` FreshSend, `:2252`/`:2305` FreshRecv, `:2883` RevisitApply,
+        // `:1965` Completion). An undiscriminated hook would record
+        // mid-execution graphs, on which `next_P(G) != {}` and the draft's
+        // Def. visg is undefined — "a graph that still admits an event has
+        // neither a status nor a set of visible traces".
+        if gate == Gate::Completion {
+            if let Some(sink) = self.collected.as_mut() {
+                sink.push(g1.clone());
+            }
+        }
         if self.pruned {
             return GateOutcome::Continue;
         }

@@ -175,7 +175,6 @@ pub struct ConfConfig {
     pub(crate) stop_at_first_report: bool,
     pub(crate) triage: bool,
     pub(crate) skip_spec_errfree_check: bool,
-    pub(crate) naive_oracle: bool,
 }
 
 impl ConfConfig {
@@ -208,7 +207,6 @@ pub struct ConfBuilder {
     stop_at_first_report: bool,
     triage: bool,
     skip_spec_errfree_check: bool,
-    naive_oracle: bool,
 }
 
 impl Default for ConfBuilder {
@@ -233,7 +231,6 @@ impl ConfBuilder {
             // §5.4's precheck is default-*on*, so the opt-out is default-off.
             skip_spec_errfree_check: false,
             // §7.3: debug only.
-            naive_oracle: false,
         }
     }
 
@@ -292,12 +289,6 @@ impl ConfBuilder {
         self
     }
 
-    /// §7.3's `--naive-oracle`: per report, re-answer coverability with the
-    /// un-Φ'd search and cross-check. Debug only, default off.
-    pub fn naive_oracle(mut self, b: bool) -> Self {
-        self.naive_oracle = b;
-        self
-    }
 
     /// §9's config-time layer, then the configuration.
     ///
@@ -319,7 +310,6 @@ impl ConfBuilder {
             stop_at_first_report: self.stop_at_first_report,
             triage: self.triage,
             skip_spec_errfree_check: self.skip_spec_errfree_check,
-            naive_oracle: self.naive_oracle,
         })
     }
 }

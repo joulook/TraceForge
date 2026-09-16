@@ -121,8 +121,14 @@ impl Best {
     }
 }
 
-/// One recomputation over the specification, with Φ on (diagnostics) or off
-/// (the naive oracle).
+/// One recomputation over the specification, with Φ on (diagnostics) or off.
+///
+/// The Φ-off mode was the `--naive-oracle` flag's engine. **The flag is gone**
+/// (S6, night-run Poll 1): F-17 established that this traversal and
+/// `Search::cover` are two transcriptions of one algorithm, so their agreement
+/// was not evidence. The traversal itself survives as `pub(crate)` test
+/// material, which is what the poll ruled, and `conformance::oracle` is the
+/// project's first genuine oracle.
 pub(crate) struct Recompute {
     config: Config,
     spec: Arc<dyn Fn() + Send + Sync>,
@@ -148,8 +154,11 @@ impl Recompute {
         }
     }
 
-    /// Answer coverability, discarding the diagnostics. §7.3's
-    /// `--naive-oracle` is this with `use_phi = false`.
+    /// Answer coverability, discarding the diagnostics.
+    ///
+    /// `use_phi = false` was `--naive-oracle`'s engine; **the flag is gone**
+    /// (S6, Poll 1), so that mode now has no non-test caller. The traversal is
+    /// kept as `pub(crate)` test material, which is what the poll ruled.
     pub(crate) fn answer(&self, g1: &ExecutionGraph, complete: bool) -> Result<Answer, ObsError> {
         self.answer_counting(g1, complete).map(|(a, _)| a)
     }
@@ -356,7 +365,7 @@ impl Recompute {
                         fuel: &mut usize,
                         best: &mut Best|
          -> Result<Option<Answer>, ObsError> {
-            // `SpecStep`'s follow check. With Φ off (the naive oracle) it
+            // `SpecStep`'s follow check. With Φ off it
             // stays on: the un-Φ'd search is the draft's `SpecStep` without
             // the Φ *filter on the loop's range*, not without the morphism.
             if through_step {

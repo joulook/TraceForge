@@ -809,8 +809,12 @@ mod tests {
         assert_eq!(hidden_status(&finished_invisible, "fine"), Status::Done);
     }
 
-    /// (M3)'s **failing** case — the draft's Ex. blocking, and the reason
-    /// (M3) exists at all.
+    /// (M3)'s **failing** case — this project's "Ex. blocking" shorthand, and
+    /// the reason (M3) exists at all.
+    ///
+    /// **The draft has no such label.** It is `ex:morph`'s (M3) variation
+    /// (`ref2.tex:495-497`); the nickname is ours and is fine as shorthand, but
+    /// attributing it to the draft is not (S6 criteria round 1, m1).
     ///
     /// Two programs whose visible observations are identical (both empty) but
     /// whose visible thread ends differently: one blocked on a receive nothing

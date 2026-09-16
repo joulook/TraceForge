@@ -309,53 +309,6 @@ pub enum TriageOutcome {
     OtherAssertion { thread: String, pos: String },
 }
 
-/// The `--naive-oracle` cross-check for one report (§7.3, criterion 10).
-///
-/// **What it compares, stated correctly at the third attempt** (gate-4 round
-/// 2, M2). Not Φ against un-Φ: those are the same traversal. Φ filters
-/// `SpecVisit`'s loop *range*, and every offer it would reject is refused a
-/// step later by `spec_step`'s own `follows` conjunct, which this module keeps
-/// in both modes — while the one offer kind that bypasses `spec_step`, a
-/// nondet, has an extension that follows exactly when its parent does, so Φ
-/// never rejects one. The `use_phi` flag changes no answer and visits no
-/// different graph.
-///
-/// What it does compare is `conformance::diagnose::Recompute` against
-/// S3's `Search::cover` — **two implementations of one algorithm**. That is
-/// real content and it is what a disagreement means: one of the two is wrong.
-/// It is also less than criterion 10 asked for, since neither is independent
-/// of the other's premises. See the S5 report's finding F-17.
-///
-/// **Three-valued, and it has to be** (gate-4 round 1, M2). The first version
-/// asked `matches!(answer, Ok(Answer::Found))` and reported "agrees" for
-/// everything else — so a traversal that ran out of budget, having established
-/// nothing whatever, rendered as a second opinion confirming the report. That
-/// is `search.rs`'s own recurring defect, the one its comments record removing
-/// six times: **a failure turned into an answer**. It is worse here than
-/// anywhere, because this artefact exists for no other purpose than to be an
-/// independent check.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum OracleOutcome {
-    /// The independent traversal found no cover either. The report is
-    /// confirmed, by an implementation that is not the one that produced it.
-    Agrees,
-    /// The independent traversal **found a cover** where `Search::cover`
-    /// reported none. The two implementations disagree, and one of them is
-    /// wrong.
-    Disagrees,
-    /// The independent traversal ran out of budget. It established
-    /// **nothing**: this is neither agreement nor disagreement.
-    ///
-    /// Unreachable on the `NoCover` path as things stand — a report *means*
-    /// `Search::cover`'s rebuild-from-empty completed inside one budget, and
-    /// this is the same traversal from the same start with the same budget.
-    /// The variant exists because that is a property of two implementations
-    /// agreeing, not an invariant, and the alternative is to fold exhaustion
-    /// into one of the other two.
-    Inconclusive { budget: usize },
-    /// The traversal raised a usage error (§8/§9) rather than answering.
-    Failed { detail: String },
-}
 
 /// One recorded candidate violation, with everything §7.1 asks a report to
 /// carry.
@@ -371,7 +324,6 @@ pub struct ConfReport {
     pub(crate) replay: ReplaySnapshot,
     pub(crate) diagnostics: Diagnostics,
     pub(crate) triage: Option<TriageOutcome>,
-    pub(crate) oracle: Option<OracleOutcome>,
 }
 
 /// §7.1's "serialized replay information — the existing `ReplayInformation`
@@ -459,10 +411,6 @@ impl ConfReport {
     }
     pub fn triage(&self) -> Option<&TriageOutcome> {
         self.triage.as_ref()
-    }
-    /// The `--naive-oracle` cross-check, when it was asked for.
-    pub fn oracle(&self) -> Option<&OracleOutcome> {
-        self.oracle.as_ref()
     }
     pub fn graph_dump(&self) -> &str {
         &self.dump
@@ -1065,41 +1013,6 @@ impl fmt::Display for TriageOutcome {
     }
 }
 
-impl fmt::Display for OracleOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            OracleOutcome::Agrees => write!(
-                f,
-                "naive oracle: a second, independently written traversal of the same \
-                 algorithm agrees \u{2014} it found no cover either"
-            ),
-            // **Not "\u{3a6} lost a cover"** (gate-4 round 2, M2). The comparison is
-            // between two implementations, not between two filters; the un-\u{3a6}
-            // traversal visits the same graphs in the same order as the \u{3a6}'d one,
-            // so a difference in answer cannot be attributed to \u{3a6}.
-            OracleOutcome::Disagrees => write!(
-                f,
-                "naive oracle: **disagreement**. A second, independently written traversal \
-                 of the same algorithm found a cover where the search that produced this \
-                 report found none. One of the two is wrong, and this report is only as \
-                 good as whichever it is \u{2014} treat it as unreliable until the two are \
-                 reconciled"
-            ),
-            OracleOutcome::Inconclusive { budget } => write!(
-                f,
-                "naive oracle: **established nothing**. The second traversal spent all \
-                 {budget} of its nodes without deciding, so it neither confirms nor \
-                 contradicts this report. Raise the budget with `{BUDGET_KNOB}(n)` if you \
-                 want the cross-check to mean something"
-            ),
-            OracleOutcome::Failed { detail } => write!(
-                f,
-                "naive oracle: **could not run**. The second traversal raised a usage error \
-                 rather than answering, so it established nothing: {detail}"
-            ),
-        }
-    }
-}
 
 impl fmt::Display for ConfExhaustion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1191,9 +1104,6 @@ impl fmt::Display for ConfReport {
         writeln!(f, "  {}", self.diagnostics)?;
         if let Some(t) = &self.triage {
             writeln!(f, "  {t}")?;
-        }
-        if let Some(o) = &self.oracle {
-            writeln!(f, "  {o}")?;
         }
         writeln!(f, "  implementation graph:\n{}", indent(&self.dump))?;
         match &self.replay {
@@ -1475,6 +1385,5 @@ pub(crate) fn build_report(
         replay,
         diagnostics,
         triage: None,
-        oracle: None,
     }
 }

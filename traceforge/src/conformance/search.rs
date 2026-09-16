@@ -1212,7 +1212,15 @@ mod tests {
         );
     }
 
-    /// Ex. blocking: the two graphs carry the same visible events and both are
+    /// `ex:morph`'s (M3) variation, **mirrored** — and the draft has no
+    /// "Ex. blocking" label; that was this project's nickname hardening into a
+    /// citation (S6 criteria round 1, m1). The published variant puts the extra
+    /// unsatisfiable receive in `P₁`, the *specification*, on the relay pair;
+    /// this fixture puts it in the implementation on a direct pair. Both are
+    /// genuine (M3) mismatches. The published orientation is covered by
+    /// `paper_examples::ex_morph_m3_variation_papers_orientation_reports_through_verify`.
+    ///
+    /// The two graphs carry the same visible events and both are
     /// complete, and what separates them is a status. `Cover` must **report**.
     ///
     /// The completeness flag is what makes (M3) reachable at all, so the same
