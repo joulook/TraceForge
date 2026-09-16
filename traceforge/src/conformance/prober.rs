@@ -78,11 +78,42 @@ where
     let _guard = CurrentMustGuard;
 
     let f = Arc::new(f);
-    CONTINUATION_POOL.set(&ContinuationPool::new(), || {
+    // **The pool is drained explicitly, and it must be** (F50).
+    //
+    // `Drop for ContinuationPool` deliberately does *not* free its stacks: it
+    // runs from a thread-local destructor, and freeing means resuming each
+    // continuation, which reads the generator crate's own thread-local —
+    // forbidden during TLS destruction on Linux. So it marks them unreusable
+    // and returns; the `ManuallyDrop` generator, and its `mmap`ed stack, are
+    // never released.
+    //
+    // **The mechanism is the plain one, and an earlier version of this comment
+    // got it wrong** (gate 3). It said the leak happened "because `probe_park`
+    // is `loop { switch() }` — a parked thread never finishes, so its
+    // `PooledContinuation` is never returned to the pool". That is false, and
+    // it is self-refuting: if the continuations were never *in* the pool,
+    // `drain_and_free` — which frees only what is in it — could not fix
+    // anything. `Execution::cleanup` (`runtime/execution.rs:293-308`) calls
+    // `cancel_gen()` then `reinitialize_generator()` on every unfinished task,
+    // which marks it reusable, so `PooledContinuation::drop` does return it.
+    //
+    // The real mechanism: **one pool per `probe_from` call, dropped without
+    // draining, once per search node.**
+    // `Search::cover` probes once per node, so the mappings accumulate until
+    // `mmap` fails with `ENOMEM` **at 394 MB RSS** — not memory exhaustion
+    // but `vm.max_map_count`, measured at 63,196 mappings against a limit of
+    // 65,530.
+    //
+    // `drain_and_free` is the path that exists for exactly this, and it was
+    // called from `parallel_verify.rs` alone. It is called here inside the
+    // scope, during normal execution, which is its documented precondition.
+    let pool = ContinuationPool::new();
+    CONTINUATION_POOL.set(&pool, || {
         let execution = Execution::new(Rc::clone(&must));
         Must::begin_execution(&must);
         let f = Arc::clone(&f);
         execution.run(move || f());
+        pool.drain_and_free();
     });
 
     // No park may outlive the probe: one that does means a handler recorded an
@@ -692,5 +723,311 @@ mod tests {
             let _ = t.join();
         });
         assert!(offers.is_empty(), "offers: {offers:?}");
+    }
+
+    /// Lines in `/proc/self/maps`, which is one per `mmap`ed region.
+    ///
+    /// The count, not the byte total, is the quantity F50 is about: the probe
+    /// died with `ENOMEM` at a peak RSS of 394 MB, which is nowhere near
+    /// exhaustion and is instead the signature of `vm.max_map_count` — 65,530
+    /// on this machine, against 63,196 mappings measured in the failing run.
+    #[cfg(target_os = "linux")]
+    fn mapping_count() -> usize {
+        std::fs::read_to_string("/proc/self/maps")
+            .expect("/proc/self/maps is readable on Linux")
+            .lines()
+            .count()
+    }
+
+    /// **A probe frees the coroutine stacks it allocated** (F50).
+    ///
+    /// `Drop for ContinuationPool` deliberately does not free its stacks — it
+    /// runs from a thread-local destructor, and freeing means resuming a
+    /// continuation, which reads the generator crate's own thread-local, which
+    /// Linux forbids during TLS destruction. `drain_and_free` is the path that
+    /// exists for exactly that, and until this fix `probe_from` did not call
+    /// it. `Search::cover` probes once per search node, so the mappings
+    /// accumulated until `mmap` refused.
+    ///
+    /// **Measured**, 200 probes of a three-thread program, alone in a process:
+    ///
+    /// | | mappings gained |
+    /// |---|---|
+    /// | with `drain_and_free` | **0** |
+    /// | without it (mutation) | **1200** |
+    ///
+    /// Six per probe: three threads, two mappings each (stack and guard page).
+    ///
+    /// # Why it runs in a child process, and it has to
+    ///
+    /// The first version of this measured `/proc/self/maps` around the loop in
+    /// the ordinary test thread. It passed under `--test-threads=1` and
+    /// **failed on every run under the default parallel harness**, which is
+    /// how the suite is normally invoked — and the failure was not the probe's.
+    /// `/proc/self/maps` is process-wide, so the window also counts whatever
+    /// the other ~350 conformance tests allocate on their own threads
+    /// meanwhile. Measured, with the *fix in place* and the loop asserting
+    /// nothing: the process gained **1998, 1988 and 2090** mappings across
+    /// three runs of that window, against a true probe contribution of 0.
+    ///
+    /// Most of that ambient figure is real leakage from elsewhere and is a
+    /// finding in its own right (see the developer's S7-fixes report:
+    /// `conformance::testing::run_once` and `lib.rs`'s `explore` create a
+    /// `ContinuationPool` per call and never drain it, at six mappings a call)
+    /// — but none of it is attributable to `probe_from`, and a test that
+    /// cannot tell the two apart measures the harness rather than the code.
+    ///
+    /// So the loop runs in a **fresh child process** with `--test-threads=1`
+    /// and nothing else in it, where `/proc/self/maps` does mean what the
+    /// measurement needs it to mean. The child is
+    /// [`f50_probe_loop_child`], `#[ignore]`d so it runs only when named.
+    ///
+    /// **Mutation, MEASURED**: delete `pool.drain_and_free()` from
+    /// `probe_from` and this test fails, surfacing the child's own assertion
+    /// (`200 probes gained 1200 mappings`). The same mutation leaves the whole
+    /// `--lib` suite green (363 passed either way) and kills
+    /// `bench::two_pc_scaling` with
+    /// `failed to alloc sys stack: ENOMEM` from `generator`'s `stack/mod.rs`:
+    /// the leak costs nothing but resources until it costs everything.
+    ///
+    /// Linux-only, because `/proc/self/maps` is. On another platform the
+    /// property is untested rather than asserted vacuously.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_probe_frees_its_coroutine_stacks() {
+        const CHILD: &str = "conformance::prober::tests::f50_probe_loop_child";
+
+        let exe = std::env::current_exe().expect("the test binary knows its own path");
+        let out = std::process::Command::new(exe)
+            .args(["--exact", CHILD, "--ignored", "--test-threads=1"])
+            .output()
+            .expect("re-running this test binary for one ignored test");
+
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+
+        // A filter that matches nothing also exits 0, which would be a silent
+        // pass. The child must say it ran exactly one test.
+        assert!(
+            stdout.contains("1 passed") || stdout.contains("1 failed"),
+            "the child did not run {CHILD}; filter or name drift.\n\
+             --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+        );
+        assert!(
+            out.status.success(),
+            "the probe leaked coroutine stacks (F50).\n\
+             --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+        );
+    }
+
+    /// The loop [`a_probe_frees_its_coroutine_stacks`] runs in a child process.
+    ///
+    /// `#[ignore]`d so that it runs **only** when named, which is what keeps
+    /// the measurement alone in its process; running it in the ordinary
+    /// parallel suite is exactly the thing that made the first version of this
+    /// test fail for reasons that had nothing to do with the probe.
+    #[test]
+    #[ignore = "F50: measured in a child process by a_probe_frees_its_coroutine_stacks"]
+    #[cfg(target_os = "linux")]
+    fn f50_probe_loop_child() {
+        const WARMUP: usize = 10;
+        const PROBES: usize = 200;
+        // Six mappings per leaked probe, so 1200 is the leaking figure; 100 is
+        // two orders of magnitude inside it and still absorbs an allocator
+        // taking a fresh arena during the window.
+        const BOUND: usize = 100;
+
+        for _ in 0..WARMUP {
+            let _ = probe_once(Config::builder().build(), two_senders);
+        }
+        let before = mapping_count();
+        for _ in 0..PROBES {
+            let _ = probe_once(Config::builder().build(), two_senders);
+        }
+        let after = mapping_count();
+
+        let delta = after.saturating_sub(before);
+        assert!(
+            delta < BOUND,
+            "{PROBES} probes gained {delta} mappings ({before} -> {after}). A probe \
+             leaking its stacks gains about six per probe; `probe_from` is not \
+             calling `ContinuationPool::drain_and_free` (F50)"
+        );
+    }
+
+    /// **F51's two unmeasured sites**: `testmode::test` and `exec_pool`'s
+    /// worker loop.
+    ///
+    /// The lead measured `lib.rs`'s `explore` (0 mappings gained over 100
+    /// `verify` calls, 800 with the drain removed) and **read** the other
+    /// two. Reading a `drain_and_free` call is not the same as establishing
+    /// that the stacks come back: `exec_pool`'s call sits after the worker
+    /// loop exits, on a thread the measuring thread does not own, and
+    /// `testmode`'s sits after a `CONTINUATION_POOL.set` whose pool is shared
+    /// across every sample. Either could be on a path the run does not take,
+    /// and `/proc/self/maps` is the only witness that settles it.
+    ///
+    /// **Measured**, this tree, 2026-09-16 (developer's P3-skips pass), each
+    /// loop alone in a child process:
+    ///
+    /// | site | loop | mappings gained, fixed | with the drain deleted |
+    /// |---|---|---|---|
+    /// | `testmode::test` | 100 calls x 4 samples | **0** | **600** |
+    /// | `exec_pool::worker_loop` | 50 parallel `verify` calls, 2 workers | **0** | **300** |
+    ///
+    /// Six per leaked `test` call — three threads, two mappings each (stack
+    /// and guard page), one pool however many samples the call took — and six
+    /// per leaked parallel `verify` call across its two workers. The zero is
+    /// literal: both children pass with `BOUND` set to 1. `BOUND` is left at
+    /// 100 rather than 1 so that an allocator taking a fresh arena inside the
+    /// window cannot turn a correct run red; that is two orders of magnitude
+    /// inside the leaking figure.
+    ///
+    /// Both run in a fresh
+    /// child process with `--test-threads=1`, for the reason
+    /// [`a_probe_frees_its_coroutine_stacks`] gives at length:
+    /// `/proc/self/maps` is process-wide, so measured in the ordinary parallel
+    /// harness the window also counts what the other ~350 conformance tests
+    /// allocate meanwhile, and the ambient figure (~2000 mappings) swamps the
+    /// true contribution.
+    ///
+    /// Linux-only, because `/proc/self/maps` is.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_remaining_pool_sites_free_their_coroutine_stacks() {
+        for child in [
+            "conformance::prober::tests::f51_testmode_child",
+            "conformance::prober::tests::f51_exec_pool_child",
+        ] {
+            let exe = std::env::current_exe().expect("the test binary knows its own path");
+            let out = std::process::Command::new(exe)
+                .args(["--exact", child, "--ignored", "--test-threads=1"])
+                .output()
+                .expect("re-running this test binary for one ignored test");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // A filter that matches nothing also exits 0, which would be a
+            // silent pass. The child must say it ran exactly one test.
+            assert!(
+                stdout.contains("1 passed") || stdout.contains("1 failed"),
+                "the child did not run {child}; filter or name drift.\n\
+                 --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+            );
+            assert!(
+                out.status.success(),
+                "{child} reported leaked coroutine stacks (F51).\n\
+                 --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}"
+            );
+        }
+    }
+
+    /// `testmode::test` shares **one** pool across all its samples and drains
+    /// it once at the end, so the leaking figure is per *call*, not per
+    /// sample: six mappings — three threads, two mappings each (stack and
+    /// guard page) — however many samples the call took.
+    ///
+    /// **Mutation, MEASURED**: delete `pool.drain_and_free()` from
+    /// `testmode::test` and this child fails; the figures are in the report
+    /// for task `P3-skips-dev`.
+    #[test]
+    #[ignore = "F51: measured in a child process by the_remaining_pool_sites_free_their_coroutine_stacks"]
+    #[cfg(target_os = "linux")]
+    fn f51_testmode_child() {
+        const WARMUP: usize = 5;
+        const CALLS: usize = 100;
+        // Six mappings per leaked call, so 600 is the leaking figure; 100 is
+        // well inside it and still absorbs an allocator taking a fresh arena.
+        const BOUND: usize = 100;
+
+        for _ in 0..WARMUP {
+            let _ = crate::test(Config::builder().build(), two_senders, 4);
+        }
+        let before = mapping_count();
+        for _ in 0..CALLS {
+            let _ = crate::test(Config::builder().build(), two_senders, 4);
+        }
+        let after = mapping_count();
+
+        let delta = after.saturating_sub(before);
+        assert!(
+            delta < BOUND,
+            "{CALLS} `test` calls gained {delta} mappings ({before} -> {after}). A \
+             call leaking its pool gains about six; `testmode::test` is not \
+             calling `ContinuationPool::drain_and_free` (F51)"
+        );
+    }
+
+    /// `exec_pool`'s worker loop drains the pool it owns, **on the worker
+    /// thread**, after the loop exits.
+    ///
+    /// The measurement has a precondition the other two do not: the workers
+    /// must have finished before `/proc/self/maps` is read, or the drain has
+    /// simply not happened yet and a passing run would mean nothing.
+    /// `ExecutionPool::explore` returning is what establishes it — it joins
+    /// its workers — so the count is taken strictly after the `verify` call
+    /// returns, and never inside one.
+    ///
+    /// The leaking figure is per *worker* per `verify` call, so it scales with
+    /// the machine; the bound is set against the smallest leak that could
+    /// occur (one worker, six mappings a call) rather than against this
+    /// machine's core count.
+    ///
+    /// **Mutation, MEASURED**: delete `continuation_pool.drain_and_free()`
+    /// from `worker_loop` and this child fails; the figures are in the report
+    /// for task `P3-skips-dev`.
+    #[test]
+    #[ignore = "F51: measured in a child process by the_remaining_pool_sites_free_their_coroutine_stacks"]
+    #[cfg(target_os = "linux")]
+    fn f51_exec_pool_child() {
+        const WARMUP: usize = 5;
+        const CALLS: usize = 50;
+        const BOUND: usize = 100;
+
+        let cfg = || {
+            Config::builder()
+                .with_parallel(true)
+                .with_parallel_workers(2)
+                .build()
+        };
+        for _ in 0..WARMUP {
+            let _ = crate::verify(cfg(), two_senders);
+        }
+        let before = mapping_count();
+        for _ in 0..CALLS {
+            let _ = crate::verify(cfg(), two_senders);
+        }
+        let after = mapping_count();
+
+        let delta = after.saturating_sub(before);
+        assert!(
+            delta < BOUND,
+            "{CALLS} parallel `verify` calls gained {delta} mappings ({before} -> \
+             {after}). A worker leaking its pool gains about six per call per \
+             worker; `exec_pool::worker_loop` is not calling \
+             `ContinuationPool::drain_and_free` (F51)"
+        );
+    }
+
+    /// The same 200 probes answer the same thing every time.
+    ///
+    /// `drain_and_free` resumes each pooled continuation with `Exit` and drops
+    /// its generator, which is a real operation on the engine's state rather
+    /// than a deallocation the compiler could elide. So the claim that F50's
+    /// fix "changes resource use and not verdicts" needs an assertion, and the
+    /// cheapest honest one is that the offers are identical across a run long
+    /// enough for the leak to have mattered.
+    ///
+    /// The `--lib` suite passing identically with and without the fix (363
+    /// passed both ways) is the broader version of the same check; this one
+    /// pins it at the probe.
+    #[test]
+    fn draining_the_pool_does_not_change_what_a_probe_offers() {
+        let first = probe_once(Config::builder().build(), two_senders);
+        let first: Vec<_> = first.iter().map(|o| (o.kind(), o.pos())).collect();
+        for i in 0..200 {
+            let again = probe_once(Config::builder().build(), two_senders);
+            let again: Vec<_> = again.iter().map(|o| (o.kind(), o.pos())).collect();
+            assert_eq!(again, first, "probe {i} disagreed with the first");
+        }
     }
 }

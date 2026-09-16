@@ -48,12 +48,22 @@ where
     let _guard = CurrentMustGuard;
 
     let f = Arc::new(f);
-    CONTINUATION_POOL.set(&ContinuationPool::new(), || {
+    // **F51.** `Drop for ContinuationPool` cannot free its stacks — it runs
+    // from a thread-local destructor, and freeing means resuming each
+    // continuation, which reads the generator crate's own thread-local,
+    // forbidden during TLS destruction on Linux. So the `ManuallyDrop`
+    // generator and its `mmap`ed stack survive the drop. `drain_and_free` is
+    // the path that exists for this, and it must be called explicitly, during
+    // normal execution.
+    // Measured before the fix: **6 mappings per `run_once` call**.
+    let pool = ContinuationPool::new();
+    CONTINUATION_POOL.set(&pool, || {
         let execution = Execution::new(Rc::clone(&must));
         Must::begin_execution(&must);
         let f = Arc::clone(&f);
         execution.run(move || f());
     });
+    pool.drain_and_free();
 
     let graph = must.borrow_mut().take_graph();
     graph

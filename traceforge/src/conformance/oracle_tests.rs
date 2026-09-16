@@ -1280,3 +1280,50 @@ fn e2_a_bounded_exploration_is_a_hard_error() {
         ),
     }
 }
+
+// ===========================================================================
+// Gate 4, M1 --- a visible thread's failed assertion is a value `vis` is
+// defined on, so the oracle enumerates it rather than refusing.
+// ===========================================================================
+
+/// **`vis_of_program` answers on a program whose visible thread errors.**
+///
+/// It used to return `Err(OracleError::VisibleError)` on
+/// `ctx.collect_errors().first()`, *above* the loop over `ctx.collected()` —
+/// so it threw away the graphs `ConfMode::Collect` exists to keep untruncated,
+/// and B1's whole edit to `report_visible_error` changed no oracle answer.
+///
+/// `differential_smoke::a_visible_error_pair_is_enumerated_and_scores_rather_than_refusing`
+/// establishes the consequence for a *pair*, through `compare`. This
+/// establishes the claim the fix actually rests on, at the oracle: the set is
+/// non-empty and its words carry `Status::Errored`, which is what makes
+/// inclusion fail against an err-free specification rather than collapsing
+/// into `DiffError::Oracle`.
+///
+/// Group D's `collect_run` already shows the *captured graph* keeps the failed
+/// assertion; what was untested is that `vis_of_program` lets it through.
+///
+/// **Mutation, MEASURED**: restore
+/// `if let Some((thread, _)) = ctx.collect_errors().first() { return Err(..) }`
+/// above the enumeration loop and this test fails at its `expect`, with
+/// `VisibleError { thread: "w" }`.
+#[test]
+fn vis_of_program_enumerates_a_visible_error_rather_than_refusing() {
+    let vis = names(&["w"]);
+    let set = vis_of_program(cfg(), &vis, || {
+        let _w = named("w", || crate::assert(false));
+    })
+    .expect("the oracle must enumerate a visible-error run, not refuse it");
+
+    assert!(
+        !set.is_empty(),
+        "conformance: the collect run produced no vis word at all, so the \
+         enumeration was empty rather than merely un-refused"
+    );
+    assert!(
+        set.iter().all(|w| w.statuses.get("w") == Some(&Status::Errored)),
+        "conformance: `w` failed its assertion in every execution, so every vis \
+         word must carry Errored; got {:?}",
+        render(&set)
+    );
+}

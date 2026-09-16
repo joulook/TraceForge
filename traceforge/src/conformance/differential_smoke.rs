@@ -602,3 +602,53 @@ fn each_outcome_class_is_supplied_by_a_named_mode() {
          mode's construction rather than from a run."
     );
 }
+
+/// **Gate 4's M1: the `Collect` branch is load-bearing, and a visible-error
+/// pair scores instead of collapsing.**
+///
+/// Before this, `vis_of_program` returned `Err(OracleError::VisibleError)` on
+/// `collect_errors().first()` *before* reading `collected()` — throwing away
+/// the graphs `ConfMode::Collect` exists to keep untruncated. The branch
+/// therefore changed no oracle answer, and the reviewer's dissenting route
+/// (no edit to a sealed file) would have been observationally identical.
+///
+/// Three things this asserts, and the third is the one that was impossible:
+///
+/// 1. the oracle **answers** on a pair whose implementation's visible thread
+///    fails an assertion, rather than refusing;
+/// 2. it answers `Fails` — the implementation has `vis` words carrying
+///    `Status::Errored`, and the specification, being err-free, has none;
+/// 3. the pair therefore scores `BothFail` through `compare()`. Gate 4's M4
+///    recorded §11.5's visible-error shape as un-emittable by the generator
+///    *because the oracle refused to answer on it*; that is now false.
+///
+/// **Mutation, MEASURED**: restore the early
+/// `return Err(OracleError::VisibleError { .. })` above the enumeration loop
+/// in `vis_of_program` — `compare` then yields `DiffError::Oracle` and this
+/// test fails on its first assertion.
+#[test]
+fn a_visible_error_pair_is_enumerated_and_scores_rather_than_refusing() {
+    use crate::conformance::differential::{compare, Agreement};
+    use crate::{thread, ConsType, Config};
+
+    fn named<F: FnOnce() + Send + 'static>(n: &str, f: F) -> thread::JoinHandle<()> {
+        thread::Builder::new().name(n.to_string()).spawn(f).unwrap()
+    }
+
+    let cfg = Config::builder().with_cons_type(ConsType::FIFO).build();
+    let vis = vec!["w".to_string()];
+    let imp = || {
+        let _w = named("w", || crate::assert(false));
+    };
+    let spec = || {
+        let _w = named("w", || {});
+    };
+
+    let got = compare(cfg, &vis, imp, spec)
+        .expect("the oracle must answer on a visible-error pair, not refuse it");
+    assert!(
+        matches!(got, Agreement::BothFail { .. }),
+        "an implementation whose visible thread errors does not refine an err-free \
+         specification, and the tool reports it; got {got:?}"
+    );
+}

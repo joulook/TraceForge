@@ -226,19 +226,55 @@ fn cfg() -> Config {
 /// Plain model checking of the implementation alone — the baseline the
 /// overhead ratio is against. It must use the **same** `Config` the
 /// conformance run does, or the comparison is not like-for-like.
+/// Time `f` properly: repeat it until at least `MIN_SECS` of work has
+/// happened, then divide. Returns seconds **per iteration**.
+///
+/// **F54.** The first version of this benchmark timed a single un-repeated run.
+/// At `N <= 4` the plain baseline takes 1-16 ms, which is far too short to
+/// divide by: three clean runs gave ratios spanning 32.8x-96.7x and a "flat
+/// 80-87x" claim was published from one sample of that. A ratio is only as
+/// stable as its denominator.
+fn timed<T>(mut f: impl FnMut() -> T) -> (T, f64) {
+    const MIN_SECS: f64 = 0.2;
+    const ROUNDS: usize = 3;
+
+    // One un-timed pass, so page faults and lazy initialisation land outside
+    // every measurement.
+    let mut last = f();
+
+    // **The minimum across rounds, not the mean.** This machine is shared, and
+    // interference only ever makes a run *slower* — so the minimum is the
+    // cleanest estimate of the true cost, and the mean mostly measures what
+    // else was running. Three rounds, each averaged over as many iterations as
+    // fit in `MIN_SECS`.
+    let mut best = f64::INFINITY;
+    for _ in 0..ROUNDS {
+        let start = Instant::now();
+        let mut iters = 0u32;
+        loop {
+            last = f();
+            iters += 1;
+            if start.elapsed().as_secs_f64() >= MIN_SECS {
+                break;
+            }
+        }
+        let per = start.elapsed().as_secs_f64() / iters as f64;
+        if per < best {
+            best = per;
+        }
+    }
+    (last, best)
+}
+
 fn baseline(n: usize, eager: bool) -> (crate::Stats, f64) {
     let p = two_pc(n, eager);
-    let t = Instant::now();
-    let stats = crate::verify(cfg(), p);
-    (stats, t.elapsed().as_secs_f64())
+    timed(move || crate::verify(cfg(), p.clone()))
 }
 
 fn conformance(n: usize, eager: bool) -> (Outcome, f64) {
     let imp = two_pc(n, eager);
     let spec = two_pc_spec();
-    let t = Instant::now();
-    let out = verify_conformance(cfg(), imp, spec, visible(), 10_000);
-    (out, t.elapsed().as_secs_f64())
+    timed(move || verify_conformance(cfg(), imp.clone(), spec.clone(), visible(), 10_000))
 }
 
 /// **The benchmark.** Conforming direction, scaling in `N`.
@@ -247,22 +283,30 @@ fn conformance(n: usize, eager: bool) -> (Outcome, f64) {
 /// conformance, and the **ratio**, which is the number S7 should carry — the
 /// absolute seconds are a property of this machine.
 ///
+/// **`skipped` is the number of mid-run checks F49's repair suppressed.** It is
+/// not zero on this pair and is not expected to be: `reports = 0` therefore
+/// establishes "no check that ran found a violation". Every *end-of-execution*
+/// check did run — that is guaranteed by `ConfCtx::gate`'s discrimination and
+/// its assertion, not by this table.
+///
 /// `#[ignore]` because it is a measurement, not an assertion: it takes far
 /// longer than a unit test and its output is a table for a human. Run it with
 /// `cargo test -j 2 -p traceforge --lib conformance::bench -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn two_pc_scaling() {
-    println!("\n  N | plain execs | plain s | conf reports | conf s | ratio");
-    println!("----+-------------+---------+--------------+--------+-------");
+    println!("\n  N | plain execs |  plain s  | reports | skipped |   inert | conf s | ratio");
+    println!("----+-------------+-----------+---------+---------+---------+--------+-------");
     for n in 2..=5usize {
         let (bs, bt) = baseline(n, false);
         let (out, ct) = conformance(n, false);
         let ratio = if bt > 0.0 { ct / bt } else { f64::NAN };
         println!(
-            " {n:2} | {:11} | {bt:7.3} | {:12} | {ct:6.3} | {ratio:5.1}x",
+            " {n:2} | {:11} | {bt:9.5} | {:7} | {:7} | {:7} | {ct:6.3} | {ratio:5.1}x",
             bs.execs,
-            out.reports.len()
+            out.reports.len(),
+            out.skipped_gates,
+            out.inert_gates
         );
         // F43: a run that exhausted its inner budget established less than it
         // appears to, and reads as clean to anyone looking at reports alone.
@@ -271,6 +315,14 @@ fn two_pc_scaling() {
             "N={n}: {} inner-search exhaustion(s) — this measurement is not sound",
             out.exhaustions.len()
         );
+        // **Review `P3-A16`, M4 — reported, not asserted away.** This pair is
+        // exactly F49's skip-triggering shape, so mid-run skips are expected
+        // and a `skipped == 0` assertion would simply fail. What must never
+        // happen is a skipped **completion** gate, and that is guaranteed by
+        // construction: `ConfCtx::gate` discriminates on the variant and
+        // asserts the precondition. So the count is printed in the table
+        // instead, because a reader of `reports = 0` is entitled to know how
+        // many checks did not run.
     }
 }
 
@@ -304,30 +356,27 @@ fn two_pc_eager_coordinator_is_reported() {
 /// the correct two-phase reply — the second assertion then fails, because the
 /// pair conforms in both directions and the benchmark measures nothing.
 ///
-/// # `#[ignore]`d: this is F49's reproduction, not a passing test
+/// # It was F49's reproduction, and it is not `#[ignore]`d any more
 ///
-/// **It panics**, on the probe thread, at `obs.rs:304`:
+/// This test used to panic on the probe thread at `obs.rs:304`
+/// (*"observed a send at (t2, 3) whose value is still pending"*), which is
+/// what F49 records. The `#[ignore]` said it "should start passing the day
+/// F49 is fixed"; `ctx.rs`'s replay-frontier skip is that fix, and the
+/// developer's gate-3 pass measured the day: it passes.
 ///
-/// ```text
-/// conformance: observed a send at (t2, 3) whose value is still pending.
-/// `wobs` was called before this send was re-executed; its value was blanked
-/// by initialize_for_execution and has not come back yet (conf-plan.md §6.1)
-/// ```
+/// The trigger recorded on the `#[ignore]` — "`nondet()` in a declared visible
+/// thread" — was the **first** hypothesis and it is wrong; one visible
+/// branching thread is fine. It takes **two**, and the corrected table is in
+/// `backlog/flaws.md` F49. The minimal shape is
+/// `gate_tests::two_visible_threads_that_both_branch_survive_the_replay_frontier`,
+/// which is where the F49 regression lives now; this one keeps the realistic
+/// shape.
 ///
-/// The trigger is **`nondet()` in a declared visible thread**, isolated by
-/// bisection: with `participant`'s vote a constant this passes; with
-/// `crate::nondet()` restored it panics every run, nothing else changed.
-///
-/// It is kept, ignored and named, rather than deleted or worked around,
-/// because it is the only reproduction of F49 in the tree and it should start
-/// passing the day F49 is fixed. Run it with
-/// `cargo test -j 2 -p traceforge --lib conformance::bench -- --ignored`.
-///
-/// **§9 admits `nondet()`** — `probe_park` is installed at `nondet` and
-/// `named_nondet` precisely so the probe handles it — so the assertion that
-/// fires is a working guard on a precondition a legitimate program violates.
+/// **Mutation, MEASURED (F49)**: delete `ctx.rs`'s
+/// `if !g1.unreplayed_events.is_empty() { return GateOutcome::Continue; }` —
+/// this test fails with the `obs.rs:304` panic above, as do all three other
+/// tests in this module.
 #[test]
-#[ignore = "F49: nondet() in a visible thread panics the probe; this is the reproduction"]
 fn the_two_pc_pair_conforms_and_its_perturbation_does_not() {
     let (clean, _) = conformance(2, false);
     assert!(
@@ -341,3 +390,72 @@ fn the_two_pc_pair_conforms_and_its_perturbation_does_not() {
         "the eager coordinator loses agreement and must be reported"
     );
 }
+
+/// **A violation this pair commits is still caught at a *fresh-add* gate, not
+/// only at completion** — which is the measurable half of A16.
+///
+/// F49's fix skips any gate whose graph still has unreplayed events, and the
+/// argument offered for its soundness is that the completion gate always runs
+/// fully replayed, so a violation is reported "later, not never". That
+/// argument would be cold comfort if the skip had in practice moved *every*
+/// report to the completion gate, because the early gates would then be
+/// decorative and the flat overhead ratio would be measuring a search that
+/// never prunes.
+///
+/// It has not. This pair is exactly F49's shape — two declared visible threads
+/// that both branch — so the skip fires all through the run, and the reports
+/// it produces still come predominantly from fresh-add gates.
+///
+/// **Measured**, `--lib`, this tree, 2026-09-16 (developer's P3-skips pass):
+///
+/// | | reports | `FreshSend` | `FreshRecv` | `RevisitApply` | `Completion` |
+/// |---|---|---|---|---|---|
+/// | `N = 2` | 5 | 2 | 3 | 0 | 0 |
+/// | `N = 3` | 28 | 10 | 16 | 0 | **2** |
+///
+/// **The previous figures in this doc were wrong and are corrected here.** They
+/// read "`N = 3`: 15 `FreshRecv` and 13 `FreshSend`" with no completion
+/// reports, and they were taken on a **pre-F42** build: F42's inertness skip
+/// defers some fresh-add gates, which moves both the split between the two
+/// fresh gates and — at `N = 3` — two reports onto the completion gate. The
+/// assertion below was always the weaker "at least one fresh-add report",
+/// which is why it did not notice; the numbers in the prose did not survive
+/// the change and a reader would have trusted them.
+///
+/// The accompanying claim that the skip fired "1379 times across 59,925 gate
+/// calls over the whole benchmark, of which none was a completion gate" is
+/// **not re-verified** and is removed rather than restated: a total gate-call
+/// count cannot be obtained from outside `ConfCtx::gate`, because both skips
+/// return above `cover` and so record no `Exhaustion`. What *is* measured is
+/// `Outcome::skipped_gates`, printed per `N` by [`two_pc_scaling`] (840 at
+/// `N = 5`). That no skip is ever a completion gate holds by construction —
+/// `ConfCtx::gate` discriminates on the variant — not by measurement.
+///
+/// **Mutation, MEASURED**: delete `ctx.rs`'s replay-frontier skip and this
+/// test does not merely fail its assertion — it panics at `obs.rs:304`, which
+/// is F49. There is no mutation that keeps the run alive and moves the reports
+/// to the completion gate, because the skip is the only thing standing between
+/// this program and the pending-value guard; that limit is stated rather than
+/// worked around.
+#[test]
+fn the_eager_pairs_reports_come_from_fresh_add_gates() {
+    use crate::conformance::ctx::Gate;
+
+    let (out, _) = conformance(2, true);
+    assert!(
+        !out.reports.is_empty(),
+        "the eager coordinator loses agreement and must be reported"
+    );
+    let fresh = out
+        .reports
+        .iter()
+        .filter(|r| matches!(r.gate, Some(Gate::FreshSend) | Some(Gate::FreshRecv)))
+        .count();
+    assert!(
+        fresh > 0,
+        "every report arrived at a non-fresh gate, so the replay-frontier skip \
+         has pushed all detection to completion: {:?}",
+        out.reports.iter().map(|r| r.gate).collect::<Vec<_>>()
+    );
+}
+

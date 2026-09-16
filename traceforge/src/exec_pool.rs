@@ -288,6 +288,16 @@ fn worker_loop<F>(
     // Loop has been exited; shutdown must have been set.
     debug!("[{}] worker is shutdown.", thread_idx);
 
+    // **F51.** `Drop for ContinuationPool` cannot free its stacks — it runs
+    // from a thread-local destructor, and freeing means resuming each
+    // continuation, which reads the generator crate's own thread-local,
+    // forbidden during TLS destruction on Linux. So the `ManuallyDrop`
+    // generator and its `mmap`ed stack survive the drop. `drain_and_free` is
+    // the path that exists for this, and it must be called explicitly, during
+    // normal execution.
+    // One worker's pool, shared across every graph it handled, freed once here.
+    continuation_pool.drain_and_free();
+
     let must_stats = must_wrap.borrow().stats();
     pool_exec_stats
         .lock()

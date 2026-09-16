@@ -277,9 +277,12 @@ pub(crate) enum OracleError {
     /// completion gate.
     PartialGraph,
     /// A declared visible thread failed an assertion during the enumeration.
-    /// Not fatal to `Graphs(P)` — collect mode does not prune (B1) — but the
-    /// caller is told, because a specification that can error is not
-    /// err-free and §5.4 would refuse it.
+    ///
+    /// **No longer returned by `vis_of_program`** (gate 4, M1): such runs are
+    /// now *enumerated*, because `Collect` keeps their rows untruncated and
+    /// `Status::Errored` is a value `vis` is defined on. Kept so a caller that
+    /// wants to refuse the class rather than score it has the variant to
+    /// return; `ConfCtx::collect_errors()` is where the failures are observed.
     VisibleError { thread: String },
     Obs(String),
 }
@@ -355,11 +358,31 @@ where
     // gates its count. An exhausted run therefore can never be scored as a
     // certificate, which is what F43 asks for.
 
-    if let Some((thread, _)) = ctx.collect_errors().first() {
-        return Err(OracleError::VisibleError {
-            thread: thread.clone(),
-        });
-    }
+    // **A visible thread's failed assertion is enumerated, not refused** —
+    // and this is what makes `ConfMode::Collect`'s branch load-bearing
+    // (gate 4, M1).
+    //
+    // An earlier version returned `Err(OracleError::VisibleError)` here, on
+    // `collect_errors().first()`, *before* reading `collected()`. That threw
+    // away the very graphs the `Collect` branch exists to keep untruncated, so
+    // the branch changed no oracle answer and the poll's edit to a sealed file
+    // bought nothing. The fix is not to revert the branch — it is to use it.
+    //
+    // Enumerating is also what criterion 2(a) asks for ("collect a graph at
+    // **every** execution ending — all-threads-completed, deadlock, **and
+    // failed assertion**"), and it is semantically right: `Status::Errored` is
+    // a value `vis(σ) ≝ ⟨w, status|_Tvis⟩` is defined on, `status_of` extracts
+    // it by scanning every index for a `Block(Assert)`, and the draft's own
+    // `ex:morph` variation turns on statuses alone.
+    //
+    // What it yields on a pair is the right answer rather than a refusal: an
+    // implementation whose visible thread errors has `vis` words carrying
+    // `Errored`; a specification is err-free by §5.4's precheck, so has none;
+    // so inclusion **fails**, and the tool also reports (§4.4). Oracle and
+    // tool agree, and the pair scores as a correct report instead of
+    // collapsing into `DiffError`. That also dissolves gate 4's M4 — §11.5's
+    // visible-error shape was un-emittable by the generator only because the
+    // oracle refused to answer on it.
 
     let mut set = VisSet::default();
     for g in ctx.collected() {

@@ -222,6 +222,9 @@ pub(crate) mod generator;
 mod differential_smoke;
 #[cfg(test)]
 mod paper_examples;
+/// A guided demonstration of the draft's examples, one at a time. **Test-only.**
+#[cfg(test)]
+mod demo;
 #[cfg(test)]
 mod refinement_suite;
 /// S7's benchmark: two-phase commit, and what conformance costs. **Test-only**;
@@ -249,6 +252,17 @@ pub(crate) struct Outcome {
     pub(crate) diagnostics: Vec<ctx::Diagnostic>,
     pub(crate) stats: Option<crate::Stats>,
     pub(crate) end: report::SearchEnd,
+    /// How many gates F49's replay-frontier skip suppressed (review `P3-A16`).
+    ///
+    /// **A skipped gate is a check that did not happen.** A run with a non-zero
+    /// count established "no gate *that ran* found a violation", which is
+    /// weaker than refinement — so any figure derived from it must assert this
+    /// is zero or state what it was. Same obligation F43 imposes for
+    /// exhaustions.
+    pub(crate) skipped_gates: usize,
+    /// How many gates F42's inertness skip suppressed — a fresh event that
+    /// changed nothing observable, so the gate's answer could not differ.
+    pub(crate) inert_gates: usize,
 }
 
 /// Run `implementation` under conformance against `specification`, at the
@@ -324,6 +338,8 @@ pub(crate) fn verify_conformance_with(
         diagnostics: conf.diagnostics().to_vec(),
         stats: Some(must.stats()),
         end: conf.end(),
+        skipped_gates: conf.skipped_gates(),
+        inert_gates: conf.inert_gates(),
     }
 }
 

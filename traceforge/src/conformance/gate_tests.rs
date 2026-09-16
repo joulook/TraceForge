@@ -82,7 +82,40 @@ where
         "a zero budget established nothing, so it must report nothing: {:?}",
         out.reports
     );
+    assert_skips_did_not_blind_the_census(&out);
     out.exhaustions.iter().map(|e| e.gate).collect()
+}
+
+/// The census is `exhaustions`, and **both skips return above `cover`** — so a
+/// skipped gate records no `Exhaustion` and is invisible to every caller of
+/// [`gates_fired`]. That is not a nuance: the reviewer re-introduced the exact
+/// defect [`c2_replayed_events_are_not_re_gated`] exists to catch — a
+/// `conf_gate(FreshSend)` in `handle_send`'s **replay** branch — and the test
+/// still passed, because the re-gated replayed sends were being skipped before
+/// they could be counted. F49's replay-frontier skip is what blinded it; F42's
+/// inertness skip blinds it the same way, and the note claiming "the property
+/// under test is unchanged" was false.
+///
+/// The repair is not a new counter — a gate that returns before `cover` can
+/// only be counted inside `ConfCtx::gate`, which is production code. It is to
+/// make the existing instrument **self-checking**: `Outcome` already carries
+/// both skip totals, so a census is sound exactly when both are zero, and this
+/// turns a silent undercount into a loud failure. A program on which the skips
+/// do fire simply cannot be measured this way, and must say so rather than
+/// quietly report a short count.
+fn assert_skips_did_not_blind_the_census(out: &Outcome) {
+    assert_eq!(
+        (out.skipped_gates, out.inert_gates),
+        (0, 0),
+        "the gate census is blind to {} replay-frontier skip(s) and {} inertness \
+         skip(s): both return above `cover`, so they record no `Exhaustion` and \
+         this program's `exhaustions` is a short count. Any assertion derived \
+         from it is unsound — choose a program the skips do not fire on (declare \
+         every thread visible to defeat F42; avoid a shape that gates behind the \
+         replay frontier to defeat F49), or count something else.",
+        out.skipped_gates,
+        out.inert_gates
+    );
 }
 
 fn count(gates: &[Gate], want: Gate) -> usize {
@@ -420,6 +453,14 @@ fn c2_nondet_installs_and_flips_are_not_gated() {
 
     // Not vacuous: with a send in the program the trace does grow, so the
     // counter really does see non-completion gates.
+    //
+    // **`w` is declared visible** so that F42's inertness skip cannot fire.
+    // `w`'s ⊥ receive is a fresh-add gate on an *invisible* thread, so it was
+    // being skipped above `cover` and recorded no `Exhaustion` — this call was
+    // measuring a census one gate short, which `assert_skips_did_not_blind_the_census`
+    // now refuses. Declaring `w` visible restores a complete census; the
+    // property under test — that the coin toss fires no gate of its own — is
+    // untouched by which threads are declared visible.
     let gates = gates_fired(
         || {
             let w = named("w", || {
@@ -429,7 +470,7 @@ fn c2_nondet_installs_and_flips_are_not_gated() {
                 crate::send_msg(w, 1u64);
             }
         },
-        &["main"],
+        &["main", "w"],
     );
     assert!(
         count(&gates, Gate::FreshSend) >= 1,
@@ -455,7 +496,15 @@ fn c2_replayed_events_are_not_re_gated() {
             named("b", move || crate::send_msg(m, 2u64));
             let _: u64 = crate::recv_msg_block();
         },
-        &["main"],
+        // **`a` and `b` are declared visible here deliberately** (F42). This
+        // test counts `FreshSend` firings to detect re-gating, and F42 skips a
+        // fresh gate whose event changed nothing observable — which is exactly
+        // what an *invisible* thread's send does. With `&["main"]` the two
+        // sends became inert and the count stopped measuring re-gating and
+        // started measuring visibility. Making the senders visible restores
+        // what the test is for: the property under test is that a **replayed**
+        // send is not gated a second time, and that is unchanged.
+        &["main", "a", "b"],
     );
     // Execution 1: two fresh sends, one fresh receive, one completion.
     // Execution 2: the revisit-apply gate for the re-pointed rf, then one
@@ -685,7 +734,13 @@ fn o6_a_pruned_sends_backward_revisits_survive_the_prune() {
     // exploration this program has: the second execution is entered through
     // the revisit-apply gate, so a surviving revisit is what a second
     // execution means here.
-    let unpruned = gates_fired(implementation, &["main"]);
+    // **Every thread is declared visible for the census, and only for it.**
+    // F42's inertness skip returns above `cover`, so an invisible thread's
+    // fresh gate records no `Exhaustion`; with `&["main"]` this census was one
+    // gate short and `assert_skips_did_not_blind_the_census` now refuses it.
+    // The `conf` run below keeps `&["main"]` — *that* visible list is part of
+    // the property, since it is what makes the specification fail to match.
+    let unpruned = gates_fired(implementation, &["main", "w", "x"]);
     assert!(
         unpruned.contains(&Gate::RevisitApply),
         "the program reaches its second execution some other way than a revisit: {unpruned:?}"
@@ -2715,4 +2770,396 @@ fn c5_an_invisible_failure_after_a_prune_is_not_reachable_by_this_construction()
         !out.diagnostics.is_empty(),
         "the invisible thread never failed, so nothing was under test"
     );
+}
+
+// ===========================================================================
+// F49 --- the replay frontier.
+//
+// `ExecutionGraph::initialize_for_execution` blanks **every** send value at
+// the start of each execution and the values come back only as each event is
+// re-executed. A fresh-add gate can therefore fire while a *different* visible
+// thread is still behind that frontier, and `wobs` walks every visible row —
+// so it reaches a blanked send and trips `obs.rs`'s pending-value guard. The
+// repair in `ConfCtx::gate` is to skip a gate whose graph still has unreplayed
+// events.
+//
+// Two tests: the crash does not happen, and the skip does not reach the
+// completion gate. Both are new in the developer's S7-fixes pass; F49 had no
+// regression test at all, only `bench.rs`'s realistic pair.
+// ===========================================================================
+
+/// The **minimal** shape F49 needs, which is not the shape the flaw was first
+/// filed under.
+///
+/// The lead's first hypothesis was "`nondet()` in a declared visible thread";
+/// that is wrong, and the corrected table in `backlog/flaws.md` F49 is
+/// measured one variable at a time:
+///
+/// | visible threads | of which branch | result |
+/// |---|---|---|
+/// | 1 | 1 | OK |
+/// | 2 | 0 | OK |
+/// | 2 | 1 | OK |
+/// | 2 | **2** | **PANIC** |
+///
+/// So the program below is the smallest thing that reproduces it: one
+/// invisible hub (`main`), and **two** declared visible threads that each
+/// `recv` → `nondet()` → `send` → `recv`. One of them is adding a fresh event
+/// while the other sits behind the replay frontier, which is the whole
+/// mechanism.
+///
+/// The pair is the program against **itself**, so conformance is expected to
+/// hold and any report would be a separate finding. That is deliberate: this
+/// test is about the run surviving, and a violating pair would confound "the
+/// guard did not fire" with "the search found something".
+///
+/// **Mutation, MEASURED**: delete
+/// `if !g1.unreplayed_events.is_empty() { return GateOutcome::Continue; }`
+/// from `ConfCtx::gate` and this test fails with
+///
+/// ```text
+/// thread 'traceforge-conformance-probe' panicked at conformance/obs.rs:304:
+/// conformance: observed a send at (t1, 3) whose value is still pending.
+/// ```
+#[test]
+fn two_visible_threads_that_both_branch_survive_the_replay_frontier() {
+    let out = conf(
+        two_branching_visibles,
+        two_branching_visibles,
+        &["p0", "p1"],
+    );
+    assert!(
+        out.reports.is_empty(),
+        "the program conforms to itself; a report here is a separate finding: {:?}",
+        report_gates(&out)
+    );
+    assert_eq!(
+        stats(&out).execs,
+        8,
+        "the outer exploration must be the one an ordinary run does; a different \
+         count means the skip changed *which* executions happen, not just when \
+         the gate asks"
+    );
+}
+
+/// One invisible hub and two declared visible threads that each branch.
+///
+/// No `ThreadId` crosses a *visible* thread's observation — the hub is
+/// `main_thread_id()`, which is `t0` in both programs, and the participants'
+/// ids are used only by the hub — so F41 does not arise and the pair's
+/// conformance is not an artefact of spawn order.
+fn two_branching_visibles() {
+    let hub = main_thread_id();
+    let branching = move || {
+        let _: i32 = crate::recv_msg_block();
+        let v = crate::nondet();
+        crate::send_msg(hub, if v { 1i32 } else { 0i32 });
+        let _: i32 = crate::recv_msg_block();
+    };
+    let p0 = named("p0", branching);
+    let p1 = named("p1", branching);
+    crate::send_msg(p0, 0i32);
+    crate::send_msg(p1, 0i32);
+    let _a: i32 = crate::recv_msg_block();
+    let _b: i32 = crate::recv_msg_block();
+    crate::send_msg(p0, 9i32);
+    crate::send_msg(p1, 9i32);
+}
+
+/// **The completion gate is never the one that gets skipped**, on the program
+/// that makes the skip fire hardest.
+///
+/// This is the load-bearing half of the argument offered for F49's fix (the
+/// lead recorded the rest as **A16**, unproven): a fresh-add gate that cannot
+/// observe the graph is skipped, and the answer is deferred to the completion
+/// gate, which "always runs with every event replayed". Deferring to a gate
+/// that is itself skipped would not be a deferral — it would be a silent loss,
+/// and the difference is not visible in any verdict, because a skipped gate
+/// leaves no trace in the outcome.
+///
+/// [`gates_fired`]'s instrument makes it visible. With a budget of zero every
+/// gate that reaches `cover` records one `Exhaustion` carrying its `Gate`, and
+/// a gate the replay guard skipped returns *above* `cover` and records
+/// nothing. So the completion gates in `out.exhaustions` are exactly the
+/// completion gates that were not skipped, and `execs + block` is how many
+/// execution endings there were.
+///
+/// **Measured** on this program, this tree, 2026-09-16 (developer's P3-skips
+/// pass): 8 executions, 0 blocked, and a census of 7 `FreshSend`, 23
+/// `FreshRecv`, 4 `RevisitApply`, **8 `Completion`** — one per ending, none
+/// missing.
+///
+/// **The previous figures were wrong and are corrected here.** They read
+/// "24 `FreshSend`, 29 `FreshRecv`" and were taken on a **pre-F42** build.
+/// The 53 fresh-add gates became 30, and the missing **23** are exactly this
+/// run's `Outcome::inert_gates` — F42's skip returns above `cover`, so those
+/// gates record no `Exhaustion` and drop out of the census. The completion
+/// count is unaffected, which is the point: F42 skips only the two fresh
+/// gates, so `Completion` is the one column this instrument still counts
+/// completely, and the assertion below rests on that column alone.
+///
+/// The fresh-add counts are therefore **not** a complete gate census on this
+/// program, and the "not vacuous" assertion below is worded accordingly.
+///
+/// **Mutation, MEASURED**: deleting the skip does not make this test fail with
+/// a wrong count — it makes it **panic** at `obs.rs:304`, because a zero
+/// budget does not short-circuit `wobs` (`cover` extracts the observation
+/// before it spends). So this test's failing direction is F49's crash, and the
+/// count assertion is what would catch a *future* skip that swallowed a
+/// completion gate. Stated rather than claimed both ways.
+#[test]
+fn the_completion_gate_is_never_skipped_by_the_replay_guard() {
+    let out = verify_conformance(fifo(), two_branching_visibles, || {}, names(&["p0", "p1"]), 0);
+    assert!(
+        out.reports.is_empty(),
+        "a zero budget established nothing, so it must report nothing: {:?}",
+        out.reports
+    );
+    let st = stats(&out);
+    let completions = out
+        .exhaustions
+        .iter()
+        .filter(|e| e.gate == Gate::Completion)
+        .count();
+    assert_eq!(
+        completions,
+        st.execs + st.block,
+        "every execution ending must reach the completion gate: {} ending(s) but \
+         {completions} completion gate(s) got as far as `cover`. The skipped ones \
+         are where a violation would have been lost rather than deferred.",
+        st.execs + st.block
+    );
+    // Not vacuous: fresh-add gates reach `cover` too, so the census is of a
+    // real run rather than a run of nothing but completions.
+    //
+    // Deliberately **not** `assert_skips_did_not_blind_the_census`: this
+    // program exists to make both skips fire, so its fresh-add census is
+    // knowingly short. Only the `Completion` column above is complete, and it
+    // is the only one asserted on.
+    assert!(
+        count(&out.exhaustions.iter().map(|e| e.gate).collect::<Vec<_>>(), Gate::FreshSend) > 0,
+        "no fresh-add gate reached `cover`, so this program does not exercise the skip"
+    );
+    assert!(
+        out.skipped_gates > 0 && out.inert_gates > 0,
+        "both skips must fire on this program or it is not the hard case it \
+         claims to be: skipped={} inert={}",
+        out.skipped_gates,
+        out.inert_gates
+    );
+}
+
+// ===========================================================================
+// F42 --- the inertness skip, and what the two skip counters are worth.
+//
+// Written in the developer's P3-skips pass. F42 shipped with no test of its
+// own; `c2_replayed_events_are_not_re_gated` was *adjusted* for it, which is
+// not the same thing.
+// ===========================================================================
+
+/// **The total number of gate calls**, which `exhaustions` alone cannot give.
+///
+/// This is the instrument the gate census was missing. At a budget of zero
+/// every gate that reaches `cover` records exactly one `Exhaustion`, and every
+/// gate that does not reach `cover` returns through one of the two skips,
+/// each of which increments its own counter. Nothing else stands between the
+/// top of `ConfCtx::gate` and `cover` on a budget-zero run: the `pruned` latch
+/// is never set (a zero budget reports nothing, so nothing prunes) and
+/// `worker.is_none()` is false for a `verify_conformance` context. So the sum
+/// is the whole call count, and it is sound even on programs where
+/// [`gates_fired`] is not.
+///
+/// What it deliberately does **not** give is the count *per `Gate` variant*.
+/// `ConfCtx` carries the two skip totals but not a breakdown, so a skipped
+/// gate's variant is unrecoverable from outside. That would need a
+/// per-variant counter in `ConfCtx::gate`, which is production code and is
+/// recorded rather than added here.
+fn gates_called<I>(implementation: I, visible: &[&str]) -> usize
+where
+    I: Fn() + Send + Sync + 'static,
+{
+    let out = verify_conformance(fifo(), implementation, || {}, names(visible), 0);
+    assert!(
+        out.reports.is_empty(),
+        "a zero budget established nothing, so it must report nothing: {:?}",
+        out.reports
+    );
+    out.exhaustions.len() + out.skipped_gates + out.inert_gates
+}
+
+/// Two `u64` senders into `main`, all three threads nameable.
+fn two_workers() {
+    let m = main_thread_id();
+    let _w1 = named("w1", move || {
+        crate::send_msg(m, 1u64);
+        crate::send_msg(m, 2u64);
+    });
+    let _w2 = named("w2", move || {
+        crate::send_msg(m, 3u64);
+        crate::send_msg(m, 4u64);
+    });
+    let _: u64 = crate::recv_msg_block();
+    let _: u64 = crate::recv_msg_block();
+}
+
+/// **`inert_gates` counts gates that really were suppressed**, and the
+/// predicate really does select the *invisible* thread's fresh events.
+///
+/// Declaring a thread visible or not cannot change the implementation's
+/// exploration — at a budget of zero nothing prunes, and the visible list
+/// reaches nothing but the observation extractor — so the **total** number of
+/// gate calls is the same whichever threads are declared. What changes is how
+/// many of them F42 suppresses. Both halves are asserted:
+///
+/// 1. `gates_called` is invariant across four visible lists. A counter that
+///    over-counted (incrementing without returning) or under-counted (skipping
+///    without incrementing) would break the sum, because `exhaustions` is an
+///    independent count of the gates that *did* reach `cover`.
+/// 2. `inert_gates` is **zero** when every thread is declared visible, and
+///    rises as threads are hidden. This is the predicate's claim — "the count
+///    moves iff the actor was visible" — in its testable direction.
+///
+/// **Measured**, this tree, 2026-09-16, on `two_workers`:
+///
+/// | visible | exhaustions | skipped | inert | total |
+/// |---|---|---|---|---|
+/// | `main, w1, w2` | 13 | 1 | **0** | 14 |
+/// | `main, w1` | 11 | 1 | 2 | 14 |
+/// | `main` | 10 | 1 | 3 | 14 |
+/// | `w1` | 9 | 1 | 4 | 14 |
+///
+/// **Mutation, MEASURED** (one direction of two). Incrementing `inert_gates`
+/// *without* taking the early return — the audit form the developer used to
+/// attack F42 — makes this program's totals read `main, w1, w2` = 14 but
+/// `main` = **17**, and the invariance assertion fails. The opposite
+/// direction, returning without incrementing, is the symmetric argument and
+/// was **not run**: `ctx.rs` was frozen at the lead's request while the
+/// `last_visible_obs` fix was applied, so no further mutation of it was made.
+///
+/// **What it does not establish**: that the *skipped gate's answer* would have
+/// been the same as the gate before it. That is F42's actual soundness claim,
+/// it is not a property any counter can see, and the developer's report for
+/// `P3-skips-dev` records that it is **false** as shipped — the stale
+/// `last_visible_obs` defect. This test is about the counter, not the skip.
+#[test]
+fn the_inert_counter_conserves_the_gate_call_count() {
+    let all = gates_called(two_workers, &["main", "w1", "w2"]);
+    for narrower in [
+        &["main", "w1"][..],
+        &["main"][..],
+        &["w1"][..],
+    ] {
+        assert_eq!(
+            gates_called(two_workers, narrower),
+            all,
+            "declaring {narrower:?} visible instead of every thread changed the \
+             total gate call count. Visibility cannot change the implementation's \
+             exploration at a zero budget, so the two skip counters and \
+             `exhaustions` are not accounting for the same set of gate calls."
+        );
+    }
+
+    let out = verify_conformance(
+        fifo(),
+        two_workers,
+        || {},
+        names(&["main", "w1", "w2"]),
+        0,
+    );
+    assert_eq!(
+        out.inert_gates, 0,
+        "every thread is declared visible, so every fresh event contributes an \
+         observation and no gate can be inert — but {} were skipped as inert. \
+         F42's predicate is selecting something other than invisibility.",
+        out.inert_gates
+    );
+
+    let narrow = verify_conformance(fifo(), two_workers, || {}, names(&["main"]), 0);
+    assert!(
+        narrow.inert_gates > 0,
+        "hiding both workers made no gate inert, so this test is vacuous"
+    );
+}
+
+/// A **visible** thread's fresh event is never inert, on every shape the
+/// developer could construct that might have made one.
+///
+/// F42's predicate is "the visible observation count did not move", and it
+/// stands in for "the fresh event was invisible". The substitution is wrong if
+/// a visible thread's fresh send or receive can leave the count where it was.
+/// Four shapes were tried, each with **every** thread declared visible so that
+/// no fresh event *can* be invisible; a non-zero `inert_gates` on any of them
+/// is a counterexample.
+///
+/// - plain sends and blocking receives (`two_workers`);
+/// - a visible thread whose blocking receive never has a candidate, so the
+///   engine installs a `RecvMsg` and **overwrites it with `Block(Value)`** —
+///   the one path in the engine that removes an observation from a row;
+/// - a visible thread taking a non-blocking receive that reads ⊥ in some
+///   executions and a real value in others;
+/// - two visible threads that both branch on `nondet()`, which is F49's own
+///   shape and the one that drives the replay frontier hardest.
+///
+/// **Measured**: `inert_gates == 0` on all four. No counterexample was found,
+/// which is weaker than a proof and is the honest statement of what was done.
+/// The mechanism agrees: the overwrite path installs and removes the
+/// `RecvMsg` inside one `visit_rfs` call, with no gate between the two, so the
+/// decrement is never observed by a gate.
+#[test]
+fn no_visible_threads_fresh_event_is_inert() {
+    fn a_visible_thread_blocks_forever() {
+        let m = main_thread_id();
+        let _v = named("v", move || {
+            crate::send_msg(m, 1u64);
+            let _: u64 = crate::recv_msg_block(); // nobody ever sends to v
+        });
+        let _u = named("u", move || {
+            crate::send_msg(m, 2u64);
+        });
+        let _: u64 = crate::recv_msg_block();
+        let _: u64 = crate::recv_msg_block();
+    }
+    fn a_visible_thread_reads_bottom() {
+        let m = main_thread_id();
+        let _v = named("v", move || {
+            let _: Option<u64> = crate::recv_msg();
+            crate::send_msg(m, 1u64);
+        });
+        let v2 = named("v2", move || {
+            let _: Option<u64> = crate::recv_msg();
+            crate::send_msg(m, 2u64);
+        });
+        crate::send_msg(v2, 9u64);
+        let _: u64 = crate::recv_msg_block();
+        let _: u64 = crate::recv_msg_block();
+    }
+
+    for (name, p, vis) in [
+        ("two_workers", two_workers as fn(), &["main", "w1", "w2"][..]),
+        (
+            "blocks_forever",
+            a_visible_thread_blocks_forever as fn(),
+            &["main", "v", "u"][..],
+        ),
+        (
+            "reads_bottom",
+            a_visible_thread_reads_bottom as fn(),
+            &["main", "v", "v2"][..],
+        ),
+        (
+            "branching",
+            two_branching_visibles as fn(),
+            &["main", "p0", "p1"][..],
+        ),
+    ] {
+        let out = verify_conformance(fifo(), p, || {}, names(vis), 0);
+        assert_eq!(
+            out.inert_gates, 0,
+            "{name}: every thread is declared visible, so a fresh event on any of \
+             them contributes an observation — yet {} gate(s) were skipped as \
+             inert. A visible thread's fresh event left the observation count \
+             where it was, which is the case F42's predicate does not cover.",
+            out.inert_gates
+        );
+    }
 }

@@ -746,7 +746,17 @@ where
 {
     must.borrow_mut().started_at = Instant::now();
     Must::set_current(Some(must.clone()));
-    CONTINUATION_POOL.set(&ContinuationPool::new(), || loop {
+    // **F51.** `Drop for ContinuationPool` cannot free its stacks — it runs
+    // from a thread-local destructor, and freeing means resuming each
+    // continuation, which reads the generator crate's own thread-local,
+    // forbidden during TLS destruction on Linux. So the `ManuallyDrop`
+    // generator and its `mmap`ed stack survive the drop. `drain_and_free` is
+    // the path that exists for this, and it must be called explicitly, during
+    // normal execution.
+    // Measured before the fix: **6 mappings per `verify` call** leaked here,
+    // on the path of the public entry point.
+    let pool = ContinuationPool::new();
+    CONTINUATION_POOL.set(&pool, || loop {
         let f = Arc::clone(f);
         let execution = Execution::new(Rc::clone(must));
         Must::begin_execution(must);
@@ -756,6 +766,7 @@ where
             break;
         }
     });
+    pool.drain_and_free();
     // end of model checking
     must.borrow_mut().run_metrics_at_end();
 }

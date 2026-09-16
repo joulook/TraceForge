@@ -588,6 +588,22 @@ pub(crate) struct ConfCtx {
     /// receives an `EndCondition` and a `CoverageInfo` but no graph, `take_graph`
     /// is destructive, and the report sink captures graphs only on reports.
     collected: Option<Vec<ExecutionGraph>>,
+    /// The number of visible observations the last gate saw, for F42's
+    /// inertness skip. `None` before the first gate of an execution.
+    last_visible_obs: Option<usize>,
+    /// How many gates F42's inertness skip suppressed — a *different* reason
+    /// from [`Self::skipped_gates`], counted separately so a figure can say
+    /// which.
+    inert_gates: usize,
+    /// How many gates F49's replay-frontier skip suppressed on this run.
+    ///
+    /// **Counted, not merely skipped** (review `P3-A16`, M4). A skipped gate is
+    /// a check that did not happen, so a run with a non-zero count established
+    /// "no gate *that ran* found a violation" — which is weaker than
+    /// refinement. F43 set the precedent for exhaustions; this is the same
+    /// obligation for skips, and any figure derived from a run must assert it
+    /// is zero or state what it was.
+    skipped_gates: usize,
     /// Visible assertion failures seen under [`ConfMode::Collect`], which does
     /// not prune (S6 round 3, B1). Always empty on every other mode.
     ///
@@ -620,6 +636,9 @@ impl ConfCtx {
             end: SearchEnd::Unknown,
             collected: None,
             collect_errors: Vec::new(),
+            skipped_gates: 0,
+            last_visible_obs: None,
+            inert_gates: 0,
         }
     }
 
@@ -652,6 +671,9 @@ impl ConfCtx {
             end: SearchEnd::Unknown,
             collected: None,
             collect_errors: Vec::new(),
+            skipped_gates: 0,
+            last_visible_obs: None,
+            inert_gates: 0,
         }
     }
 
@@ -766,6 +788,25 @@ impl ConfCtx {
     /// wrong, one missing clear silences a gate for a whole execution.
     pub(crate) fn begin_execution(&mut self) {
         self.pruned = false;
+        // **F42's cache must not cross an execution boundary** (review
+        // `P3-skips`, M1 — a verdict-changing defect, found independently by
+        // the reviewer and the developer).
+        //
+        // Without this, the route is: a pruned execution returns at
+        // `if self.pruned` *above* F42's block, so its `Completion` gate never
+        // reaches the reset; `conf_revisit_gate` does not fire `RevisitApply`
+        // for `CToss`/`Choice` revisits, so that reset can be missed too; and
+        // the next execution's first fresh-add gate then compares its
+        // observation count against a value cached **in a different
+        // execution**. The per-event maximality argument F42 rests on is
+        // simply false across that boundary — the code was silently relying on
+        // the weaker "`Completion` always runs" fallback.
+        //
+        // Measured on the eager 2PC pair at N=4: **174 reports before this
+        // line, 148 after**, and 148 is what F42-disabled gives. So the report
+        // set was not preserved. With the line, F42 is verdict-identical to
+        // F42-disabled at zero cost — the inert counts are unchanged.
+        self.last_visible_obs = None;
     }
 
     /// The revisit-apply gate pruned, so the alternative is abandoned before
@@ -789,6 +830,16 @@ impl ConfCtx {
     /// returning an empty slice keeps the read side total.
     pub(crate) fn collected(&self) -> &[ExecutionGraph] {
         self.collected.as_deref().unwrap_or(&[])
+    }
+
+    /// How many gates F42's inertness skip suppressed.
+    pub(crate) fn inert_gates(&self) -> usize {
+        self.inert_gates
+    }
+
+    /// How many gates F49's skip suppressed. See the field for why it matters.
+    pub(crate) fn skipped_gates(&self) -> usize {
+        self.skipped_gates
     }
 
     /// Visible assertion failures recorded by a [`ConfMode::Collect`] run.
@@ -924,6 +975,137 @@ impl ConfCtx {
             return GateOutcome::Continue;
         }
 
+        // **F49: a gate fired mid-replay cannot observe the graph, so it is
+        // skipped.** Algorithm-level; see `backlog/flaws.md` F49 and the note
+        // below — this changes *when* the algorithm checks, and the owner
+        // should rule on it.
+        //
+        // `initialize_for_execution` blanks **every** send value at the start
+        // of each execution (`exec_graph.rs:104-114`), deliberately: without
+        // it, code that assumes a replay already carries values is silently
+        // wrong. Values come back only as each event is re-executed, and
+        // `process_event` removes the event from `unreplayed_events` as that
+        // happens.
+        //
+        // A **fresh**-add gate can therefore fire while a *different* visible
+        // thread still holds events from the previous execution that have not
+        // been replayed. `wobs` walks every visible thread's row, so it reaches
+        // one of those sends and trips `obs.rs`'s pending-value assertion —
+        // which is a working guard on a precondition the gate violates. That
+        // is F49, and it needs **two** visible threads that branch, because one
+        // must be adding a fresh event while the other is behind the replay
+        // frontier.
+        //
+        // **§8's guard runs BEFORE the skip** (F52). A gate suppressed by
+        // F49's replay-frontier skip must still check §8's precondition: a
+        // declared visible thread spawned after its program has communicated is
+        // the *user's* error in whichever program commits it, not a conformance
+        // verdict, and it does not stop being one because the gate could not
+        // observe the graph. An earlier version sat below the skip, so a skipped
+        // gate skipped this too — and the comment claimed a single change where
+        // there were two.
+        if let Err(e) = check_spawn_order(g1, &self.visible) {
+            panic!("conformance: {e}");
+        }
+
+        // Skipping is the conservative repair: the observation genuinely does
+        // not exist yet, so there is nothing for the gate to compare.
+        //
+        // **What this rests on is weaker than A16, and A16 is a theorem.**
+        // (Review `P3-A16`.) An earlier version of this comment called the
+        // monotonicity "the draft's to confirm and not established here".
+        // Both halves were wrong. It *is* established — it is the
+        // contrapositive of `lem:gate`, proved in full at
+        // `popl-conf/tex/appendix.tex:123-166` — and it is **not the
+        // proposition this skip needs**. The draft's proof of `thm:alg` pivots
+        // on "every place the outer search abandons a branch is a place it
+        // reports", and **a skip abandons no branch**: the execution continues
+        // and every later gate still fires.
+        //
+        // **Discriminated on the gate variant, and it must be.** An
+        // undiscriminated skip also suppresses `Gate::Completion` — the one
+        // gate `thm:alg`'s soundness depends on — and "completion always runs
+        // fully replayed" is an *unchecked condition* that three things in this
+        // tree contradict: `unreplayed_events`' own doc calls its entries
+        // "never consulted"; `must.rs` records the completion gate having
+        // already fired on an unreplayed graph once, with one route closed and
+        // no argument it was the only one; and an **invisible** thread's
+        // `Block(Assert)` — which the draft admits — enters
+        // `unreplayed_events`, survives `revisit_view` into the next execution,
+        // and can never be drained, because `is_thread_runnable` never
+        // schedules the thread at that index. Left undiscriminated, that path
+        // skips the completion gate, never calls `cover`, and **misses a
+        // violation in silence**.
+        if gate != Gate::Completion && !g1.unreplayed_events.is_empty() {
+            self.skipped_gates += 1;
+            return GateOutcome::Continue;
+        }
+
+        // **F42: a fresh gate that changed nothing observable is skipped.**
+        //
+        // The gate's question is "does some specification graph cover `G₁`?".
+        // A **fresh** event added by an *invisible* thread cannot change that
+        // answer, and the argument is already written out above `Diagnostic`:
+        // such an event is `porf`-**maximal**, so it is the source of no `porf`
+        // path between two events that already exist — it therefore adds no
+        // `vo` edge between pre-existing visible events, and leaves both the
+        // observations and `matches` unchanged.
+        //
+        // The cheap test for "the fresh event was invisible" is that the
+        // **visible observation count did not change**. A visible thread's
+        // fresh send or receive contributes exactly one observation, so the
+        // count moves iff the actor was visible. This costs one graph walk,
+        // against a whole specification execution for the probe it avoids.
+        //
+        // **Only the two fresh gates.** `RevisitApply` changes an existing
+        // receive's `rf`, which can reorder pre-existing events and is exactly
+        // the case the maximality argument does not cover; `Completion` is the
+        // gate soundness rests on. Both always run.
+        //
+        // **What is not closed**, and it is recorded above `Diagnostic` rather
+        // than discovered here: §4.1 exempts CToss/Choice revisits from the
+        // revisit-apply gate, so after such a pop a replayed prefix carrying
+        // visible events is first seen by whichever fresh event gates next.
+        // Skipping that gate leaves the prefix unchecked *in this execution* —
+        // and it is checked at `Completion`, which always runs, for the same
+        // reason F49's skip is sound: **a skip abandons no branch**. That is
+        // the whole argument; it is weaker than the unproven implication the
+        // `Diagnostic` note flags, and it does not depend on it.
+        if matches!(gate, Gate::FreshSend | Gate::FreshRecv) {
+            let seen = crate::conformance::obs::wobs(g1, &self.visible)
+                .map(|w| {
+                    self.visible
+                        .iter()
+                        .map(|n| w.of(n).len())
+                        .sum::<usize>()
+                })
+                .ok();
+            if let Some(seen) = seen {
+                if self.last_visible_obs == Some(seen) {
+                    self.inert_gates += 1;
+                    return GateOutcome::Continue;
+                }
+                self.last_visible_obs = Some(seen);
+            }
+        } else {
+            // A revisit or a completion may change what is observed without
+            // adding an event, so the cache cannot be trusted across them.
+            self.last_visible_obs = None;
+        }
+
+        // The precondition the discrimination above relies on, **checked
+        // rather than assumed** — the rule `check_spawn_order` follows a few
+        // lines below. If this ever fires, the skip is not an adequate repair
+        // and the narrower per-event predicate ("a send some visible row needs
+        // is still pending") is required instead.
+        assert!(
+            gate != Gate::Completion || g1.unreplayed_events.is_empty(),
+            "conformance: the completion gate fired on a graph with {} unreplayed \
+             event(s). F49's skip assumes this cannot happen, and the soundness \
+             argument for it rests on that assumption",
+            g1.unreplayed_events.len()
+        );
+
         // **No consistency check runs here, deliberately** (criterion 2, and
         // gate-4 review m4: the criterion says leaving this unstated is not
         // acceptable). F38 records that the consistency checker contributes
@@ -932,13 +1114,6 @@ impl ConfCtx {
         // happened to reject would have its conformance verdict silently
         // skipped. `Cover` carries the whole weight.
         //
-        // §8's precondition, checked rather than assumed. A violation is the
-        // *user's* mistake in the implementation program, not a conformance
-        // verdict, so it is raised loudly and is never folded into ⊥ — the
-        // same rule `ObsError` follows in the search.
-        if let Err(e) = check_spawn_order(g1, &self.visible) {
-            panic!("conformance: {e}");
-        }
 
         // **A gate-disabled context has nothing to ask.** §8's guard above
         // still ran — a §8 violation is the user's error in whichever program

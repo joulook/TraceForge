@@ -82,6 +82,17 @@ where
             seed = rng.next_u64();
         }
     });
+    // **F51.** `Drop for ContinuationPool` cannot free its stacks — it runs
+    // from a thread-local destructor, and freeing means resuming each
+    // continuation, which reads the generator crate's own thread-local,
+    // forbidden during TLS destruction on Linux. So the `ManuallyDrop`
+    // generator and its `mmap`ed stack survive the drop. `drain_and_free` is
+    // the path that exists for this, and it must be called explicitly, during
+    // normal execution.
+    // The pool is deliberately shared across all samples above, so stacks are
+    // reused rather than reallocated per sample; this frees them once, at the
+    // end, rather than leaking the whole run's worth.
+    pool.drain_and_free();
 
     // Clear the thread-local reference so the Must instance can be dropped
     Must::set_current(None);
