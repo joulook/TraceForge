@@ -138,9 +138,10 @@ fn conformance_sources() -> Vec<(String, String)> {
 /// The test modules. They are `#[cfg(test)]`, so nothing they print is in a
 /// user's output at all, which is why they are out of criterion 1's domain
 /// rather than allowlisted within it.
-const TEST_ONLY_FILES: [&str; 4] = [
+const TEST_ONLY_FILES: [&str; 5] = [
     "adversarial.rs",
     "gate_tests.rs",
+    "s5_harden.rs",
     "s5_tests.rs",
     "testing.rs",
 ];
@@ -1952,7 +1953,7 @@ fn c9_a_recomputation_that_cannot_reproduce_the_verdict_says_so() {
         true,
     );
     match r.diagnose(&graph, true) {
-        Diagnostics::Unavailable { because } => {
+        Diagnostics::Unavailable { because, .. } => {
             assert!(because.contains("budget"), "{because}");
         }
         other => panic!("a recomputation with no budget produced a diagnostic anyway: {other:?}"),

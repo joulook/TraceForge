@@ -192,6 +192,7 @@ impl Recompute {
             Ok(Cover::NoCover) => {}
             Ok(Cover::Found(_)) => {
                 return Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                     because: "re-running the search on the reported graph found a cover, so \
                               this recomputation does not describe the same question the \
                               gate answered"
@@ -200,6 +201,7 @@ impl Recompute {
             }
             Ok(Cover::BudgetExhausted) => {
                 return Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                     because: "re-running the search on the reported graph ran out of budget, \
                               so it did not reproduce the gate's \u{22a5}"
                         .to_owned(),
@@ -207,6 +209,7 @@ impl Recompute {
             }
             Err(e) => {
                 return Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                     because: format!(
                         "re-running the search on the reported graph raised a usage error: {e}"
                     ),
@@ -224,6 +227,7 @@ impl Recompute {
             },
             Err(e) => {
                 return Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                     because: format!("the implementation graph's observations could not be extracted: {e}"),
                 }
             }
@@ -233,6 +237,7 @@ impl Recompute {
             Ok(Answer::NoCover) => {}
             Ok(other) => {
                 return Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                     because: format!(
                         "the recomputation answered {other:?} where the search answered \u{22a5}"
                     ),
@@ -240,6 +245,7 @@ impl Recompute {
             }
             Err(e) => {
                 return Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                     because: format!("the recomputation raised a usage error: {e}"),
                 }
             }
@@ -247,6 +253,7 @@ impl Recompute {
 
         let Some(graph) = best.graph else {
             return Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                 because: "no specification attempt followed the implementation graph at all, \
                           not even the empty one"
                     .to_owned(),
@@ -259,8 +266,19 @@ impl Recompute {
             .zip(best.vector.iter().copied())
             .collect();
         match self.obligation(&outer, &graph) {
-            Ok(obligation) => Diagnostics::Available { prefix, obligation },
+            Ok(Some(obligation)) => Diagnostics::Available { prefix, obligation },
+            // The morphism holds on this attempt and no extension of it
+            // covers, which §7.1's four values cannot express (round-5 B1).
+            // Saying so is better than emitting a Φ claim that is false.
+            Ok(None) => Diagnostics::Unavailable {
+                kind: report::UnavailableKind::NoValueForIt,
+                because: "the morphism holds on the furthest-following attempt and no \
+                          extension of it covers, which §7.1's obligation list has no \
+                          value for; see F-7"
+                    .to_owned(),
+            },
             Err(e) => Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
                 because: format!("the failing obligation could not be identified: {e}"),
             },
         }
@@ -544,7 +562,7 @@ impl Recompute {
         &self,
         outer: &Outer<'_>,
         graph: &ExecutionGraph,
-    ) -> Result<Obligation, ObsError> {
+    ) -> Result<Option<Obligation>, ObsError> {
         let spec_wobs = wobs(graph, &self.visible)?;
 
         // (M1)
@@ -553,17 +571,17 @@ impl Recompute {
             let i = outer.wobs.of(name);
             for (k, ((_, a), (_, b))) in s.iter().zip(i).enumerate() {
                 if a != b {
-                    return Ok(Obligation::ObservationMismatch {
+                    return Ok(Some(Obligation::ObservationMismatch {
                         thread: name.clone(),
                         position: k,
                         spec: report::obs_text(a),
                         imp: report::obs_text(b),
-                    });
+                    }));
                 }
             }
             if s.len() != i.len() {
                 let k = s.len().min(i.len());
-                return Ok(Obligation::ObservationMismatch {
+                return Ok(Some(Obligation::ObservationMismatch {
                     thread: name.clone(),
                     position: k,
                     spec: s
@@ -574,7 +592,7 @@ impl Recompute {
                         .get(k)
                         .map(|(_, o)| report::obs_text(o))
                         .unwrap_or_else(report::nothing_text),
-                });
+                }));
             }
         }
 
@@ -597,12 +615,12 @@ impl Recompute {
                 let spec_ordered = se1 != se2 && graph.in_porf(*se1, *se2);
                 let imp_ordered = ie1 != ie2 && outer.graph.in_porf(*ie1, *ie2);
                 if spec_ordered && !imp_ordered {
-                    return Ok(Obligation::MissingPullBack {
+                    return Ok(Some(Obligation::MissingPullBack {
                         spec_from: report::event_text(*se1),
                         spec_to: report::event_text(*se2),
                         imp_from: report::event_text(*ie1),
                         imp_to: report::event_text(*ie2),
-                    });
+                    }));
                 }
             }
         }
@@ -620,17 +638,41 @@ impl Recompute {
                     let a = spec_statuses.get(name);
                     let b = imp_statuses.get(name);
                     if a != b {
-                        return Ok(Obligation::StatusMismatch {
+                        return Ok(Some(Obligation::StatusMismatch {
                             thread: name.clone(),
                             spec: a.copied().map(report::status_text).unwrap_or("absent").to_owned(),
                             imp: b.copied().map(report::status_text).unwrap_or("absent").to_owned(),
-                        });
+                        }));
                     }
                 }
             }
         }
 
-        Ok(Obligation::NoOfferablePassedPhi)
+        // §7.1's fourth value, **verified before it is emitted**.
+        //
+        // Round-5 review, B1: this used to return the variant unconditionally,
+        // and the first fixture anyone built for it showed the sentence to be
+        // false — an offerable specification event *had* passed Φ at the very
+        // attempt the report names. The cause is structural rather than
+        // incidental. Φ-emptiness is a property of a traversal **leaf**, and
+        // `graph` here is `best.graph`, the max-vector *following* attempt:
+        // `Best::offer` replaces only on a strictly greater vector, so an
+        // extension installing an **invisible** event leaves `best.graph`
+        // unmoved. A non-leaf best attempt is therefore ordinary, not exotic.
+        //
+        // So ask. If no offer passes Φ the value is true and is emitted; if
+        // some offer does, we know the morphism held on this attempt and that
+        // no extension of it covered, which is a *different* statement and
+        // §7.1 has no value for it — so say nothing rather than say something
+        // false. Introducing that fifth value is §7.1's own question and is
+        // routed to the owner with F-7, A13 and H-1.
+        let probed = self.probe(graph.clone());
+        for offer in probed.offers() {
+            if self.phi(outer, probed.graph(), offer)? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Obligation::NoOfferablePassedPhi))
     }
 }
 
@@ -733,9 +775,23 @@ pub(crate) fn spec_side_first_mismatch(d: &Diagnostics, cause: &ReportCause) -> 
         (_, ReportCause::VisibleError { .. }) => {
             "not applicable: this report is a failed assertion, not a `Cover` answer".to_owned()
         }
-        (Diagnostics::Unavailable { because }, _) => {
-            format!("unavailable ({because})")
-        }
+        (
+            Diagnostics::Unavailable {
+                kind: report::UnavailableKind::Diverged,
+                because,
+            },
+            _,
+        ) => format!("unavailable ({because})"),
+        // The recomputation agreed; §7.1 has no name for what it found (A14).
+        // Said as itself rather than folded into "unavailable", which would
+        // read as a failure of the recomputation.
+        (
+            Diagnostics::Unavailable {
+                kind: report::UnavailableKind::NoValueForIt,
+                ..
+            },
+            _,
+        ) => "no §7.1 obligation names this failure; see A14".to_owned(),
         (Diagnostics::NotApplicable, _) => "not applicable".to_owned(),
     }
 }

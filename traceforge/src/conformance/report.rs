@@ -171,12 +171,35 @@ pub enum Diagnostics {
         prefix: Vec<(String, usize)>,
         obligation: Obligation,
     },
-    /// It did **not** reproduce the search's verdict, so it says so rather
-    /// than guessing. `blame_for` cost S4 two rounds to learn this.
-    Unavailable { because: String },
+    /// No obligation is named. **Two unlike reasons**, kept apart because
+    /// the rendering used to assert the first of them unconditionally and was
+    /// therefore false for the second — B1's own shape, one layer up
+    /// (developer's B1-fix pass, F-B1b).
+    ///
+    /// `Diverged` is the original: the recomputation did not reproduce the
+    /// search's verdict, so it refuses to guess. `blame_for` cost S4 two
+    /// rounds to learn that.
+    ///
+    /// `NoValueForIt` is the case §7.1 cannot express — the morphism holds on
+    /// the furthest-following attempt and no extension of it covers. The
+    /// recomputation agreed with the search perfectly; the *enumeration* is
+    /// what falls short, which is **A14**.
+    Unavailable {
+        because: String,
+        kind: UnavailableKind,
+    },
     /// There is no inner-search attempt to describe: a §4.4 visible-error
     /// report is not a `Cover` answer at all.
     NotApplicable,
+}
+
+/// Why no obligation was named. See [`Diagnostics::Unavailable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnavailableKind {
+    /// The recomputation did not reproduce the search's verdict.
+    Diverged,
+    /// It did, and §7.1's four values have no name for what it found (A14).
+    NoValueForIt,
 }
 
 /// The first failing obligation — §7.1's four values.
@@ -953,13 +976,25 @@ impl fmt::Display for Diagnostics {
                      observation count: [{p}]\n    first failing obligation: {obligation}"
                 )
             }
-            Diagnostics::Unavailable { because } => write!(
-                f,
-                "inner-search diagnostics unavailable: {because}. The diagnostics are \
-                 recomputed outside the search, and a recomputation that does not \
-                 reproduce the search's own verdict is not evidence about this report — \
-                 saying so beats guessing"
-            ),
+            Diagnostics::Unavailable { because, kind } => match kind {
+                UnavailableKind::Diverged => write!(
+                    f,
+                    "inner-search diagnostics unavailable: {because}. The diagnostics are \
+                     recomputed outside the search, and a recomputation that does not \
+                     reproduce the search's own verdict is not evidence about this report — \
+                     saying so beats guessing"
+                ),
+                // Deliberately *not* the sentence above: here the recomputation
+                // agreed with the search exactly, and claiming otherwise would
+                // assert a condition the code did not check — which is the
+                // defect this whole path exists to have fixed.
+                UnavailableKind::NoValueForIt => write!(
+                    f,
+                    "inner-search diagnostics unavailable: {because}. The recomputation \
+                     agreed with the search here; it is §7.1's list of obligations that \
+                     has no name for what it found"
+                ),
+            },
             Diagnostics::NotApplicable => write!(
                 f,
                 "inner-search diagnostics do not apply: this report is a failed assertion, \

@@ -102,7 +102,8 @@ pub(crate) mod triage;
 //   the one distinction the theorem turns on; hiding it behind `Display` would
 //   leave a programmatic caller with `to_string().contains(..)`.
 // - **the report and its parts** — `ConfReport`, `ReportGate`, `ReportCause`,
-//   `Diagnostics`, `Obligation`, `VisTrace`, `TriageOutcome`, `OracleOutcome`,
+//   `Diagnostics`, `UnavailableKind`, `Obligation`, `VisTrace`, `TriageOutcome`,
+//   `OracleOutcome`,
 //   `ReplaySnapshot`, `ConfExhaustion`, `ConfNote`.
 //
 // What is **not** exported, deliberately: `Gate`, `ReportKind`, `Report`,
@@ -126,7 +127,8 @@ pub use config::{ConfBuilder, ConfConfig, ConfigError, ScopeField, DEFAULT_SEARC
 pub use report::{
     Certificate, ConfError, ConfExhaustion, ConfNote, ConfOutcome, ConfReport, ConfVerdict,
     Diagnostics, NotACertificate, Obligation, OracleOutcome, ReplaySnapshot,
-    ReportCause, ReportGate, SearchEnd, SpecErrFreedom, TriageFailure, TriageOutcome, VisTrace,
+    ReportCause, ReportGate, SearchEnd, SpecErrFreedom, TriageFailure, TriageOutcome,
+    UnavailableKind, VisTrace,
 };
 
 use std::sync::Arc;
@@ -205,6 +207,8 @@ pub(crate) fn assert_config_in_scope(config: &crate::Config, engine: &str) {
 pub(crate) mod adversarial;
 #[cfg(test)]
 mod gate_tests;
+#[cfg(test)]
+mod s5_harden;
 #[cfg(test)]
 mod s5_tests;
 #[cfg(test)]
