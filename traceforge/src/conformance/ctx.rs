@@ -1041,6 +1041,47 @@ impl ConfCtx {
             return GateOutcome::Continue;
         }
 
+        // The precondition the discrimination above relies on, **checked
+        // rather than assumed** — the rule `check_spawn_order` follows a few
+        // lines below. If this ever fires, the skip is not an adequate repair
+        // and the narrower per-event predicate ("a send some visible row needs
+        // is still pending") is required instead.
+        assert!(
+            gate != Gate::Completion || g1.unreplayed_events.is_empty(),
+            "conformance: the completion gate fired on a graph with {} unreplayed \
+             event(s). F49's skip assumes this cannot happen, and the soundness \
+             argument for it rests on that assumption",
+            g1.unreplayed_events.len()
+        );
+
+        // **No consistency check runs here, deliberately** (criterion 2, and
+        // gate-4 review m4: the criterion says leaving this unstated is not
+        // acceptable). F38 records that the consistency checker contributes
+        // nothing under this fragment — `is_consistent` is vacuous in scope —
+        // so calling it would add cost and decide nothing, and a graph it
+        // happened to reject would have its conformance verdict silently
+        // skipped. `Cover` carries the whole weight.
+
+        // **A gate-disabled context has nothing to ask.** §8's guard above
+        // still ran — a §8 violation is the user's error in whichever program
+        // commits it, and the precheck is the only engine that sees the
+        // specification's own graphs from outside the search — but there is no
+        // probe worker, no seed and no `Cover` call.
+        if self.worker.is_none() {
+            return GateOutcome::Continue;
+        }
+
+        // **F57: this sits below the gate-disabled return, deliberately.**
+        // The inertness test costs one `wobs` walk per fresh event, and its
+        // only use is to skip a `cover` call. A gate-disabled context (precheck,
+        // triage, oracle) never calls `cover`, so above that return the walk
+        // bought nothing: measured at 15–24% of oracle runtime on a one-sender
+        // fixture, where the per-gate cost doubled as the graph doubled (F57).
+        // Below it, gate-enabled contexts are
+        // unaffected — `worker` is fixed at construction (`Some` in `new`,
+        // `None` in `gate_disabled`) and never taken — and the published
+        // `inert_gates` count comes only from the gate-enabled context.
+        //
         // **F42: a fresh gate that changed nothing observable is skipped.**
         //
         // The gate's question is "does some specification graph cover `G₁`?".
@@ -1090,38 +1131,18 @@ impl ConfCtx {
         } else {
             // A revisit or a completion may change what is observed without
             // adding an event, so the cache cannot be trusted across them.
+            //
+            // **Redundant under `explore`'s current ordering, and kept on
+            // purpose** (developer, `P3-F57`, finding 2). An execution runs
+            // `begin_execution` (which also clears this cache, F55), then its
+            // fresh gates, then `Completion`, then `try_revisit`'s
+            // `RevisitApply` gates. So `begin_execution`'s reset always runs
+            // before the next fresh gate reads the cache, and deleting this
+            // arm alone changes no measured result. It stays so that the
+            // cache's soundness does not rest on that ordering: a revisit that
+            // is followed by a fresh gate *without* an intervening
+            // `begin_execution` would otherwise read a stale count.
             self.last_visible_obs = None;
-        }
-
-        // The precondition the discrimination above relies on, **checked
-        // rather than assumed** — the rule `check_spawn_order` follows a few
-        // lines below. If this ever fires, the skip is not an adequate repair
-        // and the narrower per-event predicate ("a send some visible row needs
-        // is still pending") is required instead.
-        assert!(
-            gate != Gate::Completion || g1.unreplayed_events.is_empty(),
-            "conformance: the completion gate fired on a graph with {} unreplayed \
-             event(s). F49's skip assumes this cannot happen, and the soundness \
-             argument for it rests on that assumption",
-            g1.unreplayed_events.len()
-        );
-
-        // **No consistency check runs here, deliberately** (criterion 2, and
-        // gate-4 review m4: the criterion says leaving this unstated is not
-        // acceptable). F38 records that the consistency checker contributes
-        // nothing under this fragment — `is_consistent` is vacuous in scope —
-        // so calling it would add cost and decide nothing, and a graph it
-        // happened to reject would have its conformance verdict silently
-        // skipped. `Cover` carries the whole weight.
-        //
-
-        // **A gate-disabled context has nothing to ask.** §8's guard above
-        // still ran — a §8 violation is the user's error in whichever program
-        // commits it, and the precheck is the only engine that sees the
-        // specification's own graphs from outside the search — but there is no
-        // probe worker, no seed and no `Cover` call.
-        if self.worker.is_none() {
-            return GateOutcome::Continue;
         }
 
         let events: usize = g1.thread_ids().into_iter().map(|t| g1.thread_size(t)).sum();
@@ -1137,7 +1158,7 @@ impl ConfCtx {
         let answer = self
             .worker
             .as_ref()
-            .expect("conformance: the worker was checked present two statements ago")
+            .expect("conformance: the worker was checked present at the gate-disabled return above")
             .cover(g1, gate.outer_complete(), seed);
         match answer {
             Ok(Cover::Found(h)) => {

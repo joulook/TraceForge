@@ -3163,3 +3163,340 @@ fn no_visible_threads_fresh_event_is_inert() {
         );
     }
 }
+
+// ===========================================================================
+// F57 --- F42's inertness walk moved below the gate-disabled return.
+//
+// Written in the developer's P3-F57 pass. Before the move, a gate-disabled
+// context (precheck, triage, oracle) paid F42's `wobs` walk on every fresh
+// gate and then returned without calling `cover`, so the walk bought nothing.
+// ===========================================================================
+
+/// **A gate-disabled context counts no inert gates**, in each of the three
+/// modes the precheck, triage and oracle build one in.
+///
+/// `inert_gates` is incremented only by F42's block. Below the gate-disabled
+/// return, a gate-disabled context never reaches that block, so its count is
+/// zero on every program. `two_workers` with only `main` visible is chosen
+/// because its fresh gates **are** inert. The test proves that on the same
+/// program: a gate-enabled run at budget 0 skips 3 of them as inert. And the
+/// gate-disabled run is a real run: it completes 4 executions.
+///
+/// **Measured before the move** (`P3-F57`, block moved back above the return):
+/// all three modes read `inert=3 skipped=1 execs=4`. After: `inert=0 skipped=1
+/// execs=4`. So this test fails on the old placement; see the audit line below.
+///
+/// **Mutation, MEASURED**: F42's block moved back above
+/// `if self.worker.is_none()` — this test fails on `Precheck: a gate-disabled
+/// context reached F42's block and counted 3 inert gate(s)`.
+#[test]
+fn a_gate_disabled_context_counts_no_inert_gates() {
+    use crate::conformance::ctx::ConfMode;
+
+    let enabled = verify_conformance(fifo(), two_workers, || {}, names(&["main"]), 0);
+    assert_eq!(
+        enabled.inert_gates, 3,
+        "the program has inert fresh gates, or this test is vacuous"
+    );
+
+    for mode in [ConfMode::Precheck, ConfMode::Triage, ConfMode::Collect] {
+        let (inert, _skipped, execs) = f57_gate_disabled_counts(mode, two_workers, &["main"]);
+        assert_eq!(
+            execs, 4,
+            "{mode:?}: the gate-disabled run explored the program"
+        );
+        assert_eq!(
+            inert, 0,
+            "{mode:?}: a gate-disabled context reached F42's block and counted {inert} \
+             inert gate(s). The block must sit below the gate-disabled return (F57)."
+        );
+    }
+}
+
+/// **Gate-enabled runs are unchanged by the F57 move**: census, skip counters
+/// and report set, pinned at the values measured on **both** placements.
+///
+/// "Before" is a measurement, not a recollection. At `P3-F57` the same probe
+/// ran on the current tree and on the tree with F42's block moved back above
+/// the gate-disabled return. Every gate-enabled line was byte-identical, and
+/// the only lines that differed were the gate-disabled `inert` counts (3 → 0).
+/// The `two_workers` rows also equal the table
+/// [`the_inert_counter_conserves_the_gate_call_count`] recorded before the move.
+///
+/// Pinned:
+/// - **Census at budget 0** — `(exhaustions, skipped_gates, inert_gates)` for
+///   `two_workers` under four visible lists, and for [`f57_four`] under three.
+///   Also F56's invariant: `exhaustions + skipped + inert` is the same for every
+///   visible list of one program (14 and 28).
+/// - **Report set at budget 4096** for [`f57_four`] against [`f57_four_spec`],
+///   under three visible lists, as sorted `gate/kind/events` triples, with the
+///   two skip counters.
+///
+/// These are exact engine figures. A later change to exploration order may move
+/// them, and that would be a real change for whoever makes it to re-derive, not
+/// noise. Neither program calls `nondet()`, so under `LTR` scheduling the
+/// unseeded `fifo()` config does not affect them. The seed drives only
+/// `nondet()`'s initial value there, and repeated runs agreed.
+///
+/// **Mutations, MEASURED at `P3-F57`** (`ctx.rs`, full lib suite):
+/// - F42's block moved back above the return — this test **passes**, which is
+///   the claim: a gate-enabled run is unaffected by where the block sits;
+/// - F42's block deleted, or the inert skip returning without incrementing —
+///   this test fails on `["main", "w1"]: census (exhaustions, skipped,
+///   inert)`;
+/// - both cache resets deleted — fails on `["main", "w1", "w2"]: census`.
+#[test]
+fn gate_enabled_runs_are_unchanged_by_the_f57_move() {
+    type Row<'a> = (&'a [&'a str], (usize, usize, usize));
+    let census = |program: fn(), rows: &[Row]| {
+        let mut totals = Vec::new();
+        for (vis, want) in rows {
+            let out = verify_conformance(fifo(), program, || {}, names(vis), 0);
+            assert!(
+                out.reports.is_empty(),
+                "{vis:?}: a zero budget reports nothing"
+            );
+            let got = (out.exhaustions.len(), out.skipped_gates, out.inert_gates);
+            assert_eq!(got, *want, "{vis:?}: census (exhaustions, skipped, inert)");
+            totals.push(got.0 + got.1 + got.2);
+        }
+        totals
+    };
+
+    let t = census(
+        two_workers,
+        &[
+            (&["main", "w1", "w2"], (13, 1, 0)),
+            (&["main", "w1"], (11, 1, 2)),
+            (&["main"], (10, 1, 3)),
+            (&["w1"], (9, 1, 4)),
+        ],
+    );
+    assert!(
+        t.iter().all(|x| *x == 14),
+        "F56: gate calls conserved: {t:?}"
+    );
+
+    let t = census(
+        f57_four,
+        &[
+            (&["main", "w1", "w2"], (23, 5, 0)),
+            (&["main", "w1"], (21, 5, 2)),
+            (&["main"], (20, 5, 3)),
+        ],
+    );
+    assert!(
+        t.iter().all(|x| *x == 28),
+        "F56: gate calls conserved: {t:?}"
+    );
+
+    let six = [
+        "Some(Completion)/NoCover/15",
+        "Some(Completion)/NoCover/15",
+        "Some(FreshRecv)/NoCover/15",
+        "Some(RevisitApply)/NoCover/13",
+        "Some(RevisitApply)/NoCover/14",
+        "Some(RevisitApply)/NoCover/14",
+    ];
+    type Reporting<'a> = (&'a [&'a str], &'a [&'a str], (usize, usize));
+    let reporting: [Reporting; 3] = [
+        (&["main"], &six, (5, 3)),
+        (&["main", "w1"], &six, (5, 2)),
+        (
+            &["main", "w1", "w2"],
+            &["Some(FreshSend)/NoCover/11"],
+            (0, 0),
+        ),
+    ];
+    for (vis, want, (skipped, inert)) in reporting {
+        let out = verify_conformance(fifo(), f57_four, f57_four_spec, names(vis), 4096);
+        assert_eq!(f57_report_signature(&out), want, "{vis:?}: report set");
+        assert_eq!(
+            (out.skipped_gates, out.inert_gates),
+            (skipped, inert),
+            "{vis:?}: (skipped, inert) on the reporting run"
+        );
+    }
+}
+
+/// **F55's execution-boundary reset of F42's cache is load-bearing, and this
+/// catches its removal.** It uses fixed seeds, because the result depends on
+/// them.
+///
+/// F42 caches the last gate's visible observation count in
+/// `last_visible_obs`, and `begin_execution` clears it (F55's fix). At `P3-F57`
+/// **no default-suite test guarded that line**: deleting it left all 405 lib
+/// tests green. The one known witness was the `#[ignore]`d eager-2PC
+/// measurement. With seeds 0 and 1 at `N = 4` it gives **148** reports on this
+/// tree and **174** without the reset, which is F55's own figure. That test
+/// asserts only a non-zero count, and it takes about 18 s per run.
+///
+/// **The seed is fixed because the default is not.** `Config`'s default seed is
+/// `rand::rng().next_u64()`, and `nondet()` draws its initial value from it.
+/// So a pruning run on a program that branches has a seed-dependent report set
+/// and seed-dependent skip counters. On this pair, the same unseeded call on
+/// one thread gave different results from round to round. Each seed below was
+/// run twice per tree, with identical results.
+///
+/// **Measured at `P3-F57`**, pinned below: visible `main, w1`, seeds `0..6`,
+/// one report (`FreshSend` at 8 events) and `skipped = 9` on every seed. The
+/// `inert` counts are `1, 1, 1, 2, 1, 1` with the reset and
+/// `1, 2, 2, 3, 2, 2` without it: five of six seeds move, and the report set
+/// does not. So this is a **counter-level** witness. The verdict-level witness
+/// is the 18 s one above. At `N = 3` the eager 2PC also moves only its counter
+/// (88/91 → 101).
+///
+/// **The other reset — the `else` arm in `ConfCtx::gate` — is not tested,
+/// because it cannot be observed while this one stands.** `explore` runs
+/// `begin_execution`, then the execution (the fresh gates), then
+/// `complete_execution`, which runs the `Completion` gate and then
+/// `try_revisit`'s `RevisitApply` gates. So `begin_execution`'s reset always
+/// comes between the `else` arm and the next fresh gate. Measured: deleting the
+/// `else` arm changes nothing on any seed above, or on the eager 2PC at
+/// `N = 3, 4`. Deleting **both** resets fails four tests.
+///
+/// **Mutations, MEASURED at `P3-F57`** (`ctx.rs`, full lib suite, restored
+/// and md5-verified after each):
+/// - `begin_execution`'s reset deleted — 405/1, **only this test**: `seed 1:
+///   (skipped, inert). An inert count above the pinned value …`;
+/// - the `else` arm deleted — 406/0 (the equivalent mutant above);
+/// - both deleted — 402/4: this test (on seed 0),
+///   `gate_enabled_runs_are_unchanged_by_the_f57_move`,
+///   `no_visible_threads_fresh_event_is_inert`, and
+///   `c2_nondet_installs_and_flips_are_not_gated`.
+#[test]
+fn f55s_execution_boundary_reset_is_load_bearing() {
+    let want_inert = [1usize, 1, 1, 2, 1, 1];
+    for (seed, inert) in want_inert.into_iter().enumerate() {
+        let config = Config::builder()
+            .with_cons_type(ConsType::FIFO)
+            .with_seed(seed as u64)
+            .build();
+        let out = verify_conformance(
+            config,
+            f57_branching_workers,
+            f57_branching_spec,
+            names(&["main", "w1"]),
+            4096,
+        );
+        assert_eq!(
+            f57_report_signature(&out),
+            ["Some(FreshSend)/NoCover/8"],
+            "seed {seed}: report set"
+        );
+        assert_eq!(
+            (out.skipped_gates, out.inert_gates),
+            (9, inert),
+            "seed {seed}: (skipped, inert). An inert count above the pinned value is \
+             F42's cache surviving an execution boundary (F55)."
+        );
+    }
+}
+
+/// Two invisible workers that each branch on `nondet()`; `main` receives
+/// three values.
+fn f57_branching_workers() {
+    let m = main_thread_id();
+    let _w1 = named("w1", move || {
+        if crate::nondet() {
+            crate::send_msg(m, 1u64);
+        } else {
+            crate::send_msg(m, 2u64);
+        }
+        crate::send_msg(m, 3u64);
+    });
+    let _w2 = named("w2", move || {
+        crate::send_msg(m, 4u64);
+        if crate::nondet() {
+            crate::send_msg(m, 5u64);
+        }
+    });
+    for _ in 0..3 {
+        let _: u64 = crate::recv_msg_block();
+    }
+}
+
+/// The specification for [`f57_branching_workers`]: no branching, fixed values.
+fn f57_branching_spec() {
+    let m = main_thread_id();
+    let _w1 = named("w1", move || {
+        crate::send_msg(m, 1u64);
+        crate::send_msg(m, 3u64);
+    });
+    let _w2 = named("w2", move || {
+        crate::send_msg(m, 4u64);
+        crate::send_msg(m, 5u64);
+    });
+    for _ in 0..3 {
+        let _: u64 = crate::recv_msg_block();
+    }
+}
+
+/// `(inert_gates, skipped_gates, completed executions)` of a **gate-disabled**
+/// context of the given mode, run over `program` with `visible` declared.
+///
+/// Built the way the precheck, triage and oracle build theirs:
+/// `ConfCtx::gate_disabled` handed to `Must::enable_conformance`, then
+/// `explore`.
+fn f57_gate_disabled_counts<F>(
+    mode: crate::conformance::ctx::ConfMode,
+    program: F,
+    visible: &[&str],
+) -> (usize, usize, usize)
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    use crate::conformance::ctx::ConfCtx;
+    use crate::must::Must;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    let must = Rc::new(RefCell::new(Must::new(fifo(), false)));
+    must.borrow_mut()
+        .enable_conformance(ConfCtx::gate_disabled(fifo(), names(visible), mode));
+    {
+        let _guard = crate::conformance::testing::CurrentMustGuard;
+        crate::explore(&must, &Arc::new(program));
+    }
+    let m = must.borrow();
+    let ctx = m.conf_ctx().expect("conformance: context went missing");
+    (ctx.inert_gates(), ctx.skipped_gates(), m.stats().execs)
+}
+
+/// A run's report set, as `(gate, kind, events)` sorted.
+fn f57_report_signature(out: &Outcome) -> Vec<String> {
+    let mut v: Vec<String> = out
+        .reports
+        .iter()
+        .map(|r| format!("{:?}/{:?}/{}", r.gate, r.kind, r.events))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Two invisible-capable workers each sending two values; `main` receives all
+/// four. More gates and more executions than `two_workers`.
+fn f57_four() {
+    f57_four_with(4)
+}
+
+/// [`f57_four`] with `w2`'s second value changed, so a run reports.
+fn f57_four_spec() {
+    f57_four_with(5)
+}
+
+fn f57_four_with(last: u64) {
+    let m = main_thread_id();
+    let _w1 = named("w1", move || {
+        crate::send_msg(m, 1u64);
+        crate::send_msg(m, 2u64);
+    });
+    let _w2 = named("w2", move || {
+        crate::send_msg(m, 3u64);
+        crate::send_msg(m, last);
+    });
+    for _ in 0..4 {
+        let _: u64 = crate::recv_msg_block();
+    }
+}

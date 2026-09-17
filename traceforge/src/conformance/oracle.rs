@@ -423,8 +423,9 @@ where
     // **No exhaustions check here, deliberately** (F-D9, gate 3). An earlier
     // version of this function checked `ctx.exhaustions().is_empty()` for F43.
     // That guard **cannot fire on this path**: the only `exhaustions.push` is
-    // inside the `Cover::BudgetExhausted` arm (`ctx.rs:990`), which sits below
-    // `ctx.rs:948`'s `if self.worker.is_none() { return }`, and this function
+    // inside the `Cover::BudgetExhausted` arm of `ConfCtx::gate`, which sits
+    // below that function's gate-disabled return
+    // (`if self.worker.is_none() { return GateOutcome::Continue; }`), and this function
     // builds its context with `gate_disabled` — the only constructor setting
     // `worker: None`. A guard that cannot fire is reassurance, not a control,
     // and refusing one is why the `search_budget` refusal was declined in the
