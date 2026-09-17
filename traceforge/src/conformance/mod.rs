@@ -260,6 +260,9 @@ pub(crate) struct Outcome {
     /// is zero or state what it was. Same obligation F43 imposes for
     /// exhaustions.
     pub(crate) skipped_gates: usize,
+    /// The random seed the outer engine used (F61). Any figure derived from a
+    /// program that calls `nondet()` depends on it; print it with the figure.
+    pub(crate) seed: u64,
     /// How many gates F42's inertness skip suppressed — a fresh event that
     /// changed nothing observable, so the gate's answer could not differ.
     pub(crate) inert_gates: usize,
@@ -307,6 +310,7 @@ pub(crate) fn verify_conformance_with(
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    let seed = config.seed;
     let ctx = ctx::ConfCtx::new(
         config.clone(),
         specification,
@@ -340,6 +344,7 @@ pub(crate) fn verify_conformance_with(
         end: conf.end(),
         skipped_gates: conf.skipped_gates(),
         inert_gates: conf.inert_gates(),
+        seed,
     }
 }
 
@@ -520,5 +525,6 @@ fn run(
         spec_errfree,
         budget: cc.search_budget,
         triage_enabled: cc.triage,
+        seed: cc.config.seed,
     }))
 }

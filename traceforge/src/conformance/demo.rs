@@ -133,6 +133,10 @@ fn run(
         panic!("UNSOUND: the algorithm certified a pair the naive procedure says does not refine");
     }
 
+    // F61: the run's seed decides the exploration order, so the violating
+    // trace printed below can differ between runs of the same pair.
+    println!("  run seed:                                 {}", v.outcome().seed());
+
     match &v {
         ConfVerdict::Conforms(_) => {
             println!("\n  VERDICT:  CONFORMS");

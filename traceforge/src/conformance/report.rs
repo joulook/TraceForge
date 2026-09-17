@@ -578,9 +578,46 @@ pub struct ConfOutcome {
     pub(crate) spec_errfree: SpecErrFreedom,
     pub(crate) budget: usize,
     pub(crate) triage_enabled: bool,
+    /// The random seed this run's engines used (F61).
+    pub(crate) seed: u64,
 }
 
 impl ConfOutcome {
+    /// **The random seed this run used** (F61).
+    ///
+    /// `nondet()` draws its first value from this seed, and that draw sets the
+    /// order in which the checker explores a program. The verdict did not
+    /// change with the seed in anything measured (`P3-F61`), but the *set* of
+    /// reports, the concrete graph inside a report, the triage trace and some
+    /// internal counts do. Under a bounded `Config` (`max_iterations`), which
+    /// branch is explored first can also decide the precheck's result.
+    ///
+    /// **What this seed reproduces, and what it does not.** Every engine a
+    /// conformance run builds (the outer run, the precheck, triage and the
+    /// diagnostics) is built from the same `Config` and so draws from this
+    /// seed. Rebuilding the **same** `Config` (every other setting unchanged)
+    /// with `.with_seed(seed)` added therefore reproduces **the choices
+    /// TraceForge makes**. It reproduces the whole run only when, in
+    /// addition, the program under test is deterministic apart from
+    /// TraceForge's own `nondet()`: it does not read time, OS randomness,
+    /// atomics or other state outside the checker. The run must also use the
+    /// same TraceForge version, and any callbacks registered with
+    /// `Config::with_callback` must not carry state that changes execution.
+    /// Callbacks are shared between *clones* of a `Config`, so a stateful one
+    /// is **not** reset by cloning it. A `Config` rebuilt through
+    /// `Config::builder()` holds only the observers registered on it, so
+    /// rebuild it with freshly constructed observers rather than clone it. An
+    /// observer that keeps its state behind its own shared handle (an `Arc`
+    /// field, say) carries that state into the rebuilt `Config` too. Within
+    /// those limits, exact
+    /// reproduction is tested, including triage's own `nondet()` rolls
+    /// (`P3-F61-fix`).
+    ///
+    /// `Config`'s default seed is fresh randomness on every call, so without
+    /// this value an unseeded run generally cannot be repeated.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
     pub fn reports(&self) -> &[ConfReport] {
         &self.reports
     }
@@ -1129,6 +1166,12 @@ fn indent(s: &str) -> String {
 
 impl fmt::Display for ConfVerdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // F61: the seed goes first, so no rendering of a verdict omits it.
+        let seed = self.outcome().seed;
+        writeln!(
+            f,
+            "conformance: run seed {seed} (reproduce with the same `Config` plus `.with_seed({seed})`)"
+        )?;
         match self {
             // ---- the certificate -------------------------------------------
             ConfVerdict::Conforms(c) => {

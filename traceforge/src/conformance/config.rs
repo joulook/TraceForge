@@ -197,6 +197,23 @@ impl ConfConfig {
     pub fn max_iterations(&self) -> Option<u64> {
         self.config.max_iterations
     }
+
+    /// **The random seed every engine of a run built from this configuration
+    /// will use** (F61): the outer run, the precheck, triage, the
+    /// specification search and the diagnostics.
+    ///
+    /// The same value appears in the result as `ConfOutcome::seed`, but
+    /// `verify` returns no outcome when it fails with an error. The
+    /// specification's err-freedom precheck is one such case, and under a
+    /// bounded `Config` whether it fails can depend on this seed. `verify`
+    /// takes the configuration by value, so read this before calling it (or
+    /// from a clone kept for the purpose). That is how such a failure is
+    /// reproduced:
+    /// rebuild the same `Config` with `.with_seed(seed)` added. See
+    /// `ConfOutcome::seed` for what that does and does not reproduce.
+    pub fn seed(&self) -> u64 {
+        self.config.seed
+    }
 }
 
 /// Builds a [`ConfConfig`]. §8's entry point.

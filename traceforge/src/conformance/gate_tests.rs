@@ -3500,3 +3500,542 @@ fn f57_four_with(last: u64) {
         let _: u64 = crate::recv_msg_block();
     }
 }
+
+// ===========================================================================
+// F61 --- the run seed is recorded, printed, and reproduces the run.
+//
+// Written in the developer's P3-F61-fix pass.
+// ===========================================================================
+
+/// Everything a user can read from a `verify` run, as one comparable value:
+/// the rendered `Display` text (which carries the seed line, the verdict, and
+/// every report with its witness), plus the structured fields the text might
+/// summarise away — verdict variant, report count, each report's gate, cause,
+/// size, witness dump, triage outcome and diagnostics, and the exhaustions.
+fn f61_public_digest(v: &crate::conformance::ConfVerdict) -> String {
+    use crate::conformance::ConfVerdict;
+    let variant = match v {
+        ConfVerdict::Conforms(_) => "Conforms",
+        ConfVerdict::Reported(_) => "Reported",
+        ConfVerdict::Inconclusive(_) => "Inconclusive",
+    };
+    let o = v.outcome();
+    let reports: Vec<String> = o
+        .reports()
+        .iter()
+        .map(|r| {
+            format!(
+                "{:?}|{:?}|{}\n{}\n{:?}\n{:?}",
+                r.gate(),
+                r.cause(),
+                r.events(),
+                r.graph_dump(),
+                r.triage(),
+                r.diagnostics()
+            )
+        })
+        .collect();
+    let exhaustions: Vec<String> = o
+        .exhaustions()
+        .iter()
+        .map(|e| format!("{:?}/{}/{}", e.gate(), e.events, e.budget()))
+        .collect();
+    format!(
+        "{variant}\nreports={}\n{}\nexhaustions={exhaustions:?}\n---display---\n{v}",
+        reports.len(),
+        reports.join("\n~~\n")
+    )
+}
+
+/// A triage-enabled `verify` of [`f57_branching_workers`] against its spec,
+/// with `config` as given. Visible `main`: the F61 sweep measured this pair's
+/// report set, witness dumps and triage traces varying with the seed.
+fn f61_run(config: Config) -> crate::conformance::ConfVerdict {
+    let cc = crate::conformance::ConfBuilder::new()
+        .visible_threads(["main"])
+        .config(config)
+        .triage(true)
+        .build()
+        .expect("in scope");
+    crate::conformance::verify(cc, f57_branching_workers, f57_branching_spec).expect("run")
+}
+
+fn f61_seeded(seed: u64) -> Config {
+    Config::builder()
+        .with_cons_type(ConsType::FIFO)
+        .with_seed(seed)
+        .build()
+}
+
+/// [`f61_public_digest`] with the leading seed line of the `Display` text
+/// removed, so two runs under **different** seeds can be compared on content.
+fn f61_digest_without_seed_line(v: &crate::conformance::ConfVerdict) -> String {
+    let d = f61_public_digest(v);
+    let (head, display) = d.split_once("---display---\n").expect("digest shape");
+    let (first, rest) = display.split_once('\n').expect("display has lines");
+    assert!(
+        first.starts_with("conformance: run seed "),
+        "the Display text must open with the seed line; got {first:?}"
+    );
+    format!("{head}---display---\n{rest}")
+}
+
+/// **An unseeded run is reproduced from the seed it records** (F61), on a
+/// deterministic program.
+///
+/// `ConfOutcome::seed`'s rustdoc promises that rebuilding the same `Config`
+/// with `.with_seed(seed)` reproduces the choices TraceForge makes, and the
+/// whole run when the program is deterministic apart from `nondet()`, on the
+/// same TraceForge version, with no stateful callbacks. That is the whole
+/// value of recording the seed. This test checks the promise on one
+/// program that meets those conditions. It is evidence for the scoped claim,
+/// not for exact replay of arbitrary programs. This test checks it on the pair where `P3-F61` measured the most
+/// seed dependence: [`f57_branching_workers`] with `main` visible, triage on.
+/// There, report sets, witness dumps and triage traces all vary with the seed.
+///
+/// For four **unseeded** runs, the seed is read back and the run repeated
+/// with `with_seed`, and **everything a user can read** must be identical:
+/// - the verdict variant and the report count;
+/// - each report's gate, cause, size, witness dump, triage outcome and
+///   diagnostics;
+/// - the exhaustions;
+/// - the full `Display` text, seed line included.
+///
+/// Triage is covered because every report here carries a completed triage.
+/// Triage builds its `Must` from the same `Config`, so its fresh `CToss`
+/// rolls come from the same seed and repeat too.
+///
+/// **Not vacuous.** The same comparison with the seed line removed tells
+/// seeds 0 and 1 apart. `P3-F61-fix` measured 5 distinct outputs over seeds
+/// 0..12 on this pair, identical across two processes. So equality here comes
+/// from the seed, not from a pair whose output never changes.
+///
+/// **Also pinned for the internal `Outcome`** (the census path the benchmarks
+/// print): an unseeded run's `Outcome::seed` is its `Config`'s seed, and a
+/// rerun with that seed gives the same report set and skip counters.
+///
+/// **What it does not show:**
+/// - reproduction across **different** `Config` settings (the seed
+///   reproduces a run only together with the rest of its configuration);
+/// - reproduction across TraceForge versions;
+/// - reproduction for programs that read state outside the checker, or with
+///   stateful callbacks;
+/// - the precheck. This pair's precheck is unbounded and explores fully, so
+///   its result cannot depend on the seed. A **bounded** precheck can, and
+///   [`a_bounded_precheck_result_is_reproduced_from_the_seed`] covers it.
+///
+/// **Mutations, MEASURED at `P3-F61-fix`** (production file restored and
+/// md5-verified after each):
+/// - `run()` records a constant seed, or `ConfOutcome::seed()` returns one —
+///   `seed 0: the unseeded run was NOT reproduced by \`with_seed(0)\``;
+/// - `run()` records a fresh random value — the rerun's recorded seed is not
+///   the one set;
+/// - the `Display` seed line dropped — `the Display text must open with the
+///   seed line`;
+/// - `Outcome::seed` random, or a constant — `Outcome::seed is the Config's
+///   seed`.
+#[test]
+fn an_unseeded_run_is_reproduced_exactly_from_its_recorded_seed() {
+    use crate::conformance::ConfVerdict;
+
+    let unseeded = || Config::builder().with_cons_type(ConsType::FIFO).build();
+
+    for _ in 0..4 {
+        let first = f61_run(unseeded());
+        let seed = first.outcome().seed();
+        let ConfVerdict::Reported(o) = &first else {
+            panic!("seed {seed}: this pair reports; got {first:?}");
+        };
+        assert!(!o.reports().is_empty());
+        assert!(
+            o.reports().iter().all(|r| r.triage().is_some()),
+            "seed {seed}: every report carries a triage, or triage is not covered"
+        );
+        let again = f61_run(f61_seeded(seed));
+        assert_eq!(again.outcome().seed(), seed);
+        let (a, b) = (f61_public_digest(&first), f61_public_digest(&again));
+        if a != b {
+            let at = a
+                .chars()
+                .zip(b.chars())
+                .position(|(x, y)| x != y)
+                .unwrap_or(a.len().min(b.len()));
+            panic!(
+                "seed {seed}: the unseeded run was NOT reproduced by `with_seed({seed})`. \
+                 First difference at byte {at}:\n  first: {:?}\n  again: {:?}",
+                &a[at.saturating_sub(80)..(at + 80).min(a.len())],
+                &b[at.saturating_sub(80)..(at + 80).min(b.len())]
+            );
+        }
+    }
+
+    assert_ne!(
+        f61_digest_without_seed_line(&f61_run(f61_seeded(0))),
+        f61_digest_without_seed_line(&f61_run(f61_seeded(1))),
+        "seeds 0 and 1 gave identical output, so the equality above proves nothing"
+    );
+
+    // The internal census path.
+    let config = unseeded();
+    let seed = config.seed;
+    let out = crate::conformance::verify_conformance_with(
+        config,
+        std::sync::Arc::new(f57_branching_workers),
+        std::sync::Arc::new(f57_branching_spec),
+        names(&["main"]),
+        4096,
+        false,
+    );
+    assert_eq!(out.seed, seed, "Outcome::seed is the Config's seed");
+    let rerun = verify_conformance(
+        f61_seeded(seed),
+        f57_branching_workers,
+        f57_branching_spec,
+        names(&["main"]),
+        4096,
+    );
+    assert_eq!(rerun.seed, seed);
+    assert_eq!(
+        (
+            f57_report_signature(&out),
+            out.skipped_gates,
+            out.inert_gates
+        ),
+        (
+            f57_report_signature(&rerun),
+            rerun.skipped_gates,
+            rerun.inert_gates
+        ),
+        "seed {seed}: the census run was not reproduced"
+    );
+}
+
+/// **The seed is recorded and printed, with the value that was set, on every
+/// verdict variant** (F61).
+///
+/// A fixed, distinctive seed goes in through `with_seed`. Then:
+/// - `ConfOutcome::seed()` returns it;
+/// - the `Display` text **opens** with exactly
+///   `conformance: run seed N (reproduce with the same `Config` plus `.with_seed(N)`)`;
+/// - the internal `Outcome::seed` returns it.
+///
+/// This holds on `Reported` (the F57 pair), `Conforms` (`two_workers` against
+/// itself) and `Inconclusive` (the same pair at budget 0), because the seed
+/// line is written before the `match` on the variant.
+///
+/// **Mutations, MEASURED at `P3-F61-fix`**:
+/// - `run()` records a constant seed, or `ConfOutcome::seed()` returns one —
+///   `Reported: ConfOutcome::seed()`;
+/// - the `Display` line dropped, or it prints `seed + 1` — `Reported: the
+///   Display text must open with the seed line`;
+/// - `Outcome::seed` random, or a constant — `Outcome::seed`;
+/// - `run()` records a fresh random value — `Reported: ConfOutcome::seed()`.
+#[test]
+fn the_seed_is_recorded_and_printed_on_every_verdict_variant() {
+    use crate::conformance::{ConfBuilder, ConfVerdict};
+
+    const SEED: u64 = 4_242_424_242;
+    let line = format!(
+        "conformance: run seed {SEED} (reproduce with the same `Config` plus `.with_seed({SEED})`)"
+    );
+    let check = |what: &str, v: &ConfVerdict| {
+        assert_eq!(v.outcome().seed(), SEED, "{what}: ConfOutcome::seed()");
+        let text = format!("{v}");
+        assert_eq!(
+            text.lines().next(),
+            Some(line.as_str()),
+            "{what}: the Display text must open with the seed line"
+        );
+    };
+
+    let reported = f61_run(f61_seeded(SEED));
+    assert!(matches!(reported, ConfVerdict::Reported(_)), "{reported:?}");
+    check("Reported", &reported);
+
+    let with_budget = |budget: usize| {
+        let cc = ConfBuilder::new()
+            .visible_threads(["main"])
+            .config(f61_seeded(SEED))
+            .search_budget(budget)
+            .build()
+            .expect("in scope");
+        crate::conformance::verify(cc, two_workers, two_workers).expect("run")
+    };
+    let conforms = with_budget(4096);
+    assert!(matches!(conforms, ConfVerdict::Conforms(_)), "{conforms:?}");
+    check("Conforms", &conforms);
+    let inconclusive = with_budget(0);
+    assert!(
+        matches!(inconclusive, ConfVerdict::Inconclusive(_)),
+        "{inconclusive:?}"
+    );
+    check("Inconclusive", &inconclusive);
+
+    let out = verify_conformance(
+        f61_seeded(SEED),
+        f57_branching_workers,
+        f57_branching_spec,
+        names(&["main"]),
+        4096,
+    );
+    assert_eq!(out.seed, SEED, "Outcome::seed");
+}
+
+/// A pair whose **triage completion must roll a `nondet()` of its own.**
+///
+/// Visible `main` sends `9` to visible `c`; the specification sends `1`. Under
+/// `LTR`, `main` runs to its send before the invisible `w` has taken a step, so
+/// the report fires at `FreshSend` on a 6-event graph that contains no toss.
+/// Triage then completes that graph, `w` rolls, and `c`'s second observation
+/// is `3` or `4` depending on the roll.
+fn f61_triage_rolls_impl() {
+    f61_triage_rolls_with(9)
+}
+
+fn f61_triage_rolls_spec() {
+    f61_triage_rolls_with(1)
+}
+
+fn f61_triage_rolls_with(first: i32) {
+    let c = thread::Builder::new()
+        .name("c".to_owned())
+        .spawn(|| {
+            let _: i32 = crate::recv_msg_block();
+            let _: i32 = crate::recv_msg_block();
+        })
+        .unwrap();
+    let cid = c.thread().id();
+    let _w = named("w", move || {
+        crate::send_msg(cid, if crate::nondet() { 3i32 } else { 4i32 });
+    });
+    crate::send_msg(cid, first);
+}
+
+/// The triage word of the single report of [`f61_triage_rolls_impl`], run
+/// with `config`.
+fn f61_triage_word(config: Config) -> Vec<String> {
+    use crate::conformance::report::TriageOutcome;
+    let cc = crate::conformance::ConfBuilder::new()
+        .visible_threads(["main", "c"])
+        .config(config)
+        .triage(true)
+        .build()
+        .expect("in scope");
+    let v =
+        crate::conformance::verify(cc, f61_triage_rolls_impl, f61_triage_rolls_spec).expect("run");
+    let reports = v.outcome().reports();
+    assert_eq!(reports.len(), 1, "one report: {v}");
+    assert_eq!(
+        (format!("{:?}", reports[0].gate()), reports[0].events()),
+        ("FreshSend".to_owned(), 6),
+        "the report fires before `w` has run, so the toss is triage's own"
+    );
+    match reports[0].triage() {
+        Some(TriageOutcome::Completed { vis, .. }) => vis.word().to_vec(),
+        other => panic!("expected a completed triage; got {other:?}"),
+    }
+}
+
+/// **Triage's own `nondet()` rolls come from the run seed, so they reproduce**
+/// (F61).
+///
+/// Triage completes a reported graph in one execution, and a toss it meets
+/// there takes the rolled value directly. `P3-F61` flagged this as the one
+/// place the seed matters beyond exploration order. It reproduces only if
+/// triage's `Must` is seeded from the run's `Config`, which it is:
+/// `triage_one` clones `cc.config`.
+///
+/// **Measured at `P3-F61-fix`** on [`f61_triage_rolls_impl`], seeds 0..8: the
+/// report is identical every time (`FreshSend`, 6 events), and the triage
+/// word ends in `c: receive 3` on seeds 0 and 6 and in `c: receive 4` on
+/// seeds 1–5.
+///
+/// So: 12 repeated runs on seed 0 must all give `…receive 3`, 12 on seed 1
+/// must all give `…receive 4`, and the two must differ.
+///
+/// **Probabilistic in its failing direction, and stated so.** If triage
+/// reseeded itself randomly, each run's final value would be a fair coin.
+/// Every repetition must equal the **named** word, so a seed slips through
+/// only if all 12 coins land on that one value: probability 2⁻¹² per seed,
+/// and 2⁻²⁴ (about 1 in 16.8 million) for both seeds together. That is
+/// cheaper than any deterministic hook, which would be a production change.
+/// (`P3-F61-fix` first gave 2⁻¹¹ and 1 in 4.2 million, which counts either
+/// all-equal outcome; review round 1, m1, corrected it.)
+///
+/// **Mutation, MEASURED at `P3-F61-fix`**: `triage_one` gives its `Config` a
+/// fresh random seed. It failed twice out of two runs, on `seed 0, repetition
+/// 0: triage did not reproduce`. The reproduction test and the plumbing test
+/// both stayed green under that mutation: neither exercises a triage roll.
+#[test]
+fn triage_rolls_come_from_the_run_seed() {
+    let expect = |seed: u64, last: &str| {
+        for i in 0..12 {
+            let word = f61_triage_word(f61_seeded(seed));
+            assert_eq!(
+                word,
+                ["main: send 9", "c: receive 9", last],
+                "seed {seed}, repetition {i}: triage did not reproduce"
+            );
+        }
+    };
+    expect(0, "c: receive 3");
+    expect(1, "c: receive 4");
+}
+
+/// A specification whose `main` fails an assertion on the `true` branch of its
+/// only `nondet()`, and does nothing on the `false` branch.
+fn f61_bounded_spec() {
+    if crate::nondet() {
+        crate::assert(false);
+    }
+}
+
+/// A **bounded** conformance configuration (`max_iterations = 1`), accepted by
+/// `ConfBuilder`, with `main` visible. `seed` is `None` for an unseeded
+/// `Config`.
+///
+/// Also returns the seed as `Config`'s `Serialize` shows it, read **before**
+/// `ConfBuilder` takes the `Config`. That value does not go through
+/// `ConfConfig::seed()`, so it is an independent check of the getter. It is
+/// the only one available for an unseeded `Config`, whose seed nothing else
+/// reveals.
+fn f61_bounded(seed: Option<u64>) -> (crate::conformance::ConfConfig, u64) {
+    let mut builder = Config::builder()
+        .with_cons_type(ConsType::FIFO)
+        .with_max_iterations(1);
+    if let Some(s) = seed {
+        builder = builder.with_seed(s);
+    }
+    let config = builder.build();
+    let serialized = serde_json::to_value(&config).expect("Config serializes")["seed"]
+        .as_u64()
+        .expect("the serialized Config carries its seed");
+    let cc = crate::conformance::ConfBuilder::new()
+        .visible_threads(["main"])
+        .config(config)
+        .build()
+        .expect("a bounded Config is in scope");
+    (cc, serialized)
+}
+
+/// **A bounded precheck's result is reproduced from the seed** (F61, review
+/// round 1, M1).
+///
+/// `P3-F61-fix` called a randomly reseeded precheck (mutation S10)
+/// uncatchable because "the precheck explores fully". **That is false under
+/// `max_iterations`.** `ConfBuilder` accepts a bound, and `precheck::run`
+/// passes `cc.config` to `Must::new` unchanged. With a bound of 1, the
+/// precheck of [`f61_bounded_spec`] runs one execution, and whether that
+/// execution fails the assertion depends on which `nondet()` branch the seed
+/// explores first. So the **public** result, `Err(SpecNotErrorFree)` or a
+/// verdict, depends on the seed.
+///
+/// **Measured at the round-1 response**, seeds 0..9 (the ones whose output was
+/// read): seeds 0 and 6 fail the precheck; seeds 1–5, 7 and 8 pass it and
+/// produce a verdict.
+///
+/// Asserted:
+/// - **seed 0** fails the precheck and **seed 1** passes it, 12 times each;
+/// - **unseeded runs** (8 of them): the seed is read with `cc.seed()`
+///   **before** the run, and 4 reruns with `.with_seed(cc.seed())` must give
+///   the same precheck result as the unseeded run, whether it failed or
+///   passed. Eight random seeds
+///   are not guaranteed to include a failing one (about 2 in 16 fail), so this
+///   half checks reproduction; the fixed-seed half is what guarantees both
+///   results are exercised;
+/// - whenever a verdict is produced, it records the seed that was run.
+///
+/// **How the seed is obtained on the error path.** When the precheck fails,
+/// `verify` returns `Err(ConfError::SpecNotErrorFree)`, which carries **no
+/// seed**, and no `ConfVerdict` exists to ask. The seed is read with
+/// `ConfConfig::seed()` **before** `verify` consumes the configuration, and
+/// the rerun uses `.with_seed(cc.seed())`. The owner added that getter after
+/// round 1 (F1-r1). Earlier versions of this test read the seed from the
+/// serialized `Config` instead. That read is kept only as an independent
+/// check that the getter returns the `Config`'s real seed.
+///
+/// **The getter is pinned** at the same time:
+/// - it equals the seed set with `with_seed`;
+/// - it equals the serialized seed on unseeded configurations;
+/// - it equals `outcome().seed()` whenever a verdict exists.
+///
+/// **Probabilistic in one failing direction.** If the precheck were reseeded
+/// randomly, each fixed-seed run would be a coin flip. Both seeds pass by
+/// accident with probability 2⁻²⁴, since each of 12 repetitions must match the
+/// named result. A precheck given a **different fixed** seed fails
+/// deterministically; see the mutation lines.
+///
+/// **Mutations, MEASURED at the round-1 response** (production file restored
+/// and md5-verified after each):
+/// - `run()` hands the precheck `seed + 1` — fails on `seed 0, repetition 0:
+///   the bounded precheck did not reproduce (expected it to fail)`;
+/// - `run()` hands the precheck seed `0` — fails on `seed 1, repetition 0:
+///   … (expected it to pass)`;
+/// - `run()` hands the precheck a fresh random seed — failed on both runs
+///   (`seed 0, repetition 0` and `seed 0, repetition 2`);
+/// - `precheck::run` itself builds its `Must` with `seed + 1` — fails on
+///   `seed 0, repetition 0`.
+///
+/// - `ConfConfig::seed()` returns a constant (`7` or `0`), or
+///   `self.config.seed + 1` — each fails on `ConfConfig::seed() is the
+///   with_seed value` (round-1 follow-up).
+///
+/// Before this test existed, the random-reseed variant (S10) left the whole
+/// lib suite green. That was recorded as "equivalent", which was wrong.
+#[test]
+fn a_bounded_precheck_result_is_reproduced_from_the_seed() {
+    use crate::conformance::ConfError;
+
+    // `verify` on a bounded configuration: the precheck result, and (when a
+    // verdict exists) a check that it records the configuration's seed.
+    let precheck_failed = |cc: crate::conformance::ConfConfig| -> bool {
+        let seed = cc.seed();
+        match crate::conformance::verify(cc, || {}, f61_bounded_spec) {
+            Err(ConfError::SpecNotErrorFree { .. }) => true,
+            Err(other) => panic!("seed {seed}: unexpected error {other:?}"),
+            Ok(v) => {
+                assert_eq!(
+                    v.outcome().seed(),
+                    seed,
+                    "ConfConfig::seed() and the verdict's seed must agree"
+                );
+                false
+            }
+        }
+    };
+
+    for (seed, fails) in [(0u64, true), (1, false)] {
+        for i in 0..12 {
+            let (cc, serialized) = f61_bounded(Some(seed));
+            assert_eq!(cc.seed(), seed, "ConfConfig::seed() is the with_seed value");
+            assert_eq!(serialized, seed);
+            assert_eq!(
+                precheck_failed(cc),
+                fails,
+                "seed {seed}, repetition {i}: the bounded precheck did not reproduce \
+                 (expected it to {})",
+                if fails { "fail" } else { "pass" }
+            );
+        }
+    }
+
+    for _ in 0..8 {
+        let (cc, serialized) = f61_bounded(None);
+        let seed = cc.seed();
+        assert_eq!(
+            seed, serialized,
+            "ConfConfig::seed() must be the unseeded Config's real seed"
+        );
+        let first = precheck_failed(cc);
+        for i in 0..4 {
+            let (again, _) = f61_bounded(Some(seed));
+            assert_eq!(
+                precheck_failed(again),
+                first,
+                "seed {seed}, rerun {i}: an unseeded bounded run's precheck result was \
+                 not reproduced by `.with_seed(cc.seed())` (it {} the first time)",
+                if first { "failed" } else { "passed" }
+            );
+        }
+    }
+}

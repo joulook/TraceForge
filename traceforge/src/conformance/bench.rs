@@ -295,18 +295,25 @@ fn conformance(n: usize, eager: bool) -> (Outcome, f64) {
 #[test]
 #[ignore]
 fn two_pc_scaling() {
-    println!("\n  N | plain execs |  plain s  | reports | skipped |   inert | conf s | ratio");
-    println!("----+-------------+-----------+---------+---------+---------+--------+-------");
+    // F61: the specification makes a `nondet()` choice, so the report, skip and
+    // inert columns can depend on the run's seed. `cfg()` draws a fresh seed on
+    // every call, and `timed` calls the run several times: the printed counts
+    // and seed come from the **last** of those calls, which is the `Outcome`
+    // `timed` returns, while `conf s` is the fastest of three rounds' average
+    // per-call time, over calls that each drew their own seed.
+    println!("\n  N | plain execs |  plain s  | reports | skipped |   inert | conf s | ratio | seed");
+    println!("----+-------------+-----------+---------+---------+---------+--------+-------+------");
     for n in 2..=5usize {
         let (bs, bt) = baseline(n, false);
         let (out, ct) = conformance(n, false);
         let ratio = if bt > 0.0 { ct / bt } else { f64::NAN };
         println!(
-            " {n:2} | {:11} | {bt:9.5} | {:7} | {:7} | {:7} | {ct:6.3} | {ratio:5.1}x",
+            " {n:2} | {:11} | {bt:9.5} | {:7} | {:7} | {:7} | {ct:6.3} | {ratio:5.1}x | {}",
             bs.execs,
             out.reports.len(),
             out.skipped_gates,
-            out.inert_gates
+            out.inert_gates,
+            out.seed
         );
         // F43: a run that exhausted its inner budget established less than it
         // appears to, and reads as clean to anyone looking at reports alone.
@@ -332,11 +339,11 @@ fn two_pc_scaling() {
 #[test]
 #[ignore]
 fn two_pc_eager_coordinator_is_reported() {
-    println!("\n  N | conf s | reports");
-    println!("----+--------+--------");
+    println!("\n  N | conf s | reports | seed");
+    println!("----+--------+---------+------");
     for n in 2..=4usize {
         let (out, ct) = conformance(n, true);
-        println!(" {n:2} | {ct:6.3} | {}", out.reports.len());
+        println!(" {n:2} | {ct:6.3} | {:7} | {}", out.reports.len(), out.seed);
         assert!(
             !out.reports.is_empty(),
             "N={n}: the eager coordinator loses agreement and must be reported"
