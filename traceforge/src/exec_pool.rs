@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::env;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{sleep, JoinHandle};
 use std::time::{Duration, Instant};
@@ -24,7 +25,10 @@ enum ExecutionPoolWorkerState {
     // The worker is executing a task.
     Busy,
 
-    // The worker has been notified to shut down the next time the loop restarts.
+    // The pool has asked this worker to stop. **Diagnostic only**: a worker
+    // writes its own state without re-reading it, so this can be overwritten
+    // by the worker's next write, and it is `ShutdownFlag` that actually ends
+    // the loop.
     Shutdown,
 }
 
@@ -44,6 +48,16 @@ type SharedWorkerDeque = Arc<Mutex<VecDeque<Option<ExecutionGraph>>>>;
 /// workers to pop the next job from the queue and process it.
 type CondBlocker = Arc<Condvar>;
 
+/// The pool-wide shutdown request.
+///
+/// It is separate from `ExecutionPoolWorkerState` on purpose. A worker writes
+/// its own state (`Waiting`, `Busy`) without first re-reading it, so a
+/// `Shutdown` written into that state by the pool could be overwritten by the
+/// worker's next write. The worker would then never see it, and
+/// `shutdown_now` would wait for it forever. Nothing but `shutdown_now` writes
+/// this flag, so it cannot be lost that way.
+type ShutdownFlag = Arc<AtomicBool>;
+
 /// ExecutionPoolWorker is the struct that holds all of the processing context
 /// information which is provided as arguments to the worker_loop() function.
 ///
@@ -53,6 +67,7 @@ struct ExecutionPoolWorker {
     thread_idx: usize,
     shared_queue: SharedWorkerDeque,
     loop_block_cond: CondBlocker,
+    shutdown: ShutdownFlag,
     pool_can_drain: Arc<Mutex<bool>>,
     pool_exec_stats: Arc<Mutex<Stats>>,
     must_conf: Config,
@@ -73,6 +88,7 @@ impl ExecutionPoolWorker {
         thread_idx: usize,
         shared_queue: SharedWorkerDeque,
         loop_block_cond: CondBlocker,
+        shutdown: ShutdownFlag,
         pool_can_drain: Arc<Mutex<bool>>,
         pool_exec_stats: Arc<Mutex<Stats>>,
         must_conf: &Config,
@@ -86,6 +102,7 @@ impl ExecutionPoolWorker {
             thread_idx,
             shared_queue,
             loop_block_cond,
+            shutdown,
             pool_can_drain,
             pool_exec_stats,
             must_conf: must_conf.clone(),
@@ -105,6 +122,7 @@ impl ExecutionPoolWorker {
         let worker_state = self.worker_state.clone();
         let shared_queue = self.shared_queue.clone();
         let loop_block_cond = self.loop_block_cond.clone();
+        let shutdown = self.shutdown.clone();
         let exec_func = exec_func.clone();
         let pool_exec_can_drain = self.pool_can_drain.clone();
         let pool_exec_stats = self.pool_exec_stats.clone();
@@ -119,6 +137,7 @@ impl ExecutionPoolWorker {
                     worker_state,
                     shared_queue,
                     loop_block_cond,
+                    shutdown,
                     pool_exec_can_drain,
                     pool_exec_stats,
                     exec_func,
@@ -146,6 +165,7 @@ fn worker_loop<F>(
     worker_state: LockableWorkerState,
     shared_queue: SharedWorkerDeque,
     loop_block_cond: CondBlocker,
+    shutdown: ShutdownFlag,
     pool_exec_can_drain: Arc<Mutex<bool>>,
     pool_exec_stats: Arc<Mutex<Stats>>,
     exec_func: Arc<F>,
@@ -167,26 +187,35 @@ fn worker_loop<F>(
 
     // Until the Worker is signalled to Shutdown...
     loop {
-        if *worker_state.lock().expect("Lock worker_state mutex")
-            == ExecutionPoolWorkerState::Shutdown
-        {
+        if shutdown.load(Ordering::SeqCst) {
             break;
         }
 
-        if shared_queue
-            .lock()
-            .expect("Lock shared_queue mutex")
-            .is_empty()
-        {
-            *worker_state.lock().expect("Lock worker_state mutex") =
-                ExecutionPoolWorkerState::Waiting;
+        #[cfg(test)]
+        test_hooks::pause_at(test_hooks::Point::AfterShutdownCheck);
 
-            let _timed_out = loop_block_cond
-                .wait_timeout(
-                    shared_queue.lock().expect("Couldn't provide queue mutex"),
-                    wait_timeout_ms,
-                )
-                .expect("wait_timeout() failed");
+        {
+            // The shutdown flag is re-read under the queue lock, and
+            // `shutdown_now` sets the flag and then notifies while holding that
+            // same lock. So a worker either sees the flag here or is already
+            // waiting when the notification arrives; it cannot go to sleep
+            // having missed both.
+            let queue = shared_queue.lock().expect("Lock shared_queue mutex");
+            if queue.is_empty() && !shutdown.load(Ordering::SeqCst) {
+                *worker_state.lock().expect("Lock worker_state mutex") =
+                    ExecutionPoolWorkerState::Waiting;
+
+                // Between the re-check and the wait, still holding the queue
+                // lock. A test stopped here makes `shutdown_now` block on that
+                // lock until this worker is actually waiting, which is what
+                // makes the store-and-notify-under-the-lock rule observable.
+                #[cfg(test)]
+                test_hooks::pause_at(test_hooks::Point::BeforeWait);
+
+                let _timed_out = loop_block_cond
+                    .wait_timeout(queue, wait_timeout_ms)
+                    .expect("wait_timeout() failed");
+            }
         }
 
         if cfg!(debug_assertions) {
@@ -205,10 +234,33 @@ fn worker_loop<F>(
         // After the (potential) wait_timeout() above finishes, there still may
         // or may not be work queued. Attempt to pop the head of the queue.
         //
-        let next_eg = shared_queue
-            .lock()
-            .expect("locking shared queue mutex")
-            .pop_front();
+        // Taking an item and marking the worker `Busy` happen under one queue
+        // lock. `drain_and_shutdown` reads the queue depth and the busy states
+        // under that same lock, so it can never see an empty queue and no busy
+        // worker while a worker holds an item it has not yet marked. Without
+        // this, the pool could shut down with work in flight, and the work that
+        // item would have queued would never be explored.
+        let next_eg = {
+            let mut queue = shared_queue.lock().expect("locking shared queue mutex");
+            if shutdown.load(Ordering::SeqCst) {
+                // **A worker released from its wait must not start new work.**
+                // The flag is stored under this same lock, so a worker that
+                // acquires the lock after `shutdown_now` sees it here, and no
+                // graph is begun after the request. Without this check a
+                // worker that was idle when the request arrived could take a
+                // queued item and explore it in full before reaching the
+                // check at the top of the loop. `None` sends it round the
+                // loop, where the flag ends it.
+                None
+            } else {
+                let item = queue.pop_front();
+                if item.is_some() {
+                    *worker_state.lock().expect("Couldn't lock state mutex") =
+                        ExecutionPoolWorkerState::Busy;
+                }
+                item
+            }
+        };
 
         // If there's no work, loop around and try again.
         //
@@ -217,9 +269,8 @@ fn worker_loop<F>(
             continue;
         }
 
-        // This /is/ work to do. Mark the worker as busy.
-        //
-        *worker_state.lock().expect("Couldn't lock state mutex") = ExecutionPoolWorkerState::Busy;
+        #[cfg(test)]
+        test_hooks::pause_at(test_hooks::Point::AfterTakingWork);
 
         // The queued object may or not contain an actual graph. If so,
         // add it to this worker's TraceForge queue. If this queue node does NOT
@@ -301,6 +352,7 @@ pub struct ExecutionPool {
     worker_vec: Vec<ExecutionPoolWorker>,
     work_deque: SharedWorkerDeque,
     loop_block_cond: CondBlocker,
+    shutdown: ShutdownFlag,
     can_drain: Arc<Mutex<bool>>,
     exec_stats: Arc<Mutex<Stats>>,
     is_shutdown: bool,
@@ -331,6 +383,7 @@ impl ExecutionPool {
     pub fn new(must_conf: &Config) -> Self {
         let work_deque = Arc::new(Mutex::new(VecDeque::new()));
         let loop_block_cond = Arc::new(Condvar::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
         let exec_stats = Arc::new(Mutex::new(Stats::default()));
         let can_drain = Arc::new(Mutex::new(false));
         let exec_counter = Arc::new(Mutex::new(0));
@@ -351,6 +404,7 @@ impl ExecutionPool {
                     idx,
                     work_deque.clone(),
                     loop_block_cond.clone(),
+                    shutdown.clone(),
                     can_drain.clone(),
                     exec_stats.clone(),
                     must_conf,
@@ -363,6 +417,7 @@ impl ExecutionPool {
             worker_vec,
             work_deque,
             loop_block_cond,
+            shutdown,
             exec_stats,
             can_drain,
             is_shutdown: false,
@@ -428,23 +483,32 @@ impl ExecutionPool {
                 continue;
             }
 
-            let depth = self
-                .work_deque
-                .lock()
-                .expect("Couldn't lock deque mutex")
-                .len();
+            // The depth and the busy states are read under one queue lock: a
+            // worker takes an item and marks itself `Busy` under that lock
+            // too, so the two readings are consistent with each other.
+            let (depth, any_busy) = {
+                let queue = self.work_deque.lock().expect("Couldn't lock deque mutex");
+                let any_busy = self.worker_vec.iter().any(|w| {
+                    *w.worker_state.lock().expect("worker vec mutex lock")
+                        == ExecutionPoolWorkerState::Busy
+                });
+
+                // Between the two readings, still holding the queue lock. A
+                // test stopped here cannot see them diverge while the lock is
+                // held; that is the property, and reading them under separate
+                // locks is what this point exists to expose.
+                #[cfg(test)]
+                test_hooks::pause_at(test_hooks::Point::DrainBetweenReads);
+
+                (queue.len(), any_busy)
+            };
 
             if depth > 0 {
                 trace!("Draining ... deque depth still {depth}");
                 continue;
             }
 
-            let still_busy_vec = self.worker_vec.iter().find(|&w| {
-                *w.worker_state.lock().expect("worker vec mutex lock")
-                    == ExecutionPoolWorkerState::Busy
-            });
-
-            if still_busy_vec.is_some() {
+            if any_busy {
                 debug!("Threads are still finishing ... ");
                 continue;
             }
@@ -457,10 +521,16 @@ impl ExecutionPool {
         self.shutdown_now()
     }
 
-    /// This function immediately sets all of the workers to the Shutdown state
-    /// to break them out of their worker_loop() after which this function can
-    /// join() all the completed threads. This function returns whether or not
-    /// all of the threads were joined (e.g. did any of them panic.)
+    /// This function sets the pool's `ShutdownFlag`, which is what breaks the
+    /// workers out of worker_loop(), after which it join()s the completed
+    /// threads. It returns whether all of the threads were joined (e.g. did
+    /// any of them panic.)
+    ///
+    /// The per-worker `Shutdown` state is set as well, for diagnostics only:
+    /// a worker **may** overwrite its own state on a later pass, which is the
+    /// defect this flag exists to prevent. With the flag in place it does not,
+    /// because a worker
+    /// that reads the flag leaves the loop without writing its state again.
     ///
     pub fn shutdown_now(&mut self) -> bool {
         self.is_shutdown = true;
@@ -468,6 +538,16 @@ impl ExecutionPool {
         let mut threads_joined = 0;
 
         debug!("Shutting threads down...");
+        {
+            // Set the flag and wake every worker while holding the queue lock,
+            // so a worker between its flag check and its wait cannot miss both
+            // (see `worker_loop`).
+            let _queue = self.work_deque.lock().expect("Couldn't lock deque mutex");
+            self.shutdown.store(true, Ordering::SeqCst);
+            self.loop_block_cond.notify_all();
+        }
+        // The per-worker state is still set, for diagnostics only; the flag
+        // above is what ends the worker loops.
         self.worker_vec.iter_mut().for_each(|w| {
             *w.worker_state.lock().expect("worker vec mutex lock") =
                 ExecutionPoolWorkerState::Shutdown
@@ -496,6 +576,18 @@ impl ExecutionPool {
             // break out of the loop
             if let Some(busy_worker) = self.worker_vec.iter().find(|&w| w.thread_handle.is_some()) {
                 trace!("[{}] Still isn't done. Looping().", &busy_worker.thread_idx);
+                // How long this waits is not ours to choose. A worker that
+                // was idle when the request arrived leaves within one
+                // `wait_timeout` of it, and usually at once, because it is
+                // notified and then takes no new work. A worker that was
+                // already exploring a graph checks the flag only once that
+                // exploration finishes, which can take arbitrarily longer:
+                // the flag is read at the top of the outer loop and not
+                // inside the inner one, so that no graph is abandoned
+                // half-explored. Either way the caller waits for something
+                // else to happen, so polling faster than this buys nothing,
+                // while an unslept loop burns a whole core for the duration.
+                sleep(Duration::from_millis(1));
             } else {
                 trace!("All workers have completed and join()ed.");
                 break;
@@ -504,4 +596,89 @@ impl ExecutionPool {
 
         threads_joined == self.worker_vec.len()
     } // shutdown_now()
+}
+
+/// **Test-only pause points in `worker_loop`.**
+///
+/// The shutdown races fixed above open for a few instructions at a time and
+/// are hit in well under 1% of runs, so a test cannot rely on hitting them.
+/// A test arms one point; the next worker to reach it stops there until the
+/// test releases it, which lets the test run a shutdown inside the window
+/// every time. Compiled only under `cfg(test)`.
+///
+/// The state is process-wide, so tests that arm a point must not run
+/// concurrently with each other or with any other test that uses the pool.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::{Condvar, Mutex};
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) enum Point {
+        /// After the worker's shutdown check, before it takes the queue lock
+        /// to decide whether to wait.
+        AfterShutdownCheck,
+        /// After the worker has taken an item from the queue.
+        AfterTakingWork,
+        /// Inside the queue lock, after the worker re-reads the shutdown flag
+        /// and before it waits on the condition variable.
+        BeforeWait,
+        /// Inside the queue lock in `drain_and_shutdown`, between reading the
+        /// busy states and reading the queue depth.
+        DrainBetweenReads,
+    }
+
+    struct Armed {
+        point: Point,
+        reached: bool,
+        released: bool,
+    }
+
+    static STATE: Mutex<Option<Armed>> = Mutex::new(None);
+    static CHANGED: Condvar = Condvar::new();
+
+    /// Arm `point`. Only the first worker to reach it will stop.
+    pub(crate) fn arm(point: Point) {
+        *STATE.lock().unwrap() = Some(Armed {
+            point,
+            reached: false,
+            released: false,
+        });
+    }
+
+    /// Block until a worker has stopped at the armed point.
+    pub(crate) fn wait_until_reached() {
+        let mut state = STATE.lock().unwrap();
+        while !state.as_ref().is_some_and(|a| a.reached) {
+            state = CHANGED.wait(state).unwrap();
+        }
+    }
+
+    /// Let the stopped worker continue, and disarm.
+    pub(crate) fn release() {
+        if let Some(a) = STATE.lock().unwrap().as_mut() {
+            a.released = true;
+        }
+        CHANGED.notify_all();
+    }
+
+    /// Disarm without a worker having reached the point.
+    pub(crate) fn disarm() {
+        *STATE.lock().unwrap() = None;
+        CHANGED.notify_all();
+    }
+
+    pub(super) fn pause_at(point: Point) {
+        let mut state = STATE.lock().unwrap();
+        let fire = matches!(state.as_ref(), Some(a) if a.point == point && !a.reached);
+        if !fire {
+            return;
+        }
+        if let Some(a) = state.as_mut() {
+            a.reached = true;
+        }
+        CHANGED.notify_all();
+        while !state.as_ref().map_or(true, |a| a.released) {
+            state = CHANGED.wait(state).unwrap();
+        }
+    }
 }
