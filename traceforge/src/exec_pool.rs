@@ -682,3 +682,862 @@ pub(crate) mod test_hooks {
         }
     }
 }
+
+/// **Tests for the pool's shutdown protocol.**
+///
+/// The pool shuts down once its queue is empty and no worker is busy. Two
+/// windows used to break that:
+///
+/// 1. a worker checked for shutdown, and then wrote its own state back to
+///    `Waiting` without looking again, erasing a shutdown requested in
+///    between. The worker then never exited, and `shutdown_now` spun forever
+///    waiting for it;
+/// 2. a worker took an item from the queue while still marked `Waiting`, and
+///    only then marked itself `Busy`. In between, the drain check could see an
+///    empty queue and no busy worker, and shut the pool down with work in
+///    flight.
+///
+/// Both windows are a few instructions wide, so each test uses
+/// [`test_hooks`](super::test_hooks) to stop a worker inside one and runs the
+/// shutdown while it is stopped.
+///
+/// **Every scenario runs in a child process** (`#[ignore]`d `*_child` tests,
+/// started by the test of the same pattern). A pool that never shuts down
+/// leaves a thread spinning or blocked forever, which must not take the test
+/// run with it: the parent kills the child after [`CHILD_LIMIT`] and fails.
+/// The child process also gives each scenario the process-wide hook state to
+/// itself.
+#[cfg(test)]
+mod tests {
+    use super::test_hooks::{self, Point};
+    use super::{ExecutionPool, ExecutionPoolWorkerState, LockableWorkerState};
+    use crate::thread::{self, ThreadId};
+    use crate::Config;
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
+
+    /// How long a parent waits for its child before killing it. A child
+    /// normally finishes in a few seconds.
+    const CHILD_LIMIT: Duration = Duration::from_secs(60);
+
+    /// How long a child waits for any one step. A step that takes longer is a
+    /// pool that will never get there.
+    const STEP_LIMIT: Duration = Duration::from_secs(20);
+
+    /// Runs `name` alone in a fresh copy of this test binary and fails unless
+    /// it passes within [`CHILD_LIMIT`]. A child still running then is killed.
+    fn run_child(name: &str) {
+        let exe = std::env::current_exe().expect("the test binary knows its own path");
+        let mut child = Command::new(exe)
+            .args([
+                "--exact",
+                name,
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("re-running this test binary for one ignored test");
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("polling the child") {
+                break Some(status);
+            }
+            if start.elapsed() > CHILD_LIMIT {
+                child.kill().expect("killing the child");
+                child.wait().expect("reaping the child");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let _ = child.stdout.take().unwrap().read_to_string(&mut stdout);
+        let _ = child.stderr.take().unwrap().read_to_string(&mut stderr);
+        let output = format!("--- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}");
+        let Some(status) = status else {
+            panic!(
+                "{name} did not finish within {CHILD_LIMIT:?} and was killed: the pool never \
+                 shut down.\n{output}"
+            );
+        };
+        // A filter that matches nothing also exits 0, which would be a silent
+        // pass. The child must say it ran exactly one test.
+        assert!(
+            stdout.contains("1 passed") || stdout.contains("1 failed"),
+            "the child did not run {name}; filter or name drift.\n{output}"
+        );
+        assert!(status.success(), "{name} failed.\n{output}");
+    }
+
+    /// Serializes the children if they are ever run together in one process
+    /// (`--ignored` without `--exact`): the hook state is process-wide.
+    static HOOKS: Mutex<()> = Mutex::new(());
+
+    fn hooks_lock() -> MutexGuard<'static, ()> {
+        HOOKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Disarms the pause point on drop, so a failing child never leaves a
+    /// worker stopped.
+    struct Disarm;
+
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            test_hooks::disarm();
+        }
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    enum ToCoordinator {
+        Yes,
+        No,
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    enum ToParticipant {
+        Prepare(ThreadId),
+        Commit,
+        Abort,
+    }
+
+    fn participant() {
+        let coordinator = match crate::recv_msg_block::<ToParticipant>() {
+            ToParticipant::Prepare(id) => id,
+            other => panic!("expected Prepare, got {other:?}"),
+        };
+        let yes = crate::nondet();
+        let vote = if yes {
+            ToCoordinator::Yes
+        } else {
+            ToCoordinator::No
+        };
+        crate::send_msg(coordinator, vote);
+        match crate::recv_msg_block::<ToParticipant>() {
+            ToParticipant::Commit => assert!(yes),
+            ToParticipant::Abort => {}
+            other => panic!("expected a decision, got {other:?}"),
+        }
+    }
+
+    /// Two-phase commit with `n` participants, each voting `nondet()`. The
+    /// coordinator's receives race, so the exploration revisits, and a
+    /// parallel exploration hands those revisits to other workers through the
+    /// pool's queue.
+    fn two_phase_commit(n: u32) {
+        let participants: Vec<ThreadId> = (0..n)
+            .map(|_| thread::spawn(participant).thread().id())
+            .collect();
+        let _ = thread::spawn(move || {
+            let me = thread::current().id();
+            for p in &participants {
+                crate::send_msg(*p, ToParticipant::Prepare(me));
+            }
+            let yes = (0..participants.len())
+                .filter(|_| crate::recv_msg_block::<ToCoordinator>() == ToCoordinator::Yes)
+                .count();
+            let decision = if yes == participants.len() {
+                ToParticipant::Commit
+            } else {
+                ToParticipant::Abort
+            };
+            for p in &participants {
+                crate::send_msg(*p, decision.clone());
+            }
+        });
+    }
+
+    /// The number of executions of [`two_phase_commit`]: `2^n` vote vectors
+    /// times `n!` orders in which the coordinator receives the votes.
+    fn two_phase_commit_execs(n: u32) -> usize {
+        2usize.pow(n) * (1..=n as usize).product::<usize>()
+    }
+
+    /// A pool of `workers`, and handles on each worker's state that stay
+    /// readable after the pool is moved into another thread.
+    fn pool(workers: usize) -> (ExecutionPool, Vec<LockableWorkerState>) {
+        let conf = Config::builder()
+            .with_parallel(true)
+            .with_parallel_workers(workers)
+            .build();
+        let pool = ExecutionPool::new(&conf);
+        let states = pool
+            .worker_vec
+            .iter()
+            .map(|w| w.worker_state.clone())
+            .collect();
+        (pool, states)
+    }
+
+    fn state_is(state: &LockableWorkerState, expected: ExecutionPoolWorkerState) -> bool {
+        *state.lock().unwrap() == expected
+    }
+
+    fn count_in(states: &[LockableWorkerState], expected: ExecutionPoolWorkerState) -> usize {
+        states
+            .iter()
+            .filter(|s| *s.lock().unwrap() == expected)
+            .count()
+    }
+
+    fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !condition() {
+            assert!(
+                start.elapsed() < STEP_LIMIT,
+                "timed out after {STEP_LIMIT:?} waiting for {what}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// [`test_hooks::wait_until_reached`], bounded by [`STEP_LIMIT`].
+    fn wait_until_paused() {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            test_hooks::wait_until_reached();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(STEP_LIMIT)
+            .expect("no worker reached the armed pause point");
+    }
+
+    /// On-CPU time of the calling thread, from `/proc/thread-self/schedstat`.
+    #[cfg(target_os = "linux")]
+    fn thread_cpu_time() -> Duration {
+        let schedstat = std::fs::read_to_string("/proc/thread-self/schedstat")
+            .expect("reading /proc/thread-self/schedstat");
+        let nanos = schedstat
+            .split_whitespace()
+            .next()
+            .and_then(|field| field.parse().ok())
+            .expect("the first schedstat field is the on-CPU time in nanoseconds");
+        Duration::from_nanos(nanos)
+    }
+
+    struct Explored {
+        execs: usize,
+        /// Wall time of `explore`.
+        wall: Duration,
+        /// CPU time the calling thread spent in `explore`.
+        #[cfg(target_os = "linux")]
+        cpu: Duration,
+    }
+
+    /// Runs `pool.explore` on [`two_phase_commit`]`(n)` in a thread of its
+    /// own, so the test can act while it runs.
+    fn explore_in_background(mut pool: ExecutionPool, n: u32) -> mpsc::Receiver<Explored> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("pool-caller".into())
+            .spawn(move || {
+                #[cfg(target_os = "linux")]
+                let cpu = thread_cpu_time();
+                let start = Instant::now();
+                let stats = pool.explore(&Arc::new(move || two_phase_commit(n)));
+                let _ = tx.send(Explored {
+                    execs: stats.execs,
+                    wall: start.elapsed(),
+                    #[cfg(target_os = "linux")]
+                    cpu: thread_cpu_time() - cpu,
+                });
+            })
+            .expect("spawning the pool's caller");
+        rx
+    }
+
+    fn finished(done: &mpsc::Receiver<Explored>, window: &str) -> Explored {
+        done.recv_timeout(STEP_LIMIT).unwrap_or_else(|_| {
+            panic!(
+                "explore did not return within {STEP_LIMIT:?} of the stopped worker resuming: \
+                 the pool never shut down ({window})"
+            )
+        })
+    }
+
+    /// Window 1, forced on a pool of `workers`: one worker stops just after
+    /// its shutdown check; the others explore the whole program and the pool
+    /// requests shutdown; after `hold`, the stopped worker resumes. It must
+    /// then exit, without first writing `Waiting` over the request.
+    fn shutdown_while_a_worker_is_past_its_check(
+        workers: usize,
+        n: u32,
+        hold: Duration,
+    ) -> Explored {
+        let (pool, states) = pool(workers);
+        // The first worker to start stops at its first check, before it has
+        // taken anything, so the others do all the work.
+        test_hooks::arm(Point::AfterShutdownCheck);
+        let done = explore_in_background(pool, n);
+        wait_until_paused();
+        // `shutdown_now` writes `Shutdown` into every worker's state once it
+        // has requested shutdown, and the stopped worker writes nothing.
+        wait_for("the pool to request shutdown", || {
+            count_in(&states, ExecutionPoolWorkerState::Shutdown) == workers
+        });
+        std::thread::sleep(hold);
+        test_hooks::release();
+        let explored = finished(
+            &done,
+            "idle-check window: the resumed worker missed the request",
+        );
+
+        assert_eq!(
+            explored.execs,
+            two_phase_commit_execs(n),
+            "the exploration is incomplete"
+        );
+        for (i, state) in states.iter().enumerate() {
+            assert!(
+                state_is(state, ExecutionPoolWorkerState::Shutdown),
+                "worker {i} wrote {:?} after shutdown was requested: it went back to waiting \
+                 instead of exiting",
+                *state.lock().unwrap()
+            );
+        }
+        explored
+    }
+
+    // --- Pattern 1: window 1 ------------------------------------------------
+
+    /// A shutdown requested between a worker's shutdown check and its decision
+    /// to wait is not lost: the worker exits, and `explore` returns the
+    /// complete count.
+    ///
+    /// **Before the fix** the worker overwrote the request with `Waiting` and
+    /// looped forever; the child fails after [`STEP_LIMIT`] with "explore did
+    /// not return", and this test reports it.
+    #[test]
+    fn a_shutdown_during_the_idle_check_is_not_lost() {
+        run_child("exec_pool::tests::window_1_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by a_shutdown_during_the_idle_check_is_not_lost"]
+    fn window_1_child() {
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+        let explored = shutdown_while_a_worker_is_past_its_check(2, 2, Duration::ZERO);
+        eprintln!("window 1: explore returned after {:?}", explored.wall);
+    }
+
+    // --- Pattern 2: window 2 ------------------------------------------------
+
+    /// Work a worker has taken keeps the pool from shutting down until it is
+    /// finished, and none of the work it leads to is lost.
+    ///
+    /// The pool is given a second start token. Each token makes the worker
+    /// that takes it explore the whole program with its own engine, so the
+    /// complete count is exactly twice the sequential count. One worker stops
+    /// right after taking a token, for two seconds (eight drain polls), while
+    /// the other explores the whole program and goes idle. The queue is then
+    /// empty and one worker is idle, but the stopped worker still holds work.
+    ///
+    /// **Before the fix** the stopped worker was not yet `Busy`, so the pool
+    /// requested shutdown while it held the token. This test fails with "the
+    /// pool requested shutdown while a worker held work"; if it had let the
+    /// worker go on, the worker would have overwritten the request with
+    /// `Busy` and never exited.
+    #[test]
+    fn work_taken_before_the_drain_check_is_finished_before_shutdown() {
+        run_child("exec_pool::tests::window_2_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by \
+                work_taken_before_the_drain_check_is_finished_before_shutdown"]
+    fn window_2_child() {
+        const N: u32 = 3;
+        const HOLD: Duration = Duration::from_secs(2);
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+
+        let (mut pool, states) = pool(2);
+        pool.enqueue(None);
+        test_hooks::arm(Point::AfterTakingWork);
+        let done = explore_in_background(pool, N);
+        wait_until_paused();
+        wait_for("the other worker to go idle", || {
+            count_in(&states, ExecutionPoolWorkerState::Waiting) >= 1
+        });
+        let held = Instant::now();
+        while held.elapsed() < HOLD {
+            assert_eq!(
+                count_in(&states, ExecutionPoolWorkerState::Shutdown),
+                0,
+                "the pool requested shutdown while a worker held work it had \
+                 taken (taken-work window)"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The situation the drain check had to get right: one worker idle,
+        // one holding work (and marked so), the queue empty.
+        assert_eq!(count_in(&states, ExecutionPoolWorkerState::Busy), 1);
+        assert_eq!(count_in(&states, ExecutionPoolWorkerState::Waiting), 1);
+        test_hooks::release();
+        let explored = finished(&done, "taken-work window");
+
+        assert_eq!(
+            explored.execs,
+            2 * two_phase_commit_execs(N),
+            "work was lost: two start tokens explore the program twice"
+        );
+    }
+
+    // --- Pattern 3: no spin while a worker is slow to exit -------------------
+
+    /// While a worker has not yet exited, `shutdown_now` waits for it without
+    /// burning a core.
+    ///
+    /// A worker is held past its shutdown check for one second after shutdown
+    /// is requested, so the caller spends that second in `shutdown_now`. Its
+    /// CPU time over the whole `explore` must stay under a quarter of that
+    /// second.
+    ///
+    /// **Before the fix** the held worker never exits (window 1), so the child
+    /// fails as pattern 1 does; the caller meanwhile spins at 100% of a core.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_worker_slow_to_exit_does_not_make_shutdown_spin() {
+        run_child("exec_pool::tests::slow_exit_child");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "run in a child process by a_worker_slow_to_exit_does_not_make_shutdown_spin"]
+    fn slow_exit_child() {
+        const HOLD: Duration = Duration::from_secs(1);
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+        let explored = shutdown_while_a_worker_is_past_its_check(2, 2, HOLD);
+        eprintln!(
+            "slow exit: explore took {:?} of wall time and {:?} of the caller's CPU time",
+            explored.wall, explored.cpu
+        );
+        assert!(
+            explored.cpu < HOLD / 4,
+            "the caller used {:?} of CPU time in {:?}, {HOLD:?} of it waiting for one worker: \
+             shutdown_now is spinning",
+            explored.cpu,
+            explored.wall
+        );
+    }
+
+    // --- Pattern 4: an idle pool shuts down promptly ------------------------
+
+    /// Shutting down a pool whose workers are all idle does not wait for the
+    /// workers' 250 ms poll timeout: the request wakes them.
+    ///
+    /// Five rounds, 16 idle workers each, `shutdown_now` timed. The total must
+    /// be under 500 ms.
+    ///
+    /// **Before the fix** nothing woke the workers, so each round lasted until
+    /// the last of 16 workers timed out: about 235 ms on average, and more
+    /// than 1 s over five rounds. The test fails with the measured total.
+    #[test]
+    fn an_idle_pool_shuts_down_without_waiting_out_its_poll() {
+        run_child("exec_pool::tests::idle_pool_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by \
+                an_idle_pool_shuts_down_without_waiting_out_its_poll"]
+    fn idle_pool_child() {
+        const WORKERS: usize = 16;
+        const ROUNDS: u32 = 5;
+        const BUDGET: Duration = Duration::from_millis(500);
+        let _serial = hooks_lock();
+
+        let mut total = Duration::ZERO;
+        for round in 0..ROUNDS {
+            let (mut pool, states) = pool(WORKERS);
+            let program = Arc::new(|| {});
+            pool.worker_vec.iter_mut().for_each(|w| w.start(&program));
+            wait_for("every worker to go idle", || {
+                count_in(&states, ExecutionPoolWorkerState::Waiting) == WORKERS
+            });
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                let joined_all = pool.shutdown_now();
+                let _ = tx.send((joined_all, start.elapsed()));
+            });
+            let (joined_all, took) = rx.recv_timeout(STEP_LIMIT).unwrap_or_else(|_| {
+                panic!("round {round}: shutdown_now did not return within {STEP_LIMIT:?}")
+            });
+            assert!(joined_all, "round {round}: not every worker was joined");
+            eprintln!("idle pool: round {round}: shutdown_now took {took:?}");
+            total += took;
+        }
+        assert!(
+            total < BUDGET,
+            "{ROUNDS} shutdowns of an idle {WORKERS}-worker pool took {total:?}: the workers \
+             were not woken and waited out their poll timeout"
+        );
+    }
+
+    // --- Pattern 5: a large pool, repeated ----------------------------------
+
+    /// The configuration that matters here: a pool much larger than the program needs,
+    /// explored repeatedly, with one worker caught in window 1 each time. Every
+    /// round must return, with the complete count.
+    ///
+    /// **Before the fix** the first round never returns, and the child fails
+    /// as pattern 1 does.
+    #[test]
+    fn a_large_pool_with_a_worker_in_the_window_explores_everything() {
+        run_child("exec_pool::tests::large_pool_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by \
+                a_large_pool_with_a_worker_in_the_window_explores_everything"]
+    fn large_pool_child() {
+        const WORKERS: usize = 8;
+        const N: u32 = 3;
+        const ROUNDS: u32 = 3;
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+        for round in 0..ROUNDS {
+            let explored = shutdown_while_a_worker_is_past_its_check(WORKERS, N, Duration::ZERO);
+            eprintln!(
+                "large pool: round {round}: explore returned after {:?}",
+                explored.wall
+            );
+        }
+    }
+
+    // --- Pattern 6: the request cannot be missed at the wait ----------------
+
+    /// A worker stopped at the moment it is about to wait — flag re-read, queue
+    /// lock held — still gets the shutdown request at once, rather than
+    /// sleeping out its 250 ms poll.
+    ///
+    /// The stopped worker holds the queue lock, so `shutdown_now` blocks there
+    /// until the worker is genuinely waiting on the condition variable, and its
+    /// notification, sent under that same lock, cannot arrive too early to be
+    /// seen. Three rounds, timed from the release, must total under 180 ms:
+    /// 60 ms a round, against a measured 1.1-3 ms when the wake-up works and a
+    /// full 250 ms poll when it is missed.
+    ///
+    /// **With the flag stored and the notification sent outside the lock**,
+    /// `shutdown_now` does not block, so both happen while the worker is still
+    /// stopped short of the wait. The worker then waits having missed the
+    /// notification and sleeps out its poll; the test fails with the measured
+    /// total (about 750 ms).
+    #[test]
+    fn a_shutdown_reaches_a_worker_that_is_about_to_wait() {
+        run_child("exec_pool::tests::before_wait_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by a_shutdown_reaches_a_worker_that_is_about_to_wait"]
+    fn before_wait_child() {
+        const ROUNDS: u32 = 3;
+        const BUDGET: Duration = Duration::from_millis(180);
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+
+        let mut total = Duration::ZERO;
+        for round in 0..ROUNDS {
+            let (mut pool, states) = pool(2);
+            let program = Arc::new(|| {});
+            pool.worker_vec.iter_mut().for_each(|w| w.start(&program));
+            test_hooks::arm(Point::BeforeWait);
+            wait_until_paused();
+            assert!(
+                count_in(&states, ExecutionPoolWorkerState::Waiting) >= 1,
+                "round {round}: the stopped worker marks itself Waiting before it waits"
+            );
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let joined_all = pool.shutdown_now();
+                let _ = tx.send(joined_all);
+            });
+            // Long enough for `shutdown_now` to reach the queue lock, which the
+            // stopped worker is holding.
+            std::thread::sleep(Duration::from_millis(100));
+            let released = Instant::now();
+            test_hooks::release();
+            let joined_all = rx.recv_timeout(STEP_LIMIT).unwrap_or_else(|_| {
+                panic!("round {round}: shutdown_now did not return within {STEP_LIMIT:?}")
+            });
+            let took = released.elapsed();
+            assert!(joined_all, "round {round}: not every worker was joined");
+            eprintln!("before wait: round {round}: shutdown_now returned {took:?} after release");
+            total += took;
+        }
+        assert!(
+            total < BUDGET,
+            "{ROUNDS} shutdowns of a worker stopped just before its wait took {total:?}: the \
+             request was stored and notified before the worker waited, so the worker missed it \
+             and slept out its poll"
+        );
+    }
+
+    // --- Pattern 7: the drain's two readings cannot diverge -----------------
+
+    enum Staged {
+        Valid {
+            execs: usize,
+            shutdown_after: Duration,
+        },
+        Void(String),
+    }
+
+    /// Sets up the one state the drain check has to get right — work queued
+    /// and no worker busy — and stops the drain inside it.
+    ///
+    /// Two workers explore the program; because a revisit never reaches the
+    /// shared queue (measured: over a million samples of six program shapes at
+    /// one, two and four workers, the queue only ever held a start token), the
+    /// item staged here is a start token, pushed **without notifying** so the
+    /// idle workers stay asleep with work queued. The drain reaches its check
+    /// in that state and stops between its two readings, held there past the
+    /// workers' 250 ms poll.
+    ///
+    /// While it is stopped it holds the queue lock, so no worker can take the
+    /// item and the depth it reads afterwards is still 1: it keeps draining,
+    /// and the earliest it can request shutdown is its next poll, a further
+    /// 250 ms away. Reading the two under separate locks lets a worker take
+    /// the item during the hold, so the depth reads 0 against a busy reading
+    /// taken before that, and shutdown follows within microseconds of the
+    /// release, with the work in flight.
+    ///
+    /// Staging races the drain's next poll, so an attempt can come to nothing;
+    /// that is reported as [`Staged::Void`] and retried, and only a staged
+    /// attempt asserts.
+    fn stage_one_drain_check(n: u32, hold: Duration, settle: Duration) -> Staged {
+        let (pool, states) = pool(2);
+        let queue = pool.work_deque.clone();
+        let can_drain = pool.can_drain.clone();
+        let done = explore_in_background(pool, n);
+
+        // Stage the item once the program has been explored and both workers
+        // are asleep. `can_drain` means an execution has completed, so the
+        // pool's own start token is long gone.
+        loop {
+            if *can_drain.lock().unwrap() {
+                let mut held = queue.lock().unwrap();
+                if held.is_empty() && count_in(&states, ExecutionPoolWorkerState::Waiting) == 2 {
+                    held.push_back(None);
+                    drop(held);
+                    test_hooks::arm(Point::DrainBetweenReads);
+                    break;
+                }
+            }
+            if let Ok(explored) = done.try_recv() {
+                return Staged::Void(format!(
+                    "the pool shut down ({} execs) before the item could be staged",
+                    explored.execs
+                ));
+            }
+            std::thread::yield_now();
+        }
+
+        wait_until_paused();
+        // A worker's poll may have fired before the drain's check, in which
+        // case it took the item and the check sees a busy worker: no window.
+        if count_in(&states, ExecutionPoolWorkerState::Busy) > 0 {
+            test_hooks::release();
+            let explored = finished(&done, "drain check");
+            return Staged::Void(format!(
+                "a worker took the item before the drain's check ({} execs)",
+                explored.execs
+            ));
+        }
+        // Past the workers' poll: one of them wakes inside this hold and takes
+        // the item, unless the drain is holding the queue lock.
+        std::thread::sleep(hold);
+
+        let released = Instant::now();
+        test_hooks::release();
+        // Correct, the drain reads depth 1 and keeps draining, so the earliest
+        // shutdown is its next poll. Reading across the gap, it concludes
+        // "drained" at once.
+        let mut shutdown_after = None;
+        while released.elapsed() < settle && shutdown_after.is_none() {
+            if count_in(&states, ExecutionPoolWorkerState::Shutdown) > 0 {
+                shutdown_after = Some(released.elapsed());
+            }
+            std::thread::yield_now();
+        }
+        let explored = finished(&done, "drain check");
+        Staged::Valid {
+            execs: explored.execs,
+            shutdown_after: shutdown_after.unwrap_or(settle),
+        }
+    }
+
+    /// Work queued while the drain is deciding is either counted or left for a
+    /// worker — never dropped, and never shut down from under a worker that is
+    /// taking it.
+    ///
+    /// **With the depth and the busy states read under separate locks** a
+    /// worker takes the item between the two readings, so the drain sees an
+    /// empty queue and a stale "nobody busy" and requests shutdown with that
+    /// work in flight, microseconds after the release rather than 250 ms
+    /// later. The test fails with the measured delay.
+    #[test]
+    fn work_queued_while_the_drain_decides_is_not_dropped() {
+        run_child("exec_pool::tests::drain_between_reads_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by work_queued_while_the_drain_decides_is_not_dropped"]
+    fn drain_between_reads_child() {
+        const N: u32 = 3;
+        /// Longer than the workers' 250 ms poll, so a worker does wake and try
+        /// to take the staged item while the drain is stopped.
+        const HOLD: Duration = Duration::from_millis(400);
+        /// Correct, the drain cannot request shutdown for at least its next
+        /// poll, 250 ms away; reading across the gap it does so at once. This
+        /// splits 250 ms and the 10 microseconds measured for the mutation.
+        const SETTLE: Duration = Duration::from_millis(100);
+        const ATTEMPTS: u32 = 5;
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+
+        for attempt in 0..ATTEMPTS {
+            match stage_one_drain_check(N, HOLD, SETTLE) {
+                Staged::Valid {
+                    execs,
+                    shutdown_after,
+                } => {
+                    eprintln!(
+                        "drain between reads: staged on attempt {attempt}: {execs} execs, \
+                         shutdown seen {shutdown_after:?} after the release"
+                    );
+                    assert!(
+                        shutdown_after >= SETTLE,
+                        "the pool requested shutdown {shutdown_after:?} after the release, while \
+                         a worker was taking the item the drain had just counted: the depth and \
+                         the busy states were read on either side of that"
+                    );
+                    assert!(
+                        execs > two_phase_commit_execs(N),
+                        "the staged work was dropped: {execs} executions is no more than the \
+                         {} of the exploration that had already finished",
+                        two_phase_commit_execs(N)
+                    );
+                    return;
+                }
+                Staged::Void(why) => {
+                    eprintln!("drain between reads: attempt {attempt} came to nothing: {why}")
+                }
+            }
+        }
+        panic!("could not stage the drain's check in {ATTEMPTS} attempts");
+    }
+
+    // --- Pattern 8: no new work is taken after the request ------------------
+
+    /// Counts the executions [`pre_take_check_child`]'s program begins.
+    static EXECUTIONS_BEGUN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Work already queued is not taken after a shutdown request: the worker
+    /// leaves it where it is and exits.
+    ///
+    /// One worker, idle in its wait, is stopped on its next pass at the point
+    /// between the flag check and the queue lock. The test then queues a start
+    /// token and calls `shutdown_now` from another thread; because the queue
+    /// is no longer empty, the stopped worker cannot wait, so the next thing
+    /// it does on release is the take itself. The flag is stored under the
+    /// very lock that take uses, so the worker sees it and takes nothing.
+    ///
+    /// Three independent witnesses that the token was never begun: the
+    /// program's own execution counter is 0, the token is still in the queue,
+    /// and the pool's stats record no executions.
+    ///
+    /// **Without the pre-take flag check** the worker pops the token, marks
+    /// itself `Busy` and explores it in full before it looks at the flag
+    /// again. All three witnesses change: the counter reads 1, the queue is
+    /// empty, and the stats record the execution.
+    ///
+    /// This is the one property that needs a direct `shutdown_now`: the
+    /// production path, `drain_and_shutdown`, requests shutdown only after it
+    /// has seen an empty queue and no busy worker under the queue lock, so it
+    /// cannot leave work queued at the request.
+    #[test]
+    fn queued_work_is_not_taken_after_a_shutdown_request() {
+        run_child("exec_pool::tests::pre_take_check_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by queued_work_is_not_taken_after_a_shutdown_request"]
+    fn pre_take_check_child() {
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+        EXECUTIONS_BEGUN.store(0, Ordering::SeqCst);
+
+        let (mut pool, states) = pool(1);
+        let queue = pool.work_deque.clone();
+        let stats = pool.exec_stats.clone();
+        let program = Arc::new(|| {
+            EXECUTIONS_BEGUN.fetch_add(1, Ordering::SeqCst);
+        });
+        pool.worker_vec.iter_mut().for_each(|w| w.start(&program));
+
+        // Let the worker settle into its wait, so that it is idle in the sense
+        // the guarantee is about, and stop it on its next pass.
+        wait_for("the worker to go idle", || {
+            count_in(&states, ExecutionPoolWorkerState::Waiting) == 1
+        });
+        test_hooks::arm(Point::AfterShutdownCheck);
+        wait_until_paused();
+        assert_eq!(
+            count_in(&states, ExecutionPoolWorkerState::Waiting),
+            1,
+            "the stopped worker should be idle, holding no work"
+        );
+
+        // Queue the work it would take, then request shutdown directly.
+        pool.enqueue(None);
+        assert_eq!(
+            queue.lock().unwrap().len(),
+            1,
+            "the token is queued before shutdown is requested"
+        );
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let joined_all = pool.shutdown_now();
+            let _ = tx.send(joined_all);
+        });
+        // `shutdown_now` stores the flag and only then writes the per-worker
+        // states, so seeing the state is seeing the flag already set.
+        wait_for("the shutdown request", || {
+            count_in(&states, ExecutionPoolWorkerState::Shutdown) == 1
+        });
+        test_hooks::release();
+        let joined_all = rx
+            .recv_timeout(STEP_LIMIT)
+            .unwrap_or_else(|_| panic!("shutdown_now did not return within {STEP_LIMIT:?}"));
+        assert!(joined_all, "the worker was not joined");
+
+        let begun = EXECUTIONS_BEGUN.load(Ordering::SeqCst);
+        assert_eq!(
+            begun, 0,
+            "the worker began {begun} execution(s) after shutdown had been requested: it took \
+             the queued token instead of leaving it"
+        );
+        assert_eq!(
+            queue.lock().unwrap().len(),
+            1,
+            "the queued token is gone: the worker took it after shutdown had been requested"
+        );
+        assert_eq!(
+            stats.lock().unwrap().execs,
+            0,
+            "the pool recorded executions from work taken after shutdown had been requested"
+        );
+        eprintln!("pre-take check: the token stayed queued and no execution began");
+    }
+}
