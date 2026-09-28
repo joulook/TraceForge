@@ -3321,3 +3321,899 @@ fn c1_every_name_cited_in_a_comment_exists() {
         dangling.join("\n  ")
     );
 }
+
+// ===========================================================================
+// F41 --- the three items of the "make the tool honest about thread ids"
+// ruling (tasks `P3-F41` and `P3-F41-round2`).
+//
+// Item 1: `diagnose::SeenAt` + `report::nothing_text_with_examples`, so that a
+// mismatch at a thread's first observation stops rendering as an *absence*.
+// Item 2: `report::thread_id_hint`. Item 3: the `mod.rs` doc section.
+//
+// Round 1 measured item 1 inert: `SeenAt::record` ran at the top of
+// `Recompute::visit`, and a non-following extension never reaches `visit`, so
+// every recorded row was a value-wise prefix of the implementation's and the
+// differing value --- the one thing item 1 exists to name --- was exactly what
+// could not be recorded. Round 2 tests the fix: `record` now runs at the two
+// *pruning* sites, `phi`'s `check` closure and `branch`'s `step` follow check.
+// The properties below were re-derived from the round-2 brief and F41 before
+// the new code was read (`scratchpad/f41r2/derived-properties.md`), not
+// obtained by flipping round 1's assertions; see `log/dev/P3-F41-round2.report.md`.
+//
+// The discriminating assertion throughout is **not** "an example is named" ---
+// round 1 showed that passes with the mechanism inert --- but "the named
+// example is a value the implementation does not have at that position", which
+// only a record taken at a pruning site can produce.
+//
+// **The three recording sites are complementary, and the round-2 audit
+// separates them** (`log/dev/P3-F41-round2.report.md` §5). Both pruning sites
+// record only rows that do *not* follow, so `visit`'s call is the only source
+// of *following* rows: removing it alone kills
+// `f41_item1_is_honest_where_the_specifications_row_genuinely_ends` and nothing
+// else, while removing both pruning records kills the other four item-1 tests
+// and leaves that one alive. Removing `step`'s record alone kills nothing, here
+// or anywhere in `--lib conformance` --- with `use_phi = true`, which is the
+// only mode production builds, `phi` has already rejected a `SendMsg` before
+// `branch` is entered and has already scanned a `RecvMsg`'s options up to the
+// first that follows.
+// ===========================================================================
+
+/// F41's C1 shape, verbatim from `log/dev/P3-S7-threadid-probe.report.md` §3.1:
+/// the visible thread's source is byte-identical on the two sides and the
+/// implementation spawns one extra *invisible* thread before it, so `v`'s own
+/// id --- the value it sends --- is `t2` there and `t1` in the specification.
+fn f41_c1_spec() {
+    let _v = named("v", || {
+        crate::send_msg(main_thread_id(), thread::current().id());
+    });
+    let _got: ThreadId = crate::recv_msg_block();
+}
+
+fn f41_c1_impl() {
+    let _aux = named("aux", || {});
+    let _v = named("v", || {
+        crate::send_msg(main_thread_id(), thread::current().id());
+    });
+    let _got: ThreadId = crate::recv_msg_block();
+}
+
+/// F41's C2 shape: the *user type* carrying an invisible thread's id, which is
+/// the 2PC case and the one no type-level check could see.
+#[derive(Clone, PartialEq, Debug)]
+enum F41ParticipantMsg {
+    Prepare(ThreadId),
+}
+
+/// The `(M1)` obligation of the single report a pair produces.
+fn f41_only_m1(v: &ConfVerdict) -> (String, String, usize) {
+    let reports = v.outcome().reports();
+    assert_eq!(reports.len(), 1, "expected exactly one report: {v:?}");
+    match reports[0].diagnostics() {
+        Diagnostics::Available {
+            obligation:
+                Obligation::ObservationMismatch {
+                    spec,
+                    imp,
+                    position,
+                    ..
+                },
+            ..
+        } => (spec.clone(), imp.clone(), *position),
+        other => panic!("expected an (M1) obligation, got {other:?}"),
+    }
+}
+
+/// The rendered `(M1)` obligation of the single report a pair produces.
+fn f41_only_m1_rendered(v: &ConfVerdict) -> String {
+    let reports = v.outcome().reports();
+    assert_eq!(reports.len(), 1, "expected exactly one report: {v:?}");
+    let Diagnostics::Available { obligation, .. } = reports[0].diagnostics() else {
+        panic!("expected diagnostics: {:?}", reports[0].diagnostics())
+    };
+    format!("{obligation}")
+}
+
+/// The specification slot and the rendered text of a `Diagnostics::Available`
+/// `(M1)` obligation, for the two-traversal comparison below.
+fn f41_m1_of(d: &Diagnostics, what: &str) -> (String, String) {
+    match d {
+        Diagnostics::Available { obligation, .. } => match obligation {
+            Obligation::ObservationMismatch { spec, .. } => {
+                (spec.clone(), format!("{obligation}"))
+            }
+            other => panic!("{what}: expected an (M1) obligation, got {other:?}"),
+        },
+        other => panic!("{what}: expected diagnostics, got {other:?}"),
+    }
+}
+
+/// **§7.1's slot takes a noun phrase.** Round 1's draft put a clause ending in
+/// an em-dash conclusion there, which stranded the implementation's half after
+/// it ("… not a missing event, the implementation has receive 7"). This checks
+/// the contract rather than the one string that broke it: the spec slot carries
+/// no sentence break and no em dash, its parentheses balance, and the rendered
+/// obligation still begins with §7.1's template filled in that order, so the
+/// implementation's half comes after the whole of the specification's.
+fn f41_assert_reads_as_one_sentence(
+    rendered: &str,
+    thread: &str,
+    position: usize,
+    spec: &str,
+    imp: &str,
+) {
+    assert!(
+        !spec.contains('\u{2014}') && !spec.contains(". ") && !spec.ends_with('.'),
+        "the specification slot is not a noun phrase: {spec}"
+    );
+    let depth = spec.chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert_eq!(depth, 0, "unbalanced parentheses in the slot: {spec}");
+    let expected = format!(
+        "(M1) observation mismatch on `{thread}` at position {position}: the \
+         specification has {spec}, the implementation has {imp}"
+    );
+    assert!(
+        rendered.starts_with(&expected),
+        "§7.1's template is not intact:\n  got      {rendered}\n  expected {expected}…"
+    );
+}
+
+/// **The wording asserts no cause, and claims only what was observed.**
+///
+/// Four things it must not do, each from a defect found in round 1 or ruled in
+/// round 2: no modal claim about the specification (it has many executions);
+/// not the withdrawn clause "so the difference is in the value, not a missing
+/// event", which was false wherever it fired; and not the word *execution* ---
+/// what the search saw is a rejected partial graph, which nothing shows
+/// completes. `f41_a_named_example_can_come_from_an_attempt_that_never_completes`
+/// measures that this last one is load-bearing rather than pedantic.
+fn f41_assert_claims_only_what_was_observed(spec: &str) {
+    for forbidden in [
+        "requires",
+        "must",
+        "the difference is in the value",
+        "execution",
+    ] {
+        assert!(
+            !spec.contains(forbidden),
+            "the specification slot claims `{forbidden}`: {spec}"
+        );
+    }
+    assert!(
+        spec.contains("attempt"),
+        "the specification slot does not say which thing observed the value: {spec}"
+    );
+}
+
+/// **Item 1 on F41's own C1 shape, at position 0 --- the case it was written
+/// for and the case round 1 measured it failing.**
+///
+/// The specification's `v` sends its own id, `t1`; the implementation's sends
+/// `t2`, because one extra invisible thread was spawned first. §6.1 matches by
+/// value, so no attempt follows, and the reported attempt is one in which `v`
+/// has not acted --- which is why this rendered as an *absence*.
+///
+/// What must now hold, in order of strength:
+///
+/// 1. the specification side names an example;
+/// 2. **the example is a value the implementation does not have there** ---
+///    `opaque_id: 1` against `opaque_id: 2`. This is the assertion round 1's
+///    inert mechanism could not have passed: a value differing from the
+///    implementation's exists only in a *rejected* attempt, because
+///    `morphism::observations_follow` makes every surviving row a value-wise
+///    prefix of the implementation's;
+/// 3. the two values appear side by side in one sentence --- the rendering
+///    F41's entry calls "structurally the rendering this path cannot produce";
+/// 4. the sentence parses and claims no cause.
+///
+/// What would break it: `SeenAt::record` moving back to `visit` only, or its
+/// `!follows_here` guard being inverted --- both measured to kill this test
+/// (round-2 report §5, mutants M-c and M-d).
+#[test]
+fn f41_item1_names_the_counterpart_value_on_f41s_own_c1_shape() {
+    let v = verify(base(&["v"]).build().unwrap(), f41_c1_impl, f41_c1_spec).unwrap();
+    let (spec, imp, position) = f41_only_m1(&v);
+    let rendered = f41_only_m1_rendered(&v);
+    assert_eq!(position, 0, "C1's mismatch must be at position 0");
+    assert_eq!(
+        imp, "send ThreadId { opaque_id: 2 }",
+        "C1 no longer reproduces: imp={imp}"
+    );
+    assert_ne!(
+        spec,
+        report::nothing_text(),
+        "item 1 named nothing on the shape it exists for"
+    );
+    assert!(
+        spec.contains("send ThreadId { opaque_id: 1 }"),
+        "the specification's counterpart value is not named: {spec}"
+    );
+    assert!(
+        !spec.contains(&imp),
+        "the only example named is the implementation's own value, which is the \
+         signature of the inert mechanism round 1 measured: spec={spec} imp={imp}"
+    );
+    f41_assert_reads_as_one_sentence(&rendered, "v", position, &spec, &imp);
+    f41_assert_claims_only_what_was_observed(&spec);
+}
+
+/// **Item 1 on F41's C2 shape: the id inside a user type, and belonging to an
+/// *invisible* thread.**
+///
+/// C1 is the easy half --- the differing value is the visible thread's own id.
+/// C2 is 2PC's actual shape: `v` is spawned first on *both* sides, so its own
+/// id agrees, and what differs is an invisible coordinator's id, carried to `v`
+/// inside `Prepare(..)`. Both the bare-id form (the probe report's literal C2)
+/// and the wrapped form are measured, because item 2's detection is by rendered
+/// text and item 1's recording is by rendered text too: if either were
+/// type-directed, the wrapped form would be the one to fail.
+///
+/// What would break it: the same two mutants as C1, plus `SeenAt` keying on
+/// anything narrower than `report::obs_text`.
+#[test]
+fn f41_item1_names_the_counterpart_value_on_c2_an_id_inside_a_user_type() {
+    // Wrapped: `Prepare(ThreadId)`.
+    fn c2_spec() {
+        let v = named("v", || {
+            let _who: F41ParticipantMsg = crate::recv_msg_block();
+        });
+        let coord = named("coord", || {});
+        crate::send_msg(v, F41ParticipantMsg::Prepare(coord));
+    }
+    fn c2_impl() {
+        let v = named("v", || {
+            let _who: F41ParticipantMsg = crate::recv_msg_block();
+        });
+        let _aux = named("aux", || {});
+        let coord = named("coord", || {});
+        crate::send_msg(v, F41ParticipantMsg::Prepare(coord));
+    }
+    let v = verify(base(&["v"]).build().unwrap(), c2_impl, c2_spec).unwrap();
+    let (spec, imp, position) = f41_only_m1(&v);
+    let rendered = f41_only_m1_rendered(&v);
+    assert_eq!(position, 0);
+    assert_eq!(
+        imp, "receive Prepare(ThreadId { opaque_id: 3 })",
+        "C2 no longer reproduces: imp={imp}"
+    );
+    assert!(
+        spec.contains("receive Prepare(ThreadId { opaque_id: 2 })"),
+        "the coordinator's specification-side id is not named: {spec}"
+    );
+    assert!(
+        !spec.contains(&imp),
+        "the only example named is the implementation's own value: spec={spec}"
+    );
+    f41_assert_reads_as_one_sentence(&rendered, "v", position, &spec, &imp);
+    f41_assert_claims_only_what_was_observed(&spec);
+    // Item 2 rides on the rendered text, so the wrapped id earns the note too.
+    assert!(
+        rendered.contains("a `ThreadId` is numbered per program in spawn order"),
+        "{rendered}"
+    );
+
+    // Bare: the probe report's literal C2.
+    fn c2_bare_spec() {
+        let v = named("v", || {
+            let _who: ThreadId = crate::recv_msg_block();
+        });
+        let coord = named("coord", || {});
+        crate::send_msg(v, coord);
+    }
+    fn c2_bare_impl() {
+        let v = named("v", || {
+            let _who: ThreadId = crate::recv_msg_block();
+        });
+        let _aux = named("aux", || {});
+        let coord = named("coord", || {});
+        crate::send_msg(v, coord);
+    }
+    let v = verify(base(&["v"]).build().unwrap(), c2_bare_impl, c2_bare_spec).unwrap();
+    let (spec, imp, position) = f41_only_m1(&v);
+    assert_eq!(position, 0);
+    assert_eq!(imp, "receive ThreadId { opaque_id: 3 }", "imp={imp}");
+    assert!(
+        spec.contains("receive ThreadId { opaque_id: 2 }") && !spec.contains(&imp),
+        "spec={spec}"
+    );
+}
+
+/// **The strongest case against item 1: the shape where the specification's row
+/// genuinely does end, and the example equals the implementation's own value.**
+///
+/// Two visible threads; the specification serves exactly one of `p` and `q`,
+/// the implementation serves both. `Best` takes the attempt `[p: 1, q: 0]`, in
+/// which `q`'s row really is empty --- so here the old wording was *true*, and
+/// the example item 1 adds, `receive 7`, is byte-identical to what the
+/// implementation observed. Round 1 treated that as the item's refutation. It
+/// is not; what it is, is the case where the wording has to carry its weight,
+/// so this test interrogates honesty rather than naming:
+///
+/// 1. **the example is real**, measured independently of the report: the
+///    specification's other branch, pinned and run on its own, gives `q` the
+///    observation `receive 7` at position 0;
+/// 2. **and that attempt is not a complete execution** --- in it `p` waits on a
+///    receive nothing satisfies, so `p`'s row is empty. So "attempt" is not a
+///    hedge here, it is the only true word: no *execution* of this
+///    specification observes `receive 7` on `q` while `p` is served, which is
+///    precisely the violation;
+/// 3. the sentence says "another attempt", so it does not claim the
+///    specification covers the implementation here, and it does not repeat the
+///    withdrawn "so the difference is in the value", which in this shape would
+///    be false;
+/// 4. the obligation still *states the violation* --- gate, thread, position
+///    and the implementation's value all survive, and the verdict is still
+///    `Reported`. The clause is an addendum to a violation, not a retraction.
+///
+/// What would break it: the example vanishing (item 1 losing this shape), the
+/// verdict softening, or the wording acquiring a causal claim.
+#[test]
+fn f41_item1_is_honest_where_the_specifications_row_genuinely_ends() {
+    use crate::conformance::obs::wobs;
+
+    fn spec() {
+        let p = named("p", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        let q = named("q", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        if crate::nondet() {
+            crate::send_msg(p, 7u64);
+        } else {
+            crate::send_msg(q, 7u64);
+        }
+    }
+    fn implementation() {
+        let p = named("p", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        let q = named("q", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        crate::send_msg(p, 7u64);
+        crate::send_msg(q, 7u64);
+    }
+
+    // (1) and (2): the example, measured on a real graph of the specification's
+    // own `else` branch, with `p` unserved in it.
+    let pinned = run_once(
+        Config::builder().with_cons_type(ConsType::FIFO).build(),
+        || {
+            let _p = named("p", || {
+                let _: u64 = crate::recv_msg_block();
+            });
+            let q = named("q", || {
+                let _: u64 = crate::recv_msg_block();
+            });
+            crate::send_msg(q, 7u64);
+        },
+    );
+    let visible = names(&["p", "q"]);
+    let w = wobs(&pinned, &visible).unwrap();
+    assert_eq!(
+        w.of("q")
+            .first()
+            .map(|(_, o)| report::obs_text(o))
+            .as_deref(),
+        Some("receive 7"),
+        "the specification's other branch does not observe `receive 7` on q at 0"
+    );
+    assert!(
+        w.of("p").is_empty(),
+        "that attempt serves p too, so it is not the incomparable one: {:?}",
+        w.of("p")
+    );
+
+    let v = verify(base(&["p", "q"]).build().unwrap(), implementation, spec).unwrap();
+    assert!(
+        matches!(v, ConfVerdict::Reported(_)),
+        "the violation is no longer reported"
+    );
+    let (spec_text, imp, position) = f41_only_m1(&v);
+    let rendered = f41_only_m1_rendered(&v);
+    assert_eq!(position, 0);
+    assert_eq!(imp, "receive 7");
+    // (3) The example is named, and here it *is* the implementation's own
+    // value --- asserted, so that a future change making them differ in this
+    // shape is noticed rather than silently accepted.
+    assert!(
+        spec_text.contains("another attempt of the specification observed receive 7"),
+        "spec={spec_text}"
+    );
+    f41_assert_claims_only_what_was_observed(&spec_text);
+    f41_assert_reads_as_one_sentence(&rendered, "q", position, &spec_text, &imp);
+    // (4) The violation is still stated.
+    assert!(
+        rendered.starts_with("(M1) observation mismatch on `q` at position 0:")
+            && rendered.contains("the implementation has receive 7"),
+        "{rendered}"
+    );
+}
+
+/// **A named example can come from a specification attempt that never
+/// completes**, which is why the wording says "attempt" and not "execution".
+///
+/// The specification either sends `1` and then waits on a receive **nothing in
+/// the program ever satisfies**, or sends `2` and finishes; the implementation
+/// sends `3`. Both `receive 1` and `receive 2` are named. The counters measure
+/// that the first branch was entered and never got past its blocking receive in
+/// any run of the whole verification, so no complete execution of this
+/// specification observes `receive 1` --- and the sentence is still true,
+/// because it claims an *attempt* observed it.
+///
+/// It also measures the plural form end to end.
+///
+/// This is a measured fact, filed for the owner rather than asserted to be
+/// desirable: an example drawn from a dead end is of limited use to a reader,
+/// and the rendering does not distinguish the two. See the round-2 report §4.
+///
+/// What would break it: the wording reverting to "execution" (it would then be
+/// false here), or the examples list dropping the dead-end row.
+#[test]
+fn f41_a_named_example_can_come_from_an_attempt_that_never_completes() {
+    static ENTERED: AtomicUsize = AtomicUsize::new(0);
+    static GOT_PAST_THE_BLOCK: AtomicUsize = AtomicUsize::new(0);
+
+    fn spec() {
+        let v = named("v", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        if crate::nondet() {
+            crate::send_msg(v, 1u64);
+            ENTERED.fetch_add(1, Ordering::SeqCst);
+            // Nothing in this program ever sends to `main`.
+            let _: u64 = crate::recv_msg_block();
+            GOT_PAST_THE_BLOCK.fetch_add(1, Ordering::SeqCst);
+        } else {
+            crate::send_msg(v, 2u64);
+        }
+    }
+    fn implementation() {
+        let v = named("v", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        crate::send_msg(v, 3u64);
+    }
+
+    let v = verify(base(&["v"]).build().unwrap(), implementation, spec).unwrap();
+    let (spec_text, imp, position) = f41_only_m1(&v);
+    let rendered = f41_only_m1_rendered(&v);
+    assert_eq!(position, 0);
+    assert_eq!(imp, "receive 3");
+    assert!(
+        spec_text.contains("receive 1") && spec_text.contains("receive 2"),
+        "both attempts' values should be named: {spec_text}"
+    );
+    assert!(
+        spec_text.contains("other attempts of the specification observed"),
+        "two examples must render in the plural: {spec_text}"
+    );
+    f41_assert_claims_only_what_was_observed(&spec_text);
+    f41_assert_reads_as_one_sentence(&rendered, "v", position, &spec_text, &imp);
+
+    let entered = ENTERED.load(Ordering::SeqCst);
+    let past = GOT_PAST_THE_BLOCK.load(Ordering::SeqCst);
+    assert!(entered > 0, "the dead-end branch was never taken");
+    assert_eq!(
+        past, 0,
+        "the dead-end branch completed {past} times, so it is not a dead end"
+    );
+}
+
+/// **A genuinely missing event still renders the plain wording.**
+///
+/// The implementation's `v` sends twice, the specification's once, so the
+/// specification's row really does end at position 1 and no attempt --- pruned
+/// or visited --- ever observed anything there.
+///
+/// Round 1 noted this test barely discriminated, because with the mechanism
+/// inert *every* single-visible-thread pair rendered the plain wording. It
+/// discriminates now: `f41_item1_names_the_counterpart_value_on_f41s_own_c1_shape`
+/// is a single-visible-thread pair that names an example, so the plain wording
+/// appearing here is a fact about this shape rather than about the mechanism
+/// being dead.
+///
+/// What would break it: `nothing_text_with_examples` naming something when
+/// `examples` is empty.
+#[test]
+fn f41_a_genuinely_missing_event_still_renders_the_plain_wording() {
+    let v = verify(
+        base(&["v"]).build().unwrap(),
+        || {
+            let _v = named("v", || {
+                crate::send_msg(main_thread_id(), 1u64);
+                crate::send_msg(main_thread_id(), 2u64);
+            });
+            let _a: u64 = crate::recv_msg_block();
+            let _b: u64 = crate::recv_msg_block();
+        },
+        || {
+            let _v = named("v", || {
+                crate::send_msg(main_thread_id(), 1u64);
+            });
+            let _a: u64 = crate::recv_msg_block();
+        },
+    )
+    .unwrap();
+    let (spec, imp, position) = f41_only_m1(&v);
+    assert_eq!(position, 1, "the specification's row ends at position 1");
+    assert_eq!(imp, "send 2");
+    assert_eq!(spec, report::nothing_text(), "spec={spec}");
+}
+
+/// **Item 2, both directions**, through `Obligation`'s `Display` --- the only
+/// way in, `report::thread_id_hint` being private to `report.rs`.
+///
+/// It fires on a bare `ThreadId`, on one wrapped in a user type
+/// (`Prepare(ThreadId { .. })`), which is the case no type-level check could
+/// see, and --- new in round 2 --- on an id that reaches the text only as one of
+/// item 1's *examples*, with the implementation's own value carrying no id at
+/// all. It does not fire on an ordinary value mismatch.
+///
+/// What would break it: dropping the `thread_id_hint` call from the `(M1)` arm,
+/// or inverting its condition.
+#[test]
+fn f41_the_thread_id_note_fires_on_a_rendered_thread_id_and_not_otherwise() {
+    let m1 = |spec: &str, imp: &str| {
+        format!(
+            "{}",
+            Obligation::ObservationMismatch {
+                thread: "v".to_owned(),
+                position: 0,
+                spec: spec.to_owned(),
+                imp: imp.to_owned(),
+            }
+        )
+    };
+    const NOTE: &str = "a `ThreadId` is numbered per program in spawn order";
+
+    let bare = m1(
+        "send ThreadId { opaque_id: 1 }",
+        "send ThreadId { opaque_id: 2 }",
+    );
+    assert!(bare.contains(NOTE), "{bare}");
+
+    // Wrapped in a user type, and only on the *implementation* side.
+    let wrapped = m1("send Prepare(1)", "send Prepare(ThreadId { opaque_id: 3 })");
+    assert!(wrapped.contains(NOTE), "{wrapped}");
+
+    // The specification side alone is enough too.
+    let spec_only = m1("receive ThreadId { opaque_id: 1 }", "receive 3");
+    assert!(spec_only.contains(NOTE), "{spec_only}");
+
+    // Item 1's examples are part of the specification slot, so an id that
+    // appears only there earns the note as well.
+    let from_example = m1(
+        &report::nothing_text_with_examples(&["receive ThreadId { opaque_id: 1 }".to_owned()]),
+        "receive 5",
+    );
+    assert!(from_example.contains(NOTE), "{from_example}");
+
+    let ordinary = m1("send 1", "send 2");
+    assert!(
+        !ordinary.contains(NOTE) && !ordinary.contains("Note:"),
+        "the note fired on an ordinary value mismatch: {ordinary}"
+    );
+    assert!(
+        ordinary.contains("(M1) observation mismatch on `v` at position 0"),
+        "{ordinary}"
+    );
+}
+
+/// **Item 2 reaches a real report**, not only a hand-built `Obligation`: C1's
+/// rendered obligation carries the note.
+#[test]
+fn f41_the_thread_id_note_reaches_a_real_report() {
+    let v = verify(base(&["v"]).build().unwrap(), f41_c1_impl, f41_c1_spec).unwrap();
+    let text = f41_only_m1_rendered(&v);
+    assert!(
+        text.contains("a `ThreadId` is numbered per program in spawn order"),
+        "the note did not reach the report:\n{text}"
+    );
+    assert!(
+        text.contains("send `Thread::name()` instead of the id"),
+        "{text}"
+    );
+}
+
+/// **`SeenAt`'s two bounds, and the fall-back past them.**
+///
+/// `SEEN_POSITIONS = 8` and `SEEN_EXAMPLES = 3` are private, so they are
+/// measured through `examples`: position 8 and beyond hold nothing however long
+/// the row is, and a fourth distinct value at one position is dropped. Past the
+/// bound `nothing_text_with_examples` must return **exactly** the plain wording
+/// rather than a partial claim.
+///
+/// Also the singular/plural split, and that neither form says "execution" or
+/// "requires".
+///
+/// What would break it: `examples` answering out of range instead of `&[]`, the
+/// `take(SEEN_POSITIONS)` going, or the empty case no longer falling back.
+#[test]
+fn f41_seen_at_is_bounded_and_falls_back_to_the_plain_wording() {
+    use crate::conformance::diagnose::SeenAt;
+    use crate::conformance::obs::wobs;
+
+    let visible = names(&["v"]);
+    let long = run_once(
+        Config::builder().with_cons_type(ConsType::FIFO).build(),
+        || {
+            let m = main_thread_id();
+            let _v = named("v", move || {
+                for k in 0..10u64 {
+                    crate::send_msg(m, k);
+                }
+            });
+            for _ in 0..10 {
+                let _: u64 = crate::recv_msg_block();
+            }
+        },
+    );
+    let w = wobs(&long, &visible).unwrap();
+    assert_eq!(w.of("v").len(), 10, "the probe row is not 10 long");
+
+    let mut seen = SeenAt::new();
+    seen.record(&visible, &w);
+    for k in 0..8 {
+        assert_eq!(
+            seen.examples("v", k).len(),
+            1,
+            "position {k} inside the bound was not recorded"
+        );
+    }
+    for k in [8usize, 9, 100] {
+        assert!(
+            seen.examples("v", k).is_empty(),
+            "position {k} is past SEEN_POSITIONS and must hold nothing"
+        );
+        assert_eq!(
+            report::nothing_text_with_examples(seen.examples("v", k)),
+            report::nothing_text(),
+            "past the bound the rendering must fall back to the plain wording"
+        );
+    }
+    // An unknown thread, too.
+    assert!(seen.examples("nobody", 0).is_empty());
+
+    // One example renders in the singular.
+    let one = report::nothing_text_with_examples(seen.examples("v", 0));
+    assert!(
+        one.contains("another attempt of the specification observed send 0 at this position"),
+        "{one}"
+    );
+    f41_assert_claims_only_what_was_observed(&one);
+
+    // The per-position example cap: four distinct values, three kept.
+    let mut seen = SeenAt::new();
+    for value in [100u64, 101, 102, 103] {
+        let g = run_once(
+            Config::builder().with_cons_type(ConsType::FIFO).build(),
+            move || {
+                let m = main_thread_id();
+                let _v = named("v", move || crate::send_msg(m, value));
+                let _: u64 = crate::recv_msg_block();
+            },
+        );
+        seen.record(&visible, &wobs(&g, &visible).unwrap());
+    }
+    let kept = seen.examples("v", 0);
+    assert_eq!(kept.len(), 3, "SEEN_EXAMPLES is not capping: {kept:?}");
+    assert!(
+        !kept.iter().any(|t| t.contains("103")),
+        "the fourth distinct value was kept: {kept:?}"
+    );
+    // Three examples render in the plural, and the cap is not disclosed (an
+    // honesty gap, reported).
+    let text = report::nothing_text_with_examples(kept);
+    assert!(
+        text.contains("other attempts of the specification observed send 100, send 101, send 102"),
+        "{text}"
+    );
+    f41_assert_claims_only_what_was_observed(&text);
+}
+
+/// **`SEEN_POSITIONS` end to end: inside the bound the example is named, past it
+/// the rendering falls back to the plain wording.** This is the honesty
+/// property --- past the bound the tool must say the plain thing rather than
+/// present half a claim --- and round 1 never measured it, because the `n = 8`
+/// half was behind a wording assertion that tripped first.
+///
+/// One visible thread and one parameter. The implementation feeds `q` the
+/// values `0..=n`; the specification feeds it `0..n` and then, under a
+/// `nondet`, one more value `99`. So there are exactly two attempts: the short
+/// one follows and wins `Best` with `n` observations, putting the obligation at
+/// position `n`; the long one diverges at position `n` and is pruned, which is
+/// where its `receive 99` is recorded.
+///
+/// `receive 99` is a value the implementation never has, so at `n = 7` this
+/// measures item 1 end to end and not merely that some text appears, and at
+/// `n = 8` the same construction must produce **exactly** `nothing_text()`.
+///
+/// **Cost, re-measured for the round-2 placement** (round 1 used a
+/// two-visible-thread shape costing ~36 s at `search_budget(600_000)`): ~12 s
+/// at `search_budget(120_000)` --- 2.6 s for `n = 7` and 9.4 s for `n = 8`. The
+/// budget is not slack: at 40 000 the `n = 8` half is `Inconclusive`
+/// (`SearchExhausted`) and measures nothing, 60 000 is the smallest round
+/// figure that suffices, and 120 000 costs the same as 60 000. The default
+/// 10 000 is `Inconclusive` for both halves.
+///
+/// What would break it: `SEEN_POSITIONS` moving in either direction (measured:
+/// at 16 the `n = 8` half names `receive 99`).
+#[test]
+fn f41_seen_positions_bound_end_to_end() {
+    for (n, expect_example) in [(7usize, true), (8usize, false)] {
+        let spec = move || {
+            let q = named("q", move || {
+                for _ in 0..(n + 1) {
+                    let _: u64 = crate::recv_msg_block();
+                }
+            });
+            for k in 0..n {
+                crate::send_msg(q, k as u64);
+            }
+            if crate::nondet() {
+                crate::send_msg(q, 99u64);
+            }
+        };
+        let implementation = move || {
+            let q = named("q", move || {
+                for _ in 0..(n + 1) {
+                    let _: u64 = crate::recv_msg_block();
+                }
+            });
+            for k in 0..(n + 1) {
+                crate::send_msg(q, k as u64);
+            }
+        };
+        let v = verify(
+            base(&["q"]).search_budget(120_000).build().unwrap(),
+            implementation,
+            spec,
+        )
+        .unwrap();
+        let (spec_text, imp, position) = f41_only_m1(&v);
+        assert_eq!(position, n, "n={n}: the mismatch is not at position {n}");
+        assert_eq!(imp, format!("receive {n}"), "n={n}");
+        if expect_example {
+            assert!(
+                spec_text.contains(
+                    "another attempt of the specification observed receive 99 at this position"
+                ),
+                "n={n}: inside the bound, the pruned attempt's value was not named: {spec_text}"
+            );
+            assert!(
+                !spec_text.contains(&imp),
+                "n={n}: the example is the implementation's own value: {spec_text}"
+            );
+        } else {
+            assert_eq!(
+                spec_text,
+                report::nothing_text(),
+                "n={n}: past SEEN_POSITIONS the rendering must fall back to the \
+                 plain wording"
+            );
+        }
+    }
+}
+
+/// **What a diagnostic *says* must not depend on which traversal produced it.**
+///
+/// `SeenAt` has three recording sites and one of them, `step`'s follow check,
+/// is unreachable-or-redundant while Φ is on — round 2 measured that removing it
+/// leaves `--lib conformance` at 400/0/5. That is not an argument for deleting
+/// it and not an argument for keeping it either; it is an argument that the
+/// claim has to be stated where it *can* fail. `Recompute::new` takes `use_phi`
+/// and `Recompute::diagnose` is `pub(crate)`, so it can be, and this is where.
+///
+/// This test takes F41's C1 shape, where the informative row **disagrees** with
+/// the implementation. Such a row is only ever recorded at a pruning site, so
+/// with Φ on it arrives through `phi`'s `check`, and with Φ off — where `phi`
+/// never runs — it can only arrive through `step`'s. The property: the `(M1)`
+/// obligation `diagnose` renders is **byte-identical** in the two modes.
+///
+/// Non-vacuity is asserted, not assumed: the Φ-on arm must first name
+/// `opaque_id: 1`, so "the two agree" cannot be satisfied by both falling back
+/// to the plain wording.
+///
+/// **This is the test that makes `step`'s record a tested line.** What would
+/// break it, measured (`P3-F41-round3` §2): removing `seen.record` from `step`'s
+/// `through_step` block — the Φ-off arm then renders
+/// `nothing (the row ends here)` while the Φ-on arm names `opaque_id: 1`.
+/// `f41_the_two_traversals_agree_where_the_example_follows` is the control that
+/// survives that mutation, so the kill is about the pruning site and not about
+/// Φ-off diagnostics being broken in general.
+#[test]
+fn f41_the_two_traversals_render_the_same_obligation_on_a_disagreeing_row() {
+    let cfg = || Config::builder().with_cons_type(ConsType::FIFO).build();
+    let graph = run_once(cfg(), f41_c1_impl);
+    let mode = |use_phi: bool| {
+        Recompute::new(
+            cfg(),
+            std::sync::Arc::new(f41_c1_spec as fn()),
+            names(&["v"]),
+            4096,
+            use_phi,
+        )
+        .diagnose(&graph, true)
+    };
+    let (phi_spec, phi_text) = f41_m1_of(&mode(true), "phi");
+    let (_, un_phi_text) = f41_m1_of(&mode(false), "un-phi");
+    assert!(
+        phi_spec.contains("send ThreadId { opaque_id: 1 }"),
+        "the phi arm did not name the counterpart value, so the comparison \
+         below would be vacuous: {phi_spec}"
+    );
+    assert_eq!(
+        phi_text, un_phi_text,
+        "the two traversals rendered different obligations, so what the \
+         diagnostic says depends on which one produced it"
+    );
+}
+
+/// **The control for `…_on_a_disagreeing_row`: where the example *follows*, the
+/// two traversals agree for a reason that has nothing to do with `step`.**
+///
+/// The incomparable shape — the specification serves exactly one of `p` and `q`
+/// — has the example on a row that follows, and following rows are recorded at
+/// `visit`, which both traversals execute unconditionally. So this must agree
+/// whatever happens to `step`'s record, and it does: measured, it survives the
+/// mutation that kills the disagreeing-row test (`P3-F41-round3` §2).
+///
+/// Without it, that kill would be equally consistent with Φ-off diagnostics
+/// being broken across the board.
+///
+/// What would break it: removing `seen.record` from `visit` — the Φ-on arm then
+/// names nothing and the non-vacuity assertion trips (round 2, M-f).
+#[test]
+fn f41_the_two_traversals_agree_where_the_example_follows() {
+    let cfg = || Config::builder().with_cons_type(ConsType::FIFO).build();
+    fn inc_impl() {
+        let p = named("p", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        let q = named("q", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        crate::send_msg(p, 7u64);
+        crate::send_msg(q, 7u64);
+    }
+    fn inc_spec() {
+        let p = named("p", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        let q = named("q", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        if crate::nondet() {
+            crate::send_msg(p, 7u64);
+        } else {
+            crate::send_msg(q, 7u64);
+        }
+    }
+    let graph = run_once(cfg(), inc_impl);
+    let mode = |use_phi: bool| {
+        Recompute::new(
+            cfg(),
+            std::sync::Arc::new(inc_spec as fn()),
+            names(&["p", "q"]),
+            4096,
+            use_phi,
+        )
+        .diagnose(&graph, true)
+    };
+    let (phi_spec, phi_text) = f41_m1_of(&mode(true), "phi");
+    let (_, un_phi_text) = f41_m1_of(&mode(false), "un-phi");
+    assert!(
+        phi_spec.contains("another attempt of the specification observed receive 7"),
+        "the phi arm did not name the example, so the comparison would be \
+         vacuous: {phi_spec}"
+    );
+    assert_eq!(
+        phi_text, un_phi_text,
+        "the two traversals rendered different obligations"
+    );
+}

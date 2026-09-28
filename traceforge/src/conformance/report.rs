@@ -915,11 +915,17 @@ impl fmt::Display for Obligation {
                 position,
                 spec,
                 imp,
-            } => write!(
-                f,
-                "(M1) observation mismatch on `{thread}` at position {position}: the \
-                 specification has {spec}, the implementation has {imp}"
-            ),
+            } => {
+                write!(
+                    f,
+                    "(M1) observation mismatch on `{thread}` at position {position}: the \
+                     specification has {spec}, the implementation has {imp}"
+                )?;
+                if let Some(hint) = thread_id_hint(spec, imp) {
+                    write!(f, "{hint}")?;
+                }
+                Ok(())
+            }
             Obligation::MissingPullBack {
                 spec_from,
                 spec_to,
@@ -1327,9 +1333,130 @@ pub(crate) fn obs_text(obs: &crate::conformance::obs::Obs) -> String {
     }
 }
 
+/// **The commonest cause of a value mismatch, named when it is visible.**
+///
+/// A `ThreadId` is an opaque number allocated per program in spawn order, so
+/// the same logical thread carries a different number on the two sides whenever
+/// they spawn a different count of *invisible* threads before it — which is what
+/// an abstraction does. A protocol that tells one thread about another by
+/// sending its id therefore mismatches on every such observation while both
+/// programs behave identically. It is the trap a first-time user falls into,
+/// because passing ids in messages is the natural way to write an actor
+/// protocol.
+///
+/// Detection is by the **rendered** value, so it also catches an id inside a
+/// user type (`Prepare(ThreadId { .. })`), which no type-level check could see:
+/// a `Val` is a `Box<dyn Message>`, and `Message` is `Send + DynClone` plus
+/// `Debug` under `print_vals`, with no reflection and no serialization to look
+/// inside a user type with.
+///
+/// So it detects through `Debug`, and the text says `ThreadId` because the
+/// derived `Debug` prints the struct's name. Under `print_vals_custom` values
+/// would render through `Display` instead, where a hand-written impl need not
+/// print the name and the note would not fire — the cause it names would be
+/// unaffected, only the detection. That is stated as a conditional on purpose:
+/// **that configuration does not compile today**, and
+/// [`nothing_text_with_examples`] carries the measurement.
+///
+/// A false positive costs a sentence and is harmless; a message whose own text
+/// happens to contain the word would earn one undeservedly.
+fn thread_id_hint(spec: &str, imp: &str) -> Option<&'static str> {
+    if !spec.contains("ThreadId") && !imp.contains("ThreadId") {
+        return None;
+    }
+    Some(
+        ".\n  Note: a `ThreadId` is numbered per program in spawn order, so the same \
+         thread has a different number on the two sides whenever they spawn a different \
+         number of invisible threads before it. If an id travels inside a message, either \
+         give the threads whose ids are observed the same spawn position on both sides, or \
+         send `Thread::name()` instead of the id.",
+    )
+}
+
 /// Where a row has no observation at all at a position.
 pub(crate) fn nothing_text() -> String {
     "nothing (the row ends here)".to_owned()
+}
+
+/// The same, naming what the specification **was** seen to observe there.
+///
+/// A mismatch at a thread's first observation is reported against an attempt in
+/// which that thread has not acted, so the bare wording above says the row ends
+/// — which a reader takes to mean the specification is *missing* an event. It
+/// may not be: other attempts of the same specification were seen to observe
+/// something at that position, and those are what this names
+/// (`diagnose::SeenAt`).
+///
+/// **It names them and stops**, in four deliberate respects.
+///
+/// - *No cause is asserted.* An earlier draft ended "so the difference is in
+///   the value, not a missing event". That is sometimes true — on F41's own
+///   shape the example is `send ThreadId { opaque_id: 1 }` against an
+///   implementation's `2`, and the difference is exactly in the value — and
+///   sometimes false: where the two attempts are `follows`-incomparable the
+///   example is byte-identical to the implementation's own observation, so the
+///   disagreement is in the order or the coverage and the row really does end.
+///   Both shapes reach this function and it cannot tell them apart, because
+///   `SeenAt` records a following row and a rejected one alike. So it asserts
+///   no cause: the examples are evidence for the reader, not a diagnosis.
+/// - *They are examples, not requirements.* A specification generally has many
+///   executions and different ones may observe different things here, so this
+///   must never read as "the specification requires".
+/// - *It stays a noun phrase*, because §7.1 substitutes it into "the
+///   specification has _, the implementation has _". A clause here does not
+///   parse in that slot, which is how the earlier draft read.
+/// - *It says "attempt", not "execution".* What the search saw is a partial
+///   specification graph. Such a graph is a genuine prefix of specification
+///   behaviour — every offer installed in it came from probing the
+///   specification — but nothing shows it extends to a *complete* execution,
+///   and elsewhere in this module "a specification execution" means a complete
+///   one. **Measured, not hypothetical**: an example has been observed coming
+///   from a branch entered six times that got past its blocking receive zero
+///   times (`P3-F41-round2` §5). With "execution" the sentence would be false
+///   there; with "attempt" it is true, and it is the strongest true thing this
+///   function knows.
+///
+/// Two things it does **not** disclose, both recorded rather than papered over:
+/// that an example may come from an attempt which never completes, as above;
+/// and that `diagnose::SEEN_EXAMPLES` may have truncated the list. Note which
+/// wording is exposed: the singular "another attempt" fires exactly when one
+/// value was kept, and truncation needs a *fourth* distinct value, which always
+/// renders in the plural — so the undisclosed case is a plural list of three
+/// that is three **of more**, never a singular claim that understates.
+/// Whether either deserves words in a user-facing
+/// report is an owner question — more hedging in a sentence read during a
+/// failure is not obviously an improvement.
+///
+/// **The `Debug` dependency is not a configuration a user can be in.** Both
+/// items this function belongs to need values to render, so the obvious question
+/// is what happens without `print_vals`. Measured (2026-09-28,
+/// `cargo check -p traceforge --lib`): `--no-default-features` fails with **7**
+/// errors and `--features print_vals_custom` with **85**. The two builds fail in
+/// different places and the distinction is worth keeping straight. Of the seven,
+/// two are [`obs_text`] itself, which formats a `Val` with `{:?}`, and the other
+/// five are upstream: `exec_graph.rs` (three), `msg.rs`, and `sync/mpsc.rs`,
+/// which does `format!("{:?}", msg).contains("mpscClose")` on an unbounded `T`.
+/// The 85 are elsewhere again — `sync/rwlock.rs`, `msg.rs`, `future/mod.rs`,
+/// `lib.rs`, `sync/mutex.rs` — and conformance is a rounding error in that
+/// total. So there is no build of this crate in
+/// which a message does not implement `Debug`, and the dependency cannot be
+/// exercised. It is recorded rather than defended: if those configurations are
+/// ever repaired, this function and [`thread_id_hint`] both need a look, and
+/// `obs_text` needs a rendering that does not assume `Debug`.
+pub(crate) fn nothing_text_with_examples(examples: &[String]) -> String {
+    if examples.is_empty() {
+        return nothing_text();
+    }
+    let listed = examples.join(", ");
+    let attempts = if examples.len() == 1 {
+        "another attempt of the specification observed"
+    } else {
+        "other attempts of the specification observed"
+    };
+    format!(
+        "nothing here (this attempt's row ends, though {attempts} {listed} at \
+         this position)"
+    )
 }
 
 /// One event position.

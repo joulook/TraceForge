@@ -121,6 +121,116 @@ impl Best {
     }
 }
 
+/// **Specification observations seen at each position, across the attempts the
+/// traversal reached — those it kept and those it rejected.**
+///
+/// This exists for one rendering. When the implementation's *first* observation
+/// on a thread already differs, no attempt `follows`, so [`Best::offer`] is
+/// never called with one and the reported attempt is the first one visited —
+/// typically a graph in which that thread has not acted at all. §7.1's
+/// obligation then renders the specification side as "nothing (the row ends
+/// here)", which reads as *the specification is missing a send* when the truth
+/// may be that it observes a **different value**.
+///
+/// **Three call sites, and they are complementary rather than redundant.** This
+/// took two attempts to get right and the record of both is kept here, because
+/// the obvious placement is the wrong one and the second-most obvious reason
+/// for the fix was also wrong.
+///
+/// - `visit`, on a node the traversal keeps. Every row here **follows**, so it
+///   agrees with the implementation wherever it is defined: `observations_follow`
+///   asks for a value-wise prefix. This is therefore the only source of rows
+///   that *follow* — not "match", which is a different predicate in this module
+///   — and it is what the incomparable-attempt shape needs: there the
+///   specification's row genuinely ends, and the useful thing to say is that
+///   another attempt did observe something here.
+/// - `phi`'s `check`, on an extension Φ rejects. **With Φ on**, this is the only
+///   source of rows that **disagree**, and so the only site that can name a
+///   value the implementation does not have — F41's own case, `opaque_id: 1`
+///   against `opaque_id: 2`.
+/// - `step`'s follow check, which is that same source **with Φ off**, where
+///   `phi` never runs and this is the only pruning site at all. The "with Φ on"
+///   above is what keeps this bullet from being a restatement of it.
+///
+/// **The first version recorded at `visit` alone and did nothing for F41.** An
+/// extension whose row disagrees never reaches `visit`: `phi` drops the offer
+/// and `step` returns `NoCover` first. Measured form of the defect: moving the
+/// call under `if follows` changed no test (developer, `P3-F41` §2.1). **The
+/// fix then over-corrected in prose**, claiming `visit`'s call added nothing a
+/// pruning site had not recorded. Also measured false: removing only it kills
+/// the honest-row test and nothing else (`P3-F41-round2`, M-f). Each of the
+/// first two sites is the sole source of one of the two kinds of row.
+///
+/// **`step`'s call kills nothing *with Φ on*** — production builds one
+/// `Recompute` with `use_phi = true`, and there the site is unreachable for sends
+/// and redundant for receives (`P3-F41-round2`, M-b: 400/0/5 on
+/// `--lib conformance` without it). It is not untested, which is what an earlier
+/// draft of this paragraph amounted to saying. What it guarantees is that a
+/// diagnostic's *content* does not depend on which traversal produced it, and
+/// that is asserted directly by
+/// `f41_the_two_traversals_render_the_same_obligation_on_a_disagreeing_row`,
+/// which compares the two modes through `Recompute::diagnose` and **dies when
+/// this one line is removed** (`P3-F41-round3`): the Φ-off arm falls back to
+/// "nothing (the row ends here)" while the Φ-on arm names `opaque_id: 1`. The
+/// un-Φ traversal is supported `pub(crate)` material with its own entry point
+/// (S6, Poll 1), so that is a property worth holding.
+///
+/// Bounded on purpose: a diagnostic must not grow with the program. Positions
+/// beyond [`SEEN_POSITIONS`] and values beyond [`SEEN_EXAMPLES`] per position
+/// are dropped, and the rendering falls back to the plain wording.
+pub(crate) struct SeenAt {
+    rows: std::collections::BTreeMap<String, Vec<Vec<String>>>,
+}
+
+/// How many leading positions per visible thread [`SeenAt`] remembers.
+const SEEN_POSITIONS: usize = 8;
+
+/// How many distinct values per position [`SeenAt`] remembers.
+const SEEN_EXAMPLES: usize = 3;
+
+impl SeenAt {
+    pub(crate) fn new() -> Self {
+        SeenAt {
+            rows: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Record one attempt's observations.
+    ///
+    /// Called from all three sites above, so `w` may be the row of an attempt
+    /// the traversal kept or of one it rejected. The caller decides; this makes
+    /// no distinction, and the rendering does not either — see
+    /// [`report::nothing_text_with_examples`] for what that costs.
+    pub(crate) fn record(&mut self, visible: &[String], w: &Wobs) {
+        for name in visible {
+            let row = w.of(name);
+            if row.is_empty() {
+                continue;
+            }
+            let slots = self
+                .rows
+                .entry(name.clone())
+                .or_insert_with(|| vec![Vec::new(); SEEN_POSITIONS]);
+            for (k, (_, obs)) in row.iter().enumerate().take(SEEN_POSITIONS) {
+                let text = report::obs_text(obs);
+                let at = &mut slots[k];
+                if at.len() < SEEN_EXAMPLES && !at.contains(&text) {
+                    at.push(text);
+                }
+            }
+        }
+    }
+
+    /// What the specification was seen to observe at `position` on `thread`.
+    /// Empty when nothing was seen there, or the position is past the bound.
+    pub(crate) fn examples(&self, thread: &str, position: usize) -> &[String] {
+        match self.rows.get(thread) {
+            Some(slots) if position < slots.len() => &slots[position],
+            _ => &[],
+        }
+    }
+}
+
 /// One recomputation over the specification, with Φ on (diagnostics) or off.
 ///
 /// The Φ-off mode was the `--naive-oracle` flag's engine. **The flag is gone**
@@ -175,13 +285,20 @@ impl Recompute {
         complete: bool,
     ) -> Result<(Answer, usize), ObsError> {
         let mut best = Best::new(self.visible.len());
+        let mut seen = SeenAt::new();
         let outer = Outer {
             graph: g1,
             wobs: wobs(g1, &self.visible)?,
             complete,
         };
         let mut fuel = self.budget;
-        let answer = self.visit(&outer, ExecutionGraph::default(), &mut fuel, &mut best)?;
+        let answer = self.visit(
+            &outer,
+            ExecutionGraph::default(),
+            &mut fuel,
+            &mut best,
+            &mut seen,
+        )?;
         Ok((answer, self.budget - fuel))
     }
 
@@ -228,6 +345,7 @@ impl Recompute {
 
         // Check two: this module's own traversal.
         let mut best = Best::new(self.visible.len());
+        let mut seen = SeenAt::new();
         let outer = match wobs(g1, &self.visible) {
             Ok(w) => Outer {
                 graph: g1,
@@ -242,7 +360,13 @@ impl Recompute {
             }
         };
         let mut fuel = self.budget;
-        match self.visit(&outer, ExecutionGraph::default(), &mut fuel, &mut best) {
+        match self.visit(
+            &outer,
+            ExecutionGraph::default(),
+            &mut fuel,
+            &mut best,
+            &mut seen,
+        ) {
             Ok(Answer::NoCover) => {}
             Ok(other) => {
                 return Diagnostics::Unavailable {
@@ -274,7 +398,7 @@ impl Recompute {
             .cloned()
             .zip(best.vector.iter().copied())
             .collect();
-        match self.obligation(&outer, &graph) {
+        match self.obligation(&outer, &graph, &seen) {
             Ok(Some(obligation)) => Diagnostics::Available { prefix, obligation },
             // The morphism holds on this attempt and no extension of it
             // covers, which §7.1's four values cannot express (round-5 B1).
@@ -301,6 +425,7 @@ impl Recompute {
         graph: ExecutionGraph,
         fuel: &mut usize,
         best: &mut Best,
+        seen: &mut SeenAt,
     ) -> Result<Answer, ObsError> {
         if *fuel == 0 {
             return Ok(Answer::Exhausted);
@@ -313,6 +438,13 @@ impl Recompute {
         // follows trivially, so `best` is always populated on a run that gets
         // this far.
         let spec_wobs = wobs(probed.graph(), &self.visible)?;
+
+        // The only site that records a row which **follows**. Measured: remove
+        // just this and the honest-row test dies, and only it (M-f). The
+        // pruning sites record only rows that do *not* follow, so they cannot
+        // cover this. See `SeenAt`.
+        seen.record(&self.visible, &spec_wobs);
+
         if follows(
             probed.graph(),
             outer.graph,
@@ -334,10 +466,10 @@ impl Recompute {
 
         let mut exhausted = false;
         for offer in probed.offers() {
-            if self.use_phi && !self.phi(outer, probed.graph(), offer)? {
+            if self.use_phi && !self.phi(outer, probed.graph(), offer, seen)? {
                 continue;
             }
-            match self.branch(outer, probed.graph(), offer, fuel, best)? {
+            match self.branch(outer, probed.graph(), offer, fuel, best, seen)? {
                 Answer::Found => return Ok(Answer::Found),
                 Answer::Exhausted => exhausted = true,
                 Answer::NoCover => {}
@@ -357,13 +489,15 @@ impl Recompute {
         offer: &Offer,
         fuel: &mut usize,
         best: &mut Best,
+        seen: &mut SeenAt,
     ) -> Result<Answer, ObsError> {
         let mut exhausted = false;
         let step = |this: &Self,
                         extended: ExecutionGraph,
                         through_step: bool,
                         fuel: &mut usize,
-                        best: &mut Best|
+                        best: &mut Best,
+                        seen: &mut SeenAt|
          -> Result<Option<Answer>, ObsError> {
             // `SpecStep`'s follow check. With Φ off it
             // stays on: the un-Φ'd search is the draft's `SpecStep` without
@@ -377,10 +511,16 @@ impl Recompute {
                     &outer.wobs,
                     &this.visible,
                 ) {
+                    // `phi`'s counterpart for the traversal without Φ, where
+                    // this is the only pruning site. With Φ on it kills nothing
+                    // (M-b); what it does kill is
+                    // `f41_the_two_traversals_render_the_same_obligation_on_a_disagreeing_row`,
+                    // which is the point. See `SeenAt`.
+                    seen.record(&this.visible, &w);
                     return Ok(Some(Answer::NoCover));
                 }
             }
-            match this.visit(outer, extended, fuel, best)? {
+            match this.visit(outer, extended, fuel, best, seen)? {
                 Answer::Found => Ok(None),
                 a => Ok(Some(a)),
             }
@@ -388,7 +528,7 @@ impl Recompute {
 
         macro_rules! try_one {
             ($extended:expr, $through:expr) => {{
-                match step(self, $extended, $through, fuel, best)? {
+                match step(self, $extended, $through, fuel, best, seen)? {
                     None => return Ok(Answer::Found),
                     Some(Answer::Exhausted) => exhausted = true,
                     Some(_) => {}
@@ -456,16 +596,22 @@ impl Recompute {
         outer: &Outer<'_>,
         graph: &ExecutionGraph,
         offer: &Offer,
+        seen: &mut SeenAt,
     ) -> Result<bool, ObsError> {
-        let check = |extended: &ExecutionGraph| -> Result<bool, ObsError> {
-            let w = wobs(extended, &self.visible)?;
-            Ok(follows(
-                extended,
-                outer.graph,
-                &w,
-                &outer.wobs,
-                &self.visible,
-            ))
+        let visible = &self.visible;
+        let check = |extended: &ExecutionGraph,
+                         seen: &mut SeenAt|
+         -> Result<bool, ObsError> {
+            let w = wobs(extended, visible)?;
+            let follows_here = follows(extended, outer.graph, &w, &outer.wobs, visible);
+            if !follows_here {
+                // The only site that records a row which **disagrees** with the
+                // implementation, and so the only one that can name a value the
+                // implementation does not have. This is what F41 needed. See
+                // `SeenAt`.
+                seen.record(visible, &w);
+            }
+            Ok(follows_here)
         };
         match offer.label() {
             LabelEnum::RecvMsg(_) => {
@@ -482,7 +628,7 @@ impl Recompute {
                 );
                 for rf in options {
                     let extended = install_recv(self.config.clone(), graph.clone(), offer, rf);
-                    if check(&extended)? {
+                    if check(&extended, seen)? {
                         return Ok(true);
                     }
                 }
@@ -500,11 +646,11 @@ impl Recompute {
                     )
                 };
                 let extended = install_nondet(self.config.clone(), graph.clone(), offer, v);
-                check(&extended)
+                check(&extended, seen)
             }
             LabelEnum::SendMsg(_) => {
                 let extended = install(self.config.clone(), graph.clone(), offer);
-                check(&extended)
+                check(&extended, seen)
             }
             other => unreachable!("conformance: a probe offered a {other}, which is not a choice point"),
         }
@@ -571,6 +717,7 @@ impl Recompute {
         &self,
         outer: &Outer<'_>,
         graph: &ExecutionGraph,
+        seen: &SeenAt,
     ) -> Result<Option<Obligation>, ObsError> {
         let spec_wobs = wobs(graph, &self.visible)?;
 
@@ -593,10 +740,14 @@ impl Recompute {
                 return Ok(Some(Obligation::ObservationMismatch {
                     thread: name.clone(),
                     position: k,
-                    spec: s
-                        .get(k)
-                        .map(|(_, o)| report::obs_text(o))
-                        .unwrap_or_else(report::nothing_text),
+                    // **The specification side names a counterpart value when
+                    // one was seen.** Rendering only "nothing (the row ends
+                    // here)" reads as a missing send, and on the commonest
+                    // cause of a position-0 mismatch — a value that differs,
+                    // not an absent one — that reading is wrong. See `SeenAt`.
+                    spec: s.get(k).map(|(_, o)| report::obs_text(o)).unwrap_or_else(
+                        || report::nothing_text_with_examples(seen.examples(name, k)),
+                    ),
                     imp: i
                         .get(k)
                         .map(|(_, o)| report::obs_text(o))
@@ -676,8 +827,22 @@ impl Recompute {
         // false. Introducing that fifth value is §7.1's own question and is
         // routed to the owner with F-7, A13 and H-1.
         let probed = self.probe(graph.clone());
+        // `phi` records the rows it rejects (see `SeenAt`), and this call is a
+        // *query*: it asks whether any offer passes Φ, while the report is being
+        // rendered and after the traversal has finished. So it gets a scratch
+        // recorder, which keeps `obligation` a `&SeenAt` reader rather than a
+        // writer — the narrower signature is the whole benefit, and it is worth
+        // one allocation on a path that runs once per report.
+        //
+        // An earlier comment here claimed more: that recording would let this
+        // probe change what a later obligation's `examples()` returns. That is
+        // false and was measured so (`P3-F41-round2`, M-e). It cannot happen —
+        // `obligation` has one call site, the recorder is built by the single
+        // traversal that precedes it, and this loop runs only after the `(M1)`
+        // arm has already read `examples()` and returned.
+        let mut scratch = SeenAt::new();
         for offer in probed.offers() {
-            if self.phi(outer, probed.graph(), offer)? {
+            if self.phi(outer, probed.graph(), offer, &mut scratch)? {
                 return Ok(None);
             }
         }

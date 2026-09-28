@@ -48,6 +48,118 @@
 //! boundary inside conformance's hot path, and S4 was bitten at that exact
 //! boundary by a failure that became a different failure and lost its origin.
 //!
+//! # Writing a pair: do not send a `ThreadId` a visible thread will observe
+//!
+//! A `ThreadId` is an opaque number allocated **per program in spawn order**.
+//! The implementation and the specification are different programs, and a
+//! specification normally spawns fewer invisible threads — that is what the
+//! abstraction is. So the same logical thread holds a different number on the
+//! two sides:
+//!
+//! ```text
+//! implementation            specification
+//!   1  logger    (hidden)     1  coordinator (hidden)
+//!   2  coordinator (hidden)   2  participant (visible)
+//!   3  participant (visible)
+//! ```
+//!
+//! §6.1 matches a visible thread's observations **by value**. If the
+//! participant receives `Prepare(coordinator_id)`, the implementation observes
+//! `2` and the specification `1`, so every such observation mismatches and the
+//! run reports a candidate violation although the two programs agree.
+//!
+//! **Nothing detects this for you**, and the reason is in the message trait.
+//! [`crate::Message`] is `Send + DynClone`, plus whichever formatting trait the
+//! selected feature adds: `Debug` under the default `print_vals`, `Display`
+//! under `print_vals_custom`, neither under `--no-default-features`. The blanket
+//! implementation asks a user type for **more**, and for something different in
+//! each of the three configurations: `Send + PartialEq + DynClone + 'static`
+//! throughout, plus `Debug` with no feature (`msg.rs:129`) and under
+//! `print_vals` (`:134`), but `Display` under `print_vals_custom` (`:147`).
+//! `PartialEq` is the bound §6.1's by-value matching rests on and is demanded
+//! everywhere; the formatting bound is not, so nothing here may assume `Debug`
+//! without naming the feature. Note the feature-free arm asks for `Debug` while
+//! its trait adds no formatting supertrait at all — part of why that build does
+//! not compile. There is no `Serialize` and no
+//! reflection, so what conformance holds — a `Val`, a `Box<dyn Message>` beside
+//! a type name — can be inspected in exactly two ways: compared against another
+//! value of a type the caller already names, by downcast; or rendered, and only
+//! because a feature supplied a formatting trait. Neither lets it walk a
+//! message's fields looking for an id.
+//!
+//! Two ways to write such a protocol so that it works:
+//!
+//! 1. **Send the name, not the id** — as an **owned** value.
+//!    [`crate::thread::Thread::name`] gives the declared name, and a name —
+//!    unlike an id — is chosen by the author rather than allocated by the
+//!    runtime, so the same string can appear on both sides and a message
+//!    carrying it compares equal by construction. It returns `Option<&str>`,
+//!    which borrows the handle, and [`crate::send_msg`] takes
+//!    `T: Message + 'static`, so the borrowed form **cannot be sent as it
+//!    stands**: copy it out.
+//!
+//!    ```text
+//!    // One literal, named by both programs, sent as an owned `String`.
+//!    const COORD: &str = "coordinator";
+//!
+//!    let coord = traceforge::thread::Builder::new()
+//!        .name(COORD.to_owned())
+//!        .spawn(coordinator)?;
+//!    traceforge::send_msg(participant, Prepare(COORD.to_owned()));
+//!
+//!    // Or read it back off the handle, remembering that it borrows:
+//!    //   let who: Option<String> = coord.thread().name().map(str::to_owned);
+//!    ``` For
+//!    *visible* threads the sharing is automatic: one `visible_threads` list on
+//!    [`ConfConfig`] names the visible threads of both programs, so a visible
+//!    name is shared or the pair does not run at all.
+//!
+//!    **The thread whose id travels is usually not one of those** — in the
+//!    table above it is the coordinator, hidden on both sides — and for it the
+//!    sharing is a discipline, not a guarantee: `name` returns
+//!    `Option<&str>`, and nothing requires an invisible thread to be named, or
+//!    to be named the same on the two sides. **Still prefer this**, for a
+//!    reason that is not strength but visibility: what it couples is two
+//!    string literals in the spawn prologues, which a reader comparing the two
+//!    programs can see, where option 2 couples their spawn *orders*, which
+//!    nothing on the page shows.
+//! 2. **Align the spawn order** of every thread whose id is observed, so that
+//!    it occupies the same position on both sides and therefore has the same
+//!    number. This is what `bench.rs`'s two-phase-commit pair does, by spawning
+//!    the coordinator first on both sides.
+//!
+//!    **The discipline that makes it work: every spawn before the observed
+//!    thread is unconditional.** That is *sufficient*, and it is the version
+//!    worth holding, because it is the one a reader can check by eye. Within it
+//!    the numbering is deterministic — measured identical across executions,
+//!    across revisits and across separate runs — so equal positions give equal
+//!    ids.
+//!
+//!    It is not *necessary*. An id is `max(existing)+1` within the **current**
+//!    graph, so a thread spawned under a `nondet()` shifts the numbering of
+//!    everything after it *between executions of one program*: one program then
+//!    produces two different observed values for one behaviour. That is fatal
+//!    only if the other program cannot produce both — a specification mirroring
+//!    the same conditional structure admits a matching execution for each, and
+//!    the pair can still verify. What fails is *positional* alignment across
+//!    programs whose conditional spawn behaviour differs.
+//!
+//!    Prefer the unconditional form anyway. Aligned conditional structure is a
+//!    property of two programs' branch behaviour that nothing checks and no
+//!    error message names, where unconditional prologues are two lists a reader
+//!    can compare — and this option is already the fragile one, since a single
+//!    hidden thread added in the wrong place breaks it silently.
+//!
+//! Neither is needed for a thread's *own* identity: an observation's thread is
+//! recorded by declared name, not by id (see `obs.rs`). This is only about ids
+//! travelling **inside message values**.
+//!
+//! If it goes wrong anyway, the report says so: an `(M1)` mismatch either of
+//! whose rendered values mentions `ThreadId` carries a note that restates the
+//! per-program numbering and both remedies inline. It names no section — a
+//! report is read without the source at hand — so this section and that note
+//! have to be kept in agreement by whoever changes either.
+//!
 //! # Map of the module
 //!
 //! `prober`/`probe` (S1) ask the specification what it could do next;
