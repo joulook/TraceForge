@@ -49,6 +49,17 @@
 //!
 //! **This workaround covers unconditional spawns only** (F44). It is sound
 //! here because every spawn below is unconditional.
+//!
+//! # A second corpus in this module: the `ndk` family
+//!
+//! 2PC answers "what does conformance cost on a realistic protocol". It does not
+//! exhibit the three *cost defects* the backlog records, because its
+//! specification's event count is constant in `N` and its search never gets
+//! large enough. The `ndk` family does, and it is the only corpus in the tree
+//! where F63, F69 and F70 are all visible at once. It is a synthetic
+//! one-parameter family rather than a protocol, which is the point: its minimum
+//! budgets are predictable and two of them are pinned to figures P3-F61
+//! published independently. See [`ndk`].
 
 use std::time::Instant;
 
@@ -466,3 +477,618 @@ fn the_eager_pairs_reports_come_from_fresh_add_gates() {
     );
 }
 
+// ===========================================================================
+// The `ndk` family --- the cost corpus F63, F69 and F70 are all visible in.
+// ===========================================================================
+
+/// One member of the `ndk` family: `senders.len()` **invisible** senders, each
+/// choosing by `nondet()` between the two values it is given, and one
+/// **visible** receiver `c` that takes one value per sender.
+///
+/// `Tvis = {c}`, `ConsType::FIFO`. Nothing else is declared, so `main` and every
+/// sender are invisible and a pair differs observably only in the multiset of
+/// values `c` receives and the order it receives them in.
+///
+/// **The conforming member is the one where every sender draws from the *same*
+/// two-element set.** That is the family P3-F61 published budget figures for and
+/// P3-F63 recovered from prose, and the recovery is what identifies it: the
+/// minimum budget at which the pair runs without exhausting is **33** for two
+/// senders and **981** for three, both matching P3-F61's `ndk2_conf` and
+/// `ndk3_conf` exactly. Those two numbers are pinned by the tests below, and
+/// they are the reason this family is worth keeping rather than re-deriving: two
+/// independent exact hits on a one-parameter family.
+///
+/// **Why it is in the tree.** Three backlog entries are visible here and
+/// nowhere else in the corpus:
+///
+/// - **F63** — the cost asymmetry between a conforming and a non-conforming pair
+///   is redundant re-derivation, not a larger search space: 488 against 649
+///   distinct specification graphs, but 981 against 12 082 nodes.
+/// - **F69** — the empty-seed rebuild. `ndk3 bad_A` through `verify` spends
+///   65 410 duplicate nodes, 17.6% of the run, and the guard in
+///   `conformance::search::cover` removes exactly that.
+/// - **F70** — the budget's cost curve is not monotone: `bad_A` is *slower* at
+///   the default 10 000, where it exhausts eleven times, than at 12 082, where
+///   it does not exhaust at all.
+///
+/// Two earlier tasks rebuilt this family from P3-F61's prose and deleted it
+/// again; a third rebuild would have been a third chance to build it
+/// differently, which is why it is permanent now.
+///
+/// **F41.** Both sides of a pair spawn the same threads in the same order — `c`
+/// first, then the senders — so `c` is `t1` on both and no `ThreadId` reaches an
+/// observed value. The spawns are unconditional, which is what F44 requires of
+/// that workaround.
+fn ndk(senders: Vec<(u64, u64)>) -> impl Fn() + Send + Sync + Clone + 'static {
+    move || {
+        let takes = senders.len();
+        let c = named("c", move || {
+            for _ in 0..takes {
+                let _: u64 = recv_msg_block();
+            }
+        })
+        .thread()
+        .id();
+        for (i, (a, b)) in senders.iter().copied().enumerate() {
+            let _ = named(&format!("s{}", i + 1), move || {
+                send_msg(c, if crate::nondet() { a } else { b })
+            });
+        }
+    }
+}
+
+/// `ndk`'s conforming member at `n` senders: every sender draws from `{1, 2}`.
+fn ndk_conf(n: usize) -> Vec<(u64, u64)> {
+    vec![(1, 2); n]
+}
+
+/// `ndk3`'s `bad_A`: the specification pins `s1` and `s2` to `1`, so it shares
+/// every value with the implementation and Φ cuts almost nothing.
+///
+/// **This is not P3-F61's original `ndk3_bad`**, which no surviving artefact
+/// records; it is the closest of ten candidates P3-F63 tried, matched on
+/// character rather than on figures — reports and exhaustions of the same order,
+/// exhaustions present at the default budget. Its own figures are pinned below
+/// and every F63/F69/F70 number quoted for "`bad_A`" is this pair.
+fn ndk3_bad_a() -> Vec<(u64, u64)> {
+    vec![(1, 1), (1, 1), (1, 2)]
+}
+
+/// Run one `ndk` pair through the engine — no precheck, no diagnostics, no
+/// triage — at `budget`.
+///
+/// **The seed is pinned to 0** (F61): every member calls `nondet()`, so the
+/// report, exhaustion and skip counts depend on it and a figure taken at a
+/// fresh seed is not reproducible.
+///
+/// **On its own 64 MiB thread.** The inner search recurses once per installed
+/// specification event, and the default test-thread stack is not enough for
+/// three senders at a budget in the thousands. `Search::cover` also requires a
+/// thread that is not inside another execution, which this is.
+fn ndk_run(
+    implementation: Vec<(u64, u64)>,
+    specification: Vec<(u64, u64)>,
+    budget: usize,
+) -> Outcome {
+    let imp = ndk(implementation);
+    let spec = ndk(specification);
+    std::thread::Builder::new()
+        .name("ndk".to_owned())
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            verify_conformance(
+                Config::builder()
+                    .with_cons_type(ConsType::FIFO)
+                    .with_seed(0)
+                    .build(),
+                imp,
+                spec,
+                vec!["c".to_string()],
+                budget,
+            )
+        })
+        .expect("ndk: could not spawn the run thread")
+        .join()
+        .expect("ndk: the run thread panicked")
+}
+
+/// **`ndk2_conf`'s minimum budget is 33**, which is P3-F61's figure exactly.
+///
+/// Pinned as a minimum rather than as a bound: at 32 the pair exhausts, at 33 it
+/// does not. One assertion without the other would pass at any budget above 33
+/// and would identify nothing.
+#[test]
+fn ndk2_conf_needs_a_budget_of_exactly_33() {
+    let tight = ndk_run(ndk_conf(2), ndk_conf(2), 32);
+    assert!(
+        !tight.exhaustions.is_empty(),
+        "32 must not be enough, or 33 is not the minimum"
+    );
+    let clean = ndk_run(ndk_conf(2), ndk_conf(2), 33);
+    assert!(
+        clean.exhaustions.is_empty(),
+        "33 is P3-F61's `ndk2_conf` and must exhaust nowhere, got {} exhaustions",
+        clean.exhaustions.len()
+    );
+    assert!(
+        clean.reports.is_empty(),
+        "a program against itself conforms: {} reports",
+        clean.reports.len()
+    );
+}
+
+/// **`ndk3_conf`'s minimum budget is 981**, which is P3-F61's figure exactly,
+/// and the second of the two independent hits that identify this family.
+#[test]
+fn ndk3_conf_needs_a_budget_of_exactly_981() {
+    let tight = ndk_run(ndk_conf(3), ndk_conf(3), 980);
+    assert!(
+        !tight.exhaustions.is_empty(),
+        "980 must not be enough, or 981 is not the minimum"
+    );
+    let clean = ndk_run(ndk_conf(3), ndk_conf(3), 981);
+    assert!(
+        clean.exhaustions.is_empty(),
+        "981 is P3-F61's `ndk3_conf` and must exhaust nowhere, got {} exhaustions",
+        clean.exhaustions.len()
+    );
+    assert!(
+        clean.reports.is_empty(),
+        "a program against itself conforms: {} reports",
+        clean.reports.len()
+    );
+}
+
+/// **`bad_A` at the default budget: 15 reports and 11 exhaustions** — the pair
+/// every F63, F69 and F70 figure is quoted from.
+///
+/// It is the shape all three entries need: reports *and* exhaustions in the same
+/// run, so that a verdict is neither silence nor a clean refutation.
+///
+/// `#[ignore]` because it takes ~15 s — a measurement's worth of time, for an
+/// assertion the cheaper members already cover in character. Run it with
+/// `cargo test -j 2 -p traceforge --lib conformance::bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn ndk3_bad_a_reports_and_exhausts_at_the_default_budget() {
+    let out = ndk_run(ndk_conf(3), ndk3_bad_a(), 10_000);
+    println!(
+        "[ndk3 bad_A b=10000] reports={} exhaustions={} skipped={} inert={} seed={}",
+        out.reports.len(),
+        out.exhaustions.len(),
+        out.skipped_gates,
+        out.inert_gates,
+        out.seed
+    );
+    assert_eq!(
+        (out.reports.len(), out.exhaustions.len()),
+        (15, 11),
+        "P3-F63 §1 measured 15 reports and 11 exhaustions at the default budget \
+         with seed 0; a change here means the pair is not the one the F63, F69 \
+         and F70 figures were taken on"
+    );
+}
+
+/// **F70, pinned: a smaller budget is both non-exhaustive and slower.**
+///
+/// `bad_A` exhausts eleven times at the default 10 000 and not at all at 12 082,
+/// its minimum exhaustive budget — and the exhaustive run is the *cheaper* one,
+/// because `BudgetExhausted → Continue` withholds the prune a finished traversal
+/// would have authorised. P3-F63 §6 measured 17.8 s against 13.2 s.
+///
+/// Only the non-monotonicity in *answers* is asserted; the wall clock is printed
+/// and not asserted, because a timing assertion on a shared machine is a flaky
+/// test rather than a measurement.
+///
+/// `#[ignore]`: two runs of ~15 s each. Run it with
+/// `cargo test -j 2 -p traceforge --lib conformance::bench -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn ndk3_bad_a_exhausts_at_the_default_budget_and_not_at_12082() {
+    let (default, default_secs) = {
+        let start = Instant::now();
+        let out = ndk_run(ndk_conf(3), ndk3_bad_a(), 10_000);
+        (out, start.elapsed().as_secs_f64())
+    };
+    let (raised, raised_secs) = {
+        let start = Instant::now();
+        let out = ndk_run(ndk_conf(3), ndk3_bad_a(), 12_082);
+        (out, start.elapsed().as_secs_f64())
+    };
+    println!(
+        "[F70] b=10000: reports={} exhaustions={} secs={:.2}",
+        default.reports.len(),
+        default.exhaustions.len(),
+        default_secs
+    );
+    println!(
+        "[F70] b=12082: reports={} exhaustions={} secs={:.2}",
+        raised.reports.len(),
+        raised.exhaustions.len(),
+        raised_secs
+    );
+    assert!(
+        !default.exhaustions.is_empty(),
+        "the default budget must bind on this pair, or F70 has moved"
+    );
+    assert!(
+        raised.exhaustions.is_empty(),
+        "12 082 is P3-F63 §6.1's minimum exhaustive budget for `bad_A` and must \
+         exhaust nowhere, got {}",
+        raised.exhaustions.len()
+    );
+    assert!(
+        raised.reports.len() > default.reports.len(),
+        "the exhaustive run must find *more* reports than the truncated one \
+         ({} against {}), which is what makes the default both non-exhaustive \
+         and slower",
+        raised.reports.len(),
+        default.reports.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Demo harness (2026-09-29). Two `#[ignore]`d measurements written for a talk:
+// the conforming pair at N = 2, 3, 4 with the **outer** search's explored-graph
+// count, and the eager coordinator at the same sizes printing one concrete
+// trace that witnesses the refinement violation.
+//
+// In `bench.rs` on purpose: this file is already on criterion 1's
+// `TEST_ONLY_FILES`, so `println!` here needs no allowlist change (F68).
+// ---------------------------------------------------------------------------
+
+/// **Demo, conforming direction.** The correct 2PC refines the agreement
+/// specification at N = 2, 3, 4, and the table says how much work that took.
+///
+/// `outer graphs` is the **outer** search's own count — complete plus blocked
+/// executions of the implementation under conformance, from `Outcome::stats`.
+/// That is the number a reader wants when asking "what did it explore?", and it
+/// is not the same as `two_pc_scaling`'s `plain execs`, which is the *baseline*
+/// engine with no gate attached.
+///
+/// Asserts what it prints: no reports, and **no inner-search exhaustion**, so
+/// every gate's answer is exhaustive rather than truncated (F43, F70).
+///
+/// ```text
+/// cargo test -j 2 -p traceforge --lib conformance::bench::demo_2pc_correct_at_2_3_4 -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn demo_2pc_correct_at_2_3_4() {
+    println!("\n  2PC, correct coordinator — does it refine the agreement spec?\n");
+    println!("   N | verdict  | outer graphs | reports | exhaustions | skipped | inert | seconds | seed");
+    println!("  ---+----------+--------------+---------+-------------+---------+-------+---------+------");
+    for n in 2..=4usize {
+        let start = Instant::now();
+        let out = verify_conformance(cfg(), two_pc(n, false), two_pc_spec(), visible(), 10_000);
+        let secs = start.elapsed().as_secs_f64();
+        let graphs = out
+            .stats
+            .as_ref()
+            .map(|s| s.execs + s.block)
+            .expect("the engine records stats");
+        let verdict = if out.reports.is_empty() && out.exhaustions.is_empty() {
+            "conforms"
+        } else {
+            "REPORTED"
+        };
+        println!(
+            "  {n:2} | {verdict:8} | {graphs:12} | {:7} | {:11} | {:7} | {:5} | {secs:7.3} | {}",
+            out.reports.len(),
+            out.exhaustions.len(),
+            out.skipped_gates,
+            out.inert_gates,
+            out.seed
+        );
+        assert!(
+            out.reports.is_empty(),
+            "N={n}: the correct 2PC must refine the agreement specification, got {} report(s)",
+            out.reports.len()
+        );
+        assert!(
+            out.exhaustions.is_empty(),
+            "N={n}: {} inner-search exhaustion(s) — the answer is not exhaustive",
+            out.exhaustions.len()
+        );
+    }
+    println!("\n  Every row is exhaustive: zero exhaustions, so `conforms` means the search");
+    println!("  finished rather than ran out of room.\n");
+}
+
+/// **Demo, violating direction.** The eager coordinator loses agreement, and
+/// this prints a concrete trace witnessing it at N = 2, 3, 4.
+///
+/// Uses the public [`crate::conformance::verify`] rather than the engine half,
+/// because the trace comes from **triage**: `ConfBuilder::triage(true)`
+/// completes each reported graph into a concrete execution. `stop_at_first_report`
+/// is on, so each size prints **one** minimal witness instead of every report —
+/// `two_pc_eager_coordinator_is_reported` is the test that counts them all.
+///
+/// Everything printed below a size's heading is violation evidence: a conforming
+/// run at the same size prints no trace at all.
+///
+/// ```text
+/// cargo test -j 2 -p traceforge --lib conformance::bench::demo_2pc_eager_violation_traces -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn demo_2pc_eager_violation_traces() {
+    use crate::conformance::{verify, ConfBuilder};
+    println!("\n  2PC, EAGER coordinator — traces witnessing the refinement violation\n");
+    for n in 2..=4usize {
+        let cc = ConfBuilder::new()
+            .config(cfg())
+            .visible_threads(visible())
+            .triage(true)
+            .stop_at_first_report(true)
+            .search_budget(10_000)
+            .build()
+            .expect("the demo config is in scope");
+        let start = Instant::now();
+        let verdict = verify(cc, two_pc(n, true), two_pc_spec()).expect("the run completes");
+        let secs = start.elapsed().as_secs_f64();
+        println!("  ===== N = {n} participants ({secs:.3} s) =====");
+        println!("{verdict}");
+    }
+}
+
+// ===========================================================================
+// P3-DEMOS (developer, 2026-09-29): the demo pair's claims, pinned cheaply and
+// checked against an independent ground truth.
+//
+// The two `demo_*` measurements above are `#[ignore]`d, so nothing in an
+// ordinary suite run would notice if version 1 stopped demonstrating anything.
+// The three tests below are un-`ignore`d and cost 0.19 s together (measured:
+// 0.11 + 0.06 + 0.02, each run alone with `--exact`).
+//
+// **The ground truth is `conformance::oracle`, not the tool.** `oracle` builds
+// `vis(P)` by materialising, for every graph, *every* linear extension of
+// `vo(G)` — the draft's Def. visg literally — and answers set inclusion. It
+// never consults the morphism, `Search::cover` or a canonical representative,
+// so an agreement between it and the tool is evidence and not a tautology.
+// What it cannot falsify is listed in that module: it shares `obs::wobs`,
+// `in_porf` and `Val::eq` with the tool, so an error in any of those cancels.
+// ===========================================================================
+
+/// One oracle `vis` word rendered the way `diagnose::canonical_vis` renders
+/// the tool's, so a word quoted in a document can be **located** in an
+/// oracle-built set by text.
+///
+/// Location only. Every verdict below is decided by `VisSet::contains`, which
+/// is `Obs`'s own `msg_equals` on a `Val`; this string is never the thing
+/// compared. `obs.rs` says why that distinction matters — `Debug` is neither
+/// injective nor type-aware, so `1u32` and `1i64` render alike and compare
+/// unequal.
+fn render_word(w: &crate::conformance::oracle::VisWord) -> String {
+    let word = w
+        .word
+        .iter()
+        .map(|e| {
+            format!(
+                "{}: {}",
+                e.thread,
+                crate::conformance::report::obs_text(&e.obs)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" → ");
+    let st = w
+        .statuses
+        .iter()
+        .map(|(t, s)| format!("{t}: {}", crate::conformance::report::status_text(*s)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{word} , [{st}]")
+}
+
+/// **The pair demonstrates what it claims to, and a second procedure says so.**
+///
+/// The correct coordinator refines the agreement specification at `N = 2, 3, 4`
+/// and the eager one does not — established by set inclusion on materialised
+/// `vis` sets rather than by the algorithm under test. So a change that made
+/// the tool agree with itself would not move this test.
+///
+/// It also answers the question the demo document cannot answer by running:
+/// the correct pair conforms *for the right reason*. `vis(Impl) ⊆ vis(Spec)`
+/// holds exactly, with **0** of the implementation's words uncovered at every
+/// size — not merely "the tool found nothing".
+///
+/// Measured on this tree: 0.11 s for all six runs.
+///
+/// **Mutation, MEASURED**: give `coordinator_eager` the correct two-phase
+/// reply (collect all votes, then send one decision to each) and the
+/// `Inclusion::Fails` arm below fails at every `N`, with the message naming the
+/// size.
+#[test]
+fn the_2pc_pair_is_sound_by_the_naive_oracle() {
+    use crate::conformance::oracle::{includes, Inclusion};
+    for n in 2..=4usize {
+        match includes(cfg(), &visible(), two_pc(n, false), two_pc_spec()) {
+            Ok(Inclusion::Holds) => {}
+            other => panic!(
+                "N={n}: the correct 2PC must satisfy vis(Impl) ⊆ vis(Spec); the oracle said {other:?}"
+            ),
+        }
+        match includes(cfg(), &visible(), two_pc(n, true), two_pc_spec()) {
+            Ok(Inclusion::Fails { .. }) => {}
+            other => panic!(
+                "N={n}: the eager coordinator loses agreement, so inclusion must fail; \
+                 the oracle said {other:?}"
+            ),
+        }
+    }
+}
+
+/// **F71, refuted.** `DEMO-2PC-ALL.md` exhibits this word for version 1 at
+/// `N = 4` and argues it is *inside* `vis(Spec)` — "both participants receive
+/// `Abort`, so the oracle discards the votes, chooses `Abort`, and sends it to
+/// both" — and concludes the report is an instance of the single-cover gap
+/// rather than a caught bug.
+///
+/// It is not inside `vis(Spec)`, and the missing half of the argument is the
+/// **order**. `vis(σ)` is a word: a linearisation of the whole trace with the
+/// invisible events deleted, not a per-thread row. The specification's
+/// coordinator runs `for _ in 0..ps.len() { recv }` **before** it chooses `d`,
+/// so in every specification trace *both* vote-sends precede *both*
+/// decision-receives. The document's word has `p0` receiving `Abort` at
+/// position 2, before `p1` has voted at position 4 — which is precisely what
+/// the eager coordinator does and precisely what the correct one cannot.
+///
+/// The two assertions are a matched pair, and the second is the load-bearing
+/// one: the *content* the document reasons about (`p0` votes `No`, `p1` votes
+/// `Yes`, both receive `Abort`) really is producible by the specification, so
+/// the document's premise is right and its conclusion still does not follow.
+/// Move the one observation and the same multiset of observations lands inside
+/// `vis(Spec)`.
+///
+/// The third block pins the **other three** witnesses this demo has been
+/// observed to print, for the reason F71 exists: the witness depends on the
+/// run's seed, so a document that argues about one word is arguing about one
+/// run. Two of the four show no loss of agreement at all.
+///
+/// Cost: 0.06 s.
+///
+/// **Mutation, MEASURED**: swap `DOCUMENTED` and `REORDERED` — the test fails
+/// on both of the first two assertions at once.
+#[test]
+fn the_documented_n4_2pc_witness_is_outside_vis_of_the_specification() {
+    use crate::conformance::oracle::vis_of_program;
+
+    /// `DEMO-2PC-ALL.md`, "Version 1 — `n = 4`: reported, but **not** shown to
+    /// be a non-conformer", transcribed into the tool's own rendering.
+    const DOCUMENTED: &str = "p0: receive Prepare(ThreadId { opaque_id: 1 }) → p0: send No → \
+p0: receive Abort → p1: receive Prepare(ThreadId { opaque_id: 1 }) → p1: send Yes → \
+p1: receive Abort , [p0: done, p1: done]";
+    /// The same observations, with `p0`'s decision-receive moved after `p1`'s
+    /// vote — the only change, and it is the whole difference.
+    const REORDERED: &str = "p0: receive Prepare(ThreadId { opaque_id: 1 }) → p0: send No → \
+p1: receive Prepare(ThreadId { opaque_id: 1 }) → p1: send Yes → p0: receive Abort → \
+p1: receive Abort , [p0: done, p1: done]";
+
+    let spec =
+        vis_of_program(cfg(), &visible(), two_pc_spec()).expect("the specification enumerates");
+    let imp =
+        vis_of_program(cfg(), &visible(), two_pc(4, true)).expect("the implementation enumerates");
+
+    let documented = imp
+        .iter()
+        .find(|w| render_word(w) == DOCUMENTED)
+        .unwrap_or_else(|| {
+            panic!("the documented N=4 witness is not a word of the eager implementation at all")
+        });
+    assert!(
+        !spec.contains(documented),
+        "the documented N=4 witness IS in vis(Spec), so F71 stands and this test is wrong"
+    );
+
+    let reordered = imp
+        .iter()
+        .find(|w| render_word(w) == REORDERED)
+        .expect("the reordering is also an implementation word");
+    assert!(
+        spec.contains(reordered),
+        "the specification cannot produce these observations in any order, so the \
+         discriminator is not the order after all and the argument above is wrong"
+    );
+
+    // **Every witness this demo has been observed to print is outside
+    // `vis(Spec)`, including the two in which the decisions *agree*.**
+    //
+    // `demo_2pc_eager_violation_traces` draws a fresh seed per run (F61) and
+    // the witness it prints is whichever report `stop_at_first_report` stopped
+    // at. Four runs over `N = 2, 3, 4` — twelve witnesses — produced exactly
+    // these four words, and **which size produces which is a seed artefact**:
+    // the document's `N = 4` word came out at `N = 3` in two of the four runs.
+    //
+    // Two of the four show no loss of agreement at all: both participants
+    // receive `Commit`, or both receive `Abort`, which is what *correct* 2PC
+    // does. They are reported anyway, and correctly — so the document's
+    // agreement argument is not what makes any of these witnesses a violation.
+    // What makes all four violations is the same thing: `p0` has its decision
+    // before `p1` has voted.
+    const OBSERVED: [&str; 3] = [
+        // p0 Yes → Commit, p1 No → Abort. Seven of the twelve.
+        "p0: receive Prepare(ThreadId { opaque_id: 1 }) → p0: send Yes → p0: receive Commit → \
+p1: receive Prepare(ThreadId { opaque_id: 1 }) → p1: send No → p1: receive Abort , \
+[p0: done, p1: done]",
+        // p0 Yes → Commit, p1 Yes → Commit — the decisions agree. Printed as the
+        // `N = 2` witness on run seed 7989666650678556505.
+        "p0: receive Prepare(ThreadId { opaque_id: 1 }) → p0: send Yes → p0: receive Commit → \
+p1: receive Prepare(ThreadId { opaque_id: 1 }) → p1: send Yes → p1: receive Commit , \
+[p0: done, p1: done]",
+        // p0 No → Abort, p1 No → Abort — the decisions agree. Printed as the
+        // `N = 4` witness on run seed 10860480359802314445.
+        "p0: receive Prepare(ThreadId { opaque_id: 1 }) → p0: send No → p0: receive Abort → \
+p1: receive Prepare(ThreadId { opaque_id: 1 }) → p1: send No → p1: receive Abort , \
+[p0: done, p1: done]",
+    ];
+    for observed in OBSERVED {
+        let w = imp
+            .iter()
+            .find(|w| render_word(w) == observed)
+            .unwrap_or_else(|| {
+                panic!("this demo printed a word the implementation cannot produce:\n  {observed}")
+            });
+        assert!(
+            !spec.contains(w),
+            "this witness IS in vis(Spec), so the demo printed a false alarm:\n  {observed}"
+        );
+    }
+
+    // **Agreement really is lost, and this is where the document's claim is
+    // right.** Everything above says the *printed* witnesses are ordering
+    // witnesses; it does not say the eager coordinator keeps agreement. This
+    // word does: both vote-sends precede both decision-receives, which is an
+    // order the specification can produce, and the decisions still differ. So
+    // `vis(Impl) ⊄ vis(Spec)` for the reason 2PC exists to rule out as well as
+    // for the timing — the two are independent, and only the second is what any
+    // witness observed so far exhibits.
+    //
+    // Note `p0` votes `No` and receives `Commit`. That is the eager
+    // coordinator's second, undocumented facet: `for p in &ps { recv(); send(*p,
+    // …) }` replies to `ps[i]` with the verdict standing after the *i*-th vote
+    // **arrived**, whoever cast it, so a participant is told the decision for
+    // someone else's vote.
+    const DISAGREEING: &str = "p0: receive Prepare(ThreadId { opaque_id: 1 }) → p0: send No → \
+p1: receive Prepare(ThreadId { opaque_id: 1 }) → p1: send Yes → p0: receive Commit → \
+p1: receive Abort , [p0: done, p1: done]";
+    let disagreeing = imp
+        .iter()
+        .find(|w| render_word(w) == DISAGREEING)
+        .expect("the eager coordinator can give the two participants different decisions");
+    assert!(
+        !spec.contains(disagreeing),
+        "the specification permits disagreement, so it is not an agreement specification"
+    );
+}
+
+/// The `#[ignore]`d table's essential claim at the smallest size that shows it,
+/// asserted the way the table asserts it — **including `exhaustions`**.
+///
+/// [`the_two_pc_pair_conforms_and_its_perturbation_does_not`] already pins the
+/// reports half, but it does not look at `exhaustions`, and a run that
+/// exhausted its inner budget establishes less than it appears to while reading
+/// as clean to anyone looking at reports alone (F43). `conforms` is the
+/// conjunction, so the test is too.
+///
+/// Cost: 0.03 s. It does not use [`timed`], so it is one run rather than the
+/// several that function repeats.
+///
+/// **Mutation, MEASURED**: this call's own `search_budget` argument 10_000 → 1
+/// and the `exhaustions` assertion fires while the `reports` one still passes —
+/// which is the whole point of asserting both.
+#[test]
+fn the_correct_2pc_run_is_exhaustive_and_not_merely_silent() {
+    let out = verify_conformance(cfg(), two_pc(2, false), two_pc_spec(), visible(), 10_000);
+    assert!(
+        out.reports.is_empty(),
+        "N=2: the correct 2PC must refine the agreement specification, got {} report(s)",
+        out.reports.len()
+    );
+    assert!(
+        out.exhaustions.is_empty(),
+        "N=2: {} inner-search exhaustion(s) — `conforms` would mean \
+         \"nothing found in the part we looked at\"",
+        out.exhaustions.len()
+    );
+}
