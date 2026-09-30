@@ -60,6 +60,87 @@ impl Cover {
     }
 }
 
+/// Is `g` the graph a rebuild would start from — one thread, one label?
+///
+/// **Conservative on purpose, because the two failure directions are not
+/// symmetric.** Failing to fire costs the redundant traversal F69 measures,
+/// which is slow but correct. Firing when it should not would skip a rebuild
+/// that might have found a cover, turning a coverable graph into a **report** —
+/// a false alarm. So this must never be true of a graph with any progress in it.
+///
+/// It is not testable as "no events": `ExecutionGraph::new()` seeds main with
+/// `Begin::main()`, so the initial graph has exactly **one** event. The first
+/// attempt at this predicate compared an event count against zero, never fired,
+/// and would have "confirmed" F69's absence by accident (developer, `P3-F63`).
+///
+/// **Nor is it `==`, and two earlier accounts of why were both wrong.** It is
+/// not the `HashMap`s: `HashMap` implements `PartialEq` whenever its values do.
+/// Nor is meaning the *first* obstacle. The derive **does not compile** —
+/// `ThreadInfo` (`exec_graph.rs:19`), `LabelEnum` and `TCreate`
+/// (`event_label.rs:19`, `:653`) each derive `Clone`/`Serialize`/`Deserialize`
+/// and **not** `PartialEq`, and no manual impl exists for any of them. So it
+/// needs `PartialEq` derived across `event_label.rs` as well, over `LabelEnum`'s
+/// variants, the symbolic ones and their payloads: a multi-file upstream change,
+/// which is a far stronger objection than "meaning" and comes before it. *If* it
+/// did compile, then the meaning objection applies — `sends` and `recvs` are
+/// derived caches documented as empty during `replay_mode`, so two graphs of one
+/// execution can differ in them.
+///
+/// **`Display` comparison is the real alternative, and it needs no upstream
+/// change at all** — it is what `P3-F63`'s instrument used. It is not rejected on
+/// cost: `cover` runs 141 times in a whole `verify` run of `bad_A`, so ~282
+/// formats against 372 246 probes is immaterial. (The instinct to call it hot
+/// comes from F63's instrument defect, where the same call sat once per
+/// `spec_visit` **node**, three orders of magnitude hotter.) It is rejected
+/// because the two are **equally safe** and this one is cheaper: `Display` prints
+/// neither `stamp` nor `task_id_map`, so it has precisely the shape test's blind
+/// spot and rests on the very same "no seed has been cut" premise below.
+///
+/// **Why one thread of one label is the root, argued without the premise this
+/// file denies.** An argument from "every event appends a label" would
+/// contradict [`Budget`]'s rustdoc forty lines below, which cites F34 for the
+/// probe graph being **non-monotone**. So the two deletion paths have to be
+/// named and dismissed (developer, `P3-F69` §5):
+///
+/// - `unblock_ready` deletes a `Block(Value)` without returning its stamp. It
+///   cannot reach one thread of one label, because a `Block` is deleted only
+///   once a matching send exists or a joined thread has finished, and either
+///   witness is itself a label — earlier in the same row, or in a second thread.
+/// - `cut_to_view` erases whole threads and leaves `stamp` at its **high-water
+///   mark**, so it could produce a graph of this shape that is not the root. The
+///   retained stamp alone carries that; an earlier version of this paragraph also
+///   said it "does not prune `task_id_map`", which is **false** — it calls
+///   `tasks.remove` for every erased thread (`exec_graph.rs:1144`). The claim came
+///   from the commented-out `// tasks.remove(&id)` a few lines above it. Its
+///   callers are the forward, backward and symbolic revisit paths, and
+///   `probe_from` runs one `Execution::run` and then `take_graph` — never the
+///   worklist loop a revisit comes from.
+///
+/// So the premise this predicate rests on is **"no seed has been cut"**, which
+/// `cover`'s preconditions half-state already. It is the thing to check first if
+/// this guard is ever suspected.
+///
+/// **The initial-shaped cover is not a hypothetical, and it is not a hazard.**
+/// An earlier draft of this paragraph hedged that *if* a `Cover::Found(H)` were
+/// ever initial-shaped, its `stamp` and `task_id_map` "need not match" a fresh
+/// `default()`. Both halves were wrong. It **is** constructible — an empty
+/// specification, or one whose `main` only tosses a coin, at a gate with no
+/// visible observations, where `main` never gets an `End` and `Done` holds
+/// vacuously — and such an `H` is **identical** to `ExecutionGraph::default()` in
+/// every field, `Debug` included, so the traversals coincide by identity rather
+/// than by accident. That is a consequence of the predicate given the premise
+/// above, not an assumption on top of it.
+fn is_initial_graph(g: &ExecutionGraph) -> bool {
+    let mut ids = g.thread_ids().into_iter();
+    match (ids.next(), ids.next()) {
+        // `main_thread_id()` is checked so the predicate does not rest on the
+        // unstated invariant that a lone thread must be main (developer's
+        // suggestion, `P3-F69` §8).
+        (Some(only), None) => only == crate::thread::main_thread_id() && g.thread_size(only) == 1,
+        _ => false,
+    }
+}
+
 /// A node ceiling, so that a non-terminating search fails loudly instead of
 /// hanging.
 ///
@@ -189,11 +270,62 @@ impl Search {
             complete: outer_complete,
         };
 
+        // Whether the seed already *is* what the rebuild would start from.
+        // Tested before the seed is moved into the traversal. See F69.
+        let seed_is_initial = is_initial_graph(&seed);
+
         let mut budget = Budget {
             remaining: self.budget,
         };
         let from_seed = self.spec_visit(&outer, seed, &mut budget)?;
         if from_seed.is_found() || matches!(from_seed, Cover::BudgetExhausted) {
+            return Ok(from_seed);
+        }
+
+        // **F69: the rebuild is the same search when the seed was the root.**
+        //
+        // Reaching here, `from_seed` is `NoCover` — `Found` and
+        // `BudgetExhausted` returned above. A `NoCover` is a *completed*
+        // traversal within budget, so a second traversal of the same space, from
+        // the same graph, **does** reach the same answer having spent the same
+        // nodes.
+        //
+        // That rests on **two independent premises**, and an earlier version of
+        // this comment ran them together with a colon, which made one read as the
+        // content of the other:
+        //
+        // 1. *The specification behaves the same on both traversals.* Its
+        //    support is the module's re-entrancy contract, not this function:
+        //    `probe` builds a fresh `Must::with_initial_graph` per node, which
+        //    gives fresh **engine** state, and the contract supplies the rest by
+        //    requiring the program to carry no state across re-entries. Stating
+        //    only the fresh `Must` was the reviewer's blocking finding in
+        //    `P3-F69` round 01 — right premise, wrong support — because a closure
+        //    may legally capture an atomic that no replay resets (F72).
+        // 2. *The two attempts do not share a counter.* Each gets its own fresh
+        //    `Budget`. This one is about **exact equivalence to the pre-guard
+        //    code**, not about soundness, and an earlier comment overstated it: a
+        //    depleted shared counter could only make the redundant second
+        //    traversal return `BudgetExhausted`, changing the value this function
+        //    returns — it could not manufacture a false `NoCover`, since the first
+        //    traversal completed and its answer stands on its own.
+        //
+        // Neither implies the other, and only the first bears on soundness.
+        //
+        // Measured, not deduced: of 15 empty-seed rebuilds on `ndk3 bad_A`,
+        // **same answer 15/15 and same node count 15/15** (`P3-F63`); answers
+        // compared against the unguarded body along the **diagnostics-shaped**
+        // seed sequence, which is the one this guard is reachable from — along
+        // the gate sequence it never fires at all; and end to end, the guard
+        // recovers **65 410 probes, 17.57% of a `verify` run**, with engine-only
+        // probes *identical* in both arms, which is what localises the saving to
+        // the diagnostics path (`P3-F69`).
+        //
+        // The caller that does this is `Recompute::diagnose`, which passes a
+        // literal `ExecutionGraph::default()` once per report. The guard sits
+        // here rather than there because it is correct for every caller and
+        // needs no second entry point.
+        if seed_is_initial {
             return Ok(from_seed);
         }
 
@@ -1839,6 +1971,651 @@ mod tests {
                     Decision::Value(v) => install_nondet(cfg(), g, &offers[i], v),
                 };
             }
+        }
+    }
+
+    // ------------------------------------------- F69: the empty-seed guard
+
+    /// The labels in `g`, which is what a "the graph is empty" predicate would
+    /// count. It is never zero: `ExecutionGraph::new()` installs `main`'s
+    /// `Begin`.
+    fn labels_in(g: &ExecutionGraph) -> usize {
+        g.thread_ids().into_iter().map(|t| g.thread_size(t)).sum()
+    }
+
+    /// `cover` without F69's guard: the seed attempt, and on `NoCover` a
+    /// rebuild from the root with a **fresh** budget.
+    ///
+    /// A transcription of the body as it stood before the guard, rather than a
+    /// switch on the real one. Two reasons, and the second is the important
+    /// one. A switch would be a production change made to test a production
+    /// change. And a transcription makes the comparison *asymmetric in the
+    /// right direction*: deleting the guard leaves this function unchanged, so
+    /// the work comparison in
+    /// [`the_guard_halves_the_work_when_the_seed_is_the_root`] fails instead of
+    /// quietly comparing two identical code paths.
+    fn cover_unguarded(
+        s: &Search,
+        g1: &ExecutionGraph,
+        vis: &[&str],
+        complete: bool,
+        seed: ExecutionGraph,
+        budget: usize,
+    ) -> Cover {
+        let outer = outer_of(g1, vis, complete);
+        let mut b = Budget { remaining: budget };
+        let from_seed = s
+            .spec_visit(&outer, seed, &mut b)
+            .expect("the seed attempt");
+        if from_seed.is_found() || matches!(from_seed, Cover::BudgetExhausted) {
+            return from_seed;
+        }
+        let mut b = Budget { remaining: budget };
+        s.spec_visit(&outer, ExecutionGraph::default(), &mut b)
+            .expect("the rebuild")
+    }
+
+    /// An answer rendered so that two of them can be compared.
+    ///
+    /// `Cover` has no `PartialEq` and neither has `ExecutionGraph`, so a
+    /// `Found` is keyed on the graph's `Display`. That is a **comparison key for
+    /// the corpus below, not a canonical form** — an earlier version of this
+    /// sentence called it canonical in the same breath as listing what it drops,
+    /// which cannot both be true. `Display` omits stamps, and without
+    /// `--features print_vals` it omits `SendMsg`'s value too (`P3-F63` §2), so
+    /// two covers differing only in a payload would share a key. It is adequate
+    /// here because every pair below distinguishes its sends by position or by a
+    /// `nondet` result, both of which `Display` prints; it would not be adequate
+    /// for an arbitrary pair.
+    fn answer_key(c: &Cover) -> String {
+        match c {
+            Cover::Found(g) => format!("Found\n{g}"),
+            Cover::NoCover => "NoCover".to_owned(),
+            Cover::BudgetExhausted => "BudgetExhausted".to_owned(),
+        }
+    }
+
+    /// Wrap a program so that every probe of it is counted.
+    ///
+    /// `Search` runs the specification exactly once per `SpecVisit` node —
+    /// `spec_visit` spends a budget unit and then probes — so this counter *is*
+    /// the node count, without instrumenting anything. Verified on a
+    /// 16-node traversal: nodes 16, invocations 16.
+    fn counting(counter: &Arc<std::sync::atomic::AtomicUsize>, p: Prog) -> Prog {
+        let counter = Arc::clone(counter);
+        Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            p();
+        })
+    }
+
+    /// Run `f` and report how many times the counted specification was probed.
+    fn probes_of<T>(
+        counter: &Arc<std::sync::atomic::AtomicUsize>,
+        f: impl FnOnce() -> T,
+    ) -> (T, usize) {
+        use std::sync::atomic::Ordering;
+        counter.store(0, Ordering::SeqCst);
+        let out = f();
+        (out, counter.load(Ordering::SeqCst))
+    }
+
+    /// The graph at every gate of a greedy drive of `p`, with the completion
+    /// gate flagged — the sequence `ConfCtx` would put to `cover`.
+    fn gate_graphs(p: &Prog) -> Vec<(ExecutionGraph, bool)> {
+        let mut out = Vec::new();
+        let mut graph = ExecutionGraph::default();
+        for _ in 0..64 {
+            let (offers, g) = probe_of(p, graph).into_parts();
+            if offers.is_empty() {
+                out.push((g, true));
+                return out;
+            }
+            out.push((g.clone(), false));
+            let (i, d) = greedy(&offers, &g).expect("greedy has an offer to take");
+            graph = match d {
+                Decision::Send => install(cfg(), g, &offers[i]),
+                Decision::Recv(rf) => install_recv(cfg(), g, &offers[i], rf),
+                Decision::Value(v) => install_nondet(cfg(), g, &offers[i], v),
+            };
+        }
+        panic!("gate_graphs: more than 64 steps; the program is not the small one this test meant");
+    }
+
+    /// The pairs the guard is checked against: this module's programs, paired
+    /// both ways wherever both directions share a visible vocabulary. The
+    /// corpus therefore holds covering pairs, pairs with no cover at all, and
+    /// the `blocking` shape that covers at every in-execution gate and reports
+    /// only at completion.
+    fn f69_pairs() -> Vec<(&'static str, Prog, Prog, Vec<&'static str>)> {
+        vec![
+            ("relay", relay_impl(), relay_spec(), vec!["main", "c"]),
+            (
+                "relay reversed",
+                relay_spec(),
+                relay_impl(),
+                vec!["main", "c"],
+            ),
+            ("restart", restart_impl(), restart_spec(), vec!["main", "c"]),
+            (
+                "restart reversed",
+                restart_spec(),
+                restart_impl(),
+                vec!["main", "c"],
+            ),
+            (
+                "blocking",
+                blocking_impl(),
+                blocking_spec(),
+                vec!["main", "c"],
+            ),
+            (
+                "blocking reversed",
+                blocking_spec(),
+                blocking_impl(),
+                vec!["main", "c"],
+            ),
+            (
+                "sched",
+                sched_prog(),
+                sched_prog(),
+                vec!["main", "b1", "b2"],
+            ),
+            (
+                "rebuild",
+                rebuild_prog(),
+                rebuild_prog(),
+                vec!["a", "b", "c"],
+            ),
+            ("two_sends", two_sends(), two_sends(), vec!["main"]),
+            (
+                "one_send 2 vs 1",
+                one_send(2),
+                one_send(1),
+                vec!["main", "sink"],
+            ),
+            (
+                "one_send 1 vs 1",
+                one_send(1),
+                one_send(1),
+                vec!["main", "sink"],
+            ),
+            (
+                "naive k=3",
+                naive(3, 0),
+                naive(3, 1),
+                vec!["main", "a", "b0", "b1", "b2"],
+            ),
+            (
+                "provenance",
+                provenance_prog(),
+                provenance_prog(),
+                vec!["b2", "c"],
+            ),
+            (
+                "may_read_nothing",
+                may_read_nothing_prog(),
+                may_read_nothing_prog(),
+                vec!["s", "c"],
+            ),
+        ]
+    }
+
+    /// The budget the F69 tests run at: above every traversal in `f69_pairs`,
+    /// so no answer is a `BudgetExhausted` that hides a difference.
+    const F69_BUDGET: usize = 4096;
+
+    /// **F69, the predicate.** `is_initial_graph` is true of the graph a
+    /// rebuild starts from and of nothing that has made progress.
+    ///
+    /// Both directions, and the three near misses that matter:
+    ///
+    /// - **One thread, two labels.** `main` blocked on a receive. A predicate
+    ///   that looked only at the thread count would fire here, skip a rebuild,
+    ///   and turn a coverable graph into a report.
+    /// - **Two threads, the second holding only its `Begin`.** The case the
+    ///   F69 brief singled out. It is rejected twice over, which the test
+    ///   records: spawning appends a `TCREATE` to the parent's row, so the
+    ///   parent already has two labels, and the thread count is two.
+    /// - **Zero labels is not the test.** The root has exactly one, so an
+    ///   event count compared against zero never fires — the trap the first
+    ///   instrument in `P3-F63` fell into.
+    #[test]
+    fn is_initial_graph_holds_of_the_root_and_of_nothing_with_progress() {
+        let root = ExecutionGraph::default();
+        assert!(is_initial_graph(&root), "the root is the root");
+        assert!(
+            is_initial_graph(&ExecutionGraph::new()),
+            "`new` and `default` are the same graph"
+        );
+        assert_eq!(
+            labels_in(&root),
+            1,
+            "the root carries `main`'s `Begin`, so `labels == 0` is never the test"
+        );
+
+        // One thread, two labels: `main` blocked on a receive with no send.
+        let blocked = probe_of(
+            &prog(|| {
+                let _: i32 = recv_msg_block();
+            }),
+            ExecutionGraph::default(),
+        );
+        let g = blocked.graph();
+        assert_eq!(g.thread_ids().len(), 1, "nothing was spawned");
+        assert_eq!(
+            labels_in(g),
+            2,
+            "`Begin` and the `Block` the receive installs"
+        );
+        assert!(
+            !is_initial_graph(g),
+            "a blocked `main` has made progress:\n{g}"
+        );
+
+        // Two threads, the second holding only its `Begin`, parked at a send.
+        let parked = probe_of(
+            &prog(|| {
+                let mid = main_thread_id();
+                let _c = spawn_named("c", move || send_msg(mid, 1i32));
+            }),
+            ExecutionGraph::default(),
+        );
+        let g = parked.graph();
+        let ids: Vec<ThreadId> = g.thread_ids().into_iter().collect();
+        assert_eq!(ids.len(), 2, "`main` and `c`");
+        assert_eq!(
+            g.thread_size(ids[1]),
+            1,
+            "`c` holds its `Begin` and nothing else — the offer is not installed"
+        );
+        assert_eq!(
+            g.thread_size(ids[0]),
+            2,
+            "and the thread count is not the only thing rejecting it: spawning \
+             appended a `TCREATE` to `main`'s row"
+        );
+        assert!(!is_initial_graph(g), "a spawned thread is progress:\n{g}");
+
+        // And anything larger.
+        for (name, p) in [
+            ("one send", one_send(1)),
+            ("two sends", two_sends()),
+            ("relay", relay_impl()),
+        ] {
+            let g = complete_graph(&p);
+            assert!(
+                !is_initial_graph(&g),
+                "{name}: a completed graph is not the root:\n{g}"
+            );
+        }
+    }
+
+    /// **F69, the premise.** The rebuild the guard skips is the search it just
+    /// ran: the same traversal, run twice in one process, gives the same answer
+    /// having spent the same nodes.
+    ///
+    /// This is the property the guard rests on, asserted directly rather than
+    /// inferred from the guard's effect. If a probe ever picked up state from
+    /// an earlier probe — a scheduler seed advanced, a cache retained — the two
+    /// traversals could diverge and skipping the second would be the one thing
+    /// this tool must not do: manufacture a report. `P3-F63` measured the
+    /// agreement on 15 of 15 empty-seed rebuilds of `ndk3 bad_A`, answer and
+    /// node count both; this fixes it as a test.
+    #[test]
+    fn the_root_traversal_repeats_itself_in_answer_and_in_nodes() {
+        let mut checked = 0;
+        let mut biggest = 0;
+        for (name, impl_p, spec_p, vis) in f69_pairs() {
+            let gates = gate_graphs(&impl_p);
+            let (g1, complete) = gates.last().expect("a drive has at least one gate");
+            let s = search_for(&spec_p, &vis, F69_BUDGET);
+            let outer = outer_of(g1, &vis, *complete);
+
+            let mut b = Budget {
+                remaining: F69_BUDGET,
+            };
+            let first = s.spec_visit(&outer, ExecutionGraph::default(), &mut b);
+            let first_nodes = F69_BUDGET - b.remaining;
+
+            let mut b = Budget {
+                remaining: F69_BUDGET,
+            };
+            let second = s.spec_visit(&outer, ExecutionGraph::default(), &mut b);
+            let second_nodes = F69_BUDGET - b.remaining;
+
+            match (first, second) {
+                (Ok(a), Ok(b2)) => assert_eq!(
+                    answer_key(&a),
+                    answer_key(&b2),
+                    "{name}: two traversals of the same space disagreed"
+                ),
+                (Err(a), Err(b2)) => assert_eq!(
+                    format!("{a:?}"),
+                    format!("{b2:?}"),
+                    "{name}: the two traversals raised different errors"
+                ),
+                (a, b2) => {
+                    panic!("{name}: one traversal errored and the other did not: {a:?} / {b2:?}")
+                }
+            }
+            assert_eq!(
+                first_nodes, second_nodes,
+                "{name}: the same traversal spent a different number of nodes"
+            );
+            checked += 1;
+            biggest = biggest.max(first_nodes);
+        }
+        assert_eq!(
+            checked,
+            f69_pairs().len(),
+            "every pair must have been checked"
+        );
+        assert!(
+            biggest > 1,
+            "at least one traversal must be more than a single node, or the \
+             agreement is about nothing"
+        );
+    }
+
+    /// **F69, the headline: no answer changed.** Two call sequences, each
+    /// answered by `cover` and by the unguarded body, compared answer for
+    /// answer.
+    ///
+    /// The two sequences are the two ways `cover` is called, and only the
+    /// second reaches the guard. `P3-F63` §3 measured why, and this test was
+    /// written before that was remembered and then corrected by it:
+    ///
+    /// - **The gate sequence**, with the seed threaded through as `ConfCtx`
+    ///   threads it. The seed is the root only at gate 0, because `ConfCtx::h`
+    ///   is written on every `Found` and never cleared — and gate 0 covers. So
+    ///   the guard is *never reached* here. The comparison still belongs in the
+    ///   test: it is the evidence that adding the guard changed no answer on the
+    ///   path that carries the run.
+    /// - **The diagnostics sequence**, which is `diagnose.rs:317` — a *literal*
+    ///   `ExecutionGraph::default()` seed, once per report. This is where F69
+    ///   lives and where the guard fires, and the count of firings is asserted
+    ///   non-zero. Without that, the whole test would pass on a guard that
+    ///   never fires anywhere — the safe failure direction, but not the one
+    ///   under test.
+    ///
+    /// `Found` is compared on the covering graph and not only on the verdict: a
+    /// guard that returned the same *kind* of answer while changing *which*
+    /// cover is carried forward would change the next gate's seed, and a
+    /// verdict-only comparison would miss it.
+    #[test]
+    fn the_guard_changes_no_answer_on_either_path_of_these_pairs() {
+        let mut fired = 0;
+        let mut gate_calls = 0;
+        let mut diagnose_calls = 0;
+        for (name, impl_p, spec_p, vis) in f69_pairs() {
+            let s = search_for(&spec_p, &vis, F69_BUDGET);
+            let gates = gate_graphs(&impl_p);
+
+            // The gate path: one seed, carried.
+            let mut guarded_seed = ExecutionGraph::default();
+            let mut plain_seed = ExecutionGraph::default();
+            for (i, (g1, complete)) in gates.iter().enumerate() {
+                let seed_was_root = is_initial_graph(&guarded_seed);
+                let guarded = s
+                    .cover(g1, *complete, guarded_seed.clone())
+                    .unwrap_or_else(|e| panic!("{name} gate {i}: {e:?}"));
+                let plain =
+                    cover_unguarded(&s, g1, &vis, *complete, plain_seed.clone(), F69_BUDGET);
+                assert_eq!(
+                    answer_key(&guarded),
+                    answer_key(&plain),
+                    "{name} gate {i}: the guard changed the answer"
+                );
+                if seed_was_root && matches!(guarded, Cover::NoCover) {
+                    fired += 1;
+                }
+                gate_calls += 1;
+                if let Cover::Found(h) = guarded {
+                    guarded_seed = h;
+                }
+                if let Cover::Found(h) = plain {
+                    plain_seed = h;
+                }
+            }
+
+            // The diagnostics path: a fresh root seed every time.
+            for (i, (g1, complete)) in gates.iter().enumerate() {
+                let guarded = s
+                    .cover(g1, *complete, ExecutionGraph::default())
+                    .unwrap_or_else(|e| panic!("{name} diagnose {i}: {e:?}"));
+                let plain = cover_unguarded(
+                    &s,
+                    g1,
+                    &vis,
+                    *complete,
+                    ExecutionGraph::default(),
+                    F69_BUDGET,
+                );
+                assert_eq!(
+                    answer_key(&guarded),
+                    answer_key(&plain),
+                    "{name} diagnose {i}: the guard changed the answer"
+                );
+                if matches!(guarded, Cover::NoCover) {
+                    fired += 1;
+                }
+                diagnose_calls += 1;
+            }
+        }
+        assert!(
+            gate_calls > 40 && diagnose_calls > 40,
+            "only {gate_calls} gate calls and {diagnose_calls} diagnostics \
+             calls were compared"
+        );
+        assert!(
+            fired > 0,
+            "the guard never fired on this corpus, so the comparison says \
+             nothing about it"
+        );
+    }
+
+    /// **F69, the saving, and the failing direction.** On a root seed the guard
+    /// halves the work; on a carried seed it must not fire at all.
+    ///
+    /// The work is counted without instrumenting anything: `spec_visit` probes
+    /// the specification exactly once per node, so a specification that counts
+    /// its own invocations counts nodes.
+    ///
+    /// Both halves are needed, and they fail in opposite directions:
+    ///
+    /// - Delete the guard, or make `is_initial_graph` always false, and the
+    ///   root-seed half fails — the same answer costs twice the nodes, which is
+    ///   F69. Measured: these two mutants kill this test and, apart from the
+    ///   predicate's own test, nothing else in the suite.
+    /// - Make it always true, or negate `seed_is_initial` **at the call site**,
+    ///   and the carried-seed half fails — a rebuild that would have found a
+    ///   cover is skipped. That is the direction that manufactures a report,
+    ///   and it is also caught by
+    ///   [`the_guard_changes_no_answer_on_either_path_of_these_pairs`] and by
+    ///   twenty tests that predate F69.
+    ///
+    ///   Negating inside `is_initial_graph`'s `(Some(only), None)` arm is *not*
+    ///   that mutant and does not reach this half: the `_ => false` arm is
+    ///   untouched, so a multi-thread seed still answers `false` and no
+    ///   rebuild is skipped.
+    #[test]
+    fn the_guard_halves_the_work_when_the_seed_is_the_root() {
+        use std::sync::atomic::AtomicUsize;
+
+        // -- a root seed, and no cover: the F69 case.
+        let vis = &["main", "a", "b0", "b1", "b2"];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let spec = counting(&counter, naive(3, 1));
+        let g1 = complete_graph(&naive(3, 0));
+        let s = Search::new(cfg(), Arc::clone(&spec), names(vis), F69_BUDGET);
+
+        let (guarded, guarded_nodes) = probes_of(&counter, || {
+            s.cover(&g1, true, ExecutionGraph::default()).unwrap()
+        });
+        let (plain, plain_nodes) = probes_of(&counter, || {
+            cover_unguarded(&s, &g1, vis, true, ExecutionGraph::default(), F69_BUDGET)
+        });
+
+        assert!(
+            matches!(guarded, Cover::NoCover) && matches!(plain, Cover::NoCover),
+            "this pair has no cover, and both answers must say so: \
+             {guarded:?} / {plain:?}"
+        );
+        assert!(
+            guarded_nodes > 1,
+            "a one-node traversal would make the factor of two meaningless"
+        );
+        assert_eq!(
+            plain_nodes,
+            2 * guarded_nodes,
+            "the rebuild from a root seed is the seed attempt again, so the \
+             guard must remove exactly half the work"
+        );
+
+        // -- a carried seed: the guard must not fire, even though the seed
+        // -- attempt answers `NoCover`. This is Ex. restart.
+        let vis = &["main", "c"];
+        let counter = Arc::new(AtomicUsize::new(0));
+        let spec = counting(&counter, restart_spec());
+        let impl_p = restart_impl();
+        let s = Search::new(cfg(), Arc::clone(&spec), names(vis), F69_BUDGET);
+
+        let g1_one = drive(&impl_p, {
+            let mut taken = 0;
+            move |_offers, _g| {
+                taken += 1;
+                (taken <= 1).then_some((0, Decision::Send))
+            }
+        });
+        let seed = found(s.cover(&g1_one, false, ExecutionGraph::default()).unwrap());
+        assert!(
+            !is_initial_graph(&seed),
+            "the seed carried from gate 1 has made progress:\n{seed}"
+        );
+
+        let g1_both = complete_graph(&impl_p);
+        let outer = outer_of(&g1_both, vis, true);
+        let mut b = Budget {
+            remaining: F69_BUDGET,
+        };
+        assert!(
+            matches!(
+                s.spec_visit(&outer, seed.clone(), &mut b).unwrap(),
+                Cover::NoCover
+            ),
+            "the seed attempt must fail here, or the guard is never reached"
+        );
+
+        let (guarded, guarded_nodes) =
+            probes_of(&counter, || s.cover(&g1_both, true, seed.clone()).unwrap());
+        let (plain, plain_nodes) = probes_of(&counter, || {
+            cover_unguarded(&s, &g1_both, vis, true, seed.clone(), F69_BUDGET)
+        });
+        assert!(
+            guarded.is_found() && plain.is_found(),
+            "the rebuild finds the cover the seed cannot reach: \
+             {guarded:?} / {plain:?}"
+        );
+        assert_eq!(
+            guarded_nodes, plain_nodes,
+            "a carried seed must cost the rebuild: the guard fired when it \
+             should not have"
+        );
+    }
+
+    /// **F69's known edge, constructed.** A `Cover::Found(H)` really can return
+    /// an initial-shaped `H`, and when it does, `H` is the root itself — every
+    /// field, `stamp` and `task_id_map` included.
+    ///
+    /// **This test predates the rustdoc it describes.** It was written when
+    /// `is_initial_graph` stated the edge as an *assumption* — that such an `H`
+    /// "arrived by another route", so its `stamp` "need not match" a fresh
+    /// `default()`. That rustdoc has since been rewritten to assert the opposite,
+    /// which is what this test measures. The edge exists — an empty specification
+    /// at a gate with no visible observations covers vacuously, and so does one
+    /// whose `main` only tosses a coin — and being initial-shaped *is* being the
+    /// root:
+    ///
+    /// - Exactly one thread means `add_thread` never ran on this graph, so
+    ///   `task_id_map` is still the single entry `ExecutionGraph::new` installs.
+    /// - Exactly one label on that thread means it is the `Begin` the
+    ///   constructor put there, so no `insert_label` survived and `stamp` was
+    ///   never handed out. A probe that parks a receive installs a label and
+    ///   then takes it back with `release_last_stamp`, so asking leaves no
+    ///   trace (`must.rs`, `probe_recv` — "the question is asked, the label is
+    ///   gone").
+    ///
+    /// **Both premises need the deletion paths dismissed, because the graph is
+    /// not monotone** — `Budget`'s rustdoc in this file says so, citing F34, and
+    /// an argument from "every event appends a label" would be arguing from a
+    /// premise this file denies. There are two, and neither can reach a seed:
+    ///
+    /// - `unblock_ready` deletes a `Block(Value)` and does **not** give its
+    ///   stamp back. It cannot reach one thread of one label: a `Block` is
+    ///   deleted only once a matching send exists or a joined thread has
+    ///   finished, and either witness is itself a label — earlier in the same
+    ///   row, or in a second thread.
+    /// - `cut_to_view` erases whole threads, leaves `stamp` at its high-water
+    ///   mark and does not prune `task_id_map`, so it *could* produce a graph of
+    ///   this shape that is not the root. Its only callers are the forward,
+    ///   backward and symbolic revisit paths, and `probe_from` runs one
+    ///   `Execution::run` and then `take_graph` — never the worklist loop a
+    ///   revisit comes from. So no graph `cover` can be handed as a seed has
+    ///   been cut.
+    ///
+    /// The test asserts the conclusion the way it is checked: `Debug` prints
+    /// every field of `ExecutionGraph`, serde-skipped ones included, so
+    /// comparing two renderings compares the whole struct.
+    #[test]
+    fn an_initial_shaped_cover_is_the_root_itself() {
+        let root = format!("{:?}", ExecutionGraph::default());
+        let g1 = complete_graph(&one_send(1));
+
+        for (name, spec) in [
+            ("an empty specification", prog(|| {})),
+            (
+                "a specification whose `main` only tosses a coin",
+                prog(|| {
+                    let _b = crate::nondet();
+                }),
+            ),
+        ] {
+            // No visible names, so `matches` holds vacuously and `Done` is
+            // reached at the first node.
+            let s = search_for(&spec, &[], F69_BUDGET);
+            let h = found(s.cover(&g1, false, ExecutionGraph::default()).unwrap());
+            assert!(
+                is_initial_graph(&h),
+                "{name}: the cover found at the root is initial-shaped"
+            );
+            assert_eq!(
+                format!("{h:?}"),
+                root,
+                "{name}: an initial-shaped cover differs from the root in some field"
+            );
+
+            // And carried into a later gate as a seed, it answers what the
+            // rebuild it suppresses would have answered.
+            let vis = &["main", "sink"];
+            let s = search_for(&spec, vis, F69_BUDGET);
+            let outer = outer_of(&g1, vis, true);
+            let mut b = Budget {
+                remaining: F69_BUDGET,
+            };
+            let from_h = s.spec_visit(&outer, h.clone(), &mut b).unwrap();
+            let mut b = Budget {
+                remaining: F69_BUDGET,
+            };
+            let from_root = s
+                .spec_visit(&outer, ExecutionGraph::default(), &mut b)
+                .unwrap();
+            assert_eq!(
+                answer_key(&from_h),
+                answer_key(&from_root),
+                "{name}: the traversal from the carried `H` and the traversal \
+                 from the root disagreed"
+            );
         }
     }
 }

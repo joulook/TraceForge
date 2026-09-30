@@ -48,6 +48,30 @@
 //! boundary inside conformance's hot path, and S4 was bitten at that exact
 //! boundary by a failure that became a different failure and lost its origin.
 //!
+//! # Writing a pair: both programs must be re-entrant
+//!
+//! **A program is re-executed from its entry point, many times, and must behave
+//! the same way each time.** The engine explores by calling the program again and
+//! replaying the prefix it has recorded — `lib.rs`'s
+//! `loop { Execution::new(..); execution.run(|| f()) }` — and conformance does the
+//! same to the *specification* once per inner-search node, which is far more
+//! often: 372 246 probes in one `verify` run of the `ndk3` pair measured in F63.
+//!
+//! What replay restores is the **engine's** decisions: thread interleaving,
+//! `nondet()`, and which send a receive reads from. All three live in the graph.
+//! What it cannot restore is memory the program itself keeps — a captured atomic
+//! or `static`, a clock, `rand`, a file — because those lines are ordinary Rust
+//! and simply run again.
+//!
+//! So both programs must put **all** their nondeterminism through `nondet()` and
+//! carry **no** state across executions. A program that breaks this does not fail
+//! loudly; it yields a wrong answer. Demonstrated in
+//! `traceforge/tests/f72_stateful_program.rs`: a captured counter reads `0` then
+//! `1` on two executions, and a program whose send value depends on it records a
+//! graph describing a send it would no longer make — with a clean exit and no
+//! diagnostic. Backlog **F72**; the same sentence belongs on [`crate::verify`],
+//! which is an upstream change.
+//!
 //! # Writing a pair: do not send a `ThreadId` a visible thread will observe
 //!
 //! A `ThreadId` is an opaque number allocated **per program in spawn order**.
