@@ -2557,7 +2557,9 @@ mod tests {
     ///   finished, and either witness is itself a label — earlier in the same
     ///   row, or in a second thread.
     /// - `cut_to_view` erases whole threads, leaves `stamp` at its high-water
-    ///   mark and does not prune `task_id_map`, so it *could* produce a graph of
+    ///   mark — it *does* prune `task_id_map`, via `tasks.remove` per erased thread
+    ///   (`exec_graph.rs:1144`); the retained stamp alone is what could produce a
+    ///   graph of
     ///   this shape that is not the root. Its only callers are the forward,
     ///   backward and symbolic revisit paths, and `probe_from` runs one
     ///   `Execution::run` and then `take_graph` — never the worklist loop a

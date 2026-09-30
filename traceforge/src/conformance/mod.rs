@@ -64,12 +64,22 @@
 //! and simply run again.
 //!
 //! So both programs must put **all** their nondeterminism through `nondet()` and
-//! carry **no** state across executions. A program that breaks this does not fail
-//! loudly; it yields a wrong answer. Demonstrated in
-//! `traceforge/tests/f72_stateful_program.rs`: a captured counter reads `0` then
-//! `1` on two executions, and a program whose send value depends on it records a
-//! graph describing a send it would no longer make — with a clean exit and no
-//! diagnostic. Backlog **F72**; the same sentence belongs on [`crate::verify`],
+//! carry **no** state across executions.
+//!
+//! **Breaking it is detected sometimes and not others, which is the awkward part.**
+//! The engine does validate replay — `ExecutionGraph::validate_replay_event` runs
+//! `compare_for_replay`, and on a mismatch it panics with *"TraceForge programs
+//! must be deterministic. Any nondeterminism should be under the control of
+//! TraceForge via the nondet() function"*. But that comparison is partial:
+//! `RecvMsg` returns `Ok` unconditionally, and a `SendMsg` value is compared only
+//! when the recorded value is **not pending** (`event_label.rs:194`). So a
+//! divergence can be caught loudly, and can also pass unnoticed — detection is not
+//! something to rely on.
+//!
+//! `traceforge/tests/f72_stateful_program.rs` (on `fix/f72-contract`) exhibits the
+//! silent side: a captured counter reads `0` then `1` across two executions, and a
+//! program whose *pending* send value depends on it completes normally with no
+//! diagnostic. Backlog **F72**; the same account belongs on [`crate::verify`],
 //! which is an upstream change.
 //!
 //! # Writing a pair: do not send a `ThreadId` a visible thread will observe
