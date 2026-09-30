@@ -545,6 +545,11 @@ impl ExecutionPool {
             let _queue = self.work_deque.lock().expect("Couldn't lock deque mutex");
             self.shutdown.store(true, Ordering::SeqCst);
             self.loop_block_cond.notify_all();
+            // Last statement *inside* the critical section, so the lock is still
+            // held here. See `test_hooks::Point::AfterShutdownStore`; the position
+            // is the whole point and it was moved here on a measurement.
+            #[cfg(test)]
+            test_hooks::pause_at(test_hooks::Point::AfterShutdownStore);
         }
         // The per-worker state is still set, for diagnostics only; the flag
         // above is what ends the worker loops.
@@ -625,6 +630,67 @@ pub(crate) mod test_hooks {
         /// Inside the queue lock in `drain_and_shutdown`, between reading the
         /// busy states and reading the queue depth.
         DrainBetweenReads,
+        /// In `shutdown_now`, the **last statement inside** the critical section
+        /// that stores the shutdown flag and notifies — so reaching it means the
+        /// request is published **and the queue lock is still held**.
+        ///
+        /// The fifth point exists because of what the four before it could not
+        /// distinguish. §5.2's rule is that the store and the notify happen inside
+        /// the queue lock. The minimal violation — keep the lock acquisition, move
+        /// only the store and notify after it — **survived all eight patterns**;
+        /// pattern 6 catches only the maximal form, and catches it through the
+        /// blocking of the lock acquisition rather than through where the store
+        /// sits, so the set pinned "`shutdown_now` must contend for the lock before
+        /// storing", which is weaker than the rule the original bug turned on
+        /// Measured: that mutation passed all eight of the tests that existed
+        /// before this point was added.
+        ///
+        /// **The position was corrected on a measurement, and the first attempt is
+        /// worth recording.** This marker was first placed immediately *after* the
+        /// critical section. That killed the minimal violation when the mutation
+        /// put the store after the marker line, and **missed the same program**
+        /// when it put the store before it — two mutants differing only in which
+        /// side of a `cfg(test)` line the store sat on, a line that does not exist
+        /// in a non-test build. So the test pinned "the store precedes this source
+        /// line", not "the store is inside the lock". From **inside** the block
+        /// there is no such gap: any mutation that lifts the store out of the
+        /// critical section necessarily lands after this marker, and both forms
+        /// die. Measured both ways — with the marker outside, one spelling was
+        /// killed and the other missed; with it inside, both are killed and the two
+        /// spellings become the same program up to a comment.
+        ///
+        /// **What it costs.** A test parked here holds the queue lock, so a worker
+        /// cannot acquire it and the *behavioural* witness — a woken worker takes
+        /// nothing — becomes a post-release race. The discriminating witness is
+        /// therefore the flag read. That is the right instrument for a rule about
+        /// ordering, and the behavioural consequence is not lost from the set:
+        /// pattern 8 establishes that queued work is not taken after a request.
+        ///
+        /// **The position is load-bearing in both directions, and the second one is
+        /// a false red rather than a false green.** Below the marker, nothing can
+        /// lift the store out of the critical section undetected — that is what it
+        /// is for. But a *rule-preserving* reorder that puts the store below the
+        /// marker while keeping it inside the lock (notify, marker, store) also
+        /// fails the test, although the program is equivalent. Measured as E3
+        /// while keeping it inside the lock, and that was measured.
+        ///
+        /// **So state what the test is and is not.** It is a *structural guard for
+        /// this implementation*: it establishes that the store precedes this marker,
+        /// which given the marker's position means the store is inside the lock
+        /// **here**. It is not a behavioural proof that every implementation
+        /// satisfying the rule would pass — an equivalent one that stores below the
+        /// marker does not. Observing lock ownership without imposing
+        /// store-before-marker ordering would need richer instrumentation or a
+        /// state-machine test; that is the cost of the small hook, and it buys the
+        /// guarantee that no mutation can move the store past this critical section
+        /// undetected. It is the
+        /// conservative direction for a test whose
+        /// job is that no mutation lifts the store out of the lock, and the failure
+        /// message names the benign possibility explicitly rather than asserting
+        /// the defect. Telling "inside the lock but below the marker" from "outside
+        /// the lock" would need a second observation point, and `test_hooks` can
+        /// arm only one at a time.
+        AfterShutdownStore,
     }
 
     struct Armed {
@@ -717,7 +783,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
-    use std::sync::{Arc, Mutex, MutexGuard};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard};
     use std::time::{Duration, Instant};
 
     /// How long a parent waits for its child before killing it. A child
@@ -829,9 +895,16 @@ mod tests {
     }
 
     /// Two-phase commit with `n` participants, each voting `nondet()`. The
-    /// coordinator's receives race, so the exploration revisits, and a
-    /// parallel exploration hands those revisits to other workers through the
-    /// pool's queue.
+    /// coordinator's receives race, so the exploration revisits.
+    ///
+    /// **It does not hand those revisits to other workers through the pool's
+    /// queue**, which an earlier version of this comment claimed. Measured:
+    /// `Must::backward_revisit` is entered **0 times in 4 352 executions** across
+    /// five program shapes, serial and parallel, including this one — its sole
+    /// call site never runs. So this program exercises the pool's *lifecycle* —
+    /// start, explore, drain, shut down — and not its queue as a work-distribution
+    /// channel. The patterns that need work in the queue stage it directly, which
+    /// is why they do.
     fn two_phase_commit(n: u32) {
         let participants: Vec<ThreadId> = (0..n)
             .map(|_| thread::spawn(participant).thread().id())
@@ -1539,5 +1612,301 @@ mod tests {
             "the pool recorded executions from work taken after shutdown had been requested"
         );
         eprintln!("pre-take check: the token stayed queued and no execution began");
+    }
+    // --- Pattern 9: a request mid-graph does not abandon the graph -----------
+
+    /// Counts the executions [`mid_graph_child`]'s program begins.
+    static MID_GRAPH_BEGUN: AtomicUsize = AtomicUsize::new(0);
+    /// Holds that program's first execution until the test opens the gate.
+    static MID_GRAPH_GATE: Mutex<bool> = Mutex::new(false);
+    static MID_GRAPH_OPEN: Condvar = Condvar::new();
+
+    /// A shutdown requested while a worker is **inside** a graph does not
+    /// abandon that graph: the worker explores it to the end, and only then
+    /// exits.
+    ///
+    /// This is the one guarantee the other eight patterns leave untested,
+    /// because through the production route it cannot arise: a worker inside a
+    /// graph is `Busy`, and `drain_and_shutdown` requests shutdown only when no
+    /// worker is. It is reachable, and asserted here, through a direct
+    /// `shutdown_now` — the route a future timeout, cancel or abort caller
+    /// would use, and the one the flag being read at the top of the *outer*
+    /// loop rather than the inner one exists to serve.
+    ///
+    /// No pause point is needed: the program a worker explores is the test's
+    /// own closure, so the test stops the graph from inside it.
+    ///
+    /// **With the flag also read inside the inner loop** the worker abandons
+    /// the graph at the next execution boundary, and the test fails with the
+    /// count it reached — 1 of 8 — against the closed form `2^n · n!`.
+    #[test]
+    fn a_shutdown_inside_a_graph_does_not_abandon_it() {
+        run_child("exec_pool::tests::mid_graph_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by a_shutdown_inside_a_graph_does_not_abandon_it"]
+    fn mid_graph_child() {
+        const N: u32 = 2;
+        let _serial = hooks_lock();
+        MID_GRAPH_BEGUN.store(0, Ordering::SeqCst);
+        *MID_GRAPH_GATE.lock().unwrap() = false;
+
+        let (mut pool, states) = pool(1);
+        let queue = pool.work_deque.clone();
+        let stats = pool.exec_stats.clone();
+        let program = Arc::new(move || {
+            if MID_GRAPH_BEGUN.fetch_add(1, Ordering::SeqCst) == 0 {
+                // The graph's first execution stops here, so the request lands
+                // while the worker is inside the inner loop.
+                let mut open = MID_GRAPH_GATE.lock().unwrap();
+                while !*open {
+                    open = MID_GRAPH_OPEN.wait(open).unwrap();
+                }
+            }
+            two_phase_commit(N);
+        });
+        pool.worker_vec.iter_mut().for_each(|w| w.start(&program));
+        pool.enqueue(None);
+
+        wait_for("the worker to begin the graph's first execution", || {
+            MID_GRAPH_BEGUN.load(Ordering::SeqCst) >= 1
+        });
+        wait_for("the worker to be marked busy on that graph", || {
+            count_in(&states, ExecutionPoolWorkerState::Busy) == 1
+        });
+
+        // Request shutdown with the worker stopped inside the graph.
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let joined_all = pool.shutdown_now();
+            let _ = tx.send(joined_all);
+        });
+        wait_for("the shutdown request", || {
+            count_in(&states, ExecutionPoolWorkerState::Shutdown) == 1
+        });
+
+        // Let the graph run on.
+        *MID_GRAPH_GATE.lock().unwrap() = true;
+        MID_GRAPH_OPEN.notify_all();
+
+        let joined_all = rx
+            .recv_timeout(STEP_LIMIT)
+            .unwrap_or_else(|_| panic!("shutdown_now did not return within {STEP_LIMIT:?}"));
+        assert!(joined_all, "the worker was not joined");
+
+        let expected = two_phase_commit_execs(N);
+        let begun = MID_GRAPH_BEGUN.load(Ordering::SeqCst);
+        assert_eq!(
+            begun, expected,
+            "the worker began {begun} of the graph's {expected} executions before exiting: a \
+             shutdown requested mid-graph abandoned the rest of it"
+        );
+        assert_eq!(
+            stats.lock().unwrap().execs,
+            expected,
+            "the pool's stats do not account for the whole graph"
+        );
+        assert!(
+            queue.lock().unwrap().is_empty(),
+            "the graph left work queued that nothing will ever take"
+        );
+        eprintln!("mid-graph shutdown: the graph ran to completion, {begun} executions");
+    }
+    // --- Pattern 10: the request is published when the lock is released -----
+
+    /// Counts the executions [`after_store_child`]'s program begins.
+    static AFTER_STORE_BEGUN: AtomicUsize = AtomicUsize::new(0);
+
+    /// One attempt at the window pattern 10 needs.
+    enum Published {
+        /// The request was published while the worker was still asleep on
+        /// queued work, so the witnesses were taken in the window.
+        Valid,
+        /// The worker's poll fired before the request was made and it took the
+        /// staged token on its own: no window.
+        Void(String),
+    }
+
+    /// Stages the state §5.2's rule is about — a worker asleep on work that is
+    /// already queued — publishes a shutdown request into it, and holds
+    /// `shutdown_now` **inside** the critical section that published it.
+    ///
+    /// The pause point is the last statement in that block, so in the window
+    /// the queue lock is held by the stopped `shutdown_now` and nothing about
+    /// the queue can move: no worker can take the staged token, and the test
+    /// itself must not touch the queue — it would block on that lock until the
+    /// release. That is what the position buys.
+    ///
+    /// **Witness 1, the rule itself.** The flag is already set while that lock
+    /// is still held, so the store happened inside the critical section. A
+    /// mutation that lifts the store out of the block lands after this marker
+    /// and leaves the flag unset here, whichever side of the marker line it is
+    /// written on.
+    ///
+    /// **Witness 2, the consequence.** Released and woken, the worker takes
+    /// nothing. Under the rule that is forced — the store happened under the
+    /// very lock the take needs, before any worker could acquire it — but
+    /// against a mutation that publishes late it is a race, since such a
+    /// mutation stores within nanoseconds of the release. So witness 2
+    /// confirms; witness 1 discriminates. See [`Point::AfterShutdownStore`].
+    ///
+    /// Without the pause point neither witness exists: `shutdown_now` runs on
+    /// into the per-worker writes and the join, and the interval the rule is
+    /// about is a few instructions wide.
+    ///
+    /// Staging races the worker's 250 ms poll: if it wakes on its own and takes
+    /// the token before the request is made there is no window, and the attempt
+    /// is [`Published::Void`] and retried. That is decided by the worker's own
+    /// state rather than by the queue, both because the queue is unreadable
+    /// here and because `Busy` is written under the same lock as the take, so a
+    /// worker that has taken the token is `Busy` before it lets go of it.
+    fn stage_one_publication() -> Published {
+        AFTER_STORE_BEGUN.store(0, Ordering::SeqCst);
+        let (mut pool, states) = pool(1);
+        let queue = pool.work_deque.clone();
+        let wake = pool.loop_block_cond.clone();
+        let requested = pool.shutdown.clone();
+        let stats = pool.exec_stats.clone();
+        let program = Arc::new(|| {
+            AFTER_STORE_BEGUN.fetch_add(1, Ordering::SeqCst);
+        });
+        pool.worker_vec.iter_mut().for_each(|w| w.start(&program));
+
+        // Let the worker settle into its wait, then queue a start token
+        // **without notifying it**, so it stays asleep holding no lock with
+        // work in the queue that it would take on its next pass.
+        wait_for("the worker to go idle", || {
+            count_in(&states, ExecutionPoolWorkerState::Waiting) == 1
+        });
+        queue.lock().unwrap().push_back(None);
+
+        test_hooks::arm(Point::AfterShutdownStore);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let joined_all = pool.shutdown_now();
+            let _ = tx.send(joined_all);
+        });
+        wait_until_paused();
+
+        // Witness 1. The lock is held here, so this reads the flag as of a
+        // moment strictly inside the critical section. Nothing in this window
+        // may touch `queue`: it would block until the release.
+        let published = requested.load(Ordering::SeqCst);
+        let begun_at_request = AFTER_STORE_BEGUN.load(Ordering::SeqCst);
+        let busy_at_request = count_in(&states, ExecutionPoolWorkerState::Busy);
+        if begun_at_request > 0 || busy_at_request > 0 {
+            // The worker's own poll beat the request to the token, so this
+            // attempt says nothing about the rule. It cannot have taken it
+            // *after* the request: the store, the notification and this marker
+            // are one critical section, and the take needs that same lock.
+            test_hooks::release();
+            let _ = rx.recv_timeout(STEP_LIMIT);
+            return Published::Void(format!(
+                "the worker's poll fired first and it took the staged token \
+                 (executions begun {begun_at_request}, workers busy {busy_at_request})"
+            ));
+        }
+
+        // The window closes here: the block ends, and the queue lock is free.
+        test_hooks::release();
+
+        // Witness 2. The notification is the test's own, so this witness does
+        // not depend on `shutdown_now`'s — that is pattern 6's property.
+        wake.notify_all();
+        wait_for(
+            "the woken worker to take the token or leave its loop",
+            || AFTER_STORE_BEGUN.load(Ordering::SeqCst) > 0 || Arc::strong_count(&program) == 1,
+        );
+        let took = AFTER_STORE_BEGUN.load(Ordering::SeqCst);
+        // The worker's clone of the program is dropped when `worker_loop`
+        // returns, so one reference left is the worker gone.
+        let left_the_loop = Arc::strong_count(&program) == 1;
+
+        let joined_all = rx
+            .recv_timeout(STEP_LIMIT)
+            .unwrap_or_else(|_| panic!("shutdown_now did not return within {STEP_LIMIT:?}"));
+
+        assert!(
+            published,
+            "the shutdown flag was still unset at this marker, which is reached with the queue \
+             lock still held: either the store is outside the critical section — so a worker \
+             can hold that lock, read no request, and take work or go to sleep with the request \
+             already made — or it is inside the section but below this marker, which keeps the \
+             rule and which this witness cannot tell apart (see `Point::AfterShutdownStore`)"
+        );
+        assert_eq!(
+            took, 0,
+            "the woken worker began {took} execution(s) of work queued before the request was \
+             made: its read of the flag under the queue lock did not observe the request"
+        );
+        assert_eq!(
+            queue.lock().unwrap().len(),
+            1,
+            "the staged token is gone: the worker took it after the request was published"
+        );
+        assert_eq!(
+            stats.lock().unwrap().execs,
+            0,
+            "the pool recorded executions from work taken after the request was published"
+        );
+        assert!(
+            left_the_loop,
+            "the woken worker neither took the item nor left its loop"
+        );
+        assert!(joined_all, "the worker was not joined");
+        Published::Valid
+    }
+
+    /// The shutdown request is published inside the critical section that
+    /// holds the queue lock: a worker that takes that lock next observes it.
+    ///
+    /// This is §5.2's rule as stated — *the store and the notify happen while
+    /// holding the queue lock* — rather than the weaker property the other
+    /// patterns pin between them, which is that `shutdown_now` contends for
+    /// that lock before it stores. Pattern 6 catches only the form of the
+    /// violation that does not take the lock at all, and catches it through the
+    /// blocking of the acquisition; the form that keeps the acquisition and
+    /// moves only the store after it survives all nine
+    /// which passed every test that existed before this one.
+    ///
+    /// **With the store moved out of the critical section** the flag is still
+    /// unset at [`Point::AfterShutdownStore`], which is reached with the lock
+    /// still held, and the test fails on that witness. **Both** ways of writing
+    /// that mutation die, because there is no gap between the store and the
+    /// marker for one of them to sit in; with the marker one line lower, one of
+    /// the two survived; from inside the critical section both are caught.
+    ///
+    /// It fails **without the pre-take flag check** as well, on its second
+    /// witness: the worker released here wakes, takes the staged token and
+    /// begins it. Pattern 8 establishes that by another route.
+    #[test]
+    fn the_request_is_published_inside_the_critical_section() {
+        run_child("exec_pool::tests::after_store_child");
+    }
+
+    #[test]
+    #[ignore = "run in a child process by the_request_is_published_inside_the_critical_section"]
+    fn after_store_child() {
+        const ATTEMPTS: u32 = 5;
+        let _serial = hooks_lock();
+        let _disarm = Disarm;
+
+        for attempt in 0..ATTEMPTS {
+            match stage_one_publication() {
+                Published::Valid => {
+                    eprintln!(
+                        "publication: staged on attempt {attempt}: the request was already set \
+                         with the queue lock still held, and the woken worker left the token \
+                         queued"
+                    );
+                    return;
+                }
+                Published::Void(why) => {
+                    eprintln!("publication: attempt {attempt} came to nothing: {why}")
+                }
+            }
+        }
+        panic!("could not stage a publication window in {ATTEMPTS} attempts");
     }
 }
