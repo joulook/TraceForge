@@ -119,9 +119,8 @@ fn coordinator_correct() {
     }
     let mut yes = 0usize;
     for _ in 0..ps.len() {
-        match recv_msg_block::<ToCoordinator>() {
-            ToCoordinator::Yes => yes += 1,
-            _ => {}
+        if let ToCoordinator::Yes = recv_msg_block::<ToCoordinator>() {
+            yes += 1;
         }
     }
     let d = if yes == ps.len() {
@@ -151,9 +150,8 @@ fn coordinator_eager() {
     }
     let mut seen_no = false;
     for p in &ps {
-        match recv_msg_block::<ToCoordinator>() {
-            ToCoordinator::No => seen_no = true,
-            _ => {}
+        if let ToCoordinator::No = recv_msg_block::<ToCoordinator>() {
+            seen_no = true;
         }
         send_msg(
             *p,

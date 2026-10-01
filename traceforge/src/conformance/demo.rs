@@ -1113,9 +1113,16 @@ fn demo_ring_2pc_split_brain() {
 // Every `demo_*` and `diag_*` test above is `#[ignore]`d, so before these an
 // ordinary suite run asserted **nothing** about versions 2 and 3: a change that
 // made the buggy election conform, or the correct one report, would have gone
-// unnoticed until someone ran a measurement by hand. The four tests below are
-// un-`ignore`d and cost 0.22 s together (measured: 0.17 + 0.05 + under 0.01
-// twice), dominated by the `n = 3` ring run.
+// unnoticed until someone ran a measurement by hand. The five tests below are
+// un-`ignore`d and cost 0.41 s together (measured alone with `--exact`:
+// 0.20 + 0.15 + 0.06 + under 0.01 twice), dominated by the `n = 3` ring run and
+// by the obligation test's six split-brain runs.
+//
+// Four of the five assert what a run **concluded**. The fifth,
+// `the_split_brain_reports_name_m1_at_a_stated_thread_and_position`, asserts
+// what it *said* — the reported obligation's kind, thread, position and named
+// value. Nothing did, and the four demo write-ups quote all four of those; two
+// of the quotes were wrong and survived a developer pass and a reviewer pass.
 //
 // The ground truth is `conformance::oracle` — `vis(P)` materialised as every
 // linear extension of every graph, compared by set inclusion, with no reference
@@ -1356,6 +1363,173 @@ fn no_elector_or_oracle_id_is_ever_observed_by_a_participant() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// **What the tool *reports*, pinned: the obligation's kind, where it fell, and
+/// the value it names.**
+///
+/// Every test above asserts what a run **concluded** — `reports` empty or not.
+/// None asserted what the run *said*. The four demo write-ups quote the reported
+/// obligation in prose, and two published defects lived in exactly that gap,
+/// both found by `P3-DEMOS-audit` after surviving a developer pass and a
+/// reviewer pass:
+///
+/// - `DEMO-2PC-ALL.md` generalised the obligation to "(M1) on the **last**
+///   participant at position 0". False for the ring at `n = 4`: the tool names
+///   `p2`, and the last participant is `p3`. It holds in the other three of the
+///   four cases that section covers, which is why reading did not catch it.
+/// - `DEMO-2PC-ALL.md` and `DEMO-2PC-RING.md` both quote the `n = 2` obligation,
+///   under the label *verbatim*, as ending "the implementation has receive
+///   **`Vote(true)`**". It ends "receive **`BeFollower`**(…)". `Vote(true)` is
+///   `p0`'s position **0**, not position 1, and the misquote then carried three
+///   lines of derived prose in `DEMO-2PC-RING.md`.
+///
+/// **Structure, not sentences.** [`crate::conformance::report::Obligation`] is a
+/// typed enum, so this pins the discriminant and the fields and never reads the
+/// `Display` prose wrapped around them — rewording the message cannot break it.
+/// The one pinned field that is itself rendered text is `imp`, and only the
+/// observation's *kind* is pinned (`receive BeFollower(`), not the `ThreadId`
+/// debug form inside it: that form is not the claim, and pinning it would fail
+/// on a harmless `Debug` change. The negative half — `Vote` must **not** appear
+/// — is the discriminator the two write-ups failed.
+///
+/// **(M1) and not (M3)** is the distinction `DEMO-2PC-ALL.md`'s status section
+/// turns on. That section argues the violation *is* in the status component at
+/// `n ≥ 3`, and then says, correctly, that this is *our derivation* and not the
+/// tool's reported reason. This test is what keeps that caveat true: if the tool
+/// ever did name (M3) here, the section would become a description of the output
+/// and would have to be rewritten — so the assertion fails loudly rather than
+/// being relaxed.
+///
+/// The `n ≥ 3` half also pins the other half of that caveat: triage answers
+/// [`crate::conformance::report::TriageOutcome::Blocked`], so there is no
+/// ⟨word, status⟩ pair for anything to compare, while at `n = 2` it completes
+/// and every visible thread is `done`.
+///
+/// Cost: 0.15 s for all six runs, measured alone with `--exact`.
+///
+/// **Mutations, MEASURED**, one each:
+///
+/// - the ring `n = 4` row's expected thread `"p2"` → `"p3"` (the claim this test
+///   exists to refute) — fails, naming `p2`;
+/// - the expected `imp` prefix → `"receive Vote("` — fails, naming the
+///   `BeFollower` receive;
+/// - the (M1) arm swapped for [`crate::conformance::report::Obligation::
+///   StatusMismatch`] — fails on every row;
+/// - an `n = 3` row's `completes` flag `false` → `true` — fails, naming
+///   `Blocked`;
+/// - and on the production side, seeding `le_elector`'s comparison with
+///   `Some(s.me)` unconditionally (deleting the `buggy` arm) — the election
+///   stops splitting, no report is produced, and this test fails at
+///   "exactly one report", so it tracks the tool rather than itself.
+#[test]
+fn the_split_brain_reports_name_m1_at_a_stated_thread_and_position() {
+    use crate::conformance::report::{Diagnostics, Obligation, TriageOutcome};
+
+    // pair, n, obligation's thread, its position, does triage complete?
+    let cases: [(&str, usize, &str, usize, bool); 6] = [
+        ("all-to-all", 2, "p0", 1, true),
+        ("all-to-all", 3, "p2", 0, false),
+        ("all-to-all", 4, "p3", 0, false),
+        ("ring", 2, "p0", 1, true),
+        ("ring", 3, "p2", 0, false),
+        // **`p2`, not `p3`.** The counterexample to "the last participant";
+        // see this test's own rustdoc. Do not "fix" this row to `p3`.
+        ("ring", 4, "p2", 0, false),
+    ];
+
+    for (pair, n, on_thread, at_position, completes) in cases {
+        let cc = ConfBuilder::new()
+            .config(le_cfg())
+            .visible_threads(le_visible(n))
+            .triage(true)
+            .stop_at_first_report(true)
+            .search_budget(10_000)
+            .build()
+            .expect("in scope");
+        let verdict = if pair == "ring" {
+            verify(cc, ring_impl(n, true), le_spec(n))
+        } else {
+            verify(cc, le_impl(n, true), le_spec(n))
+        }
+        .expect("the run completes");
+
+        let reports = verdict.outcome().reports();
+        assert_eq!(
+            reports.len(),
+            1,
+            "{pair} n={n}: `stop_at_first_report` should leave exactly one report, got {}",
+            reports.len()
+        );
+        let report = &reports[0];
+
+        // 1. An obligation is named at all. The write-ups quote one, so a
+        //    `Diverged`/`NoValueForIt` recomputation makes them unsourced.
+        let obligation = match report.diagnostics() {
+            Diagnostics::Available { obligation, .. } => obligation,
+            other => panic!(
+                "{pair} n={n}: no obligation was named ({other:?}), so the write-ups quote a \
+                 diagnostic this run does not produce"
+            ),
+        };
+
+        // 2. Its kind: (M1), not (M3).
+        let (got_thread, got_position, got_imp) = match obligation {
+            Obligation::ObservationMismatch {
+                thread,
+                position,
+                imp,
+                ..
+            } => (thread.as_str(), *position, imp.as_str()),
+            Obligation::StatusMismatch { .. } => panic!(
+                "{pair} n={n}: the tool named (M3), a status mismatch. `DEMO-2PC-ALL.md`'s \
+                 status section presents the status argument as *our derivation* precisely \
+                 because the tool does not name it; that section is now a description of the \
+                 output and must be rewritten. Do not relax this assertion"
+            ),
+            other => panic!("{pair} n={n}: expected (M1), got {other:?}"),
+        };
+
+        // 3. Where it fell.
+        assert_eq!(
+            (got_thread, got_position),
+            (on_thread, at_position),
+            "{pair} n={n}: the obligation is on `{got_thread}` at position {got_position}. \
+             `DEMO-2PC-ALL.md` states a thread and a position for each size, and it once \
+             stated the wrong one for this row"
+        );
+
+        // 4. The counterpart value it names — the field the two write-ups
+        //    misquoted. Kind pinned, `ThreadId` debug form deliberately not.
+        assert!(
+            got_imp.starts_with("receive BeFollower("),
+            "{pair} n={n}: the implementation side of the obligation is `{got_imp}`, not a \
+             `BeFollower` receive"
+        );
+        assert!(
+            !got_imp.contains("Vote"),
+            "{pair} n={n}: the implementation side of the obligation is `{got_imp}`. Two \
+             write-ups quoted a `Vote(true)` here; `Vote(true)` is `p0`'s position 0, not \
+             the mismatch"
+        );
+
+        // 5. Whether a ⟨word, status⟩ pair exists at all.
+        match (report.triage(), completes) {
+            (Some(TriageOutcome::Completed { vis, .. }), true) => assert!(
+                vis.statuses().iter().all(|(_, s)| s.as_str() == "done"),
+                "{pair} n={n}: triage completed, so every visible thread should end `done`, \
+                 got {:?}",
+                vis.statuses()
+            ),
+            (Some(TriageOutcome::Blocked { .. }), false) => {}
+            (got, _) => panic!(
+                "{pair} n={n}: expected triage to {}, got {got:?}. At `n >= 3` triage produces \
+                 no ⟨word, status⟩ pair, which is the other half of why the status argument is \
+                 a derivation and not the tool's output",
+                if completes { "complete" } else { "block" }
+            ),
         }
     }
 }
