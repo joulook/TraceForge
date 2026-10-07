@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use crate::event::Event;
-use crate::event_label::LabelEnum;
+use crate::event_label::{Annotation, LabelEnum, Visibility};
 use crate::exec_graph::ExecutionGraph;
 use crate::msg::Val;
 use crate::thread::ThreadId;
@@ -223,6 +223,12 @@ pub(crate) enum ObsError {
     /// thread must have one. Raised by `statuses`, not by `wobs` — see
     /// [`Row::Unspawned`].
     NotSpawned { name: String },
+    /// A probe of the specification installed a `Block(Assert)`: the
+    /// specification is not assertion-safe, so the conformance question is
+    /// not well posed (plan §1; `P4-ENUMERATOR` criterion 9). Raised by the
+    /// inner search right after the probe, before any `Done` or Φ; it aborts
+    /// the run and is never folded into a `Cover` answer.
+    SpecNotAssertionSafe { thread: String, pos: Event },
 }
 
 impl std::fmt::Display for ObsError {
@@ -237,6 +243,12 @@ impl std::fmt::Display for ObsError {
                 f,
                 "declared visible thread `{name}` was never spawned in this \
                  complete execution (conf-plan.md §8)"
+            ),
+            ObsError::SpecNotAssertionSafe { thread, pos } => write!(
+                f,
+                "the specification failed an assertion on thread `{thread}` at {pos} inside \
+                 the inner search, so it is not assertion-safe and the conformance question \
+                 is not well posed (IMPL-PLAN-algorithms.md §1)"
             ),
         }
     }
@@ -257,7 +269,7 @@ pub(crate) fn wobs(graph: &ExecutionGraph, visible: &[String]) -> Result<Wobs, O
     for name in visible {
         let row = match resolve(graph, name)? {
             None => Row::Unspawned,
-            Some(tid) => Row::Resolved(tid, visible_events(graph, tid)),
+            Some(tid) => Row::Resolved(tid, visible_events(graph, tid, visible)),
         };
         rows.insert(name.clone(), row);
     }
@@ -265,15 +277,103 @@ pub(crate) fn wobs(graph: &ExecutionGraph, visible: &[String]) -> Result<Wobs, O
 }
 
 /// Walk one thread's row in program order, collecting its visible events.
-fn visible_events(graph: &ExecutionGraph, tid: ThreadId) -> Vec<(Event, Obs)> {
+///
+/// `P4-MIXED` M1: the row is built from [`is_visible`] — the one accessor — and
+/// `observe` only extracts the observation of an event the accessor admitted,
+/// so rows and predicate cannot disagree.
+fn visible_events(graph: &ExecutionGraph, tid: ThreadId, visible: &[String]) -> Vec<(Event, Obs)> {
     let mut out = Vec::new();
     for index in 0..graph.thread_size(tid) as u32 {
         let pos = Event::new(tid, index);
+        if !is_visible(graph, pos, visible) {
+            continue;
+        }
         if let Some(obs) = observe(graph, pos) {
             out.push((pos, obs));
         }
     }
     out
+}
+
+/// **The** visibility predicate (`P4-MIXED` M1, `mixed.tex` §10): `e` is visible
+/// iff its label is a send or a receive, its thread resolves to a declared name
+/// of `visible`, and the label's annotation is `Default` (the per-thread
+/// setting, the embedding of the unannotated program) or `Explicit(Visible)`.
+/// Nondet, error and lifecycle labels are never visible; an `Explicit(Visible)`
+/// on an undeclared thread reads false (its well-formedness is
+/// [`check_annotation`]'s concern). "Resolves" is today's name comparison; an
+/// ambiguous name is `wobs`'s `AmbiguousName` error, not the predicate's.
+pub(crate) fn is_visible(graph: &ExecutionGraph, e: Event, visible: &[String]) -> bool {
+    let annotation = match graph.label(e) {
+        LabelEnum::SendMsg(l) => l.annotation(),
+        LabelEnum::RecvMsg(l) => l.annotation(),
+        _ => return false,
+    };
+    let named = graph
+        .get_thread_tclab(e.thread)
+        .name()
+        .as_deref()
+        .is_some_and(|n| visible.iter().any(|v| v == n));
+    named
+        && match annotation {
+            Annotation::Default | Annotation::Explicit(Visibility::Visible) => true,
+            Annotation::Explicit(Visibility::Invisible) => false,
+        }
+}
+
+/// `P4-MIXED` M4: the paper's first condition — only threads of `Tid_v` carry
+/// `v` — checked at append, on a label **not yet in the graph** (the graph
+/// serves name resolution only). `site` is the engine label carried into the
+/// message so a test can tell which run raised it.
+pub(crate) fn check_annotation(
+    graph: &ExecutionGraph,
+    label: &LabelEnum,
+    visible: &[String],
+    site: &str,
+) -> Result<(), crate::conformance::ctx::VisibleThreadError> {
+    let annotation = match label {
+        LabelEnum::SendMsg(l) => l.annotation(),
+        LabelEnum::RecvMsg(l) => l.annotation(),
+        _ => return Ok(()),
+    };
+    check_annotation_at(graph, label.pos(), annotation, visible, site)
+}
+
+/// [`check_annotation`] on a position and its annotation, for a caller that
+/// holds the label by value and must not clone it (`Must::handle_send`).
+pub(crate) fn check_annotation_at(
+    graph: &ExecutionGraph,
+    pos: Event,
+    annotation: Annotation,
+    visible: &[String],
+    site: &str,
+) -> Result<(), crate::conformance::ctx::VisibleThreadError> {
+    if annotation != Annotation::Explicit(Visibility::Visible) {
+        return Ok(());
+    }
+    let name: Option<String> = graph.get_thread_tclab(pos.thread).name().clone();
+    let declared = name
+        .as_deref()
+        .is_some_and(|n| visible.iter().any(|v| v == n));
+    if declared {
+        return Ok(());
+    }
+    Err(
+        crate::conformance::ctx::VisibleThreadError::UndeclaredVisible {
+            thread: name.unwrap_or_else(|| pos.thread.to_string()),
+            pos,
+            site: site.to_owned(),
+        },
+    )
+}
+
+/// A thin alias of [`is_visible`], kept because the closed `apparatus_tests.rs`
+/// imports it (`P4-MIXED` M1); every read of event visibility goes through
+/// `is_visible`.
+pub(crate) fn is_visible_event(graph: &ExecutionGraph, e: Event, visible: &[String]) -> bool {
+    // `P4-MIXED` M1: a thin alias of the one accessor (kept for the closed
+    // `apparatus_tests.rs`, which imports it).
+    is_visible(graph, e, visible)
 }
 
 /// The observation of one label, or `None` if it is not a visible event.

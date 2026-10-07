@@ -1,5 +1,7 @@
 use std::{future::Future, iter};
 
+use crate::event_label::Annotation;
+use crate::Visibility;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -97,30 +99,118 @@ impl<T: Message + 'static> Sender<T> {
         }
     }
 
+    /// [`Sender::send_msg`] with an explicit visibility annotation (`P4-MIXED` M3): `(visibility, v)`.
+    pub fn send_msg_as(&self, visibility: Visibility, v: T) {
+        crate::send_msg_with_tag(
+            v,
+            None,
+            &self.inner,
+            self.comm,
+            false,
+            Annotation::Explicit(visibility),
+        );
+    }
+
+    /// [`Sender::send_lossy_msg`] with an explicit visibility annotation: `(visibility, v)`.
+    pub fn send_lossy_msg_as(&self, visibility: Visibility, v: T) {
+        crate::send_msg_with_tag(
+            v,
+            None,
+            &self.inner,
+            self.comm,
+            true,
+            Annotation::Explicit(visibility),
+        );
+    }
+
+    /// [`Sender::send_tagged_msg`] with an explicit visibility annotation: `(visibility, tag, v)`.
+    pub fn send_tagged_msg_as(&self, visibility: Visibility, tag: u32, v: T) {
+        crate::send_msg_with_tag(
+            v,
+            Some(tag),
+            &self.inner,
+            self.comm,
+            false,
+            Annotation::Explicit(visibility),
+        )
+    }
+
+    /// [`Sender::send_tagged_lossy_msg`] with an explicit visibility annotation: `(visibility, tag, v)`.
+    pub fn send_tagged_lossy_msg_as(&self, visibility: Visibility, tag: u32, v: T) {
+        crate::send_msg_with_tag(
+            v,
+            Some(tag),
+            &self.inner,
+            self.comm,
+            true,
+            Annotation::Explicit(visibility),
+        )
+    }
+
+    /// [`Sender::send_vec_tagged_msg`] with an explicit visibility annotation: `(visibility, tag, v)`.
+    pub fn send_vec_tagged_msg_as(&self, visibility: Visibility, tag: Vec<u32>, v: T) {
+        let tag = if tag.is_empty() { None } else { Some(tag) };
+        crate::send_msg_with_vec_tag(
+            v,
+            tag,
+            &self.inner,
+            self.comm,
+            false,
+            Annotation::Explicit(visibility),
+        )
+    }
+
+    /// [`Sender::send_vec_tagged_lossy_msg`] with an explicit visibility annotation: `(visibility, tag, v)`.
+    pub fn send_vec_tagged_lossy_msg_as(&self, visibility: Visibility, tag: Vec<u32>, v: T) {
+        let tag = if tag.is_empty() { None } else { Some(tag) };
+        crate::send_msg_with_vec_tag(
+            v,
+            tag,
+            &self.inner,
+            self.comm,
+            true,
+            Annotation::Explicit(visibility),
+        )
+    }
+
     pub fn send_tagged_msg(&self, tag: u32, v: T) {
-        crate::send_msg_with_tag(v, Some(tag), &self.inner, self.comm, false)
+        crate::send_msg_with_tag(
+            v,
+            Some(tag),
+            &self.inner,
+            self.comm,
+            false,
+            Annotation::Default,
+        )
     }
 
     pub fn send_tagged_lossy_msg(&self, tag: u32, v: T) {
-        crate::send_msg_with_tag(v, Some(tag), &self.inner, self.comm, true)
+        crate::send_msg_with_tag(
+            v,
+            Some(tag),
+            &self.inner,
+            self.comm,
+            true,
+            Annotation::Default,
+        )
     }
 
     pub fn send_vec_tagged_msg(&self, tag: Vec<u32>, v: T) {
         let tag = if tag.is_empty() { None } else { Some(tag) };
-        crate::send_msg_with_vec_tag(v, tag, &self.inner, self.comm, false)
+        crate::send_msg_with_vec_tag(v, tag, &self.inner, self.comm, false, Annotation::Default)
     }
 
     pub fn send_vec_tagged_lossy_msg(&self, tag: Vec<u32>, v: T) {
         let tag = if tag.is_empty() { None } else { Some(tag) };
-        crate::send_msg_with_vec_tag(v, tag, &self.inner, self.comm, true)
+        crate::send_msg_with_vec_tag(v, tag, &self.inner, self.comm, true, Annotation::Default)
     }
 
     pub fn send_msg(&self, v: T) {
-        crate::send_msg_with_tag(v, None, &self.inner, self.comm, false);
+        crate::send_msg_with_tag(v, None, &self.inner, self.comm, false, Annotation::Default);
     }
 
     pub fn send_lossy_msg(&self, v: T) {
-        crate::send_msg_with_tag(v, None, &self.inner, self.comm, true);
+        crate::send_msg_with_tag(v, None, &self.inner, self.comm, true, Annotation::Default);
     }
 }
 
@@ -146,8 +236,93 @@ impl<T: Message + Clone + 'static> Receiver<T> {
         }
     }
 
+    /// [`Receiver::recv_msg`] with an explicit visibility annotation (`P4-MIXED` M3): `(visibility)`.
+    pub fn recv_msg_as(&self, visibility: Visibility) -> Option<T> {
+        crate::recv_msg_with_tag(
+            iter::once(&self.inner),
+            self.comm,
+            None,
+            Annotation::Explicit(visibility),
+        )
+        .map(|x| x.0)
+    }
+
+    /// [`Receiver::recv_tagged_msg`] with an explicit visibility annotation: `(visibility, f)`.
+    pub fn recv_tagged_msg_as<F>(&self, visibility: Visibility, f: F) -> Option<T>
+    where
+        F: Fn(Option<u32>) -> bool + 'static + Send + Sync,
+    {
+        self.recv_vec_tagged_msg_as(visibility, move |tag_vec| {
+            let tag = tag_vec.as_ref().and_then(|tags| tags.first().copied());
+            f(tag)
+        })
+    }
+
+    /// [`Receiver::recv_vec_tagged_msg`] with an explicit visibility annotation: `(visibility, f)`.
+    pub fn recv_vec_tagged_msg_as<F>(&self, visibility: Visibility, f: F) -> Option<T>
+    where
+        F: Fn(Option<Vec<u32>>) -> bool + 'static + Send + Sync,
+    {
+        let f = move |_tid, opt| f(normalize_vec_tag(opt));
+        crate::recv_msg_with_tag(
+            iter::once(&self.inner),
+            self.comm,
+            Some(PredicateType(Arc::new(f))),
+            Annotation::Explicit(visibility),
+        )
+        .map(|x| x.0)
+    }
+
+    /// [`Receiver::recv_msg_block`] with an explicit visibility annotation: `(visibility)`.
+    pub fn recv_msg_block_as(&self, visibility: Visibility) -> T {
+        crate::recv_msg_block_with_tag(
+            iter::once(&self.inner),
+            self.comm,
+            None,
+            Annotation::Explicit(visibility),
+        )
+        .0
+    }
+
+    /// [`Receiver::try_recv`] with an explicit visibility annotation: `(visibility)`.
+    pub fn try_recv_as(&self, visibility: Visibility) -> Result<T> {
+        Ok(self.recv_msg_block_as(visibility))
+    }
+
+    /// [`Receiver::recv_tagged_msg_block`] with an explicit visibility annotation: `(visibility, f)`.
+    pub fn recv_tagged_msg_block_as<F>(&self, visibility: Visibility, f: F) -> T
+    where
+        F: Fn(Option<u32>) -> bool + 'static + Send + Sync,
+    {
+        self.recv_vec_tagged_msg_block_as(visibility, move |tag_vec| {
+            let tag = tag_vec.as_ref().and_then(|tags| tags.first().copied());
+            f(tag)
+        })
+    }
+
+    /// [`Receiver::recv_vec_tagged_msg_block`] with an explicit visibility annotation: `(visibility, f)`.
+    pub fn recv_vec_tagged_msg_block_as<F>(&self, visibility: Visibility, f: F) -> T
+    where
+        F: Fn(Option<Vec<u32>>) -> bool + 'static + Send + Sync,
+    {
+        let f = move |_tid, opt| f(normalize_vec_tag(opt));
+        crate::recv_msg_block_with_tag(
+            iter::once(&self.inner),
+            self.comm,
+            Some(PredicateType(Arc::new(f))),
+            Annotation::Explicit(visibility),
+        )
+        .0
+    }
+
     pub fn recv_msg(&self) -> Option<T> {
-        crate::recv_msg_with_tag(iter::once(&self.inner), self.comm, None).map(|x| x.0)
+        crate::recv_msg_with_tag(
+            iter::once(&self.inner),
+            self.comm,
+            None,
+            Annotation::Default,
+        )
+        .map(|x| x.0)
     }
 
     pub fn async_recv_msg(&self) -> impl Future<Output = T> {
@@ -173,12 +348,19 @@ impl<T: Message + Clone + 'static> Receiver<T> {
             iter::once(&self.inner),
             self.comm,
             Some(PredicateType(Arc::new(f))),
+            Annotation::Default,
         )
         .map(|x| x.0)
     }
 
     pub fn recv_msg_block(&self) -> T {
-        crate::recv_msg_block_with_tag(iter::once(&self.inner), self.comm, None).0
+        crate::recv_msg_block_with_tag(
+            iter::once(&self.inner),
+            self.comm,
+            None,
+            Annotation::Default,
+        )
+        .0
     }
 
     pub fn try_recv(&self) -> Result<T> {
@@ -204,6 +386,7 @@ impl<T: Message + Clone + 'static> Receiver<T> {
             iter::once(&self.inner),
             self.comm,
             Some(PredicateType(Arc::new(f))),
+            Annotation::Default,
         )
         .0
     }

@@ -65,7 +65,7 @@ use std::time::Instant;
 
 use crate::conformance::{verify_conformance, Outcome};
 use crate::thread::ThreadId;
-use crate::{recv_msg_block, send_msg, thread, ConsType, Config};
+use crate::{recv_msg_block, send_msg, thread, Config, ConsType};
 
 #[derive(Clone, PartialEq, Debug)]
 enum ToCoordinator {
@@ -82,10 +82,7 @@ enum ToParticipant {
 }
 
 fn named<F: FnOnce() + Send + 'static>(n: &str, f: F) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name(n.to_string())
-        .spawn(f)
-        .unwrap()
+    thread::Builder::new().name(n.to_string()).spawn(f).unwrap()
 }
 
 /// Three events, and the whole of what a visible participant observes.
@@ -170,7 +167,7 @@ fn coordinator_eager() {
 /// Spawn order is load-bearing (F41): coordinator first, then `p0`, `p1`, then
 /// the rest. All unconditional, all before the program communicates — so §8's
 /// `check_spawn_order` is satisfied and F-6 does not arise.
-fn two_pc(n: usize, eager: bool) -> impl Fn() + Send + Sync + Clone + 'static {
+pub(super) fn two_pc(n: usize, eager: bool) -> impl Fn() + Send + Sync + Clone + 'static {
     move || {
         let coord = if eager {
             named("coord", coordinator_eager)
@@ -191,7 +188,7 @@ fn two_pc(n: usize, eager: bool) -> impl Fn() + Send + Sync + Clone + 'static {
 /// choice and sends the *same* decision to both. So the specification admits
 /// strictly more behaviour than the implementation — including `Abort` after
 /// two `Yes` — while still forbidding disagreement.
-fn two_pc_spec() -> impl Fn() + Send + Sync + Clone + 'static {
+pub(super) fn two_pc_spec() -> impl Fn() + Send + Sync + Clone + 'static {
     || {
         let coord = named("coord", || {
             let ps = match recv_msg_block::<ToCoordinator>() {
@@ -310,8 +307,12 @@ fn two_pc_scaling() {
     // and seed come from the **last** of those calls, which is the `Outcome`
     // `timed` returns, while `conf s` is the fastest of three rounds' average
     // per-call time, over calls that each drew their own seed.
-    println!("\n  N | plain execs |  plain s  | reports | skipped |   inert | conf s | ratio | seed");
-    println!("----+-------------+-----------+---------+---------+---------+--------+-------+------");
+    println!(
+        "\n  N | plain execs |  plain s  | reports | skipped |   inert | conf s | ratio | seed"
+    );
+    println!(
+        "----+-------------+-----------+---------+---------+---------+--------+-------+------"
+    );
     for n in 2..=5usize {
         let (bs, bt) = baseline(n, false);
         let (out, ct) = conformance(n, false);
@@ -501,7 +502,19 @@ fn the_eager_pairs_reports_come_from_fresh_add_gates() {
 ///
 /// - **F63** — the cost asymmetry between a conforming and a non-conforming pair
 ///   is redundant re-derivation, not a larger search space: 488 against 649
-///   distinct specification graphs, but 981 against 12 082 nodes.
+///   distinct specification graphs, but 981 against 12 082 nodes. **The 488
+///   was measured at `66d395e`.** Under F63's own settings today (engine-only,
+///   memo off, instrumented, seed 0, budget 10 000) `ndk3` conforming walks
+///   **283** run-wide `Display`-keyed graphs in 7 992 nodes over the same 160
+///   `Cover` calls (48 executions, 18 skipped and 8 inert gates, as at
+///   `66d395e`), while `bad_A` still reproduces 649 and 175 968 exactly.
+///   P4-DIFF gate 3 tried every candidate a knob on the working tree can
+///   reverse — the seed (0..=15 and two DEMO-2PC seeds: 283 every time, nodes
+///   7 956–8 002), the selector (283), the inner order (`Reverse` 232,
+///   `SendsFirst` 274), memo (283) and an unlimited budget (283) — and none
+///   restores 488: **unexplained after these**. The candidates that need a
+///   checkout (F57, F69's guard, F42/F49, Part 1b's probe force on origination
+///   vectors, the `Display` key's content) are the owner's.
 /// - **F69** — the empty-seed rebuild. `ndk3 bad_A` through `verify` spends
 ///   65 410 duplicate nodes, 17.6% of the run, and the guard in
 ///   `conformance::search::cover` removes exactly that.
@@ -517,7 +530,7 @@ fn the_eager_pairs_reports_come_from_fresh_add_gates() {
 /// first, then the senders — so `c` is `t1` on both and no `ThreadId` reaches an
 /// observed value. The spawns are unconditional, which is what F44 requires of
 /// that workaround.
-fn ndk(senders: Vec<(u64, u64)>) -> impl Fn() + Send + Sync + Clone + 'static {
+pub(super) fn ndk(senders: Vec<(u64, u64)>) -> impl Fn() + Send + Sync + Clone + 'static {
     move || {
         let takes = senders.len();
         let c = named("c", move || {
@@ -536,7 +549,7 @@ fn ndk(senders: Vec<(u64, u64)>) -> impl Fn() + Send + Sync + Clone + 'static {
 }
 
 /// `ndk`'s conforming member at `n` senders: every sender draws from `{1, 2}`.
-fn ndk_conf(n: usize) -> Vec<(u64, u64)> {
+pub(super) fn ndk_conf(n: usize) -> Vec<(u64, u64)> {
     vec![(1, 2); n]
 }
 
@@ -548,7 +561,7 @@ fn ndk_conf(n: usize) -> Vec<(u64, u64)> {
 /// character rather than on figures — reports and exhaustions of the same order,
 /// exhaustions present at the default budget. Its own figures are pinned below
 /// and every F63/F69/F70 number quoted for "`bad_A`" is this pair.
-fn ndk3_bad_a() -> Vec<(u64, u64)> {
+pub(super) fn ndk3_bad_a() -> Vec<(u64, u64)> {
     vec![(1, 1), (1, 1), (1, 2)]
 }
 
@@ -563,7 +576,7 @@ fn ndk3_bad_a() -> Vec<(u64, u64)> {
 /// specification event, and the default test-thread stack is not enough for
 /// three senders at a budget in the thousands. `Search::cover` also requires a
 /// thread that is not inside another execution, which this is.
-fn ndk_run(
+pub(super) fn ndk_run(
     implementation: Vec<(u64, u64)>,
     specification: Vec<(u64, u64)>,
     budget: usize,
@@ -754,7 +767,9 @@ fn ndk3_bad_a_exhausts_at_the_default_budget_and_not_at_12082() {
 #[ignore]
 fn demo_2pc_correct_at_2_3_4() {
     println!("\n  2PC, correct coordinator — does it refine the agreement spec?\n");
-    println!("   N | verdict  | outer graphs | reports | exhaustions | skipped | inert | seconds | seed");
+    println!(
+        "   N | verdict  | outer graphs | reports | exhaustions | skipped | inert | seconds | seed"
+    );
     println!("  ---+----------+--------------+---------+-------------+---------+-------+---------+------");
     for n in 2..=4usize {
         let start = Instant::now();

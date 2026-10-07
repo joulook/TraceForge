@@ -25,15 +25,14 @@ use crate::conformance::ctx::{ConfMode, Gate};
 use crate::conformance::diagnose::{canonical_vis, Recompute};
 use crate::conformance::morphism::CompleteExecution;
 use crate::conformance::report::{
-    self, ConfNote, ConfVerdict, Diagnostics, NotACertificate, Obligation,
-    ReplaySnapshot, ReportCause, ReportGate, SearchEnd, SpecErrFreedom, TriageFailure,
-    TriageOutcome,
+    self, ConfNote, ConfVerdict, Diagnostics, NotACertificate, Obligation, ReplaySnapshot,
+    ReportCause, ReportGate, SearchEnd, SpecErrFreedom, TriageFailure, TriageOutcome,
 };
 use crate::conformance::testing::{names, run_once};
+use crate::conformance::{verify, verify_conformance, ConfBuilder, ConfError};
 use crate::event::Event;
 use crate::event_label::LabelEnum;
 use crate::exec_graph::ExecutionGraph;
-use crate::conformance::{verify, verify_conformance, ConfBuilder, ConfError};
 use crate::thread::{self, main_thread_id, ThreadId};
 use crate::{Config, ConsType, SchedulePolicy};
 
@@ -110,7 +109,10 @@ fn strip_inline_test_module(full: &str) -> String {
             continue;
         };
         // `mod tests {` opens a body; `mod gate_tests;` does not.
-        if next.starts_with("mod ") || next.starts_with("pub(crate) mod ") || next.starts_with("pub mod ") {
+        if next.starts_with("mod ")
+            || next.starts_with("pub(crate) mod ")
+            || next.starts_with("pub mod ")
+        {
             if next.ends_with('{') {
                 return lines[..i].join("\n");
             }
@@ -602,10 +604,7 @@ fn c2_stop_at_first_report_alone_cannot_produce_a_silent_looking_outcome() {
     // flag never fires — and the run *does* complete, so this must still be a
     // certificate. The discriminating case is the one below.
     let v = verify(
-        base(&["main"])
-            .stop_at_first_report(true)
-            .build()
-            .unwrap(),
+        base(&["main"]).stop_at_first_report(true).build().unwrap(),
         two_senders,
         two_senders,
     )
@@ -617,10 +616,7 @@ fn c2_stop_at_first_report_alone_cannot_produce_a_silent_looking_outcome() {
 
     // Now the discriminating case: the flag fires.
     let v = verify(
-        base(&["main"])
-            .stop_at_first_report(true)
-            .build()
-            .unwrap(),
+        base(&["main"]).stop_at_first_report(true).build().unwrap(),
         two_senders,
         uncoverable_spec,
     )
@@ -1239,12 +1235,15 @@ fn c5_precheck_guard_symmetric_spawning() {
 
 #[test]
 fn c5_precheck_guard_monitor_registration() {
-    assert_precheck_guard("`monitor registration` is outside conformance scope", || {
-        let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
-            std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
-        let _: crate::thread::JoinHandle<u64> =
-            crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
-    });
+    assert_precheck_guard(
+        "`monitor registration` is outside conformance scope",
+        || {
+            let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
+                std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
+            let _: crate::thread::JoinHandle<u64> =
+                crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
+        },
+    );
 }
 
 #[test]
@@ -1286,23 +1285,26 @@ fn c5_precheck_guard_predetermined_named_choice_is_unreachable_by_construction()
     assert_eq!(err.field(), ScopeField::PredeterminedChoices);
 }
 
-/// §5.4 clause (iii) is **not built**, and this records what happens instead.
+/// §5.4 clause (iii), **built** by `P4-ENUMERATOR` criterion 9 — this test is
+/// that criterion's named flip (rewritten by the P4 tester; it used to pin the
+/// panic below).
 ///
 /// "Belt-and-braces: probe mode hard-errors on meeting a `Block(Assert)`" (§3
-/// item 10(d)). There is no such check on this tree — no `BlockType::Assert`
-/// arm in `handle_block`, none in `lib.rs::assert`'s probe path, none in
-/// `prober.rs`. With the precheck **skipped**, a specification that asserts
-/// therefore reaches `traceforge::assert`'s third branch's branch on the *probe* engine: a raw graph
-/// dump to stdout and then a panic the probe worker catches and re-raises.
+/// item 10(d)). With the precheck **skipped**, a specification that asserts
+/// used to reach `traceforge::assert`'s plain branch on the *probe* engine: a
+/// raw graph dump to stdout and then a panic the probe worker re-raised. Now
+/// the probe installs the `Block(Assert)` and suspends the thread, the inner
+/// search reads it off the probe's output, and the run is aborted with a
+/// precondition error — never a panic, never a verdict. Here `main` asserts
+/// right after spawning `a` (`Begin`, `TCreate`, then the block at index 2),
+/// so the **root** probe of the first `Cover` call already carries it.
 ///
-/// The test asserts the observed behaviour rather than the designed one, and
-/// names it a defect, because repairing it is S1's work and outside S5's write
-/// scope. What would break it: S1 building the designed hard error — at which
-/// point this test should be rewritten to assert *that*.
+/// What would break it: falling through to the plain path (a panic again), or
+/// `run` folding the abort into a verdict.
 #[test]
 fn f_probe_mode_has_no_block_assert_hard_error() {
     let message = panic_message(|| {
-        let _ = verify(
+        let result = verify(
             base(&["main"])
                 .skip_spec_errfree_check(true)
                 .build()
@@ -1315,18 +1317,19 @@ fn f_probe_mode_has_no_block_assert_hard_error() {
                 let _: u64 = crate::recv_msg_block();
             },
         );
-    });
-    let Some(message) = message else {
-        // If this ever stops panicking, §5.4 clause (iii) may have been built.
-        panic!(
-            "a specification that asserts under probe no longer reaches a panic; if S1 built \
-             §3 item 10(d)'s hard error, rewrite this test to assert it"
+        assert_eq!(
+            result.err(),
+            Some(ConfError::SpecNotAssertionSafe {
+                thread: "main".to_owned(),
+                pos: Event::new(main_thread_id(), 2).to_string(),
+            }),
+            "a specification that asserts under probe must abort the run with \
+             SpecNotAssertionSafe"
         );
-    };
-    assert!(
-        !message.contains("Spec must be error-free")
-            && !message.contains("conformance: the specification asserted"),
-        "§5.4 clause (iii) appears to exist after all --- rewrite this test: {message}"
+    });
+    assert_eq!(
+        message, None,
+        "a specification that asserts under probe still panics"
     );
 }
 
@@ -1359,10 +1362,7 @@ fn c6_stop_at_first_defaults_off_and_changes_only_where_the_loop_stops() {
     assert_eq!(many.outcome().end(), SearchEnd::StateSpaceExhausted);
 
     let one = verify(
-        base(&["main"])
-            .stop_at_first_report(true)
-            .build()
-            .unwrap(),
+        base(&["main"]).stop_at_first_report(true).build().unwrap(),
         program,
         spec,
     )
@@ -1392,7 +1392,10 @@ fn c6_the_stop_flag_is_inert_without_conformance() {
         let _ = crate::nondet();
         let _ = crate::nondet();
     };
-    let s = crate::verify(Config::builder().with_cons_type(ConsType::FIFO).build(), program);
+    let s = crate::verify(
+        Config::builder().with_cons_type(ConsType::FIFO).build(),
+        program,
+    );
     assert_eq!(
         (s.execs, s.block),
         (4, 0),
@@ -1619,11 +1622,7 @@ fn c8_a_visible_name_spawned_twice_in_the_specification_is_refused() {
 #[test]
 fn c8_a_visible_name_never_spawned_in_the_implementation_is_refused() {
     let message = panic_message(|| {
-        let _ = verify(
-            base(&["main", "ghost"]).build().unwrap(),
-            || {},
-            || {},
-        );
+        let _ = verify(base(&["main", "ghost"]).build().unwrap(), || {}, || {});
     })
     .expect("a declared visible thread that is never spawned must be refused");
     assert!(message.contains("was never spawned"), "{message}");
@@ -1927,7 +1926,11 @@ fn c9_the_canonical_failed_attempt_is_deterministic() {
         .map(|r| format!("{:?}", r.diagnostics()))
         .collect::<Vec<_>>()
     };
-    assert_eq!(run(), run(), "the chosen failed attempt is not deterministic");
+    assert_eq!(
+        run(),
+        run(),
+        "the chosen failed attempt is not deterministic"
+    );
 }
 
 /// The recomputation refuses to guess.
@@ -1979,7 +1982,6 @@ fn c9_a_recomputation_that_cannot_reproduce_the_verdict_says_so() {
 // node-count evidence. The genuine oracle is `conformance::oracle`.
 // ===========================================================================
 
-
 /// **The oracle does not run where there is no `Cover` answer to check**
 /// (gate-4 round 2, M1).
 ///
@@ -2006,7 +2008,10 @@ fn c10_a_visible_error_report_carries_no_inner_search_diagnostics() {
     .unwrap();
     let reports = v.outcome().reports();
     assert_eq!(reports.len(), 1);
-    assert!(matches!(reports[0].cause(), ReportCause::VisibleError { .. }));
+    assert!(matches!(
+        reports[0].cause(),
+        ReportCause::VisibleError { .. }
+    ));
     assert_eq!(
         reports[0].diagnostics(),
         &Diagnostics::NotApplicable,
@@ -2018,7 +2023,6 @@ fn c10_a_visible_error_report_carries_no_inner_search_diagnostics() {
         "the diagnostics did not say they do not apply:\n{text}"
     );
 }
-
 
 /// **The two traversals visit the same number of nodes**, which is what
 /// "Φ filters offers, not nodes" means and what the previous version of this
@@ -2114,7 +2118,6 @@ fn c10_the_two_traversals_visit_the_same_number_of_nodes() {
     );
 }
 
-
 // ===========================================================================
 // Criteria 13 and 14 --- what a report contains, and what a user reads.
 // ===========================================================================
@@ -2143,8 +2146,15 @@ fn c13_the_gate_site_renders_as_five_distinct_cases() {
     let mut sorted = rendered.clone();
     sorted.sort();
     sorted.dedup();
-    assert_eq!(sorted.len(), 5, "two gate sites render identically: {rendered:?}");
-    assert_ne!(rendered[0], rendered[1], "the two fresh gates are the same text");
+    assert_eq!(
+        sorted.len(),
+        5,
+        "two gate sites render identically: {rendered:?}"
+    );
+    assert_ne!(
+        rendered[0], rendered[1],
+        "the two fresh gates are the same text"
+    );
     assert!(rendered[4].contains("no gate"), "{}", rendered[4]);
 
     // And the mapping is the one S4's F-E fix established.
@@ -2285,10 +2295,22 @@ fn c14_ex_blocking_renders_a_visible_difference_that_a_word_alone_cannot() {
             let _: u64 = crate::recv_msg_block();
         },
     );
-    let spec = run_once(Config::builder().with_cons_type(ConsType::FIFO).build(), || {});
-    let iv = canonical_vis(&imp, &names(&["main"]), CompleteExecution::try_finished(&imp)).unwrap();
-    let sv =
-        canonical_vis(&spec, &names(&["main"]), CompleteExecution::try_finished(&spec)).unwrap();
+    let spec = run_once(
+        Config::builder().with_cons_type(ConsType::FIFO).build(),
+        || {},
+    );
+    let iv = canonical_vis(
+        &imp,
+        &names(&["main"]),
+        CompleteExecution::try_finished(&imp),
+    )
+    .unwrap();
+    let sv = canonical_vis(
+        &spec,
+        &names(&["main"]),
+        CompleteExecution::try_finished(&spec),
+    )
+    .unwrap();
     assert_eq!(
         iv.word(),
         sv.word(),
@@ -2452,7 +2474,10 @@ fn c15_the_after_prune_note_makes_no_visibility_claim() {
 #[test]
 fn c17_the_s5_engine_touch_points_are_inert_without_conformance() {
     // (1) The accessors, on a `Must` that never heard of conformance.
-    let must = crate::must::Must::new(Config::builder().with_cons_type(ConsType::FIFO).build(), false);
+    let must = crate::must::Must::new(
+        Config::builder().with_cons_type(ConsType::FIFO).build(),
+        false,
+    );
     assert!(
         !must.conf_stop_requested(),
         "the stop flag answered `true` on a plain `Must`, so it does not live on `ConfCtx`"
@@ -2474,7 +2499,10 @@ fn c17_the_s5_engine_touch_points_are_inert_without_conformance() {
         let _: u64 = crate::recv_msg_block();
         let _: u64 = crate::recv_msg_block();
     };
-    let s = crate::verify(Config::builder().with_cons_type(ConsType::FIFO).build(), program);
+    let s = crate::verify(
+        Config::builder().with_cons_type(ConsType::FIFO).build(),
+        program,
+    );
     assert_eq!(
         (s.execs, s.block),
         (2, 0),
@@ -2505,7 +2533,10 @@ fn c17_a_gate_disabled_context_refuses_to_be_the_outer_run() {
         );
     })
     .expect("a gate-disabled outer context must be refused");
-    assert!(message.contains("the outer run is the engine that has a gate"), "{message}");
+    assert!(
+        message.contains("the outer run is the engine that has a gate"),
+        "{message}"
+    );
     assert_eq!(ConfMode::Precheck.engine_label(), "precheck");
     assert_eq!(ConfMode::Triage.engine_label(), "triage");
     assert_eq!(ConfMode::Outer.engine_label(), "conformance");
@@ -2560,7 +2591,10 @@ fn c11_the_public_surface_is_what_the_module_says_it_is() {
         .visible_threads(["main"])
         .build()
         .unwrap();
-    assert_eq!(cc.search_budget(), crate::conformance::DEFAULT_SEARCH_BUDGET);
+    assert_eq!(
+        cc.search_budget(),
+        crate::conformance::DEFAULT_SEARCH_BUDGET
+    );
     assert_eq!(cc.visible_threads(), ["main".to_owned()]);
     assert_eq!(cc.max_iterations(), None);
 }
@@ -2857,13 +2891,19 @@ fn f_m1_can_only_fail_by_length_at_a_following_attempt() {
     )
     .unwrap();
     let reports = v.outcome().reports();
-    assert!(!reports.is_empty(), "the value-divergent pair stopped reporting");
+    assert!(
+        !reports.is_empty(),
+        "the value-divergent pair stopped reporting"
+    );
     let mut saw = false;
     for r in reports {
         if let Diagnostics::Available {
             obligation:
                 Obligation::ObservationMismatch {
-                    spec, imp, position, ..
+                    spec,
+                    imp,
+                    position,
+                    ..
                 },
             ..
         } = r.diagnostics()
@@ -3053,7 +3093,8 @@ fn c4_an_unrelated_replayed_assertion_is_not_the_reports_own() {
         other => panic!("unexpected triage outcome: {other:?}"),
     }
     assert!(
-        !text.contains("nondeterministic implementation") || text.contains("**not** a nondeterministic implementation"),
+        !text.contains("nondeterministic implementation")
+            || text.contains("**not** a nondeterministic implementation"),
         "either way it must not be called nondeterminism:\n{text}"
     );
 }
@@ -3272,8 +3313,14 @@ fn c1_every_name_cited_in_a_comment_exists() {
     }
 
     let mine = [
-        "config.rs", "report.rs", "diagnose.rs", "triage.rs",
-        "precheck.rs", "mod.rs", "ctx.rs", "s5_tests.rs",
+        "config.rs",
+        "report.rs",
+        "diagnose.rs",
+        "triage.rs",
+        "precheck.rs",
+        "mod.rs",
+        "ctx.rs",
+        "s5_tests.rs",
     ];
     let conf = dir.join("conformance");
     let mut dangling = Vec::new();
@@ -3289,8 +3336,13 @@ fn c1_every_name_cited_in_a_comment_exists() {
                 // Identifier-shaped: a path of segments and nothing else.
                 // Prose, generics and code fragments are out.
                 if tok.len() < 4
-                    || !tok.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':')
-                    || !tok.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+                    || !tok
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == ':')
+                    || !tok
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_alphabetic() || c == '_')
                 {
                     continue;
                 }
@@ -3418,9 +3470,7 @@ fn f41_only_m1_rendered(v: &ConfVerdict) -> String {
 fn f41_m1_of(d: &Diagnostics, what: &str) -> (String, String) {
     match d {
         Diagnostics::Available { obligation, .. } => match obligation {
-            Obligation::ObservationMismatch { spec, .. } => {
-                (spec.clone(), format!("{obligation}"))
-            }
+            Obligation::ObservationMismatch { spec, .. } => (spec.clone(), format!("{obligation}")),
             other => panic!("{what}: expected an (M1) obligation, got {other:?}"),
         },
         other => panic!("{what}: expected diagnostics, got {other:?}"),

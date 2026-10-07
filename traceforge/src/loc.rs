@@ -30,6 +30,33 @@ impl Loc {
     pub(crate) fn new<T: crate::identifier::Identifier>(id: T) -> Self {
         Loc(Box::new(id))
     }
+
+    /// The thread this location names, if it is a thread.
+    ///
+    /// Every thread-addressed send builds its `Loc` as
+    /// `Loc::new(channel::Thread(t))` — a newtype, not a bare `ThreadId`
+    /// (`channel.rs`, `thread_loc_comm`/`self_loc_comm`) — so the downcast is
+    /// to `channel::Thread`; a downcast to `ThreadId` never matches.
+    /// `Identifier` is `DynEq + …`, and `dyn_eq` supplies `as_any`, called on
+    /// the inner trait object: `Box<dyn Identifier>` is itself `Eq + 'static`,
+    /// so `self.0.as_any()` would resolve to the Box's own `Any` and never
+    /// downcast.
+    pub(crate) fn as_thread_id(&self) -> Option<ThreadId> {
+        (*self.0)
+            .as_any()
+            .downcast_ref::<crate::channel::Thread>()
+            .map(|t| t.0)
+    }
+
+    /// The event this location names, if it is one: an unnamed channel's
+    /// `Loc` is the position of its `Unique` (`channel.rs`,
+    /// `Unique::get_loc`).
+    pub(crate) fn as_event(&self) -> Option<crate::event::Event> {
+        (*self.0)
+            .as_any()
+            .downcast_ref::<crate::event::Event>()
+            .copied()
+    }
 }
 
 impl Display for Loc {
@@ -65,7 +92,8 @@ impl RecvLoc {
     /// Returns whether the receive's tag matches the send's tag
     pub(crate) fn matches_tag(&self, send: &SendMsg) -> bool {
         let send_loc = send.send_loc();
-        self.tag.is_none() || self.tag.as_ref().unwrap().0(send_loc.sender_tid, send_loc.tag.clone())
+        self.tag.is_none()
+            || self.tag.as_ref().unwrap().0(send_loc.sender_tid, send_loc.tag.clone())
     }
 
     /// Return whether the receive's tag and any of it's locations matches the send

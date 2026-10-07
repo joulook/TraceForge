@@ -34,16 +34,16 @@
 
 use std::sync::Arc;
 
-use crate::conformance::morphism::{
-    follows, matches, statuses, statuses_agree, CompleteExecution,
-};
+use crate::conformance::config::Engine;
+use crate::conformance::morphism::{follows, matches, statuses, statuses_agree, CompleteExecution};
 use crate::conformance::obs::{wobs, ObsError, Wobs};
 use crate::conformance::probe::Offer;
 use crate::conformance::prober::{install, install_nondet, install_recv, probe_from, Probed};
 use crate::conformance::report::{
     self, Diagnostics, Obligation, ReportCause, ReportGate, VisTrace,
 };
-use crate::conformance::search::{Cover, Search};
+use crate::conformance::search::{spec_assertion, Cover, Search};
+use crate::conformance::selector::InnerOrder;
 use crate::event::Event;
 use crate::event_label::LabelEnum;
 use crate::exec_graph::ExecutionGraph;
@@ -245,6 +245,17 @@ pub(crate) struct Recompute {
     visible: Vec<String>,
     budget: usize,
     use_phi: bool,
+    /// Knob B, for diagnostic consistency (`P4-SELECTOR` S3): check one's
+    /// `Search` and check two's own loops run under the order the run used.
+    /// The *answer* does not depend on it — a `NoCover` from `∅` is an
+    /// exhaustive traversal whose node multiset is order-independent — only
+    /// `best` and the obligation's recording order do.
+    inner_order: InnerOrder,
+    /// The run's memo setting, for check one's `Search` (`P4-ENUMERATOR`
+    /// criterion 4): a memo-off check one could exhaust where the memo-on run
+    /// established ⊥. Check two does not memoise — it is an explanation
+    /// traversal over a graph check one already answered.
+    memo: bool,
 }
 
 impl Recompute {
@@ -261,7 +272,21 @@ impl Recompute {
             visible,
             budget,
             use_phi,
+            inner_order: InnerOrder::Recorded,
+            memo: false,
         }
+    }
+
+    /// Set knob B; see the field.
+    pub(crate) fn with_inner_order(mut self, inner_order: InnerOrder) -> Self {
+        self.inner_order = inner_order;
+        self
+    }
+
+    /// The run's memo setting; see the field.
+    pub(crate) fn with_memo(mut self, memo: bool) -> Self {
+        self.memo = memo;
+        self
     }
 
     /// Answer coverability, discarding the diagnostics.
@@ -313,12 +338,14 @@ impl Recompute {
             Arc::clone(&self.spec),
             self.visible.clone(),
             self.budget,
-        );
+        )
+        .with_inner_order(self.inner_order.clone())
+        .with_memo(self.memo);
         match search.cover(g1, complete, ExecutionGraph::default()) {
             Ok(Cover::NoCover) => {}
             Ok(Cover::Found(_)) => {
                 return Diagnostics::Unavailable {
-                kind: report::UnavailableKind::Diverged,
+                    kind: report::UnavailableKind::Diverged,
                     because: "re-running the search on the reported graph found a cover, so \
                               this recomputation does not describe the same question the \
                               gate answered"
@@ -327,7 +354,7 @@ impl Recompute {
             }
             Ok(Cover::BudgetExhausted) => {
                 return Diagnostics::Unavailable {
-                kind: report::UnavailableKind::Diverged,
+                    kind: report::UnavailableKind::Diverged,
                     because: "re-running the search on the reported graph ran out of budget, \
                               so it did not reproduce the gate's \u{22a5}"
                         .to_owned(),
@@ -335,7 +362,7 @@ impl Recompute {
             }
             Err(e) => {
                 return Diagnostics::Unavailable {
-                kind: report::UnavailableKind::Diverged,
+                    kind: report::UnavailableKind::Diverged,
                     because: format!(
                         "re-running the search on the reported graph raised a usage error: {e}"
                     ),
@@ -354,8 +381,10 @@ impl Recompute {
             },
             Err(e) => {
                 return Diagnostics::Unavailable {
-                kind: report::UnavailableKind::Diverged,
-                    because: format!("the implementation graph's observations could not be extracted: {e}"),
+                    kind: report::UnavailableKind::Diverged,
+                    because: format!(
+                        "the implementation graph's observations could not be extracted: {e}"
+                    ),
                 }
             }
         };
@@ -370,7 +399,7 @@ impl Recompute {
             Ok(Answer::NoCover) => {}
             Ok(other) => {
                 return Diagnostics::Unavailable {
-                kind: report::UnavailableKind::Diverged,
+                    kind: report::UnavailableKind::Diverged,
                     because: format!(
                         "the recomputation answered {other:?} where the search answered \u{22a5}"
                     ),
@@ -378,7 +407,7 @@ impl Recompute {
             }
             Err(e) => {
                 return Diagnostics::Unavailable {
-                kind: report::UnavailableKind::Diverged,
+                    kind: report::UnavailableKind::Diverged,
                     because: format!("the recomputation raised a usage error: {e}"),
                 }
             }
@@ -434,6 +463,11 @@ impl Recompute {
 
         let probed = self.probe(graph);
 
+        // Criterion 9: the same scan as `Search::spec_visit`, same error.
+        if let Some(e) = spec_assertion(probed.graph()) {
+            return Err(e);
+        }
+
         // Record this node as an attempt if it follows. The empty graph
         // follows trivially, so `best` is always populated on a run that gets
         // this far.
@@ -465,7 +499,7 @@ impl Recompute {
         }
 
         let mut exhausted = false;
-        for offer in probed.offers() {
+        for offer in self.inner_order.offers(probed.offers()) {
             if self.use_phi && !self.phi(outer, probed.graph(), offer, seen)? {
                 continue;
             }
@@ -493,24 +527,18 @@ impl Recompute {
     ) -> Result<Answer, ObsError> {
         let mut exhausted = false;
         let step = |this: &Self,
-                        extended: ExecutionGraph,
-                        through_step: bool,
-                        fuel: &mut usize,
-                        best: &mut Best,
-                        seen: &mut SeenAt|
+                    extended: ExecutionGraph,
+                    through_step: bool,
+                    fuel: &mut usize,
+                    best: &mut Best,
+                    seen: &mut SeenAt|
          -> Result<Option<Answer>, ObsError> {
             // `SpecStep`'s follow check. With Φ off it
             // stays on: the un-Φ'd search is the draft's `SpecStep` without
             // the Φ *filter on the loop's range*, not without the morphism.
             if through_step {
                 let w = wobs(&extended, &this.visible)?;
-                if !follows(
-                    &extended,
-                    outer.graph,
-                    &w,
-                    &outer.wobs,
-                    &this.visible,
-                ) {
+                if !follows(&extended, outer.graph, &w, &outer.wobs, &this.visible) {
                     // `phi`'s counterpart for the traversal without Φ, where
                     // this is the only pruning site. With Φ on it kills nothing
                     // (M-b); what it does kill is
@@ -555,7 +583,7 @@ impl Recompute {
                      choice point",
                     offer.pos()
                 );
-                for value in values {
+                for value in self.inner_order.values(values) {
                     let extended = install_nondet(self.config.clone(), graph.clone(), offer, value);
                     try_one!(extended, false);
                 }
@@ -581,7 +609,9 @@ impl Recompute {
             // reason: a probe only ever offers choice points, and answering
             // "no" for anything else would drop it from the loop's range and
             // manufacture a \u{22a5}.
-            other => unreachable!("conformance: a probe offered a {other}, which is not a choice point"),
+            other => {
+                unreachable!("conformance: a probe offered a {other}, which is not a choice point")
+            }
         }
 
         Ok(if exhausted {
@@ -599,9 +629,7 @@ impl Recompute {
         seen: &mut SeenAt,
     ) -> Result<bool, ObsError> {
         let visible = &self.visible;
-        let check = |extended: &ExecutionGraph,
-                         seen: &mut SeenAt|
-         -> Result<bool, ObsError> {
+        let check = |extended: &ExecutionGraph, seen: &mut SeenAt| -> Result<bool, ObsError> {
             let w = wobs(extended, visible)?;
             let follows_here = follows(extended, outer.graph, &w, &outer.wobs, visible);
             if !follows_here {
@@ -652,7 +680,9 @@ impl Recompute {
                 let extended = install(self.config.clone(), graph.clone(), offer);
                 check(&extended, seen)
             }
-            other => unreachable!("conformance: a probe offered a {other}, which is not a choice point"),
+            other => {
+                unreachable!("conformance: a probe offered a {other}, which is not a choice point")
+            }
         }
     }
 
@@ -661,15 +691,10 @@ impl Recompute {
         if offer.may_read_nothing() {
             out.push(None);
         }
-        out
+        self.inner_order.sources(out)
     }
 
-    fn done(
-        &self,
-        outer: &Outer<'_>,
-        probed: &Probed,
-        spec_wobs: &Wobs,
-    ) -> Result<bool, ObsError> {
+    fn done(&self, outer: &Outer<'_>, probed: &Probed, spec_wobs: &Wobs) -> Result<bool, ObsError> {
         if !matches(
             probed.graph(),
             outer.graph,
@@ -745,9 +770,12 @@ impl Recompute {
                     // here)" reads as a missing send, and on the commonest
                     // cause of a position-0 mismatch — a value that differs,
                     // not an absent one — that reading is wrong. See `SeenAt`.
-                    spec: s.get(k).map(|(_, o)| report::obs_text(o)).unwrap_or_else(
-                        || report::nothing_text_with_examples(seen.examples(name, k)),
-                    ),
+                    spec: s
+                        .get(k)
+                        .map(|(_, o)| report::obs_text(o))
+                        .unwrap_or_else(|| {
+                            report::nothing_text_with_examples(seen.examples(name, k))
+                        }),
                     imp: i
                         .get(k)
                         .map(|(_, o)| report::obs_text(o))
@@ -800,8 +828,16 @@ impl Recompute {
                     if a != b {
                         return Ok(Some(Obligation::StatusMismatch {
                             thread: name.clone(),
-                            spec: a.copied().map(report::status_text).unwrap_or("absent").to_owned(),
-                            imp: b.copied().map(report::status_text).unwrap_or("absent").to_owned(),
+                            spec: a
+                                .copied()
+                                .map(report::status_text)
+                                .unwrap_or("absent")
+                                .to_owned(),
+                            imp: b
+                                .copied()
+                                .map(report::status_text)
+                                .unwrap_or("absent")
+                                .to_owned(),
                         }));
                     }
                 }
@@ -967,6 +1003,21 @@ pub(crate) fn spec_side_first_mismatch(d: &Diagnostics, cause: &ReportCause) -> 
             _,
         ) => "no §7.1 obligation names this failure; see A14".to_owned(),
         (Diagnostics::NotApplicable, _) => "not applicable".to_owned(),
+        // `P4-STATEFUL` T6 / `P4-CFIRST` C7: unreachable today (triage never
+        // runs under `Stateful` or `CompleteFirst`), kept total.
+        (
+            Diagnostics::NotProduced {
+                by: Engine::CompleteFirst,
+            },
+            _,
+        ) => "not produced: the complete-first engine computes no inner-search diagnostics"
+            .to_owned(),
+        (Diagnostics::NotProduced { by: Engine::Gated }, _) => {
+            "not produced: the gated engine computes no inner-search diagnostics".to_owned()
+        }
+        (Diagnostics::NotProduced { .. }, _) => {
+            "not produced: the stateful engine computes no inner-search diagnostics".to_owned()
+        }
     }
 }
 

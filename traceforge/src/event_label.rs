@@ -184,13 +184,29 @@ impl LabelEnum {
                     return Ok(());
                 }
             }
-            LabelEnum::RecvMsg(_s) => {
-                if let LabelEnum::RecvMsg(_o) = other {
+            LabelEnum::RecvMsg(s) => {
+                if let LabelEnum::RecvMsg(o) = other {
+                    // `P4-MIXED` M5: the recorded annotation is revisit- and
+                    // extension-stable; a thread issuing a differently annotated
+                    // command at the same position with the same history is
+                    // nondeterministic outside `nondet()`.
+                    if s.annotation != o.annotation {
+                        return Err(format!(
+                            "Expected a receive annotated {:?} but it was annotated {:?}",
+                            s.annotation, o.annotation
+                        ));
+                    }
                     return Ok(());
                 }
             }
             LabelEnum::SendMsg(s) => {
                 if let LabelEnum::SendMsg(o) = other {
+                    if s.annotation != o.annotation {
+                        return Err(format!(
+                            "Expected a send annotated {:?} but it was annotated {:?}",
+                            s.annotation, o.annotation
+                        ));
+                    }
                     if !s.val().is_pending() && s.val() != o.val() {
                         return Err(format!(
                             "Expected to send message {:?} but actually sent {:?}",
@@ -757,6 +773,40 @@ impl fmt::Display for TJoin {
     }
 }
 
+/// Per-operation visibility (`mixed.tex` §10, `P4-MIXED` M2): the annotation
+/// `α ∈ {v, i}` a send or receive carries. Annotations have no operational
+/// effect; conformance reads them through `obs::is_visible`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Visibility {
+    /// `v`: the operation is observed (it must be issued by a declared visible
+    /// thread, else the run is rejected under conformance).
+    Visible,
+    /// `i`: the operation is not observed, whatever its thread.
+    Invisible,
+}
+
+/// What a send or receive label records about its visibility (`P4-MIXED` M2).
+///
+/// `Default` is the unannotated program: the per-thread setting, resolved at
+/// read time (`v` iff the issuing thread is declared visible), which is the
+/// paper's "we drop the annotation under that convention". `Explicit(α)` is an
+/// annotated operation. Recorded on the label **at construction by the issuing
+/// thread** (`lib.rs`), before any source is proposed, so a candidate's new
+/// receive carries its operation's annotation whatever source is tried, and a
+/// stored label keeps it across executions and revisits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) enum Annotation {
+    #[default]
+    Default,
+    Explicit(Visibility),
+}
+
+impl Annotation {
+    pub(crate) fn is_default(&self) -> bool {
+        matches!(self, Annotation::Default)
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct RecvMsg {
     label: EventLabel,
@@ -765,6 +815,11 @@ pub(crate) struct RecvMsg {
     rf: Option<Event>,
     non_blocking: bool,
     revisitable: bool,
+    /// `P4-MIXED` M2. Not serialized when `Default`, so an unannotated label's
+    /// JSON (every `ReplaySnapshot`, `tests/error.trace`) is byte-identical to
+    /// Part 6's; `default` lets old traces load.
+    #[serde(default, skip_serializing_if = "Annotation::is_default")]
+    annotation: Annotation,
 }
 
 impl RecvMsg {
@@ -782,7 +837,20 @@ impl RecvMsg {
             rf,
             non_blocking,
             revisitable: true,
+            annotation: Annotation::Default,
         }
+    }
+
+    /// The label with its visibility annotation set (`P4-MIXED` M2); the
+    /// constructor's arity is unchanged so every existing site records
+    /// `Default`.
+    pub(crate) fn annotated(mut self, annotation: Annotation) -> Self {
+        self.annotation = annotation;
+        self
+    }
+
+    pub(crate) fn annotation(&self) -> Annotation {
+        self.annotation
     }
 
     pub(crate) fn rf(&self) -> Option<Event> {
@@ -891,6 +959,9 @@ pub(crate) struct SendMsg {
     /// and the respective value they would observe.
     #[serde(skip)]
     monitor_sends: MonitorSends,
+    /// `P4-MIXED` M2; see [`RecvMsg`]'s field.
+    #[serde(default, skip_serializing_if = "Annotation::is_default")]
+    annotation: Annotation,
 }
 
 impl SendMsg {
@@ -914,7 +985,18 @@ impl SendMsg {
             monitor_readers: Vec::new(),
             monitor_sends,
             cancelled_recv_readers: std::cell::RefCell::new(Vec::new()),
+            annotation: Annotation::Default,
         }
+    }
+
+    /// See [`RecvMsg::annotated`].
+    pub(crate) fn annotated(mut self, annotation: Annotation) -> Self {
+        self.annotation = annotation;
+        self
+    }
+
+    pub(crate) fn annotation(&self) -> Annotation {
+        self.annotation
     }
 
     pub(crate) fn recover_val(&mut self, other: Self) {
@@ -1194,7 +1276,13 @@ as_label!(CToss);
 impl fmt::Display for CToss {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(ref name) = self.name {
-            write!(f, "{}: NONDET({}) {}", self.as_event_label(), name, self.result())
+            write!(
+                f,
+                "{}: NONDET({}) {}",
+                self.as_event_label(),
+                name,
+                self.result()
+            )
         } else {
             write!(f, "{}: NONDET {}", self.as_event_label(), self.result())
         }

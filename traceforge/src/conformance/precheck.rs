@@ -36,24 +36,35 @@
 //! blocked item **E**'s mechanism; one flag serves both, which is why it is
 //! worth saying rather than quietly doing.
 //!
-//! # What is *not* built, and belongs to S1
+//! # The third clause, built by Part 2 (`P4-ENUMERATOR` criterion 9)
 //!
 //! §5.4's third clause — "belt-and-braces: probe mode hard-errors on meeting a
-//! `Block(Assert)`" (§3 item 10(d)) — **does not exist on this tree**. There is
-//! no such check in `handle_block`, in `lib.rs::assert`, or in `prober.rs`. A
-//! specification assertion under *probe* therefore falls to `traceforge::assert`'s third branch's
-//! branch: a raw graph dump to stdout (`traceforge::assert`'s third branch, its `print_graph` line), then a panic the probe
-//! worker catches and re-raises on the gate's thread. That is a defect S5
-//! exposes in S1 and is reported rather than fixed here.
+//! `Block(Assert)`" (§3 item 10(d)) — now exists, in three pieces: a
+//! specification assertion under *probe* takes `traceforge::assert`'s probe
+//! branch, which installs the `Block(Assert)` and suspends the thread (no
+//! print, no persisted failure, no panic); the inner search scans every probe
+//! output (`search::spec_assertion`) and returns
+//! `ObsError::SpecNotAssertionSafe`; the gate records it, writes the end
+//! `SearchEnd::SpecNotAssertionSafe` first, makes every later gate inert, and
+//! `run` returns `ConfError::SpecNotAssertionSafe` before any verdict. This
+//! precheck remains the primary check; the in-search clause is the cheap
+//! partial one. (Until Part 2 this comment recorded the clause as missing and
+//! the probe path as printing and panicking; that was the defect
+//! `s5_tests::f_probe_mode_has_no_block_assert_hard_error` pinned.)
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::conformance::config::ConfConfig;
+use crate::conformance::config::{CompletionCover, ConfConfig};
 use crate::conformance::ctx::{ConfCtx, ConfMode, ReportKind};
-use crate::conformance::report::ConfError;
+use crate::conformance::obs::is_visible;
+use crate::conformance::report::{ConfError, FlatEligibility};
+use crate::event::Event;
+use crate::event_label::LabelEnum;
+use crate::exec_graph::ExecutionGraph;
 use crate::must::Must;
+use crate::thread::main_thread_id;
 
 /// Run the specification on its own and fail the conformance run if any
 /// assertion fires.
@@ -66,7 +77,7 @@ use crate::must::Must;
 pub(crate) fn run(
     cc: &ConfConfig,
     specification: &Arc<dyn Fn() + Send + Sync>,
-) -> Result<(), ConfError> {
+) -> Result<Option<FlatEligibility>, ConfError> {
     // §9's third call site, explicit and named, as criterion 5 requires. It
     // runs *before* an engine exists, so an out-of-scope configuration is
     // refused without the precheck ever starting.
@@ -79,12 +90,15 @@ pub(crate) fn run(
     let must = Rc::new(RefCell::new(Must::new(cc.config.clone(), false)));
     // The gate is off — no probe worker, no `Cover` — and the guards are on,
     // because `conf.is_some()`.
-    must.borrow_mut()
-        .enable_conformance(ConfCtx::gate_disabled(
-            cc.config.clone(),
-            cc.visible.clone(),
-            ConfMode::Precheck,
-        ));
+    let mut ctx = ConfCtx::gate_disabled(cc.config.clone(), cc.visible.clone(), ConfMode::Precheck);
+    // `P4-FLAT` F1: only under `Flat` is every complete Spec graph kept for the
+    // eligibility scan (memory `O(|Graphs(Spec)|)`); under `Sweep` the
+    // precheck behaves exactly as before.
+    let flat = cc.completion_cover == CompletionCover::Flat;
+    if flat {
+        ctx.collect_graphs();
+    }
+    must.borrow_mut().enable_conformance(ctx);
 
     crate::explore(&must, &specification);
 
@@ -122,5 +136,53 @@ pub(crate) fn run(
             ),
         });
     }
-    Ok(())
+    Ok(if flat {
+        Some(eligibility(ctx.collected(), &cc.visible))
+    } else {
+        None
+    })
+}
+
+/// `P4-FLAT` F1/F5: the scan over the collected complete Spec graphs, in scan
+/// order — graphs in completion order, threads by `ThreadId`, events by index.
+pub(crate) fn eligibility(graphs: &[ExecutionGraph], visible: &[String]) -> FlatEligibility {
+    let mut out = FlatEligibility {
+        communication_flat: true,
+        thread_flat: true,
+        spec_graphs_scanned: graphs.len(),
+        first_invisible: None,
+    };
+    for g in graphs {
+        // `thread_ids()` is an ordered set: threads by `ThreadId`.
+        for tid in g.thread_ids() {
+            let name: Option<String> = g.get_thread_tclab(tid).name().clone();
+            let declared = name
+                .as_deref()
+                .is_some_and(|n| visible.iter().any(|v| v == n));
+            let mut communicates = false;
+            for index in 0..g.thread_size(tid) as u32 {
+                let e = Event::new(tid, index);
+                if !matches!(g.label(e), LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_)) {
+                    continue;
+                }
+                communicates = true;
+                if !is_visible(g, e, visible) {
+                    out.communication_flat = false;
+                    if out.first_invisible.is_none() {
+                        out.first_invisible =
+                            Some((name.clone().unwrap_or_else(|| tid.to_string()), e.to_string()));
+                    }
+                }
+            }
+            // `flat.tex`'s class, read with TraceForge's undeclared `main`.
+            if tid == main_thread_id() {
+                if !declared && communicates {
+                    out.thread_flat = false;
+                }
+            } else if !declared {
+                out.thread_flat = false;
+            }
+        }
+    }
+    out
 }

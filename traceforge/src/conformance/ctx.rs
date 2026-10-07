@@ -12,25 +12,31 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+use crate::conformance::canon::CanonicalGraph;
 use crate::conformance::obs::{resolve_visible, ObsError};
-use crate::conformance::report::SearchEnd;
-use crate::conformance::search::{Cover, Search};
+use crate::conformance::report::{ConfCounters, CoverCounters, ReportGate, SearchEnd};
+use crate::conformance::search::{Cover, Search, SearchOpts};
+use crate::conformance::selector::paper_events;
+use crate::conformance::selector::InnerOrder;
 use crate::event::Event;
 use crate::event_label::{AsEventLabel, LabelEnum};
 use crate::exec_graph::ExecutionGraph;
 use crate::must::MustState;
 use crate::Config;
 
-/// Which of conformance's three engines this context belongs to.
+/// Which of conformance's engines this context belongs to (four until Part
+/// 3 — outer, precheck, triage and the test-only oracle; [`ConfMode::Enumerate`]
+/// is the stateful checker's fifth, `P4-STATEFUL` T2).
 ///
 /// §9 names three — "the outer conf run, the probe `Must`, and the err-freedom
 /// precheck" — and S5 adds triage as a fourth `Must` that is also *not* the
 /// probe. The probe has its own field on `Must` (`probe: Option<ProbeCtx>`);
-/// the other three all carry a `ConfCtx`, and until S5 they could not be told
+/// every other engine carries a `ConfCtx`, and until S5 they could not be told
 /// apart, which is why `reject_out_of_scope` had only two answers for three
 /// engines (blocked item **E**).
 ///
-/// Only [`ConfMode::Outer`] has a gate. The other two exist so that
+/// Only [`ConfMode::Outer`] has a `Cover` gate ([`ConfMode::Enumerate`] runs a
+/// completion sink inside `gate`, nothing more). The gate-disabled modes exist so that
 /// `conf.is_some()` is true — which is what arms §9's handler-entry guards and
 /// keeps `store_replay_information`'s exemption (`store_replay_information`'s conformance early return) in force —
 /// without a probe worker or a `Cover` call behind it.
@@ -42,8 +48,10 @@ pub(crate) enum ConfMode {
     Precheck,
     /// §7.3's per-report completion run. Gate off, guards on.
     Triage,
-    /// §11.6's oracle enumeration run. Gate off, guards on, **and visible
-    /// assertion failures do not prune** — see [`ConfCtx::report_visible_error`].
+    /// §11.6's oracle enumeration run (test-only). Gate off, guards on, **and
+    /// visible assertion failures do not prune** — see
+    /// [`ConfCtx::report_visible_error`]. Its production twin is
+    /// [`ConfMode::Enumerate`].
     ///
     /// S6 criteria round 3, B1. The oracle must enumerate `Graphs(P)`
     /// exhaustively, and an ungated context is *not* automatically prune-free:
@@ -52,12 +60,31 @@ pub(crate) enum ConfMode {
     /// truncate every other thread's row and under-approximate `vis(P)` — the
     /// permissive direction on the specification side.
     ///
-    /// **This mode can never inhabit a reporting engine.** [`ConfCtx::new`] is
+    /// **This mode never inhabits a reporting engine** (the reporting twin is
+    /// [`ConfMode::Enumerate`], `P4-STATEFUL`). [`ConfCtx::new`] is
     /// the only constructor that builds a [`ProbeWorker`], and it hard-codes
     /// `Outer` rather than taking a mode; [`ConfCtx::gate_disabled`] is the
     /// only other constructor and sets `worker: None`. So no mirror assert is
     /// needed to keep `Collect` out of the gate's path.
     Collect,
+    /// `P4-STATEFUL` T2: the stateful checker's enumeration run — `Collect`'s
+    /// no-prune behaviour, a production engine label, and a completion sink
+    /// (T3) instead of a `Vec` of every graph.
+    Enumerate,
+    /// `P4-CFIRST` C1: the complete-first checker's outer run — `Enumerate`'s
+    /// behaviour under its own label, and the only mode that may carry the
+    /// early-error cut (C5).
+    CFirstOuter,
+    /// `P4-CFIRST` C2: one sweep of the specification inside the complete-first
+    /// checker's `Covered` — `Enumerate`'s behaviour under its own label.
+    CFirstSweep,
+    /// `P4-GATED` G1: the gated checker's outer run — an enumerating run with a
+    /// completion sink *and* a gate sink at the growing gates, under its own
+    /// label; the only mode whose stop ends the run at `try_revisit`'s head.
+    GatedOuter,
+    /// `P4-GATED` G4: one sweep of the specification inside the gated
+    /// checker's `Gate` or `Covered`, under its own label.
+    GatedSweep,
 }
 
 impl ConfMode {
@@ -68,9 +95,82 @@ impl ConfMode {
             ConfMode::Precheck => "precheck",
             ConfMode::Triage => "triage",
             ConfMode::Collect => "oracle",
+            ConfMode::Enumerate => "stateful",
+            ConfMode::CFirstOuter => "complete-first",
+            ConfMode::CFirstSweep => "complete-first sweep",
+            ConfMode::GatedOuter => "gated",
+            ConfMode::GatedSweep => "gated sweep",
         }
     }
+
+    /// `P4-CFIRST` C1: the production enumerating modes — never prune (unless
+    /// the cut is on, C5), take a completion sink, make no `Cover` call.
+    pub(crate) fn enumerates(self) -> bool {
+        matches!(
+            self,
+            ConfMode::Enumerate
+                | ConfMode::CFirstOuter
+                | ConfMode::CFirstSweep
+                | ConfMode::GatedOuter
+                | ConfMode::GatedSweep
+        )
+    }
 }
+
+/// What a completion sink tells the `Enumerate` run to do next (`P4-STATEFUL`
+/// T3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SinkVerdict {
+    Continue,
+    /// Request the run to stop at this completion (`stop_at_first_report`).
+    Stop,
+}
+
+/// `P4-STATEFUL` T3: a per-completion hook, called with the completed graph
+/// and the live `MustState` at `Gate::Completion`.
+pub(crate) type CompletionSink = Box<dyn FnMut(&ExecutionGraph, &MustState) -> SinkVerdict>;
+
+/// `P4-GATED` G1: which kind of worklist pop a `RevisitApply` gate follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RevisitKind {
+    /// A receive re-installed with an alternative source (the paper's sibling
+    /// `GStep(e, SetRF(G, e, s), M, c)` — `e` the receive).
+    Forward,
+    /// A send re-installed at a revisited receive (`ln:greset` — `e` the send).
+    Backward,
+}
+
+/// `P4-GATED` G1: what a growing gate knows about the event it follows.
+#[derive(Clone, Debug)]
+pub(crate) struct GateAt {
+    /// The installed position: the fresh send or receive, or the popped
+    /// receive at `RevisitApply`.
+    pub(crate) at: Event,
+    /// `Some` at `RevisitApply`, `None` at the fresh gates.
+    pub(crate) revisit: Option<RevisitKind>,
+    /// At `RevisitApply`, the receive's new source (`None` for an inbox
+    /// placement, which §9 keeps out of scope).
+    pub(crate) source: Option<Event>,
+    /// At a backward `RevisitApply`, a clone of the **outgoing** state's
+    /// carried pair (the state `backward_revisit` just pushed).
+    pub(crate) outgoing_carry: Option<crate::conformance::gated::Carry>,
+}
+
+/// `P4-GATED` G1: what the gate sink tells the run to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GateVerdict {
+    Continue,
+    /// First-failure mode: report the gated partial graph at this gate and
+    /// stop the whole search. A prune, with the report pushed first.
+    Report,
+    /// A gate-sweep abort: stop the whole search with no report. A prune.
+    Stop,
+}
+
+/// `P4-GATED` G1: a per-gate hook, called at `FreshSend`, `FreshRecv` and
+/// `RevisitApply` with the site, the graph and the live `MustState`.
+pub(crate) type GateSink =
+    Box<dyn FnMut(Gate, &GateAt, &ExecutionGraph, &MustState) -> GateVerdict>;
 
 /// Which of §4.1's four gates fired.
 ///
@@ -297,6 +397,13 @@ pub(crate) enum VisibleThreadError {
         create: Event,
         after: Event,
     },
+    /// `P4-MIXED` M4: an `Explicit(Visible)` send or receive on a thread no
+    /// declared name resolves to (the paper's first condition on annotations).
+    UndeclaredVisible {
+        thread: String,
+        pos: Event,
+        site: String,
+    },
 }
 
 impl std::fmt::Display for VisibleThreadError {
@@ -313,8 +420,39 @@ impl std::fmt::Display for VisibleThreadError {
                  declared visible thread to be spawned before its program \
                  communicates"
             ),
+            VisibleThreadError::UndeclaredVisible { thread, pos, site } => write!(
+                f,
+                "a `Visible` annotation on undeclared thread `{thread}` at {pos}; only \
+                 declared visible threads may annotate an operation `v` (mixed \
+                 visibility, the first condition) (site `{site}`)"
+            ),
         }
     }
+}
+
+/// `P4-MIXED` M8's count on one complete graph: the `SendMsg`/`RecvMsg` labels
+/// of declared threads that `is_visible` rejects.
+pub(crate) fn invisible_ops_of_visible_threads(
+    graph: &ExecutionGraph,
+    visible: &[String],
+) -> usize {
+    let mut n = 0;
+    for name in visible {
+        let Ok(Some(tid)) = resolve_visible(graph, name) else {
+            continue;
+        };
+        for index in 0..graph.thread_size(tid) as u32 {
+            let e = Event::new(tid, index);
+            if matches!(
+                graph.label(e),
+                LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_)
+            ) && !crate::conformance::obs::is_visible(graph, e, visible)
+            {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 /// §8's spawn-order guard.
@@ -399,14 +537,17 @@ struct Job {
 /// of a panic raised inside it.
 ///
 /// The second case is not exotic — it is how the **specification** program's
-/// §9 rejections and its own failed assertions arrive. Before this, such a
+/// §9 rejections and its Rust-level panics arrive. (A `traceforge::assert`
+/// failure in a probe no longer panics: since Part 2 it installs a
+/// `Block(Assert)` and the search returns `ObsError::SpecNotAssertionSafe`
+/// through the first case.) Before this, such a
 /// panic killed the worker thread, dropped the sender, and surfaced on the
 /// calling thread as `RecvError`: §9 requires an "outside conformance scope"
 /// error *naming the event*, and the user got "the probe worker died
 /// mid-search" (gate-4 review, M1). That is F-C's defect one layer out — a
 /// failure turned into a different failure that has lost its origin, at the
 /// one boundary S4 introduced.
-type Answer = Result<Result<Cover, ObsError>, Box<dyn std::any::Any + Send>>;
+type Answer = Result<(Result<Cover, ObsError>, CoverCounters), Box<dyn std::any::Any + Send>>;
 
 /// A dedicated OS thread that owns every probe.
 ///
@@ -441,7 +582,7 @@ impl ProbeWorker {
             .spawn(move || {
                 while let Ok(job) = job_rx.recv() {
                     let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        search.cover(&job.g1, job.complete, job.seed)
+                        search.cover_counted(&job.g1, job.complete, job.seed)
                     }));
                     let failed = answer.is_err();
                     if answer_tx.send(answer).is_err() || failed {
@@ -462,7 +603,7 @@ impl ProbeWorker {
         g1: &ExecutionGraph,
         complete: bool,
         seed: ExecutionGraph,
-    ) -> Result<Cover, ObsError> {
+    ) -> (Result<Cover, ObsError>, CoverCounters) {
         self.jobs
             .send(Job {
                 g1: g1.clone(),
@@ -477,8 +618,10 @@ impl ProbeWorker {
         {
             Ok(answer) => answer,
             // Re-raise on the calling thread with the original payload, so a
-            // specification program's §9 rejection or failed assertion reaches
-            // the caller as itself rather than as a channel error.
+            // specification program's §9 rejection or Rust-level panic reaches
+            // the caller as itself rather than as a channel error. (A
+            // `traceforge::assert` failure in a probe does not come this way
+            // since Part 2; see `Answer`'s doc.)
             Err(payload) => std::panic::resume_unwind(payload),
         }
     }
@@ -563,6 +706,12 @@ pub(crate) struct ConfCtx {
     ///
     /// Inert when `conf` is `None`, since it lives here.
     stop_requested: bool,
+    /// `P4-CFIRST` C5: the early-error cut. Set only on a `CFirstOuter`
+    /// context (`set_cut`); when on, a visible assertion failure prunes and
+    /// reports exactly as under `Outer`.
+    cut: bool,
+    /// `P4-GATED` G1: the gated checker's gate sink (`GatedOuter` only).
+    gate_sink: Option<GateSink>,
     /// **Why the outer loop stopped — a carried fact, never an inference.**
     ///
     /// Blocked item B's ruling: the "conforms" case is constructible only when
@@ -591,6 +740,17 @@ pub(crate) struct ConfCtx {
     /// The number of visible observations the last gate saw, for F42's
     /// inertness skip. `None` before the first gate of an execution.
     last_visible_obs: Option<usize>,
+    /// `P4-ENUMERATOR` criterion 9: set by the gate that saw the inner search
+    /// abort on a specification assertion. Once set, every gate is inert and
+    /// `report_visible_error` records instead of reporting; `run` returns
+    /// `Err` on it ahead of reports and end.
+    spec_error: Option<(String, Event)>,
+    /// Criterion 13.
+    counters: ConfCounters,
+    /// Criterion 13: key-level counters are computed only when set.
+    instrument: bool,
+    /// `P4-STATEFUL` T3: the completion sink of an `Enumerate` run.
+    sink: Option<CompletionSink>,
     /// How many gates F42's inertness skip suppressed — a *different* reason
     /// from [`Self::skipped_gates`], counted separately so a figure can say
     /// which.
@@ -604,15 +764,19 @@ pub(crate) struct ConfCtx {
     /// obligation for skips, and any figure derived from a run must assert it
     /// is zero or state what it was.
     skipped_gates: usize,
-    /// Visible assertion failures seen under [`ConfMode::Collect`], which does
-    /// not prune (S6 round 3, B1). Always empty on every other mode.
+    /// Visible assertion failures seen under [`ConfMode::Collect`] or
+    /// [`ConfMode::Enumerate`], which do not prune (S6 round 3, B1). Always
+    /// empty on every other mode.
     ///
     /// Kept out of `diagnostics` so the public `ConfNote` need not grow a
-    /// variant for a test-only engine.
+    /// variant: the oracle is test-only, and the stateful engine
+    /// (`P4-STATEFUL` T4) reads this list itself to answer §5.4's question.
     collect_errors: Vec<(String, Event)>,
 }
 
 impl ConfCtx {
+    /// Today's constructor, kept signature-stable (`P4-SELECTOR` S3, route
+    /// (a)): the inner search runs in `Recorded` order.
     pub(crate) fn new(
         config: Config,
         spec: Arc<dyn Fn() + Send + Sync>,
@@ -620,7 +784,54 @@ impl ConfCtx {
         budget: usize,
         stop_at_first_report: bool,
     ) -> Self {
-        let search = Search::new(config.clone(), spec, visible.clone(), budget);
+        Self::new_with_inner_order(
+            config,
+            spec,
+            visible,
+            budget,
+            stop_at_first_report,
+            InnerOrder::Recorded,
+        )
+    }
+
+    /// The constructor that carries knob B. It must be a constructor and not
+    /// a setter: the `Search` is moved into the `ProbeWorker`, whose thread
+    /// starts at once, so nothing set afterwards would reach it.
+    pub(crate) fn new_with_inner_order(
+        config: Config,
+        spec: Arc<dyn Fn() + Send + Sync>,
+        visible: Vec<String>,
+        budget: usize,
+        stop_at_first_report: bool,
+        inner_order: InnerOrder,
+    ) -> Self {
+        Self::new_with_opts(
+            config,
+            spec,
+            visible,
+            budget,
+            stop_at_first_report,
+            SearchOpts {
+                inner_order,
+                ..SearchOpts::default()
+            },
+        )
+    }
+
+    /// The constructor that carries every inner-search option (`P4-ENUMERATOR`
+    /// criterion 4, route (a)); `new` and `new_with_inner_order` delegate here
+    /// with the defaults. A constructor and not a setter: the `Search` is
+    /// moved into the `ProbeWorker`, whose thread starts at once.
+    pub(crate) fn new_with_opts(
+        config: Config,
+        spec: Arc<dyn Fn() + Send + Sync>,
+        visible: Vec<String>,
+        budget: usize,
+        stop_at_first_report: bool,
+        opts: SearchOpts,
+    ) -> Self {
+        let instrument = opts.instrument;
+        let search = Search::new(config.clone(), spec, visible.clone(), budget).with_opts(opts);
         Self {
             worker: Some(ProbeWorker::new(search)),
             mode: ConfMode::Outer,
@@ -633,12 +844,18 @@ impl ConfCtx {
             pruned: false,
             stop_at_first_report,
             stop_requested: false,
+            cut: false,
+            gate_sink: None,
             end: SearchEnd::Unknown,
             collected: None,
             collect_errors: Vec::new(),
             skipped_gates: 0,
             last_visible_obs: None,
             inert_gates: 0,
+            spec_error: None,
+            counters: ConfCounters::default(),
+            instrument,
+            sink: None,
         }
     }
 
@@ -668,12 +885,18 @@ impl ConfCtx {
             pruned: false,
             stop_at_first_report: false,
             stop_requested: false,
+            cut: false,
+            gate_sink: None,
             end: SearchEnd::Unknown,
             collected: None,
             collect_errors: Vec::new(),
             skipped_gates: 0,
             last_visible_obs: None,
             inert_gates: 0,
+            spec_error: None,
+            counters: ConfCounters::default(),
+            instrument: false,
+            sink: None,
         }
     }
 
@@ -683,11 +906,14 @@ impl ConfCtx {
 
     /// §7.1's serialized half, at capture time.
     ///
-    /// **Only the outer run's reports are ever rendered.** The precheck's and
-    /// triage's sinks are read for their *contents* — did anything assert? —
-    /// and then discarded, so serializing them would linearise a graph nobody
+    /// **Only rendered reports go through this method — the outer run's, and
+    /// the complete-first outer run's cut reports (`P4-CFIRST` C5).** The precheck's
+    /// and triage's sinks are read for their *contents* — did anything assert?
+    /// — and then discarded, so serializing them would linearise a graph nobody
     /// reads, on the two engines whose graphs are most likely to violate
-    /// `top_sort`'s precondition.
+    /// `top_sort`'s precondition. The stateful engine (`P4-STATEFUL` T3) takes
+    /// its reports' snapshots at its completion sink, through
+    /// `report::replay_snapshot` directly, not through here.
     fn snapshot(
         &self,
         graph: &ExecutionGraph,
@@ -695,7 +921,11 @@ impl ConfCtx {
         pos: Option<Event>,
     ) -> crate::conformance::report::ReplaySnapshot {
         use crate::conformance::report;
-        if self.mode != ConfMode::Outer {
+        // `P4-CFIRST` C5: a cut report is rendered, so it is serialized here
+        // like the outer run's.
+        let rendered =
+            self.mode == ConfMode::Outer || (self.mode == ConfMode::CFirstOuter && self.cut);
+        if !rendered {
             return report::replay_not_produced();
         }
         report::replay_snapshot(graph, state, &self.config, pos)
@@ -729,6 +959,88 @@ impl ConfCtx {
 
     pub(crate) fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    /// `P4-STATEFUL` T3: install the completion sink of an `Enumerate` run.
+    pub(crate) fn set_sink(&mut self, sink: CompletionSink) {
+        assert!(
+            self.mode.enumerates(),
+            "conformance: a completion sink belongs to an enumerating run"
+        );
+        self.sink = Some(sink);
+    }
+
+    /// `P4-CFIRST` C5: arm the early-error cut on the complete-first outer
+    /// run, and with it the stop flag (`gate_disabled` hard-codes it `false`,
+    /// and `report_visible_error`'s stop is gated on it — round 01 M4).
+    pub(crate) fn set_cut(&mut self, cut: bool, stop_at_first_report: bool) {
+        assert!(
+            self.mode == ConfMode::CFirstOuter,
+            "conformance: the early-error cut belongs to the complete-first outer run"
+        );
+        self.cut = cut;
+        self.stop_at_first_report = cut && stop_at_first_report;
+    }
+
+    /// `P4-GATED` G1: install the gate sink on the gated checker's outer run.
+    pub(crate) fn set_gate_sink(&mut self, sink: GateSink) {
+        assert!(
+            self.mode == ConfMode::GatedOuter,
+            "conformance: a gate sink belongs to the gated checker's outer run"
+        );
+        self.gate_sink = Some(sink);
+    }
+
+    /// `P4-GATED` G1: whether a requested stop ends the run at `try_revisit`'s
+    /// head — only the gated checker's outer run (the closed engines keep
+    /// their behaviour, F81).
+    pub(crate) fn stops_revisits(&self) -> bool {
+        self.mode == ConfMode::GatedOuter
+    }
+
+    /// Criterion 9: the specification assertion the inner search aborted on.
+    pub(crate) fn spec_error(&self) -> Option<&(String, Event)> {
+        self.spec_error.as_ref()
+    }
+
+    /// Criterion 13.
+    pub(crate) fn counters(&self) -> &ConfCounters {
+        &self.counters
+    }
+
+    /// Fold one `Cover` call's counters into the run's (criterion 13).
+    fn account_cover(&mut self, cc: &CoverCounters) {
+        let c = &mut self.counters;
+        c.spec_visit_calls += cc.spec_visit_calls;
+        c.spec_visit_calls_extend += cc.spec_visit_calls_extend;
+        c.spec_visit_calls_rebuild += cc.spec_visit_calls_rebuild;
+        c.memo_hits += cc.memo_hits;
+        c.rebuilds_taken += usize::from(cc.rebuild_taken);
+        c.rebuilds_skipped_initial_seed += usize::from(cc.rebuild_skipped_initial_seed);
+        c.rebuilds_skipped_exhausted_seed += usize::from(cc.rebuild_skipped_exhausted_seed);
+        c.distinct_keys_run_wide = cc.run_wide_distinct_so_far;
+        c.f63_distinct_run_wide = cc.f63_run_wide_distinct_so_far;
+        c.per_cover.push(cc.clone());
+    }
+
+    /// Criterion 13's first-report figure and report keys. The key of a
+    /// `RevisitApply` report graph is the graph as cut by `revisit_view`.
+    fn note_report(&mut self, gate: ReportGate, graph: &ExecutionGraph) {
+        if self.counters.paper_events_at_first_report.is_none() {
+            let paper: usize = graph
+                .thread_ids()
+                .into_iter()
+                .map(|t| paper_events(graph, t))
+                .sum();
+            self.counters.paper_events_at_first_report = Some(paper);
+        }
+        if self.instrument {
+            if let Ok(k) = CanonicalGraph::of(graph, &self.visible) {
+                self.counters
+                    .report_keys
+                    .push((gate, format!("{:?}", k.key())));
+            }
+        }
     }
 
     /// End the probe worker. Called where the conformance run ends; `Drop` is
@@ -842,14 +1154,18 @@ impl ConfCtx {
         self.skipped_gates
     }
 
-    /// Visible assertion failures recorded by a [`ConfMode::Collect`] run.
+    /// Visible assertion failures recorded by a [`ConfMode::Collect`] or
+    /// [`ConfMode::Enumerate`] run (the stateful engine reads them at its
+    /// completion sink, `P4-STATEFUL` T4).
     pub(crate) fn collect_errors(&self) -> &[(String, Event)] {
         &self.collect_errors
     }
 
     /// §4.4: record a visible thread's failed assertion and prune.
     ///
-    /// **Except under [`ConfMode::Collect`]** (S6 criteria round 3, B1). The
+    /// **Except under [`ConfMode::Collect`] and the enumerating modes with the
+    /// cut off** (S6 criteria round 3, B1; `P4-STATEFUL` criterion 1, "no
+    /// pruning"; `P4-CFIRST` C5). The
     /// oracle's enumeration run reaches this the same way any gate-disabled
     /// engine does — `conf_assert_failure` consults neither the probe, nor the
     /// worker, nor the mode — and pruning there would append `Block(ConfPrune)`
@@ -869,20 +1185,32 @@ impl ConfCtx {
         if self.pruned {
             return GateOutcome::Continue;
         }
-        if self.mode == ConfMode::Collect {
+        // Criterion 9: after the abort nothing reports; the failure is kept
+        // as a diagnostic, like a post-prune one.
+        if self.spec_error.is_some() {
+            self.record_after_prune(thread, pos);
+            return GateOutcome::Continue;
+        }
+        // `P4-CFIRST` C5: no prune iff `Collect || (enumerates() && !cut)`;
+        // `Precheck` and `Triage` keep pruning and reporting, which
+        // `precheck::run` reads.
+        if self.mode == ConfMode::Collect || (self.mode.enumerates() && !self.cut) {
             // Recorded, never silent — a bare `Continue` here is the failure
             // mode a careless implementation produces, and it would hide a
             // visible error from the oracle entirely.
             //
             // Deliberately **not** a `Diagnostic`: `DiagnosticReason` is
             // rendered by the publicly re-exported `ConfNote`, so a new variant
-            // there would grow the public surface for a test-only path, which
-            // §11.6's criterion 17 forbids. `pos` is a real event — the
+            // there would grow the public surface, which §11.6's criterion 17
+            // forbade for the test-only `Collect` path; `Enumerate` reuses the
+            // same channel and the stateful engine renders what it reads from
+            // it (`P4-STATEFUL` T4). `pos` is a real event — the
             // `Block(Assert)` is installed above `conf_assert_failure`'s
             // visibility split — and `thread` is the **declared** visible name.
             self.collect_errors.push((thread, pos));
             return GateOutcome::Continue;
         }
+        self.note_report(ReportGate::NotAGate, graph);
         self.reports.push(Report {
             gate: None,
             kind: ReportKind::VisibleError { thread, pos },
@@ -954,6 +1282,20 @@ impl ConfCtx {
         g1: &ExecutionGraph,
         state: &MustState,
     ) -> GateOutcome {
+        self.gate_at(gate, None, g1, state)
+    }
+
+    /// [`gate`](Self::gate) with the event it follows (`P4-GATED` G1): the
+    /// fresh gates pass the installed position and `RevisitApply` the popped
+    /// one with its revisit kind, source and outgoing carry. `None` from the
+    /// callers that have no gate sink to feed.
+    pub(crate) fn gate_at(
+        &mut self,
+        gate: Gate,
+        site: Option<GateAt>,
+        g1: &ExecutionGraph,
+        state: &MustState,
+    ) -> GateOutcome {
         // §11.6's capture, and it is the **first** statement deliberately.
         //
         // Placed above `if self.pruned` and above the `worker.is_none()`
@@ -966,12 +1308,47 @@ impl ConfCtx {
         // mid-execution graphs, on which `next_P(G) != {}` and the draft's
         // Def. visg is undefined — "a graph that still admits an event has
         // neither a status nor a set of visible traces".
+        self.counters.gate_invocations += 1;
         if gate == Gate::Completion {
             if let Some(sink) = self.collected.as_mut() {
                 sink.push(g1.clone());
             }
+            // Criterion 13: `L` and the explored complete graphs. Every
+            // execution's completion fires here, pruned ones included; the
+            // key is taken only for unpruned ones (a pruned graph carries
+            // `Block(ConfPrune)`, on which the canonical form is unreachable).
+            self.counters.executions += 1;
+            let paper: usize = g1
+                .thread_ids()
+                .into_iter()
+                .map(|t| paper_events(g1, t))
+                .sum();
+            self.counters.max_paper_events_per_execution =
+                self.counters.max_paper_events_per_execution.max(paper);
+            if self.instrument && !self.pruned {
+                if let Ok(k) = CanonicalGraph::of(g1, &self.visible) {
+                    self.counters
+                        .explored_complete_keys
+                        .push(format!("{:?}", k.key()));
+                }
+            }
+            // `P4-MIXED` M8: invisible operations of visible threads on this
+            // unpruned completion (read at entry, before any `Cover`), maximum
+            // over the run. A receive that blocks is a `Block{Value}`, no
+            // event, and is not counted.
+            if !self.pruned {
+                let n = invisible_ops_of_visible_threads(g1, &self.visible);
+                self.counters.invisible_ops_of_visible_threads =
+                    self.counters.invisible_ops_of_visible_threads.max(n);
+            }
+        }
+        // Criterion 9: once the inner search aborted, every gate is inert.
+        if self.spec_error.is_some() {
+            self.counters.gate_skipped_aborted += 1;
+            return GateOutcome::Continue;
         }
         if self.pruned {
+            self.counters.gate_skipped_pruned += 1;
             return GateOutcome::Continue;
         }
 
@@ -1031,13 +1408,30 @@ impl ConfCtx {
         // already fired on an unreplayed graph once, with one route closed and
         // no argument it was the only one; and an **invisible** thread's
         // `Block(Assert)` — which the draft admits — enters
-        // `unreplayed_events`, survives `revisit_view` into the next execution,
-        // and can never be drained, because `is_thread_runnable` never
-        // schedules the thread at that index. Left undiscriminated, that path
-        // skips the completion gate, never calls `cover`, and **misses a
-        // violation in silence**.
+        // `unreplayed_events` and survives the restoration into the next
+        // execution (`cut_to_stamp` for a forward revisit, `revisit_view` for
+        // a backward one: both keep every label stamped at or below the
+        // revisited receive). An earlier version of this comment claimed the
+        // entry "can never be drained". `P4-STATEFUL` gate 3 measured it
+        // (`stateful_tests::c03_an_invisible_block_assert_surviving_a_revisit`,
+        // a forward revisit restored by `cut_to_stamp`, and its
+        // `…_backward_revisit` twin, restored by `revisit_view`; the path is
+        // told by the receive's stamp against the revisiting send's): on both
+        // sides `w`'s `Block(Assert)`, stamped
+        // below `c`'s receive, is in the next execution's graph — so
+        // `initialize_for_execution` entered it into `unreplayed_events` — and
+        // the set is empty at this gate. `process_event` is the set's only
+        // remover, so the entry was drained when the restarted thread
+        // re-executed the `assert`. The route — `is_thread_runnable`'s
+        // `Assert` arm admitting the thread (`i < index`), then
+        // `handle_block`'s replay branch — is read, not run. Even so,
+        // the gate must stay discriminated: left undiscriminated, any path
+        // that *does* reach completion with an unreplayed entry would skip the
+        // completion gate, never call `cover`, and **miss a violation in
+        // silence**.
         if gate != Gate::Completion && !g1.unreplayed_events.is_empty() {
             self.skipped_gates += 1;
+            self.counters.gate_skipped_replay += 1;
             return GateOutcome::Continue;
         }
 
@@ -1062,12 +1456,65 @@ impl ConfCtx {
         // happened to reject would have its conformance verdict silently
         // skipped. `Cover` carries the whole weight.
 
+        // `P4-STATEFUL` T3: the stateful checker's completion sink, after the
+        // §8 guard and the completion assertion above, before the gate-disabled
+        // return. Only at `Completion`; `pruned` and `spec_error` are never set
+        // in `Enumerate` mode, so every completion reaches here. Under
+        // `CFirstOuter` with the cut on, a pruned completion returns at the
+        // `pruned` test above and never reaches the sink (`P4-CFIRST` C5).
+        if gate == Gate::Completion {
+            if let Some(sink) = self.sink.as_mut() {
+                if sink(g1, state) == SinkVerdict::Stop {
+                    self.stop_requested = true;
+                }
+            }
+        }
+
+        // `P4-GATED` G1: the gate sink, at the three growing gates, after the
+        // F49 skip and the completion assertion and before the gate-disabled
+        // return. `Report` and `Stop` are prunes: the snapshot is taken here,
+        // before `conf_prune` appends `Block(ConfPrune)`.
+        if gate != Gate::Completion {
+            if let (Some(sink), Some(site)) = (self.gate_sink.as_mut(), site.as_ref()) {
+                match sink(gate, site, g1, state) {
+                    GateVerdict::Continue => {}
+                    GateVerdict::Report => {
+                        let events: usize =
+                            g1.thread_ids().into_iter().map(|t| g1.thread_size(t)).sum();
+                        self.note_report(ReportGate::of(Some(gate)), g1);
+                        let replay = crate::conformance::report::replay_snapshot(
+                            g1,
+                            state,
+                            &self.config,
+                            None,
+                        );
+                        self.reports.push(Report {
+                            gate: Some(gate),
+                            kind: ReportKind::NoCover,
+                            events,
+                            graph: g1.clone(),
+                            replay,
+                        });
+                        self.pruned = true;
+                        self.stop_requested = true;
+                        return GateOutcome::Prune;
+                    }
+                    GateVerdict::Stop => {
+                        self.pruned = true;
+                        self.stop_requested = true;
+                        return GateOutcome::Prune;
+                    }
+                }
+            }
+        }
+
         // **A gate-disabled context has nothing to ask.** §8's guard above
         // still ran — a §8 violation is the user's error in whichever program
         // commits it, and the precheck is the only engine that sees the
         // specification's own graphs from outside the search — but there is no
         // probe worker, no seed and no `Cover` call.
         if self.worker.is_none() {
+            self.counters.gate_skipped_disabled += 1;
             return GateOutcome::Continue;
         }
 
@@ -1093,9 +1540,10 @@ impl ConfCtx {
         // observations and `matches` unchanged.
         //
         // The cheap test for "the fresh event was invisible" is that the
-        // **visible observation count did not change**. A visible thread's
-        // fresh send or receive contributes exactly one observation, so the
-        // count moves iff the actor was visible. This costs one graph walk,
+        // **visible observation count did not change**. A fresh visible send
+        // or receive contributes exactly one observation and an invisible one
+        // none, so the count moves iff the event is visible (`is_visible`).
+        // This costs one graph walk,
         // against a whole specification execution for the probe it avoids.
         //
         // **Only the two fresh gates.** `RevisitApply` changes an existing
@@ -1114,16 +1562,12 @@ impl ConfCtx {
         // `Diagnostic` note flags, and it does not depend on it.
         if matches!(gate, Gate::FreshSend | Gate::FreshRecv) {
             let seen = crate::conformance::obs::wobs(g1, &self.visible)
-                .map(|w| {
-                    self.visible
-                        .iter()
-                        .map(|n| w.of(n).len())
-                        .sum::<usize>()
-                })
+                .map(|w| self.visible.iter().map(|n| w.of(n).len()).sum::<usize>())
                 .ok();
             if let Some(seen) = seen {
                 if self.last_visible_obs == Some(seen) {
                     self.inert_gates += 1;
+                    self.counters.gate_skipped_inert += 1;
                     return GateOutcome::Continue;
                 }
                 self.last_visible_obs = Some(seen);
@@ -1155,17 +1599,22 @@ impl ConfCtx {
         // silently dropped whenever the search runs out of room" is not what
         // the field's rustdoc leads a reader to expect.
         let seed = self.h.clone();
-        let answer = self
+        self.counters.cover_calls += 1;
+        let (answer, cc) = self
             .worker
             .as_ref()
             .expect("conformance: the worker was checked present at the gate-disabled return above")
             .cover(g1, gate.outer_complete(), seed);
+        // Counted on every outcome, the aborting call included (gate-4 round
+        // 01, m1): `per_cover.len() == cover_calls` holds on aborted runs too.
+        self.account_cover(&cc);
         match answer {
             Ok(Cover::Found(h)) => {
                 self.h = h;
                 GateOutcome::Continue
             }
             Ok(Cover::NoCover) => {
+                self.note_report(ReportGate::of(Some(gate)), g1);
                 self.reports.push(Report {
                     gate: Some(gate),
                     kind: ReportKind::NoCover,
@@ -1181,9 +1630,22 @@ impl ConfCtx {
             }
             // Exhaustion establishes nothing, so it neither reports nor
             // prunes: pruning on it would cut a subtree on the strength of a
-            // search that ran out of room.
+            // search that ran out of room (ruling 1: inconclusive, never a
+            // report).
             Ok(Cover::BudgetExhausted) => {
                 self.exhaustions.push(Exhaustion { gate, events });
+                self.counters.cover_exhaustions += 1;
+                GateOutcome::Continue
+            }
+            // Criterion 9: the specification is not assertion-safe. Recorded,
+            // the end written **first** (so no later ending overwrites it),
+            // the outer run asked to stop, every later gate inert; no report,
+            // no prune (`Continue`, since a `Prune` at a fresh gate would
+            // `block_exec`). `run` returns `Err` on it.
+            Err(ObsError::SpecNotAssertionSafe { thread, pos }) => {
+                self.record_end(SearchEnd::SpecNotAssertionSafe);
+                self.spec_error = Some((thread, pos));
+                self.stop_requested = true;
                 GateOutcome::Continue
             }
             // A §8 violation is a user error in **whichever** program committed

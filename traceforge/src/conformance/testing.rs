@@ -70,6 +70,16 @@ where
 }
 
 /// The declared visible-thread list these tests use most often.
+/// `P4-MIXED` M6: executions begun on this thread since the last reset
+/// (`Must::begin_execution`'s `cfg(test)` counter).
+pub(crate) fn executions_begun() -> usize {
+    crate::must::EXECUTIONS_BEGUN.with(|c| c.get())
+}
+
+pub(crate) fn reset_executions_begun() {
+    crate::must::EXECUTIONS_BEGUN.with(|c| c.set(0));
+}
+
 pub(crate) fn names(ns: &[&str]) -> Vec<String> {
     ns.iter().map(|s| (*s).to_string()).collect()
 }

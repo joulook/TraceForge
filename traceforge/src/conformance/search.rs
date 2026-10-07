@@ -31,10 +31,13 @@
 
 use std::sync::Arc;
 
+use crate::conformance::canon::{CanonSet, CanonicalGraph};
 use crate::conformance::morphism::{follows, matches, statuses, statuses_agree, CompleteExecution};
-use crate::conformance::obs::{wobs, ObsError, Wobs};
+use crate::conformance::obs::{check_annotation, wobs, ObsError, Wobs};
 use crate::conformance::probe::Offer;
 use crate::conformance::prober::{install, install_nondet, install_recv, probe_from, Probed};
+use crate::conformance::report::CoverCounters;
+use crate::conformance::selector::InnerOrder;
 use crate::event::Event;
 use crate::event_label::LabelEnum;
 use crate::exec_graph::ExecutionGraph;
@@ -190,6 +193,57 @@ pub(crate) struct Search {
     spec: Arc<dyn Fn() + Send + Sync>,
     visible: Vec<String>,
     budget: usize,
+    /// Knob B (`P4-SELECTOR` S3): the order of the three sequences the search
+    /// loops over. `Recorded` — today's order — unless `with_inner_order` set
+    /// it, so every existing constructor call keeps its behaviour.
+    inner_order: InnerOrder,
+    /// `P4-ENUMERATOR` criteria 1–4: per-`Cover` memoisation on the canonical
+    /// probe output (`lem:memo`). Off unless `with_memo(true)`, so every
+    /// existing constructor call keeps its behaviour bit for bit.
+    memo: bool,
+    /// Criterion 13: distinct-key counting, off by default because with memo
+    /// off it would canonicalise every node and taint the performance arm.
+    instrument: bool,
+    /// Criterion 13's run-wide distinct-key set: **instrumentation only,
+    /// write-only from the search** — never consulted by it (consulting it
+    /// would be criterion 3's mutation). A `RefCell` because `cover` takes
+    /// `&self` and the worker thread is this value's only user.
+    run_keys: std::cell::RefCell<CanonSet>,
+    /// F63's own run-wide set (criterion 14 (i)): the `Display` of every graph
+    /// handed to `probe`, so the across-attempt factor is reproducible under
+    /// F63's definition. Instrumentation only, write-only.
+    run_display_keys: std::cell::RefCell<std::collections::HashSet<String>>,
+}
+
+/// The inner search's options, carried by route (a)'s `_with_opts`
+/// constructors (`P4-ENUMERATOR` criterion 4): the knob-B order, the memo
+/// switch and the instrumentation flag. `Default` is today's behaviour.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SearchOpts {
+    pub(crate) inner_order: InnerOrder,
+    pub(crate) memo: bool,
+    pub(crate) instrument: bool,
+}
+
+/// Per-`Cover` memo state and counters (criteria 1, 2, 13).
+///
+/// One `CanonSet` per `Cover` call, **shared by both attempts** — `lem:memo`'s
+/// licence: when `ln:rebuild` runs, `ln:extend` returned ⊥, so every graph it
+/// expanded finished with ⊥, and a repeat of one in the rebuild would too.
+/// **Invariant**: an attempt that returned `BudgetExhausted` is never followed
+/// by one sharing this set (`cover` never rebuilds after an exhausted seed; an
+/// entry whose subtree ran out of budget did not finish with ⊥, and a repeat
+/// of it would be a manufactured ⊥ — ruling 1's forbidden case).
+struct Memo {
+    set: Option<CanonSet>,
+    /// `0` = `ln:extend`, `1` = `ln:rebuild`.
+    attempt: usize,
+    counters: CoverCounters,
+    /// Instrumentation only: keys met per attempt, and F63's input-`Display`
+    /// keys per attempt.
+    met: [CanonSet; 2],
+    f63: [std::collections::HashSet<String>; 2],
+    all: CanonSet,
 }
 
 impl Search {
@@ -204,7 +258,35 @@ impl Search {
             spec,
             visible,
             budget,
+            inner_order: InnerOrder::Recorded,
+            memo: false,
+            instrument: false,
+            run_keys: std::cell::RefCell::new(CanonSet::default()),
+            run_display_keys: std::cell::RefCell::new(Default::default()),
         }
+    }
+
+    /// Set knob B. A permutation of each sequence, never a cut, so by
+    /// `lem:coverexact` the answer is unchanged at unlimited budget.
+    pub(crate) fn with_inner_order(mut self, inner_order: InnerOrder) -> Self {
+        self.inner_order = inner_order;
+        self
+    }
+
+    /// Switch the per-`Cover` memo (criteria 1–4). The answer is unchanged at
+    /// unlimited budget (`lem:memo`); at a finite budget memo on can turn an
+    /// exhaustion into an established ⊥ or a cover, hence change the verdict.
+    pub(crate) fn with_memo(mut self, memo: bool) -> Self {
+        self.memo = memo;
+        self
+    }
+
+    /// All three options at once (route (a)'s `_with_opts` constructors).
+    pub(crate) fn with_opts(mut self, opts: SearchOpts) -> Self {
+        self.inner_order = opts.inner_order;
+        self.memo = opts.memo;
+        self.instrument = opts.instrument;
+        self
     }
 
     /// `Cover(G₁, H)` — extend the seed the outer search carries; failing
@@ -264,6 +346,37 @@ impl Search {
         outer_complete: bool,
         seed: ExecutionGraph,
     ) -> Result<Cover, ObsError> {
+        self.cover_counted(g1, outer_complete, seed).0
+    }
+
+    /// [`Search::cover`] with its counters (criterion 13), **on every outcome**
+    /// — an aborting call's work is counted too (gate-4 round 01, m1). The
+    /// gate uses this form; the signature-stable `cover` discards the counters.
+    pub(crate) fn cover_counted(
+        &self,
+        g1: &ExecutionGraph,
+        outer_complete: bool,
+        seed: ExecutionGraph,
+    ) -> (Result<Cover, ObsError>, CoverCounters) {
+        let mut memo = self.fresh_memo();
+        let answer = self.cover_inner(g1, outer_complete, seed, &mut memo);
+        if self.instrument {
+            memo.counters.distinct_keys = memo.all.len();
+            memo.counters.per_attempt_distinct = [memo.met[0].len(), memo.met[1].len()];
+            memo.counters.f63_per_attempt_distinct = [memo.f63[0].len(), memo.f63[1].len()];
+            memo.counters.run_wide_distinct_so_far = self.run_keys.borrow().len();
+            memo.counters.f63_run_wide_distinct_so_far = self.run_display_keys.borrow().len();
+        }
+        (answer, memo.counters)
+    }
+
+    fn cover_inner(
+        &self,
+        g1: &ExecutionGraph,
+        outer_complete: bool,
+        seed: ExecutionGraph,
+        memo: &mut Memo,
+    ) -> Result<Cover, ObsError> {
         let outer = Outer {
             graph: g1,
             wobs: wobs(g1, &self.visible)?,
@@ -277,8 +390,16 @@ impl Search {
         let mut budget = Budget {
             remaining: self.budget,
         };
-        let from_seed = self.spec_visit(&outer, seed, &mut budget)?;
-        if from_seed.is_found() || matches!(from_seed, Cover::BudgetExhausted) {
+        memo.attempt = 0;
+        let from_seed = self.spec_visit_in(&outer, seed, &mut budget, memo)?;
+        if from_seed.is_found() {
+            return Ok(from_seed);
+        }
+        if matches!(from_seed, Cover::BudgetExhausted) {
+            // Criterion 1's invariant: no attempt shares the set with an
+            // exhausted one. Today's policy never rebuilds here; if that is
+            // ever reversed, the set must be cleared first.
+            memo.counters.rebuild_skipped_exhausted_seed = true;
             return Ok(from_seed);
         }
 
@@ -326,30 +447,123 @@ impl Search {
         // here rather than there because it is correct for every caller and
         // needs no second entry point.
         if seed_is_initial {
+            memo.counters.rebuild_skipped_initial_seed = true;
             return Ok(from_seed);
         }
 
+        debug_assert!(
+            !matches!(from_seed, Cover::BudgetExhausted),
+            "conformance: a rebuild would share the memo set with an exhausted attempt"
+        );
+        memo.counters.rebuild_taken = true;
+        memo.attempt = 1;
         let mut budget = Budget {
             remaining: self.budget,
         };
-        self.spec_visit(&outer, ExecutionGraph::default(), &mut budget)
+        self.spec_visit_in(&outer, ExecutionGraph::default(), &mut budget, memo)
     }
 
     /// `SpecVisit(G₁, G)`.
+    /// `SpecVisit` without a shared memo — one throwaway memo per call. The
+    /// signature `cover` used before Part 2, kept for the in-file tests;
+    /// `cover_inner` drives [`Search::spec_visit_in`] with the per-`Cover`
+    /// memo.
+    #[cfg(test)]
     fn spec_visit(
         &self,
         outer: &Outer<'_>,
         graph: ExecutionGraph,
         budget: &mut Budget,
     ) -> Result<Cover, ObsError> {
+        self.spec_visit_in(outer, graph, budget, &mut self.fresh_memo())
+    }
+
+    #[cfg(test)]
+    fn branch(
+        &self,
+        outer: &Outer<'_>,
+        graph: &ExecutionGraph,
+        offer: &Offer,
+        budget: &mut Budget,
+    ) -> Result<Cover, ObsError> {
+        self.branch_in(outer, graph, offer, budget, &mut self.fresh_memo())
+    }
+
+    fn fresh_memo(&self) -> Memo {
+        Memo {
+            set: self.memo.then(CanonSet::default),
+            attempt: 0,
+            counters: CoverCounters::default(),
+            met: [CanonSet::default(), CanonSet::default()],
+            f63: [Default::default(), Default::default()],
+            all: CanonSet::default(),
+        }
+    }
+
+    fn spec_visit_in(
+        &self,
+        outer: &Outer<'_>,
+        graph: ExecutionGraph,
+        budget: &mut Budget,
+        memo: &mut Memo,
+    ) -> Result<Cover, ObsError> {
         if !budget.spend() {
             return Ok(Cover::BudgetExhausted);
+        }
+        memo.counters.spec_visit_calls += 1;
+        if memo.attempt == 0 {
+            memo.counters.spec_visit_calls_extend += 1;
+        } else {
+            memo.counters.spec_visit_calls_rebuild += 1;
+        }
+        if self.instrument {
+            // F63's own key: the `Display` of the graph handed to `probe`.
+            let shown = graph.to_string();
+            self.run_display_keys.borrow_mut().insert(shown.clone());
+            memo.f63[memo.attempt].insert(shown);
         }
 
         // One probe answers two questions at once: what this graph can do
         // next, and — because the prober applies no Φ — whether it can do
         // anything at all, which is `Done`'s `next_Spec(G) = ∅` conjunct.
         let probed = self.probe(graph);
+
+        // Criterion 9, **scan first**: a `Block(Assert)` in a probe's output
+        // means the specification is not assertion-safe. It aborts the run,
+        // never folds into a `Cover` answer, and never enters the memo set.
+        if let Some(e) = spec_assertion(probed.graph()) {
+            return Err(e);
+        }
+
+        // `P4-MIXED` M4, site (ii): the enumerator sees the specification only
+        // through probes, whose `Must` has no conformance context, so every
+        // offered send or receive is checked here — before the memo return
+        // and `done`, which can both return without looking at the offers.
+        for offer in probed.offers() {
+            if let Err(e) = check_annotation(probed.graph(), offer.label(), &self.visible, "inner search") {
+                panic!("conformance: {e}");
+            }
+        }
+
+        // Criteria 1–2: the memo key is the canonical **probe output** (the
+        // engine's node — the successor set is a function of it), inserted at
+        // expansion, checked before `done`. A repeat returns ⊥ without
+        // `done`, Φ or children; it has already spent its budget unit and
+        // probed, so it counts as a call (§8.8's "returning at the probe").
+        if memo.set.is_some() || self.instrument {
+            let key = CanonicalGraph::of(probed.graph(), &self.visible)?;
+            if self.instrument {
+                memo.met[memo.attempt].insert(key.clone());
+                memo.all.insert(key.clone());
+                self.run_keys.borrow_mut().insert(key.clone());
+            }
+            if let Some(set) = memo.set.as_mut() {
+                if !set.insert(key) {
+                    memo.counters.memo_hits += 1;
+                    return Ok(Cover::NoCover);
+                }
+            }
+        }
 
         // A declared visible thread never spawned is a §8 violation by the
         // *specification program* — the user's own mistake. It propagates as
@@ -363,13 +577,13 @@ impl Search {
         }
 
         let mut exhausted = false;
-        for offer in probed.offers() {
+        for offer in self.inner_order.offers(probed.offers()) {
             // Φ defines the loop's *range* (`alg.tex:845-851`), so an offer
             // that fails it is not a backtrack point at all.
             if !self.phi(outer, probed.graph(), offer)? {
                 continue;
             }
-            let outcome = self.branch(outer, probed.graph(), offer, budget)?;
+            let outcome = self.branch_in(outer, probed.graph(), offer, budget, memo)?;
             if outcome.is_found() {
                 return Ok(outcome);
             }
@@ -388,12 +602,13 @@ impl Search {
     }
 
     /// The three cases of `alg.tex:800-808`, each looping its own decisions.
-    fn branch(
+    fn branch_in(
         &self,
         outer: &Outer<'_>,
         graph: &ExecutionGraph,
         offer: &Offer,
         budget: &mut Budget,
+        memo: &mut Memo,
     ) -> Result<Cover, ObsError> {
         let mut exhausted = false;
 
@@ -407,9 +622,9 @@ impl Search {
         macro_rules! try_one {
             ($extended:expr, $through_step:expr) => {{
                 let outcome = if $through_step {
-                    self.spec_step(outer, $extended, budget)?
+                    self.spec_step(outer, $extended, budget, memo)?
                 } else {
-                    self.spec_visit(outer, $extended, budget)?
+                    self.spec_visit_in(outer, $extended, budget, memo)?
                 };
                 if outcome.is_found() {
                     return Ok(outcome);
@@ -437,7 +652,7 @@ impl Search {
                      is not a choice point",
                     offer.pos()
                 );
-                for value in values {
+                for value in self.inner_order.values(values) {
                     let extended = install_nondet(self.config.clone(), graph.clone(), offer, value);
                     try_one!(extended, false);
                 }
@@ -499,9 +714,10 @@ impl Search {
         outer: &Outer<'_>,
         graph: ExecutionGraph,
         budget: &mut Budget,
+        memo: &mut Memo,
     ) -> Result<Cover, ObsError> {
         if self.follows(outer, &graph)? {
-            self.spec_visit(outer, graph, budget)
+            self.spec_visit_in(outer, graph, budget, memo)
         } else {
             Ok(Cover::NoCover)
         }
@@ -605,7 +821,7 @@ impl Search {
         if offer.may_read_nothing() {
             out.push(None);
         }
-        out
+        self.inner_order.sources(out)
     }
 
     /// `Done(G₁, G)` — three conjuncts, the second and third conditional on
@@ -688,6 +904,29 @@ impl Search {
         let spec = Arc::clone(&self.spec);
         probe_from(self.config.clone(), graph, move || spec())
     }
+}
+
+/// Criterion 9's trigger: the first `Block(Assert)` in a specification probe's
+/// output, as the error that aborts the run. A probe runs the specification
+/// only, so any thread here is a specification thread, visible or not; the
+/// name is the thread's declared name where it has one.
+pub(crate) fn spec_assertion(graph: &ExecutionGraph) -> Option<ObsError> {
+    for tid in graph.thread_ids() {
+        for i in 0..graph.thread_size(tid) as u32 {
+            let e = Event::new(tid, i);
+            if let LabelEnum::Block(b) = graph.label(e) {
+                if matches!(b.btype(), crate::event_label::BlockType::Assert) {
+                    let thread = graph
+                        .get_thread_tclab(tid)
+                        .name()
+                        .clone()
+                        .unwrap_or_else(|| format!("{tid}"));
+                    return Some(ObsError::SpecNotAssertionSafe { thread, pos: e });
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

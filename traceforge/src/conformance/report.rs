@@ -26,7 +26,7 @@
 
 use std::fmt;
 
-use crate::conformance::config::{ScopeField, DEFAULT_SEARCH_BUDGET};
+use crate::conformance::config::{Engine, ScopeField, DEFAULT_SEARCH_BUDGET};
 use crate::conformance::ctx::{DiagnosticReason, Gate, ReportKind};
 use crate::exec_graph::ExecutionGraph;
 
@@ -75,6 +75,95 @@ pub(crate) const UNSETTLED_CLAIM: &str =
 
 /// The knob an exhaustion must name (criterion 2).
 pub(crate) const BUDGET_KNOB: &str = "ConfBuilder::search_budget";
+
+/// `P4-STATEFUL` T6: true of every stateful report, on every run — it is
+/// `alg:stateful`'s lookup (`I[sig(G)]`), which needs only a complete index.
+pub(crate) const STATEFUL_EACH_UNCOVERED: &str =
+    "Every graph in this list is an uncovered complete graph of the implementation: each \
+     was looked up in an index of every specification graph, and either no specification \
+     graph has its signature or no order stored under its signature is contained in its \
+     own (lem:sig).";
+
+/// `P4-STATEFUL` T6: `thm:stateful`'s "exactly", printed only when both
+/// enumerations completed (`end == StateSpaceExhausted`).
+pub(crate) const STATEFUL_EXACTLY_THE_SET: &str =
+    "The list is exactly the set of such graphs (thm:stateful): both enumerations reached \
+     the end of their state spaces.";
+
+/// `P4-CFIRST` C7: true of every complete-first completion report, on every
+/// run — it is `alg:cfirst`'s `Covered`, which needs only an exhaustive
+/// failing sweep (asserted by the engine).
+pub(crate) const CFIRST_EACH_UNCOVERED: &str =
+    "Every complete graph in this list is an uncovered complete graph of the \
+     implementation: at its completion no cached witness covered it, and an unpruned \
+     sweep of the specification found no graph with its signature whose order is \
+     contained in its own (lem:sig).";
+
+/// `P4-CFIRST` C7: `thm:cfirst`'s "exactly", printed only when the outer run
+/// completed and no early-error cut fired (A27: with a cut the engine decides,
+/// it does not enumerate).
+pub(crate) const CFIRST_EXACTLY_THE_SET: &str =
+    "The list is exactly the set of such graphs (thm:cfirst): the outer exploration \
+     reached the end of its state space, no early-error cut fired, and every failing \
+     sweep reached the end of the specification's.";
+
+/// `P4-GATED` G6: true of every exhaustive-mode gated report, on every run.
+pub(crate) const GATED_EACH_UNCOVERED: &str =
+    "Every graph in this list is an uncovered complete graph of the implementation: it \
+     was reported under an absence certificate set at a gate above it (cor:absence), or \
+     no cached witness covered it and an unpruned sweep of the specification found none \
+     (lem:sig).";
+
+/// `P4-GATED` G6: `thm:gated`'s "exactly", exhaustive mode, printed only when
+/// the outer run completed.
+pub(crate) const GATED_EXACTLY_THE_SET: &str =
+    "The list is exactly the set of such graphs (thm:gated, exhaustive mode): the outer \
+     exploration reached the end of its state space and every failing sweep reached the \
+     end of the specification's.";
+
+/// `P4-GATED` G6: the first-failure report's sentence.
+pub(crate) const GATED_FIRST_FAILURE: &str =
+    "This run was gated in first-failure mode and stopped at its first report (thm:gated): \
+     the reported graph is either a partial implementation graph with a completion, every \
+     completion of every extension of which is uncovered (cor:absence), or a complete \
+     graph that no specification graph covers (lem:sig).";
+
+// `P4-FLAT` criterion 8: the `Flat` variants, selected by
+// `ConfOutcome::flat_counters.is_some()`; the `Sweep` texts above are
+// byte-identical to Parts 4–5's.
+pub(crate) const CFIRST_EACH_UNCOVERED_FLAT: &str =
+    "Every complete graph in this list is an uncovered complete graph of the \
+     implementation: at its completion no cached witness covered it, and `FlatCover` \
+     found no covering graph (thm:flat).";
+
+pub(crate) const CFIRST_EXACTLY_THE_SET_FLAT: &str =
+    "The list is exactly the set of such graphs (thm:cfirst): the outer exploration \
+     reached the end of its state space, no early-error cut fired, and `FlatCover` is \
+     exact for this communication-flat specification (thm:flat, cor:mixedflat).";
+
+pub(crate) const GATED_EACH_UNCOVERED_FLAT: &str =
+    "Every graph in this list is an uncovered complete graph of the implementation: it \
+     was reported under an absence certificate set at a gate above it (cor:absence), or \
+     no cached witness covered it and `FlatCover` found no covering graph (thm:flat).";
+
+pub(crate) const GATED_EXACTLY_THE_SET_FLAT: &str =
+    "The list is exactly the set of such graphs (thm:gated, exhaustive mode): the outer \
+     exploration reached the end of its state space, every failing gate sweep reached the \
+     end of the specification's, and `FlatCover` is exact for this communication-flat \
+     specification (thm:flat, cor:mixedflat).";
+
+pub(crate) const GATED_FIRST_FAILURE_FLAT: &str =
+    "This run was gated in first-failure mode and stopped at its first report (thm:gated): \
+     the reported graph is either a partial implementation graph with a completion, every \
+     completion of every extension of which is uncovered (cor:absence), or a complete \
+     graph that no specification graph covers (thm:flat).";
+
+/// `P4-CFIRST` C7: printed whenever a cut report is present.
+pub(crate) const CFIRST_CUT_PREFIXES: &str =
+    "Reports raised by the early-error cut are prefixes of the implementation: every \
+     completion of every extension of each is uncovered (the certificate of \u{a7}8.1); \
+     the cut skips the subtree below each, which may contain other uncovered graphs \
+     that are not listed.";
 
 // ---------------------------------------------------------------------------
 // Report content (§7.1)
@@ -152,6 +241,126 @@ pub enum ReportCause {
     VisibleError { thread: String, pos: String },
 }
 
+/// **The semantic tag**: which certificate this engine established for the
+/// report (`P4-ENUMERATOR` criteria 5–6; plan §4.4, §5.2, §6). The call-site
+/// tag is [`ReportGate`]; this one is a function of (cause, gate), stated once
+/// in [`ReportTag::of`].
+///
+/// It records the certificate **this engine** established, not the paper's
+/// line: a complete graph reported at a growing gate is tagged
+/// `GrowingExhaustion`, because the positional `Done` flag made that gate check
+/// matching and `cor:absence` certifies it; the paper's `ln:stepreport` would
+/// certify the same graph through `lem:coverexact`(2). Both are correct, and
+/// Part 6 certifies each report by **its tag's** certificate rather than
+/// requiring tag equality across engines on complete graphs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ReportTag {
+    /// No partial graph of Spec matches the reported graph, so every
+    /// completion of every extension of it is uncovered (`cor:absence`).
+    GrowingExhaustion,
+    /// No graph of Spec covers the reported complete graph
+    /// (`lem:coverexact`(2)).
+    CompleteCoverage,
+    /// A visible thread errored, so (M3) fails against every graph of Spec
+    /// (§8.1). Never checked by C1-absence: the empty graph matches.
+    VisibleError,
+}
+
+impl ReportTag {
+    /// The correspondence, stated once. Two combinations cannot occur: a
+    /// `NoCover` is always a gate firing, and a `VisibleError` never is
+    /// (`report_visible_error` carries `gate: None`).
+    pub(crate) fn of(cause: &ReportCause, gate: ReportGate) -> Self {
+        match (cause, gate) {
+            (ReportCause::VisibleError { .. }, ReportGate::NotAGate) => ReportTag::VisibleError,
+            (ReportCause::NoCover, ReportGate::Completion) => ReportTag::CompleteCoverage,
+            (
+                ReportCause::NoCover,
+                ReportGate::FreshSend | ReportGate::FreshRecv | ReportGate::RevisitApply,
+            ) => ReportTag::GrowingExhaustion,
+            (ReportCause::NoCover, ReportGate::NotAGate) => {
+                unreachable!("conformance: a NoCover report with no gate")
+            }
+            (ReportCause::VisibleError { .. }, _) => {
+                unreachable!("conformance: a VisibleError report at a gate")
+            }
+        }
+    }
+
+    /// `P4-FLAT` criterion 8: the per-report text of a `CompleteCoverage`
+    /// report whose completion decision was `FlatCover`'s — `certifies_under`'s
+    /// text with its sweep clause substituted, the leading clause verbatim. On
+    /// any other engine or tag it is `certifies_under`'s text.
+    pub(crate) fn certifies_flat(self, engine: Engine) -> &'static str {
+        match (engine, self) {
+            (Engine::CompleteFirst, ReportTag::CompleteCoverage) => {
+                "no graph of the specification covers the reported complete graph: no cached \
+                 witness did, and `FlatCover` found no covering graph of this \
+                 communication-flat specification (thm:flat, cor:mixedflat, thm:cfirst)"
+            }
+            (Engine::Gated, ReportTag::CompleteCoverage) => {
+                "no graph of the specification covers the reported complete graph: it was \
+                 reported under an absence certificate set at a gate above it (cor:absence), \
+                 or no cached witness covered it and `FlatCover` found no covering graph of \
+                 it (thm:flat, cor:mixedflat, thm:gated)"
+            }
+            _ => self.certifies_under(engine),
+        }
+    }
+
+    /// What the tag certifies under a given engine (`P4-STATEFUL` T6).
+    ///
+    /// For [`Engine::Enumerator`] this is [`ReportTag::certifies`]. The
+    /// stateful engine produces only `CompleteCoverage`, whose certificate it
+    /// states in its own terms; for the two tags it never produces the
+    /// enumerator's text is returned (a tag's certificate does not depend on
+    /// which engine is asked). Never panics.
+    pub fn certifies_under(self, engine: Engine) -> &'static str {
+        match (engine, self) {
+            (Engine::Stateful, ReportTag::CompleteCoverage) => {
+                "no graph of the specification covers the reported complete graph: its \
+                 signature has no slot in the index, or no order in the slot is contained in \
+                 the graph's (lem:sig, thm:stateful)"
+            }
+            // `P4-CFIRST` C7; `VisibleError` (the cut) and `GrowingExhaustion`
+            // (never produced) take the enumerator's text.
+            (Engine::CompleteFirst, ReportTag::CompleteCoverage) => {
+                "no graph of the specification covers the reported complete graph: no cached \
+                 witness did, and an exhaustive unpruned sweep of the specification found \
+                 none (lem:sig, thm:cfirst)"
+            }
+            // `P4-GATED` G6; `GrowingExhaustion` (a first-failure gate report)
+            // and `VisibleError` (never produced) take the enumerator's text.
+            (Engine::Gated, ReportTag::CompleteCoverage) => {
+                "no graph of the specification covers the reported complete graph: it was \
+                 reported under an absence certificate set at a gate above it (cor:absence), \
+                 or no cached witness and no graph of an exhaustive unpruned sweep covered \
+                 it (lem:sig, thm:gated)"
+            }
+            _ => self.certifies(),
+        }
+    }
+
+    /// What the tag certifies, in the paper's terms (criterion 6), for the
+    /// enumerator.
+    pub fn certifies(self) -> &'static str {
+        match self {
+            ReportTag::GrowingExhaustion => {
+                "no partial graph of the specification matches the reported graph, so every \
+                 completion of every extension of it is uncovered (cor:absence)"
+            }
+            ReportTag::CompleteCoverage => {
+                "no graph of the specification covers the reported complete graph \
+                 (lem:coverexact (2))"
+            }
+            ReportTag::VisibleError => {
+                "a visible thread errored, so the status vector fails against every graph of \
+                 the specification (\u{a7}8.1); this is not a C1-absence claim"
+            }
+        }
+    }
+}
+
 /// §7.1's inner-search diagnostics: which failed attempt got furthest, and
 /// what stopped it.
 ///
@@ -191,6 +400,9 @@ pub enum Diagnostics {
     /// There is no inner-search attempt to describe: a §4.4 visible-error
     /// report is not a `Cover` answer at all.
     NotApplicable,
+    /// `P4-STATEFUL` T6: an engine that computes no inner-search diagnostics
+    /// at all. Only the stateful engine produces this today.
+    NotProduced { by: Engine },
 }
 
 /// Why no obligation was named. See [`Diagnostics::Unavailable`].
@@ -309,13 +521,16 @@ pub enum TriageOutcome {
     OtherAssertion { thread: String, pos: String },
 }
 
-
 /// One recorded candidate violation, with everything §7.1 asks a report to
 /// carry.
 #[derive(Clone)]
 pub struct ConfReport {
+    /// Which engine raised it (`P4-STATEFUL` T6); decides the certificate text.
+    pub(crate) engine: Engine,
     pub(crate) gate: ReportGate,
     pub(crate) cause: ReportCause,
+    /// The semantic tag, a function of `(cause, gate)` — [`ReportTag::of`].
+    pub(crate) tag: ReportTag,
     pub(crate) events: usize,
     /// §7.1's outer graph snapshot, dump half.
     pub(crate) dump: String,
@@ -324,6 +539,10 @@ pub struct ConfReport {
     pub(crate) replay: ReplaySnapshot,
     pub(crate) diagnostics: Diagnostics,
     pub(crate) triage: Option<TriageOutcome>,
+    /// `P4-FLAT` criterion 8: the completion decision behind this report was
+    /// `FlatCover`'s (set by `cfirst::run`/`gated::run` on every completion
+    /// report of a `Flat` run; never on a cut or gate-site report).
+    pub(crate) by_flat_cover: bool,
 }
 
 /// §7.1's "serialized replay information — the existing `ReplayInformation`
@@ -401,6 +620,10 @@ impl ConfReport {
     }
     pub fn cause(&self) -> &ReportCause {
         &self.cause
+    }
+    /// The semantic tag: which certificate this report carries.
+    pub fn tag(&self) -> ReportTag {
+        self.tag
     }
     /// The implementation graph's size when the report was raised.
     pub fn events(&self) -> usize {
@@ -503,7 +726,9 @@ impl ConfNote {
     /// joined.
     pub fn thread(&self) -> &str {
         match self {
-            ConfNote::InvisibleThread { thread, .. } | ConfNote::AfterPrune { thread, .. } => thread,
+            ConfNote::InvisibleThread { thread, .. } | ConfNote::AfterPrune { thread, .. } => {
+                thread
+            }
         }
     }
 }
@@ -531,6 +756,13 @@ pub enum SearchEnd {
     MaxIterations(u64),
     /// `stop_at_first_report` stopped it — a bound the *gate* set.
     StoppedAtFirstReport,
+    /// The inner search found the specification not assertion-safe and
+    /// aborted the run (`P4-ENUMERATOR` criterion 9). Written **first**
+    /// through `record_end`, so no later ending can overwrite it. It is the
+    /// engine-only `Outcome`'s end on that path; [`crate::conformance::verify`]
+    /// returns [`ConfError::SpecNotAssertionSafe`] before any [`ConfOutcome`]
+    /// is built, so no `ConfOutcome` ever carries it.
+    SpecNotAssertionSafe,
     /// Nothing recorded an ending. Silence must not be inferred from this.
     ///
     /// The **default**, deliberately: the fact has to be written down by
@@ -560,12 +792,80 @@ pub enum NotACertificate {
 /// What the run assumed rather than checked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpecErrFreedom {
-    /// §5.4's precheck ran and the specification was error-free.
+    /// The specification was found error-free: by §5.4's precheck under
+    /// [`Engine::Enumerator`], or by the stateful engine's index run, which
+    /// enumerates the specification in full and *is* that check
+    /// (`P4-STATEFUL` T4).
     Checked,
-    /// `ConfBuilder::skip_spec_errfree_check(true)`. The verdict records the
-    /// assumption, because an opt-out that leaves no trace is a silent change
-    /// of what the verdict means.
+    /// The enumerator's record of `ConfBuilder::skip_spec_errfree_check(true)`.
+    /// The verdict records the assumption, because an opt-out that leaves no
+    /// trace is a silent change of what the verdict means. Never recorded by
+    /// [`Engine::Stateful`], whose index run checks regardless of the flag.
     Assumed,
+}
+
+/// `FlatCover`'s counters (`P4-FLAT` F6), each at a named program point of
+/// `flat.rs`: `calls` completions handed to `flat_cover`; `visits` the paper's
+/// FlatVisit invocations (`flat::visit`), the root included; `nd_branches` values tried at `ln:fnd`;
+/// `source_branches` options tried at `ln:fsrc` (an `install_recv` followed by
+/// a `follows` test, `⊥` included) and `source_recursions` those that passed
+/// and recursed; `send_kills` `follows` failures at `ln:fsend`; `slot_kills`
+/// the slot's thread not standing at an **offered** receive — the prober
+/// offers a blocking receive only when a source exists, so a slot thread at a
+/// blocking receive with nothing deliverable (`alg:flat`'s `ln:fsrc` with no
+/// option, counted in `source_kills` there) counts here (round 01 n1; the ⊥ answer is
+/// the same); `source_kills` no option passing; `done_kills` `ln:fdone` failures; `witnesses` non-⊥ returns;
+/// `max_depth` the recursion depth; `wall_time_ms` the flat threads' time.
+/// Tests compare fields, never whole structs (`wall_time_ms` is inside).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlatCounters {
+    pub calls: usize,
+    pub visits: usize,
+    pub nd_branches: usize,
+    pub source_branches: usize,
+    pub source_recursions: usize,
+    pub send_kills: usize,
+    pub slot_kills: usize,
+    pub source_kills: usize,
+    pub done_kills: usize,
+    pub witnesses: usize,
+    pub max_depth: usize,
+    pub wall_time_ms: u128,
+}
+
+impl FlatCounters {
+    /// Fold one `flat_cover` call's counters into the run's (sums; `max` for
+    /// the depth).
+    pub(crate) fn accumulate(&mut self, d: &FlatCounters) {
+        self.calls += d.calls;
+        self.visits += d.visits;
+        self.nd_branches += d.nd_branches;
+        self.source_branches += d.source_branches;
+        self.source_recursions += d.source_recursions;
+        self.send_kills += d.send_kills;
+        self.slot_kills += d.slot_kills;
+        self.source_kills += d.source_kills;
+        self.done_kills += d.done_kills;
+        self.witnesses += d.witnesses;
+        self.max_depth = self.max_depth.max(d.max_depth);
+        self.wall_time_ms += d.wall_time_ms;
+    }
+}
+
+/// The communication-flat eligibility record (`P4-FLAT` F1), decided on the
+/// precheck's enumeration of `Graphs(Spec)`: `communication_flat` iff every
+/// send and receive of every collected graph is visible (`is_visible`);
+/// `thread_flat` is `flat.tex`'s class — every spawned thread declared, `main`
+/// declared or communicating not at all — recorded, not used; `first_invisible`
+/// the first invisible send or receive in scan order (graphs in completion
+/// order, threads by `ThreadId`, events by index), as a thread name or id and a
+/// position.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlatEligibility {
+    pub communication_flat: bool,
+    pub thread_flat: bool,
+    pub spec_graphs_scanned: usize,
+    pub first_invisible: Option<(String, String)>,
 }
 
 /// Everything one conformance run produced.
@@ -580,6 +880,152 @@ pub struct ConfOutcome {
     pub(crate) triage_enabled: bool,
     /// The random seed this run's engines used (F61).
     pub(crate) seed: u64,
+    /// `P4-ENUMERATOR` criterion 13.
+    pub(crate) counters: ConfCounters,
+    /// `P4-STATEFUL` T6: which engine produced this outcome.
+    pub(crate) engine: Engine,
+    /// `P4-STATEFUL` criterion 8: the stateful engine's own counters; `None`
+    /// on the enumerator.
+    pub(crate) stateful_counters: Option<StatefulCounters>,
+    /// `P4-CFIRST` criterion 9: the complete-first engine's own counters;
+    /// `None` on the other engines.
+    pub(crate) cfirst_counters: Option<CFirstCounters>,
+    /// `P4-GATED` criterion 9: the gated engine's own counters; `None` on the
+    /// other engines.
+    pub(crate) gated_counters: Option<GatedCounters>,
+    /// `P4-FLAT` F6: `Some` whenever `completion_cover = Flat` ran.
+    pub(crate) flat_counters: Option<FlatCounters>,
+    /// `P4-FLAT` F1: `Some` whenever the precheck ran under `Flat`.
+    pub(crate) flat_eligibility: Option<FlatEligibility>,
+}
+
+/// The stateful engine's counters (`P4-STATEFUL` criterion 8), each defined
+/// there. Identities: `lookups = lookups_signature_miss + lookups_containment_tested`;
+/// `lookups_containment_tested = lookups_succeeded + lookups_failed_after_tests`;
+/// `reports = lookups_signature_miss + lookups_failed_after_tests`; `containment_tests ≥ lookups_containment_tested`.
+/// A `SigKey` hit followed by a full-`Sig` miss is a signature miss.
+/// `orders_held` counts after `BTreeSet` deduplication. The index size the plan
+/// calls the point of comparison is `signatures + orders_held`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StatefulCounters {
+    pub spec_graphs: usize,
+    pub impl_graphs: usize,
+    /// `SigKey` hash buckets of the index — coarser than `signatures`.
+    pub sig_key_buckets: usize,
+    /// Full-`Sig` slots of the index.
+    pub signatures: usize,
+    pub orders_held: usize,
+    pub lookups: usize,
+    pub lookups_signature_miss: usize,
+    pub lookups_containment_tested: usize,
+    pub lookups_succeeded: usize,
+    pub lookups_failed_after_tests: usize,
+    pub containment_tests: usize,
+    pub reports: usize,
+    pub spec_wall_time_ms: u128,
+    pub impl_wall_time_ms: u128,
+    /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`];
+    /// computed in this engine's implementation completion sink.
+    pub invisible_ops_of_visible_threads: usize,
+}
+
+/// The counters of one conformance run (`P4-ENUMERATOR` criterion 13; plan
+/// §6). A plain record: every field is public and the struct is `Default`.
+///
+/// **Engine definitions**, since several names are the paper's:
+///
+/// - `gate_*`: invocations of `ConfCtx::gate` (the engine's own measure, not
+///   the paper's per-event Visit), partitioned by return path. `cover_calls`
+///   is the `Cover`-calling bucket.
+/// - `rebuilds_*`: `ln:rebuild` taken (seed attempt `NoCover`, seed not
+///   initial), skipped because the seed was initial, skipped because the seed
+///   attempt was exhausted.
+/// - `spec_visit_*`: `SpecVisit` calls, total and per attempt; a memo hit
+///   counts as a call (it spent its budget unit and probed).
+/// - `distinct_*` and `per_attempt_distinct`: **instrumentation only**
+///   (`SearchOpts::instrument`), zero otherwise — with memo off they would
+///   canonicalise every node and taint the memo-off performance arm. A key is
+///   *met* in an attempt when a probe output with that key is encountered in
+///   it, hits included. `f63_per_attempt_distinct` is F63's own definition: the
+///   `Display` of the graph handed to `probe` (the input), per attempt.
+/// - `explored_complete_keys`: canonical keys of graphs captured at
+///   `Completion` of **unpruned** executions, instrumentation only.
+///   `report_keys` (instrumentation only) are the keys of report graphs, by
+///   gate, so that a consumer can form "explored complete graphs" with the
+///   paper-completeness predicate the engine does not decide for a growing
+///   graph (an implementation probe from it would; criterion 13's caveat). A
+///   `RevisitApply` report graph is keyed as cut by `revisit_view`.
+/// - `max_paper_events_per_execution` is the paper's `L`: the largest number of
+///   paper events (sends, receives, tosses, choices, assertion failures) any
+///   execution installed. `paper_events_at_first_report` counts them in the
+///   first reported graph, not `Report.events`, which counts bookkeeping.
+/// - `wall_time_ms` is the outer run's wall time; peak memory is Part 6's.
+///
+/// **On a result of [`crate::conformance::verify`] every instrumentation field
+/// is zero or empty** — `distinct_keys_run_wide`, `f63_distinct_run_wide`,
+/// `explored_complete_keys`, `report_keys`, and the `distinct_*`/`f63_*` fields
+/// of each [`CoverCounters`]: `run` does not instrument (the flag is
+/// crate-internal, for the differential harness and the tests). The other
+/// counters are always filled on the enumerator; the stateful engine fills only
+/// `executions`, `max_paper_events_per_execution`, `wall_time_ms` and
+/// `invisible_ops_of_visible_threads` (`P4-STATEFUL` T6; `P4-MIXED` M8), the
+/// sweeping engines those and `paper_events_at_first_report` (gated).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ConfCounters {
+    pub gate_invocations: usize,
+    pub gate_skipped_inert: usize,
+    pub gate_skipped_replay: usize,
+    pub gate_skipped_pruned: usize,
+    pub gate_skipped_disabled: usize,
+    pub gate_skipped_aborted: usize,
+    pub cover_calls: usize,
+    pub cover_exhaustions: usize,
+    pub rebuilds_taken: usize,
+    pub rebuilds_skipped_initial_seed: usize,
+    pub rebuilds_skipped_exhausted_seed: usize,
+    pub spec_visit_calls: usize,
+    pub spec_visit_calls_extend: usize,
+    pub spec_visit_calls_rebuild: usize,
+    pub memo_hits: usize,
+    /// Per `Cover` call, in call order.
+    pub per_cover: Vec<CoverCounters>,
+    pub distinct_keys_run_wide: usize,
+    /// F63's run-wide `Display`-keyed count (criterion 14 (i)).
+    pub f63_distinct_run_wide: usize,
+    pub explored_complete_keys: Vec<String>,
+    pub report_keys: Vec<(ReportGate, String)>,
+    pub max_paper_events_per_execution: usize,
+    pub paper_events_at_first_report: Option<usize>,
+    pub executions: usize,
+    pub wall_time_ms: u128,
+    /// `P4-MIXED` M8: the number of sends and receives of declared threads that
+    /// are invisible (an `Invisible` annotation), per unpruned complete graph,
+    /// maximum over the run — 0 on every unannotated program. Filled by all four
+    /// engines (the enumerator at its completion gate; the other three in their
+    /// implementation completion sinks). A receive that blocks is no event and
+    /// is not counted.
+    pub invisible_ops_of_visible_threads: usize,
+}
+
+/// One `Cover` call's counters (`P4-ENUMERATOR` criterion 13).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoverCounters {
+    pub spec_visit_calls: usize,
+    pub spec_visit_calls_extend: usize,
+    pub spec_visit_calls_rebuild: usize,
+    pub memo_hits: usize,
+    pub rebuild_taken: bool,
+    pub rebuild_skipped_initial_seed: bool,
+    pub rebuild_skipped_exhausted_seed: bool,
+    /// Instrumentation only.
+    pub distinct_keys: usize,
+    pub per_attempt_distinct: [usize; 2],
+    pub f63_per_attempt_distinct: [usize; 2],
+    /// Instrumentation only: the run-wide distinct count after this call.
+    pub run_wide_distinct_so_far: usize,
+    /// Instrumentation only: F63's run-wide `Display`-keyed count after this
+    /// call (criterion 14 (i), the across-attempt factor).
+    pub f63_run_wide_distinct_so_far: usize,
 }
 
 impl ConfOutcome {
@@ -656,9 +1102,228 @@ impl ConfOutcome {
             }
             SearchEnd::StoppedAtFirstReport => out.push(NotACertificate::StoppedAtFirstReport),
             SearchEnd::Unknown => out.push(NotACertificate::EndUnknown),
+            // `run` returns `Err(ConfError::SpecNotAssertionSafe)` before it
+            // builds a `ConfOutcome`, so this end never reaches one (gate-1
+            // round 04, m1). An arm rather than a `NotACertificate` variant:
+            // a variant would be a public addition no caller could observe.
+            SearchEnd::SpecNotAssertionSafe => unreachable!(
+                "conformance: a ConfOutcome was built from a run the inner search aborted; \
+                 `run` returns Err(SpecNotAssertionSafe) before building one"
+            ),
         }
         out
     }
+
+    /// `P4-ENUMERATOR` criterion 7: **inconclusive iff some `Cover` ran out of
+    /// budget**. Independent of [`ConfVerdict::Inconclusive`], which also
+    /// covers `MaxIterations` and `StoppedAtFirstReport` runs with no
+    /// exhaustion; a `Reported` run with exhaustions is inconclusive too, in
+    /// this sense, about the graphs its exhausted gates did not settle.
+    pub fn inconclusive(&self) -> bool {
+        !self.exhaustions.is_empty()
+    }
+
+    /// The run's counters (`P4-ENUMERATOR` criterion 13).
+    pub fn counters(&self) -> &ConfCounters {
+        &self.counters
+    }
+
+    /// Which engine produced this outcome (`P4-STATEFUL` T6).
+    pub fn engine(&self) -> Engine {
+        self.engine
+    }
+
+    /// The stateful engine's counters; `None` on the enumerator
+    /// (`P4-STATEFUL` criterion 8).
+    pub fn stateful_counters(&self) -> Option<&StatefulCounters> {
+        self.stateful_counters.as_ref()
+    }
+
+    /// The complete-first engine's counters; `None` on the other engines
+    /// (`P4-CFIRST` criterion 9).
+    pub fn cfirst_counters(&self) -> Option<&CFirstCounters> {
+        self.cfirst_counters.as_ref()
+    }
+
+    /// The gated engine's counters; `None` on the other engines
+    /// (`P4-GATED` criterion 9).
+    pub fn gated_counters(&self) -> Option<&GatedCounters> {
+        self.gated_counters.as_ref()
+    }
+
+    /// `FlatCover`'s counters (`P4-FLAT` F6); `Some` whenever the run's
+    /// `completion_cover` was `Flat`, zero counts allowed.
+    pub fn flat_counters(&self) -> Option<&FlatCounters> {
+        self.flat_counters.as_ref()
+    }
+
+    /// The communication-flat eligibility record (`P4-FLAT` F1); `Some`
+    /// whenever the precheck ran under `completion_cover = Flat`.
+    pub fn flat_eligibility(&self) -> Option<&FlatEligibility> {
+        self.flat_eligibility.as_ref()
+    }
+}
+
+/// `P4-GATED` criterion 9: the gated engine's counters, two families, each
+/// field defined by what it counts. Identities on every run:
+///
+/// - `gates` is the sum of `gates_skipped_certified`, `gates_declined`,
+///   `carried_hits`, `gate_cache_hits` and `gate_sweeps`;
+/// - `gate_sweeps` is the sum of its `successful`, `failing`, `budgeted` and
+///   `aborted` parts;
+/// - `certificates_set` equals `gate_sweeps_failing`;
+/// - `reports` is the sum of `reports_certified` and
+///   `reports_by_completion_test` (exhaustive), and is at most 1 (first-failure);
+/// - `impl_graphs` is the sum of `completion_cache_hits`, `completion_sweeps`
+///   and `reports_certified`;
+/// - `witness_duplicates` is asserted zero by the engine.
+///
+/// **Under `CompletionCover::Flat`** (`P4-FLAT` F6) no completion sweep runs
+/// (`completion_sweeps = 0`), `flat` is `Some`, and: `impl_graphs =
+/// completion_cache_hits + reports_certified + flat.calls` exactly;
+/// `reports_by_completion_test = flat.calls − flat.witnesses`; `reports =
+/// reports_certified + reports_by_completion_test` (exhaustive) unchanged; `flat.calls =
+/// completion_probes − completion_cache_hits`. Gate sweeps are unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GatedCounters {
+    /// The reporting contract the run used (`GatedMode::FirstFailure`).
+    pub first_failure_mode: bool,
+    // ---- the gate family ------------------------------------------------
+    /// Gate-sink calls that fired: a visible fresh send or receive, a forward
+    /// pop of a visible receive, a backward revisit by a visible send.
+    pub gates: usize,
+    /// Gate-sink calls on an invisible event: no gate.
+    pub gates_inert: usize,
+    /// Growing gates the context skipped because the previous execution was
+    /// still being replayed (F49); they never reach the sink.
+    pub gates_skipped_replay: usize,
+    /// Fired gates skipped under a valid certificate.
+    pub gates_skipped_certified: usize,
+    /// Fired gates the policy declined (`Never`).
+    pub gates_declined: usize,
+    /// `cone` tests of the carried witness (`ln:gwit`).
+    pub c1_tests_carried: usize,
+    /// … of which passed.
+    pub carried_hits: usize,
+    /// `cone_from` calls made by `W` probes at gates.
+    pub c1_tests_cache: usize,
+    /// Gates answered by `W`.
+    pub gate_cache_hits: usize,
+    /// Complete specification graphs tested by gate sweeps.
+    pub c1_tests_sweep: usize,
+    pub gate_sweeps: usize,
+    pub gate_sweeps_successful: usize,
+    /// Exhaustive sweeps that found no witness: a certificate.
+    pub gate_sweeps_failing: usize,
+    /// Sweeps stopped by `Budget(B)` with graphs left.
+    pub gate_sweeps_budgeted: usize,
+    /// Sweeps that met a specification assertion failure (the run aborts).
+    pub gate_sweeps_aborted: usize,
+    /// Per gate sweep, in sweep order.
+    pub gate_sweep_sizes: Vec<usize>,
+    /// `= gate_sweeps_failing`.
+    pub certificates_set: usize,
+    /// Certificates dropped at the point of use (`valid_at` false).
+    pub certificate_resets: usize,
+    /// Backward revisits taken (every backward `RevisitApply` call, inert or
+    /// not).
+    pub states_pushed: usize,
+    /// Backward revisits whose **outgoing** state's slot held a certificate —
+    /// an engine fact, not the paper's `ln:greset` reset.
+    pub certified_states_revisited: usize,
+    /// Completions reported under a valid certificate, without a test.
+    pub reports_certified: usize,
+    /// Completions reported by a failed `Covered`.
+    pub reports_by_completion_test: usize,
+    /// Paper events of the first report's graph, if any.
+    pub paper_events_at_first_report: Option<usize>,
+    // ---- the completion family (Part 4's) --------------------------------
+    pub impl_graphs: usize,
+    pub completion_probes: usize,
+    pub completion_cache_hits: usize,
+    pub completion_cache_tests: usize,
+    pub completion_sweeps: usize,
+    pub completion_sweeps_successful: usize,
+    pub completion_sweeps_failing: usize,
+    pub completion_sweeps_aborted: usize,
+    pub completion_sweep_sizes: Vec<usize>,
+    /// `|W|` at the end.
+    pub witnesses: usize,
+    /// Admissions `W` refused as already held — asserted zero by the engine.
+    pub witness_duplicates: usize,
+    /// Every report, of either kind.
+    pub reports: usize,
+    pub precheck_ran: bool,
+    pub precheck_wall_time_ms: u128,
+    /// Includes every sweep's time; excludes the precheck's.
+    pub outer_wall_time_ms: u128,
+    pub sweep_wall_time_ms: u128,
+    /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`];
+    /// computed in this engine's implementation completion sink.
+    pub invisible_ops_of_visible_threads: usize,
+    /// `P4-FLAT` F6: `FlatCover`'s counters, `Some` iff `completion_cover = Flat`.
+    pub(crate) flat: Option<FlatCounters>,
+}
+
+/// `P4-CFIRST` criterion 9: the complete-first engine's counters, each field
+/// defined by what it counts. Identities, on every run: `sweeps =
+/// sweeps_successful + sweeps_failing + sweeps_aborted`; `impl_graphs =
+/// cache_hits + sweeps`; `cache_probes = impl_graphs`; `sweep_graphs =
+/// Σ sweep_sizes`; `witnesses + witness_duplicates = sweeps_successful`, with
+/// `witness_duplicates = 0` asserted by the engine; with the cut off
+/// `reports = sweeps_failing`.
+///
+/// **Under `CompletionCover::Flat`** (`P4-FLAT` F6) no completion sweep runs
+/// (`sweeps = 0`), `flat` is `Some`, and the identities read: `impl_graphs =
+/// cache_hits + flat.calls`; `witnesses + witness_duplicates = flat.witnesses`;
+/// with the cut off `reports = flat.calls − flat.witnesses`; `flat.calls =
+/// cache_probes − cache_hits`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CFirstCounters {
+    /// Outer completions that reached the sink (pruned executions excluded).
+    pub impl_graphs: usize,
+    /// `W` probes — one per completion.
+    pub cache_probes: usize,
+    /// Probes answered by `W`.
+    pub cache_hits: usize,
+    /// `covered` calls made by probes (`covered` short-circuits on a signature
+    /// mismatch, so these are calls, not containment tests).
+    pub cache_tests: usize,
+    pub sweeps: usize,
+    /// Sweeps stopped at a covering witness.
+    pub sweeps_successful: usize,
+    /// Sweeps that exhausted the specification without a witness (a report).
+    pub sweeps_failing: usize,
+    /// Sweeps that met a specification assertion failure (the run aborts).
+    pub sweeps_aborted: usize,
+    /// Complete specification graphs tested, per sweep, in sweep order.
+    pub sweep_sizes: Vec<usize>,
+    /// `Σ sweep_sizes`.
+    pub sweep_graphs: usize,
+    /// `max sweep_sizes`, 0 with no sweep.
+    pub sweep_graphs_max: usize,
+    /// `|W|` at the end.
+    pub witnesses: usize,
+    /// Admissions `W` refused as already held — asserted zero by the engine.
+    pub witness_duplicates: usize,
+    /// Completion reports.
+    pub reports: usize,
+    /// Prefix reports raised by the early-error cut.
+    pub cut_reports: usize,
+    /// Whether the (unbounded) §5.4 precheck ran before the outer run.
+    pub precheck_ran: bool,
+    /// The precheck's wall time; 0 when skipped.
+    pub precheck_wall_time_ms: u128,
+    /// The outer run's wall time, which includes every sweep's
+    /// (`⊇ sweep_wall_time_ms`) and excludes the precheck's.
+    pub outer_wall_time_ms: u128,
+    /// Summed over every sweep (the sweep threads' own time).
+    pub sweep_wall_time_ms: u128,
+    /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`];
+    /// computed in this engine's implementation completion sink.
+    pub invisible_ops_of_visible_threads: usize,
+    /// `P4-FLAT` F6: `FlatCover`'s counters, `Some` iff `completion_cover = Flat`.
+    pub(crate) flat: Option<FlatCounters>,
 }
 
 /// A conformance certificate: the "conforms" case, and the **only** one.
@@ -682,6 +1347,12 @@ impl Certificate {
                 "specification err-freedom was assumed, not checked \
                  (`ConfBuilder::skip_spec_errfree_check(true)`)",
             );
+        }
+        if self.outcome.flat_counters.is_some() {
+            out.push(
+                "eligibility decided from the precheck's enumeration of `Graphs(Spec)` (D12)",
+            );
+            out.push("saturation order-independent under F79's premise");
         }
         out.push("the draft's own lemmas, including the open A4 transport gap");
         out
@@ -787,6 +1458,23 @@ pub enum ConfError {
     /// this — `build` does — but it is the same error channel as far as a
     /// caller using `?` is concerned.
     Config { field: ScopeField },
+    /// `P4-ENUMERATOR` criterion 9: a probe of the specification inside the
+    /// inner search installed a `Block(Assert)`, so the specification is not
+    /// assertion-safe (plan §1) and no verdict means anything. The run is
+    /// aborted at that gate, with no report; `pos` is the event's `Display`,
+    /// per this module's boundary policy.
+    SpecNotAssertionSafe { thread: String, pos: String },
+    /// `P4-FLAT` F5: `completion_cover = Flat` with a knob it cannot run with —
+    /// `skip_spec_errfree_check(true)` (eligibility needs the precheck, D13) or
+    /// `Engine::{Enumerator, Stateful}` — refused before any engine runs.
+    KnobConflict {
+        knob: &'static str,
+        conflicts_with: &'static str,
+    },
+    /// `P4-FLAT` F5: the precheck found a send or receive of the specification
+    /// that is not visible, so `FlatCover` is not exact for it; the first such
+    /// operation in scan order, as a thread name (or id) and a position.
+    SpecNotCommunicationFlat { thread: String, pos: String },
 }
 
 /// How triage failed. **Two origins, and they must not render alike**
@@ -830,9 +1518,13 @@ impl fmt::Display for ConfError {
                 "conformance: the specification is not error-free, so the conformance \
                  question is not well posed (conf-plan.md \u{a7}5.4; CA \u{a7}7's A-candidate 5 \
                  assumes no specification graph contains `err`). No verdict was produced. \
-                 {detail}\nEither fix the specification, or accept the assumption with \
-                 `ConfBuilder::skip_spec_errfree_check(true)`, which records it in the \
-                 verdict."
+                 {detail}\nEither fix the specification, or — on the enumerator — accept \
+                 the assumption with `ConfBuilder::skip_spec_errfree_check(true)`, which \
+                 records it in the verdict. Under `Engine::CompleteFirst` that flag skips \
+                 only the precheck: a sweep that meets a specification assertion failure \
+                 still aborts the run. Under `Engine::Gated`, as under `CompleteFirst`. \
+                 Under `Engine::Stateful` it has no effect and the only remedy is fixing \
+                 the specification."
             ),
             // **It does not "keep its pre-triage form", because the caller has
             // no reports at all**: a triage failure is a run-level failure and
@@ -856,6 +1548,31 @@ impl fmt::Display for ConfError {
                  engine is constructed, which is the guarantee.",
                 field.field_name(),
                 field.reason()
+            ),
+            ConfError::SpecNotAssertionSafe { thread, pos } => write!(
+                f,
+                "conformance: the specification failed an assertion on thread `{thread}` at \
+                 {pos} inside the inner search, so it is not assertion-safe and the \
+                 conformance question is not well posed (IMPL-PLAN-algorithms.md \u{a7}1). \
+                 No verdict was produced and no report list is returned. Fix the \
+                 specification; the \u{a7}5.4 precheck would have found this too unless it \
+                 was skipped (`skip_spec_errfree_check(true)`) or bounded by \
+                 `Config::max_iterations`."
+            ),
+            ConfError::KnobConflict { knob, conflicts_with } => write!(
+                f,
+                "conformance: `ConfBuilder::{knob}` cannot be combined with \
+                 `{conflicts_with}` (P4-FLAT F5): `FlatCover` decides its eligibility on the \
+                 precheck's enumeration of the specification and serves only the \
+                 complete-first and gated engines. No verdict was produced."
+            ),
+            ConfError::SpecNotCommunicationFlat { thread, pos } => write!(
+                f,
+                "conformance: the specification is not communication-flat: thread `{thread}` \
+                 performs a send or receive at {pos} that is not visible, so `FlatCover` \
+                 (thm:flat, cor:mixedflat) is not exact for it and the run was refused \
+                 rather than silently swept. Declare the thread visible, annotate the \
+                 operation, or use `CompletionCover::Sweep`. No verdict was produced."
             ),
         }
     }
@@ -991,6 +1708,24 @@ impl fmt::Display for Diagnostics {
                 "inner-search diagnostics do not apply: this report is a failed assertion, \
                  not a `Cover` answer"
             ),
+            Diagnostics::NotProduced {
+                by: Engine::CompleteFirst,
+            } => write!(
+                f,
+                "the complete-first engine computes no inner-search diagnostics; this report \
+                 is a failed coverage test at completion (lem:sig)"
+            ),
+            Diagnostics::NotProduced { by: Engine::Gated } => write!(
+                f,
+                "the gated engine computes no inner-search diagnostics; this report is an \
+                 absence certificate set at a gate (cor:absence) or a failed coverage test \
+                 at completion (lem:sig)"
+            ),
+            Diagnostics::NotProduced { .. } => write!(
+                f,
+                "the stateful engine computes no inner-search diagnostics; this report is a \
+                 failed signature or containment lookup (lem:sig)"
+            ),
         }
     }
 }
@@ -1056,7 +1791,6 @@ impl fmt::Display for TriageOutcome {
     }
 }
 
-
 impl fmt::Display for ConfExhaustion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -1065,11 +1799,7 @@ impl fmt::Display for ConfExhaustion {
              spent all {} of its nodes without deciding, so it established **nothing** \
              here \u{2014} neither a cover nor its absence. This is not a report and it is not \
              silence. Raise the budget with `{}(n)` (the default is {}) and run again.",
-            self.gate,
-            self.events,
-            self.budget,
-            BUDGET_KNOB,
-            DEFAULT_SEARCH_BUDGET
+            self.gate, self.events, self.budget, BUDGET_KNOB, DEFAULT_SEARCH_BUDGET
         )
     }
 }
@@ -1143,6 +1873,16 @@ impl fmt::Display for ConfReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "  {CANDIDATE_VIOLATION}: {}", self.cause)?;
         writeln!(f, "  raised at: {}", self.gate)?;
+        writeln!(
+            f,
+            "  certifies ({:?}): {}",
+            self.tag,
+            if self.by_flat_cover {
+                self.tag.certifies_flat(self.engine)
+            } else {
+                self.tag.certifies_under(self.engine)
+            }
+        )?;
         writeln!(f, "  implementation graph size: {} events", self.events)?;
         writeln!(f, "  {}", self.diagnostics)?;
         if let Some(t) = &self.triage {
@@ -1181,11 +1921,52 @@ impl fmt::Display for ConfVerdict {
         match self {
             // ---- the certificate -------------------------------------------
             ConfVerdict::Conforms(c) => {
-                writeln!(
-                    f,
-                    "conformance: silence. No candidate violation, no exhausted search \
-                     budget, and the outer loop reached the end of its state space."
-                )?;
+                match c.outcome.engine {
+                    Engine::Enumerator => writeln!(
+                        f,
+                        "conformance: silence. No candidate violation, no exhausted search \
+                         budget, and the outer loop reached the end of its state space."
+                    )?,
+                    // `P4-STATEFUL` T6, line (1).
+                    Engine::Stateful => writeln!(
+                        f,
+                        "conformance: silence. Every complete graph of the implementation is \
+                         covered by one of the specification (thm:stateful), and both \
+                         enumerations reached the end of their state spaces."
+                    )?,
+                    // `P4-CFIRST` C7, line (1).
+                    Engine::CompleteFirst if c.outcome().flat_counters.is_some() => writeln!(
+                        f,
+                        "conformance: silence. Every complete graph of the implementation is \
+                         covered by one of the specification \u{2014} by a cached witness or by \
+                         `FlatCover` (thm:cfirst with thm:flat, cor:mixedflat) \u{2014} and the \
+                         outer exploration reached the end of its state space."
+                    )?,
+                    Engine::CompleteFirst => writeln!(
+                        f,
+                        "conformance: silence. Every complete graph of the implementation is \
+                         covered by one of the specification \u{2014} by a cached witness or by \
+                         a sweep (thm:cfirst) \u{2014} and the outer exploration reached the \
+                         end of its state space."
+                    )?,
+                    // `P4-GATED` G6, line (1): both modes (a silent first-failure
+                    // run coincides with the exhaustive run).
+                    Engine::Gated if c.outcome().flat_counters.is_some() => writeln!(
+                        f,
+                        "conformance: silence. Every complete graph of the implementation is \
+                         covered by one of the specification \u{2014} by a cached witness or by \
+                         `FlatCover` (thm:gated with thm:flat, cor:mixedflat) \u{2014} and the \
+                         outer exploration reached the end of its state space."
+                    )?,
+                    Engine::Gated => writeln!(
+                        f,
+                        "conformance: silence. Every complete graph of the implementation is \
+                         covered by one of the specification \u{2014} by a cached witness or by \
+                         a sweep (thm:gated) \u{2014} and the outer exploration reached the \
+                         end of its state space."
+                    )?,
+                }
+                render_flat(f, c.outcome())?;
                 writeln!(f, "{ONLY_SILENCE_IS_A_VERDICT}")?;
                 writeln!(f, "This run therefore certifies visible-trace refinement of the specification by the implementation, resting on:")?;
                 for a in c.assumptions() {
@@ -1202,9 +1983,62 @@ impl fmt::Display for ConfVerdict {
                     o.reports.len(),
                     CANDIDATE_VIOLATION
                 )?;
-                writeln!(f, "{SETTLED_CLAIM}")?;
-                writeln!(f, "{UNSETTLED_CLAIM}")?;
-                writeln!(f, "{NOT_A_COMPLETE_SET}")?;
+                match o.engine {
+                    Engine::Enumerator => {
+                        writeln!(f, "{SETTLED_CLAIM}")?;
+                        writeln!(f, "{UNSETTLED_CLAIM}")?;
+                        writeln!(f, "{NOT_A_COMPLETE_SET}")?;
+                    }
+                    // `P4-STATEFUL` T6: the always-true lookup sentence, then
+                    // `thm:stateful`'s "exactly" only when its premise holds.
+                    Engine::Stateful => {
+                        writeln!(f, "{STATEFUL_EACH_UNCOVERED}")?;
+                        if o.end == SearchEnd::StateSpaceExhausted {
+                            writeln!(f, "{STATEFUL_EXACTLY_THE_SET}")?;
+                        }
+                    }
+                    // `P4-CFIRST` C7: the always-true sentence (scoped to
+                    // complete graphs), `thm:cfirst`'s "exactly" only when
+                    // the outer run completed *and* no cut fired (A27), and
+                    // the prefix line whenever a cut report is present.
+                    Engine::CompleteFirst => {
+                        let cut_fired = o.reports.iter().any(|r| r.tag == ReportTag::VisibleError);
+                        if o.flat_counters.is_some() {
+                            writeln!(f, "{CFIRST_EACH_UNCOVERED_FLAT}")?;
+                        } else {
+                            writeln!(f, "{CFIRST_EACH_UNCOVERED}")?;
+                        }
+                        if o.end == SearchEnd::StateSpaceExhausted && !cut_fired {
+                            if o.flat_counters.is_some() {
+                                writeln!(f, "{CFIRST_EXACTLY_THE_SET_FLAT}")?;
+                            } else {
+                                writeln!(f, "{CFIRST_EXACTLY_THE_SET}")?;
+                            }
+                        }
+                        if cut_fired {
+                            writeln!(f, "{CFIRST_CUT_PREFIXES}")?;
+                        }
+                    }
+                    // `P4-GATED` G6: first-failure's one sentence, or the
+                    // always-true sentence and `thm:gated`'s "exactly" when the
+                    // outer run completed.
+                    Engine::Gated => {
+                        let first_failure = o
+                            .gated_counters
+                            .as_ref()
+                            .is_some_and(|c| c.first_failure_mode);
+                        let flat = o.flat_counters.is_some();
+                        if first_failure {
+                            writeln!(f, "{}", if flat { GATED_FIRST_FAILURE_FLAT } else { GATED_FIRST_FAILURE })?;
+                        } else {
+                            writeln!(f, "{}", if flat { GATED_EACH_UNCOVERED_FLAT } else { GATED_EACH_UNCOVERED })?;
+                            if o.end == SearchEnd::StateSpaceExhausted {
+                                writeln!(f, "{}", if flat { GATED_EXACTLY_THE_SET_FLAT } else { GATED_EXACTLY_THE_SET })?;
+                            }
+                        }
+                    }
+                }
+                render_flat(f, o)?;
                 writeln!(f, "{RESIDUAL_SOURCES}")?;
                 writeln!(f, "{ONLY_SILENCE_IS_A_VERDICT}")?;
                 render_truncation(f, o)?;
@@ -1225,16 +2059,65 @@ impl fmt::Display for ConfVerdict {
                      and that is not the same thing as silence."
                 )?;
                 writeln!(f, "{ONLY_SILENCE_IS_A_VERDICT}")?;
+                if o.inconclusive() {
+                    writeln!(
+                        f,
+                        "inconclusive: the inner search ran out of budget {} time(s), so the \
+                         gates it exhausted established nothing (ruling 1: an exhaustion is \
+                         never a report).",
+                        o.exhaustions.len()
+                    )?;
+                }
                 writeln!(f, "This run is not a certificate, for these reasons:")?;
                 for r in o.not_a_certificate() {
                     writeln!(f, "  - {r}")?;
                 }
+                render_flat(f, o)?;
                 render_exhaustions(f, o)?;
                 render_notes(f, o)?;
                 render_caveats(f, o)
             }
         }
     }
+}
+
+/// `P4-FLAT` criterion 8: the `Flat` block — nothing at all under `Sweep`, so
+/// every pinned `Sweep` rendering is byte-identical.
+fn render_flat(f: &mut fmt::Formatter<'_>, o: &ConfOutcome) -> fmt::Result {
+    let Some(fc) = o.flat_counters.as_ref() else {
+        return Ok(());
+    };
+    if let Some(e) = o.flat_eligibility.as_ref() {
+        writeln!(
+            f,
+            "the specification is communication-flat: {} graphs scanned",
+            e.spec_graphs_scanned
+        )?;
+    }
+    if !o.reports.is_empty() {
+        writeln!(
+            f,
+            "completion reports not raised under an absence certificate are `FlatCover`'s \
+             \u{22a5} (thm:flat)"
+        )?;
+    }
+    writeln!(
+        f,
+        "FlatCover: {} calls, {} visits, {} witnesses, {} value branches, {} source options \
+         tried ({} recursed), kills send/slot/source/done {}/{}/{}/{}, max depth {}, {} ms",
+        fc.calls,
+        fc.visits,
+        fc.witnesses,
+        fc.nd_branches,
+        fc.source_branches,
+        fc.source_recursions,
+        fc.send_kills,
+        fc.slot_kills,
+        fc.source_kills,
+        fc.done_kills,
+        fc.max_depth,
+        fc.wall_time_ms
+    )
 }
 
 /// **A report list the run stopped early is a shorter list, and nothing said
@@ -1250,6 +2133,21 @@ impl fmt::Display for ConfVerdict {
 fn render_truncation(f: &mut fmt::Formatter<'_>, o: &ConfOutcome) -> fmt::Result {
     match o.end {
         SearchEnd::StateSpaceExhausted => Ok(()),
+        // `P4-GATED` G5/G6 (gate-4 round 01 m5): first-failure mode implies the
+        // stop, so the sentence must not claim the user set the knob.
+        SearchEnd::StoppedAtFirstReport
+            if o.engine == Engine::Gated
+                && o.gated_counters
+                    .as_ref()
+                    .is_some_and(|c| c.first_failure_mode) =>
+        {
+            writeln!(
+                f,
+                "**This list is truncated by configuration.** `GatedMode::FirstFailure` \
+                 implies `stop_at_first_report`, so the search stopped at the report below \
+                 and looked for no others. There may be more; this run did not ask."
+            )
+        }
         SearchEnd::StoppedAtFirstReport => writeln!(
             f,
             "**This list is truncated by configuration.** `stop_at_first_report` was set, \
@@ -1267,6 +2165,10 @@ fn render_truncation(f: &mut fmt::Formatter<'_>, o: &ConfOutcome) -> fmt::Result
             "**This list may be truncated.** Nothing recorded how the outer loop ended, so \
              whether the state space was exhausted is not established."
         ),
+        // Never rendered: see `not_a_certificate`'s arm.
+        SearchEnd::SpecNotAssertionSafe => {
+            unreachable!("conformance: rendering a ConfOutcome from a run the inner search aborted")
+        }
     }
 }
 
@@ -1285,7 +2187,11 @@ fn render_notes(f: &mut fmt::Formatter<'_>, o: &ConfOutcome) -> fmt::Result {
     if o.notes.is_empty() {
         return Ok(());
     }
-    writeln!(f, "\nnotes ({}) \u{2014} none of these is a report:", o.notes.len())?;
+    writeln!(
+        f,
+        "\nnotes ({}) \u{2014} none of these is a report:",
+        o.notes.len()
+    )?;
     for n in &o.notes {
         writeln!(f, "  {n}")?;
     }
@@ -1301,7 +2207,9 @@ fn render_caveats(f: &mut fmt::Formatter<'_>, o: &ConfOutcome) -> fmt::Result {
              can fail an assertion, the problem statement this tool answers does not hold."
         )?;
     }
-    if !o.triage_enabled && !o.reports.is_empty() {
+    // `P4-STATEFUL` T6: triage is ignored by the stateful engine, so the
+    // caveat would advertise a knob that does nothing there.
+    if !o.triage_enabled && !o.reports.is_empty() && o.engine == Engine::Enumerator {
         writeln!(
             f,
             "\ntriage is off (the default). `ConfBuilder::triage(true)` completes each \
@@ -1519,13 +2427,20 @@ pub(crate) fn replay_snapshot(
     }
 }
 
-/// The two gate-disabled engines do not produce reports anyone reads, so they
-/// do not pay for a linearisation. See `ConfCtx::snapshot`.
+/// No gate-disabled mode renders the snapshot its `ConfCtx` would take, so
+/// none of them pays for a linearisation here. Only the precheck and triage
+/// can reach this: their sinks are read for their contents and discarded.
+/// `Collect` and `Enumerate` never take a context snapshot at all — their
+/// `report_visible_error` returns before the reporting branch — and the
+/// stateful engine's rendered reports carry snapshots taken at its completion
+/// sink through [`replay_snapshot`] directly (`P4-STATEFUL` T3). See
+/// `ConfCtx::snapshot`.
 pub(crate) fn replay_not_produced() -> ReplaySnapshot {
     ReplaySnapshot::Unavailable {
         because: "this report was raised on the specification err-freedom precheck or on a \
-                  triage run, whose sink is read for its contents and discarded; only the \
-                  outer run's reports are rendered"
+                  triage run, whose sink is read for its contents and discarded rather \
+                  than rendered; a rendered stateful report takes its snapshot at the \
+                  completion sink instead"
             .to_owned(),
     }
 }
@@ -1540,6 +2455,27 @@ pub(crate) fn build_report(
     replay: ReplaySnapshot,
     diagnostics: Diagnostics,
 ) -> ConfReport {
+    build_report_for(
+        Engine::Enumerator,
+        kind,
+        gate,
+        events,
+        graph,
+        replay,
+        diagnostics,
+    )
+}
+
+/// [`build_report`] for a named engine (`P4-STATEFUL` T6).
+pub(crate) fn build_report_for(
+    engine: Engine,
+    kind: &ReportKind,
+    gate: Option<Gate>,
+    events: usize,
+    graph: &ExecutionGraph,
+    replay: ReplaySnapshot,
+    diagnostics: Diagnostics,
+) -> ConfReport {
     let cause = match kind {
         ReportKind::NoCover => ReportCause::NoCover,
         ReportKind::VisibleError { thread, pos } => ReportCause::VisibleError {
@@ -1547,13 +2483,18 @@ pub(crate) fn build_report(
             pos: pos.to_string(),
         },
     };
+    let gate = ReportGate::of(gate);
+    let tag = ReportTag::of(&cause, gate);
     ConfReport {
-        gate: ReportGate::of(gate),
+        engine,
+        gate,
         cause,
+        tag,
         events,
         dump: graph.to_string(),
         replay,
         diagnostics,
         triage: None,
+        by_flat_cover: false,
     }
 }

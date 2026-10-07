@@ -54,13 +54,7 @@ where
     I: Fn() + Send + Sync + 'static,
     S: Fn() + Send + Sync + 'static,
 {
-    verify_conformance(
-        fifo(),
-        implementation,
-        specification,
-        names(visible),
-        4096,
-    )
+    verify_conformance(fifo(), implementation, specification, names(visible), 4096)
 }
 
 /// A conformance run whose inner search can never answer: every `Cover` call
@@ -123,7 +117,9 @@ fn count(gates: &[Gate], want: Gate) -> usize {
 }
 
 fn stats(out: &Outcome) -> Stats {
-    out.stats.clone().expect("verify_conformance always fills stats")
+    out.stats
+        .clone()
+        .expect("verify_conformance always fills stats")
 }
 
 /// `Report::gate` is `Option<Gate>` since the F-E fix: `None` for a
@@ -213,7 +209,10 @@ fn c1_the_widened_scope_guards_reject_nothing_on_an_ordinary_run() {
         tx.send_msg(1);
         let _ = rx.recv_msg();
     });
-    assert!(s.execs + s.block > 0, "a TotalOrder channel run explored nothing");
+    assert!(
+        s.execs + s.block > 0,
+        "a TotalOrder channel run explored nothing"
+    );
 
     // `Mailbox` consistency, which is the config-level half of the same
     // exclusion.
@@ -257,7 +256,10 @@ fn c1_the_widened_scope_guards_reject_nothing_on_an_ordinary_run() {
             let _ = crate::named_nondet("c");
         },
     );
-    assert!(s.execs + s.block > 0, "a predetermined run explored nothing");
+    assert!(
+        s.execs + s.block > 0,
+        "a predetermined run explored nothing"
+    );
 }
 
 /// §9's config predicate must not fire on a run that never asked for
@@ -550,7 +552,12 @@ fn c11_a_pruned_execution_is_counted_blocked_not_complete() {
         &["main"],
     );
     let s = stats(&out);
-    assert_eq!(out.reports.len(), 1, "expected one report: {:?}", out.reports);
+    assert_eq!(
+        out.reports.len(),
+        1,
+        "expected one report: {:?}",
+        out.reports
+    );
     assert!(is_no_cover(&out.reports[0].kind));
     assert_eq!(s.execs, 0, "a pruned execution was counted complete");
     assert_eq!(s.block, 1, "a pruned execution was not counted blocked");
@@ -638,7 +645,11 @@ fn c11_a_fresh_gate_with_a_running_spawned_thread_does_not_assume_completeness()
         },
         &["main"],
     );
-    assert!(out.reports.is_empty(), "an identical pair reported: {:?}", out.reports);
+    assert!(
+        out.reports.is_empty(),
+        "an identical pair reported: {:?}",
+        out.reports
+    );
 }
 
 /// The completion gate must not fire on an execution the gate already pruned.
@@ -676,7 +687,10 @@ fn c3_a_pruned_graph_never_reaches_status_extraction() {
         s.execs + s.block,
         out.reports
     );
-    assert!(!out.reports.is_empty(), "the non-conforming pair reported nothing");
+    assert!(
+        !out.reports.is_empty(),
+        "the non-conforming pair reported nothing"
+    );
 }
 
 // ===========================================================================
@@ -828,7 +842,12 @@ fn c5_a_visible_threads_failed_assert_reports_and_prunes() {
         || {},
         &["main"],
     );
-    assert_eq!(out.reports.len(), 1, "expected one report: {:?}", out.reports);
+    assert_eq!(
+        out.reports.len(),
+        1,
+        "expected one report: {:?}",
+        out.reports
+    );
     match &out.reports[0].kind {
         ReportKind::VisibleError { thread, .. } => {
             assert_eq!(thread, "main", "the report named the wrong thread")
@@ -1173,10 +1192,13 @@ fn c7_a_predetermined_named_choice_is_refused_at_config_time_not_at_runtime() {
 #[test]
 #[cfg(feature = "symbolic")]
 fn c7_outer_run_rejects_a_symbolic_branch() {
-    assert_outer_guard("`symbolic constraint evaluation` is outside conformance scope", || {
-        let b = crate::symbolic::fresh_bool();
-        let _ = crate::symbolic::eval(b);
-    });
+    assert_outer_guard(
+        "`symbolic constraint evaluation` is outside conformance scope",
+        || {
+            let b = crate::symbolic::fresh_bool();
+            let _ = crate::symbolic::eval(b);
+        },
+    );
 }
 
 /// Monitor registration, the seventh runtime guard.
@@ -1197,12 +1219,15 @@ fn no_accept(_: ThreadId, _: ThreadId, _: crate::Val) -> bool {
 
 #[test]
 fn c7_outer_run_rejects_monitor_registration() {
-    assert_outer_guard("`monitor registration` is outside conformance scope", || {
-        let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
-            std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
-        let _: crate::thread::JoinHandle<u64> =
-            crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
-    });
+    assert_outer_guard(
+        "`monitor registration` is outside conformance scope",
+        || {
+            let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
+                std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
+            let _: crate::thread::JoinHandle<u64> =
+                crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
+        },
+    );
 }
 
 // ===========================================================================
@@ -1621,7 +1646,11 @@ fn c14_a_stale_carried_h_changes_no_verdict() {
         "a revisit-heavy program did not refine itself: {:?}",
         out.reports
     );
-    assert!(out.exhaustions.is_empty(), "budget ran out: {:?}", out.exhaustions);
+    assert!(
+        out.exhaustions.is_empty(),
+        "budget ran out: {:?}",
+        out.exhaustions
+    );
     let s = stats(&out);
     assert!(
         s.execs + s.block >= 3,
@@ -1757,7 +1786,6 @@ fn c4_a_prune_stops_the_execution_it_prunes() {
     );
 }
 
-
 // ---------------------------------------------------------------------------
 // §11.8's other engine. `prober.rs` and `adversarial.rs` already cover the
 // `TotalOrder` send and receive, symbolic evaluation and symmetric spawning on
@@ -1803,12 +1831,15 @@ fn c6_probe_engine_rejects_sample() {
 
 #[test]
 fn c6_probe_engine_rejects_monitor_registration() {
-    assert_probe_guard("`monitor registration` is outside conformance scope", || {
-        let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
-            std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
-        let _: crate::thread::JoinHandle<u64> =
-            crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
-    });
+    assert_probe_guard(
+        "`monitor registration` is outside conformance scope",
+        || {
+            let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
+                std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
+            let _: crate::thread::JoinHandle<u64> =
+                crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
+        },
+    );
 }
 
 /// A declared visible name the **implementation** never spawns must not be
@@ -1844,7 +1875,8 @@ fn c9_a_never_spawned_visible_name_is_not_blamed_on_the_specification() {
             &["main", "w"],
         );
     });
-    let message = message.expect("a declared visible name the implementation never spawned was accepted");
+    let message =
+        message.expect("a declared visible name the implementation never spawned was accepted");
     println!("got: {message}");
     assert!(
         !message.contains("the specification program is not a valid input"),
@@ -2006,13 +2038,15 @@ fn o6_an_abandoned_backward_revisit_leaves_a_shallower_alternative_intact() {
         report_gates(&out)
     );
     assert_eq!(
-        s.execs, 1,
+        s.execs,
+        1,
         "the non-sending branch, reachable only through a coin flip queued at a shallower \
          stamp than both prunes, did not run to completion. Reports: {:?}",
         report_gates(&out)
     );
     assert_eq!(
-        s.block, 1,
+        s.block,
+        1,
         "expected exactly the sending branch to end blocked. Reports: {:?}",
         report_gates(&out)
     );
@@ -2136,7 +2170,8 @@ fn c9_a_never_spawned_visible_name_in_the_specification_is_blamed_on_the_specifi
             &["main", "w"],
         );
     });
-    let message = message.expect("a declared visible name the specification never spawned was accepted");
+    let message =
+        message.expect("a declared visible name the specification never spawned was accepted");
     println!("got: {message}");
     assert!(
         message.contains("the specification program is not a valid input"),
@@ -2174,7 +2209,8 @@ fn c9_an_ambiguous_name_in_the_specification_is_blamed_on_the_specification() {
             &["main", "w"],
         );
     });
-    let message = message.expect("two specification threads sharing a declared visible name were accepted");
+    let message =
+        message.expect("two specification threads sharing a declared visible name were accepted");
     println!("got: {message}");
     assert!(
         message.contains("the specification program is not a valid input"),
@@ -2359,8 +2395,10 @@ fn b1_two_failing_visible_asserts_are_not_program_nondeterminism() {
     // while the report carried the declared visible name, so the same thread
     // came out as `main` in one and `main-thread-ThreadId(N)` in the other —
     // breaking exactly the join S5 needs to pair a prune with what followed it.
-    let ReportKind::VisibleError { thread: reported, pos: reported_pos } =
-        &out.reports[0].kind
+    let ReportKind::VisibleError {
+        thread: reported,
+        pos: reported_pos,
+    } = &out.reports[0].kind
     else {
         unreachable!("checked just above")
     };
@@ -2416,8 +2454,10 @@ fn b1_every_failure_after_a_prune_is_recorded() {
 
     // Every diagnostic joins to the report, and the three failing statements
     // stay distinguishable from one another.
-    let ReportKind::VisibleError { thread: reported, pos: reported_pos } =
-        &out.reports[0].kind
+    let ReportKind::VisibleError {
+        thread: reported,
+        pos: reported_pos,
+    } = &out.reports[0].kind
     else {
         panic!("{:?}", out.reports[0])
     };
@@ -2535,12 +2575,15 @@ fn c6_a_specification_using_sample_is_refused_through_verify_conformance() {
 
 #[test]
 fn c6_a_specification_using_a_total_order_send_is_refused_through_verify_conformance() {
-    assert_spec_guard("`a TotalOrder (mailbox) send` is outside conformance scope", || {
-        let (tx, _rx) = crate::channel::Builder::<i32>::new()
-            .with_comm(crate::CommunicationModel::TotalOrder)
-            .build();
-        tx.send_msg(1);
-    });
+    assert_spec_guard(
+        "`a TotalOrder (mailbox) send` is outside conformance scope",
+        || {
+            let (tx, _rx) = crate::channel::Builder::<i32>::new()
+                .with_comm(crate::CommunicationModel::TotalOrder)
+                .build();
+            tx.send_msg(1);
+        },
+    );
 }
 
 #[test]
@@ -2558,21 +2601,27 @@ fn c6_a_specification_using_a_total_order_receive_is_refused_through_verify_conf
 
 #[test]
 fn c6_a_specification_spawning_symmetrically_is_refused_through_verify_conformance() {
-    assert_spec_guard("`symmetric thread spawning` is outside conformance scope", || {
-        let m = main_thread_id();
-        let a = thread::spawn(move || crate::send_msg(m, 1u64));
-        let _ = crate::spawn_symmetric(move || crate::send_msg(m, 1u64), a.thread().id());
-    });
+    assert_spec_guard(
+        "`symmetric thread spawning` is outside conformance scope",
+        || {
+            let m = main_thread_id();
+            let a = thread::spawn(move || crate::send_msg(m, 1u64));
+            let _ = crate::spawn_symmetric(move || crate::send_msg(m, 1u64), a.thread().id());
+        },
+    );
 }
 
 #[test]
 fn c6_a_specification_registering_a_monitor_is_refused_through_verify_conformance() {
-    assert_spec_guard("`monitor registration` is outside conformance scope", || {
-        let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
-            std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
-        let _: crate::thread::JoinHandle<u64> =
-            crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
-    });
+    assert_spec_guard(
+        "`monitor registration` is outside conformance scope",
+        || {
+            let m: std::sync::Arc<std::sync::Mutex<dyn crate::monitor_types::Monitor>> =
+                std::sync::Arc::new(std::sync::Mutex::new(NoopMonitor));
+            let _: crate::thread::JoinHandle<u64> =
+                crate::spawn_monitor(|| 0u64, no_create, no_accept, m);
+        },
+    );
 }
 
 #[test]
@@ -2600,32 +2649,59 @@ fn c9_main_is_banned_as_a_builder_name_in_the_specification() {
 ///
 /// Not a §9 rejection but the same boundary question, and the one the reviewer's
 /// M1 was actually about: before the worker forwarded payloads this arrived as
-/// "the probe worker died mid-search: RecvError".
+/// "the probe worker died mid-search: RecvError". Since `P4-ENUMERATOR`
+/// criterion 9 it arrives as itself **without a panic**: the probe suspends the
+/// asserting thread, the inner search aborts the run, and the engine-only
+/// `Outcome` carries `spec_error` with no report and the new end; `verify`
+/// (precheck skipped, so the inner search is what meets it) returns
+/// `ConfError::SpecNotAssertionSafe`. This is the second flip criterion 15
+/// names (lead finding L1); rewritten by the P4 tester. `main`'s labels are
+/// `Begin`, `TCreate(w)`, the send, then the block at index 3.
 #[test]
 fn c6_a_specification_assertion_failure_reaches_the_caller_intact() {
+    let specification = || {
+        let w = named("w", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        crate::send_msg(w, 1u64);
+        crate::assert(false);
+    };
+    let implementation = || {
+        let w = named("w", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        crate::send_msg(w, 1u64);
+    };
+    let at = Event::new(main_thread_id(), 3);
+    let mut outcome = None;
     let message = panic_message(|| {
-        let _ = conf(
-            || {
-                let w = named("w", || {
-                    let _: u64 = crate::recv_msg_block();
-                });
-                crate::send_msg(w, 1u64);
-            },
-            || {
-                let w = named("w", || {
-                    let _: u64 = crate::recv_msg_block();
-                });
-                crate::send_msg(w, 1u64);
-                crate::assert(false);
-            },
-            &["main"],
-        );
+        outcome = Some(conf(implementation, specification, &["main"]));
     });
-    let message = message.expect("a specification that fails an assertion was accepted");
-    println!("got: {message}");
-    assert!(
-        !message.contains("the probe worker died"),
-        "a specification-side failure was reported as a channel error: `{message}`"
+    assert_eq!(message, None, "a specification-side assertion still panics");
+    let outcome = outcome.expect("the run returned no outcome");
+    assert_eq!(outcome.spec_error, Some(("main".to_owned(), at)));
+    assert!(outcome.reports.is_empty(), "{:?}", outcome.reports);
+    assert_eq!(
+        outcome.end,
+        crate::conformance::SearchEnd::SpecNotAssertionSafe
+    );
+
+    let verdict = crate::conformance::verify(
+        crate::conformance::ConfBuilder::new()
+            .config(fifo())
+            .visible_threads(["main"])
+            .skip_spec_errfree_check(true)
+            .build()
+            .unwrap(),
+        implementation,
+        specification,
+    );
+    assert_eq!(
+        verdict.err(),
+        Some(crate::conformance::ConfError::SpecNotAssertionSafe {
+            thread: "main".to_owned(),
+            pos: at.to_string(),
+        })
     );
 }
 
@@ -2909,7 +2985,13 @@ fn two_branching_visibles() {
 /// completion gate. Stated rather than claimed both ways.
 #[test]
 fn the_completion_gate_is_never_skipped_by_the_replay_guard() {
-    let out = verify_conformance(fifo(), two_branching_visibles, || {}, names(&["p0", "p1"]), 0);
+    let out = verify_conformance(
+        fifo(),
+        two_branching_visibles,
+        || {},
+        names(&["p0", "p1"]),
+        0,
+    );
     assert!(
         out.reports.is_empty(),
         "a zero budget established nothing, so it must report nothing: {:?}",
@@ -2937,7 +3019,10 @@ fn the_completion_gate_is_never_skipped_by_the_replay_guard() {
     // knowingly short. Only the `Completion` column above is complete, and it
     // is the only one asserted on.
     assert!(
-        count(&out.exhaustions.iter().map(|e| e.gate).collect::<Vec<_>>(), Gate::FreshSend) > 0,
+        count(
+            &out.exhaustions.iter().map(|e| e.gate).collect::<Vec<_>>(),
+            Gate::FreshSend
+        ) > 0,
         "no fresh-add gate reached `cover`, so this program does not exercise the skip"
     );
     assert!(
@@ -3044,11 +3129,7 @@ fn two_workers() {
 #[test]
 fn the_inert_counter_conserves_the_gate_call_count() {
     let all = gates_called(two_workers, &["main", "w1", "w2"]);
-    for narrower in [
-        &["main", "w1"][..],
-        &["main"][..],
-        &["w1"][..],
-    ] {
+    for narrower in [&["main", "w1"][..], &["main"][..], &["w1"][..]] {
         assert_eq!(
             gates_called(two_workers, narrower),
             all,
@@ -3059,13 +3140,7 @@ fn the_inert_counter_conserves_the_gate_call_count() {
         );
     }
 
-    let out = verify_conformance(
-        fifo(),
-        two_workers,
-        || {},
-        names(&["main", "w1", "w2"]),
-        0,
-    );
+    let out = verify_conformance(fifo(), two_workers, || {}, names(&["main", "w1", "w2"]), 0);
     assert_eq!(
         out.inert_gates, 0,
         "every thread is declared visible, so every fresh event contributes an \
@@ -3135,7 +3210,11 @@ fn no_visible_threads_fresh_event_is_inert() {
     }
 
     for (name, p, vis) in [
-        ("two_workers", two_workers as fn(), &["main", "w1", "w2"][..]),
+        (
+            "two_workers",
+            two_workers as fn(),
+            &["main", "w1", "w2"][..],
+        ),
         (
             "blocks_forever",
             a_visible_thread_blocks_forever as fn(),

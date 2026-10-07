@@ -156,7 +156,7 @@ fn matched_pairs(spec: &Wobs, imp: &Wobs, visible: &[String]) -> Vec<(Event, Eve
 /// draft's theorems are proved in a model that has no such events, and that
 /// transport is unwritten. Recorded as `backlog/algorithm-issues.md` A7, with
 /// the owner's ruling outstanding.
-fn vo(graph: &ExecutionGraph, a: Event, b: Event) -> bool {
+pub(crate) fn vo(graph: &ExecutionGraph, a: Event, b: Event) -> bool {
     a != b && graph.in_porf(a, b)
 }
 

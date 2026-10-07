@@ -39,17 +39,14 @@
 //! gone because the measurements exist.
 
 use crate::conformance::{verify, ConfBuilder, ConfVerdict};
-use crate::{recv_msg_block, send_msg, thread, ConsType, Config};
+use crate::{recv_msg_block, send_msg, thread, Config, ConsType};
 
 fn cfg() -> Config {
     Config::builder().with_cons_type(ConsType::FIFO).build()
 }
 
 fn named<F: FnOnce() + Send + 'static>(n: &str, f: F) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name(n.to_string())
-        .spawn(f)
-        .unwrap()
+    thread::Builder::new().name(n.to_string()).spawn(f).unwrap()
 }
 
 fn conf(visible: &[&str]) -> crate::conformance::ConfConfig {
@@ -68,7 +65,7 @@ fn conf(visible: &[&str]) -> crate::conformance::ConfConfig {
 // ---------------------------------------------------------------------------
 
 /// `P₂`: `A` sends to an invisible relay `R`, which forwards to `C`.
-fn p2_relay() {
+pub(super) fn p2_relay() {
     let c = named("c", || {
         let _v: i32 = recv_msg_block();
     });
@@ -81,7 +78,7 @@ fn p2_relay() {
 }
 
 /// `P₁`: `A` sends straight to `C`.
-fn p1_direct() {
+pub(super) fn p1_direct() {
     let c = named("c", || {
         let _v: i32 = recv_msg_block();
     });

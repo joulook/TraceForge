@@ -3,9 +3,9 @@ use crate::cons::Consistency;
 use crate::event::Event;
 use crate::exec_graph::{ExecutionGraph, RecvLike};
 use crate::exec_pool::ExecutionPool;
-use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::future::PollerMsg;
 use crate::loc::{CommunicationModel, Loc, WakeMsg};
+use crate::revisit::{Revisit, RevisitEnum, RevisitPlacement};
 use crate::runtime::failure::init_panic_hook;
 use crate::runtime::task::TaskId;
 use crate::telemetry::{Recorder, Telemetry};
@@ -61,6 +61,13 @@ type StateStack = Vec<MustState>;
 pub struct MustState {
     graph: ExecutionGraph,
     rqueue: RQueue,
+    /// `P4-GATED` G2: the gated checker's carried pair ⟨M, c⟩, one slot per
+    /// state. It moves with the state through `push_state`/`try_pop_state`
+    /// (a revisited execution starts from a fresh default — the paper's
+    /// `ln:greset`), is shared by the state's forward pops, and is validated
+    /// at the point of use. Not serialized; copied by `Clone` (snapshots).
+    #[serde(skip)]
+    pub(crate) conf_carry: std::cell::RefCell<crate::conformance::gated::Carry>,
 }
 
 impl MustState {
@@ -68,6 +75,7 @@ impl MustState {
         Self {
             graph: ExecutionGraph::new(),
             rqueue: RQueue::new(),
+            conf_carry: Default::default(),
         }
     }
 }
@@ -160,6 +168,12 @@ pub(crate) struct Must {
     // and an inline `Option<ConfCtx>` would grow `Must` by that much for
     // every existing TraceForge user.
     conf: Option<Box<crate::conformance::ctx::ConfCtx>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `P4-MIXED` M6: executions begun on this thread (see `begin_execution`).
+    pub(crate) static EXECUTIONS_BEGUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Must {
@@ -516,6 +530,11 @@ impl Must {
     }
 
     pub(crate) fn begin_execution(must: &Rc<RefCell<Must>>) {
+        // `P4-MIXED` M6: the one entry every execution path takes (`explore`,
+        // `explore_with_pool`, the pool workers, `parallel_verify`, the
+        // prober, `testing::run_once`), counted for the no-replay test.
+        #[cfg(test)]
+        EXECUTIONS_BEGUN.with(|c| c.set(c.get() + 1));
         let mut must = must.borrow_mut();
         #[cfg(feature = "symbolic")]
         must.symbolic_solver.reset();
@@ -675,7 +694,11 @@ impl Must {
 
         // Remaining entries become saved states (moved, not cloned)
         for (graph, rqueue) in stack {
-            self.states.push(MustState { graph, rqueue });
+            self.states.push(MustState {
+                graph,
+                rqueue,
+                ..Default::default()
+            });
         }
     }
 
@@ -803,9 +826,9 @@ impl Must {
             // something else — a `Block` — if a blocked thread had been
             // rescheduled past its blocked index, which the `Block` arm of
             // `is_thread_runnable` exists to prevent.
-            let rlab = g
-                .recv_label(pos)
-                .expect("replay installed a receive here; a Block would mean a blocked thread ran on");
+            let rlab = g.recv_label(pos).expect(
+                "replay installed a receive here; a Block would mean a blocked thread ran on",
+            );
             if let Some(send_pos) = rlab.rf() {
                 let slab = g.send_label(send_pos).unwrap();
                 if let Some(reader) = slab.reader() {
@@ -860,6 +883,19 @@ impl Must {
             return (g.val_copy(pos), g.get_receiving_index(rlab));
         }
         info!("| Handle Mode for {}", rlab);
+
+        // `P4-MIXED` M4, site (i); see `handle_send`.
+        if let Some(conf) = self.conf.as_ref() {
+            if let Err(e) = crate::conformance::obs::check_annotation_at(
+                &self.current.graph,
+                rlab.pos(),
+                rlab.annotation(),
+                conf.visible(),
+                conf.mode().engine_label(),
+            ) {
+                panic!("conformance: {e}");
+            }
+        }
 
         if self.probe_active() {
             // Probe: a receive is only a choice point if it is *enabled*. The
@@ -989,6 +1025,21 @@ impl Must {
         }
         info!("| Handle Mode for {}", slab);
 
+        // `P4-MIXED` M4, site (i): the well-formedness check at append, under
+        // conformance only (a probe `Must` has `conf = None`; the inner search
+        // checks its offers itself, site (ii) in `search.rs`).
+        if let Some(conf) = self.conf.as_ref() {
+            if let Err(e) = crate::conformance::obs::check_annotation_at(
+                &self.current.graph,
+                slab.pos(),
+                slab.annotation(),
+                conf.visible(),
+                conf.mode().engine_label(),
+            ) {
+                panic!("conformance: {e}");
+            }
+        }
+
         if self.probe_active() {
             // Probe: record what this send would be and park the thread. The
             // returned vector is a placeholder; the API layer suspends the
@@ -1034,7 +1085,7 @@ impl Must {
         //
         // The replay branch returned far above, so a replayed send never
         // reaches here — one logical event, one gate call.
-        self.conf_gate(crate::conformance::ctx::Gate::FreshSend);
+        self.conf_gate_at(crate::conformance::ctx::Gate::FreshSend, Some(pos));
 
         // stuck is only used during replay
         assert!(stuck.is_empty());
@@ -1056,12 +1107,20 @@ impl Must {
 
     /// Returns the filtered_origination_vec for the given thread.
     pub(crate) fn thread_filtered_origination_vec_from_tid(&self, tid: ThreadId) -> Vec<u32> {
-        self.current.graph.get_thread_tclab(tid).filtered_origination_vec()
+        self.current
+            .graph
+            .get_thread_tclab(tid)
+            .filtered_origination_vec()
     }
 
     /// Counts the number of TCreate events in the given thread up to and including
     /// the specified event index, excluding those whose names contain the filter pattern.
-    fn count_filtered_tcreate_events(&self, thread: ThreadId, up_to_index: u32, filter_pattern: &str) -> u32 {
+    fn count_filtered_tcreate_events(
+        &self,
+        thread: ThreadId,
+        up_to_index: u32,
+        filter_pattern: &str,
+    ) -> u32 {
         let mut count = 0;
         let thread_size = self.current.graph.thread_size(thread) as u32;
 
@@ -1141,11 +1200,19 @@ impl Must {
         let filtered_count = self.count_filtered_tcreate_events(
             pos.thread,
             pos.index,
-            crate::FILTERED_THREAD_NAME_PATTERN
+            crate::FILTERED_THREAD_NAME_PATTERN,
         );
         filtered_origination_vec.push(filtered_count);
 
-        let tclab = TCreate::new(pos, tid, name, is_daemon, sym_cid, origination_vec, filtered_origination_vec);
+        let tclab = TCreate::new(
+            pos,
+            tid,
+            name,
+            is_daemon,
+            sym_cid,
+            origination_vec,
+            filtered_origination_vec,
+        );
 
         if self.is_replay(pos) {
             info!("| Replay Mode for {}", tclab);
@@ -1560,15 +1627,27 @@ impl Must {
             });
         }
 
-        let next = match self.config.schedule_policy {
-            SchedulePolicy::LTR => runnable
+        // A conformance run or a probe picks by the selector (`P4-SELECTOR`
+        // S1), a pure function of the graph over the `is_thread_runnable`
+        // survivors; everything else is today's policy path, untouched.
+        let next = if self.uses_selector() {
+            let candidates: Vec<TaskId> = runnable
                 .iter()
-                .find(|(t, i)| self.is_thread_runnable(t, i))
-                .map(|(t, _)| t.to_owned()),
-            SchedulePolicy::Arbitrary => runnable
-                .sample(&mut self.rng, runnable.len())
-                .find(|(t, i)| self.is_thread_runnable(t, i))
-                .map(|(t, _)| t.to_owned()),
+                .filter(|(t, i)| self.is_thread_runnable(t, i))
+                .map(|(t, _)| t.to_owned())
+                .collect();
+            self.config.selector.pick(&self.current.graph, &candidates)
+        } else {
+            match self.config.schedule_policy {
+                SchedulePolicy::LTR => runnable
+                    .iter()
+                    .find(|(t, i)| self.is_thread_runnable(t, i))
+                    .map(|(t, _)| t.to_owned()),
+                SchedulePolicy::Arbitrary => runnable
+                    .sample(&mut self.rng, runnable.len())
+                    .find(|(t, i)| self.is_thread_runnable(t, i))
+                    .map(|(t, _)| t.to_owned()),
+            }
         };
         if next.is_some() {
             return next;
@@ -1640,7 +1719,20 @@ impl Must {
             .iter()
             .for_each(|task| self.current.graph.remove_last(self.to_thread_id(task.0)));
 
+        // The second selector site (`P4-SELECTOR` S1): among the waiters whose
+        // `Block` was just removed, the selector decides which installs first.
+        if self.uses_selector() {
+            let candidates: Vec<TaskId> = blocked.iter().map(|(t, _)| t.to_owned()).collect();
+            return self.config.selector.pick(&self.current.graph, &candidates);
+        }
         blocked.first().map(|(t, _)| t.to_owned())
+    }
+
+    /// `P4-SELECTOR` S1's predicate: the selector is consulted by a conformance
+    /// run (outer, `Collect`, precheck, triage, sweep) or a probe, and by
+    /// nothing else — plain `verify` and replay keep today's scheduling.
+    fn uses_selector(&self) -> bool {
+        self.conf.is_some() || self.probe.is_some()
     }
 
     fn is_waiting_on_written(&self, t: ThreadId) -> bool {
@@ -1718,16 +1810,28 @@ impl Must {
     /// live on `self`. Taking it also means a gate cannot re-enter itself —
     /// during the call `self.conf` is `None`, so any nested hook is inert.
     fn conf_gate(&mut self, gate: crate::conformance::ctx::Gate) {
-        use crate::conformance::ctx::GateOutcome;
+        self.conf_gate_at(gate, None)
+    }
+
+    /// `conf_gate` with the installed position, for the gated checker's gate
+    /// sink (`P4-GATED` G1): the fresh gates pass the event they installed.
+    fn conf_gate_at(&mut self, gate: crate::conformance::ctx::Gate, at: Option<Event>) {
+        use crate::conformance::ctx::{GateAt, GateOutcome};
         let Some(mut ctx) = self.conf.take() else {
             return;
         };
+        let site = at.map(|at| GateAt {
+            at,
+            revisit: None,
+            source: None,
+            outgoing_carry: None,
+        });
         // The `MustState` goes with the graph, because §7.1's serialized half
         // is `ReplayInformation::create(sorted_graph, state, config)` and the
         // state is what the engine itself passes at `must.rs:702`. It is
         // borrowed here and cloned only on the reporting path, so a run that
         // reports nothing pays nothing for it (S5, blocked item **H**).
-        let outcome = ctx.gate(gate, &self.current.graph, &self.current);
+        let outcome = ctx.gate_at(gate, site, &self.current.graph, &self.current);
         self.conf = Some(ctx);
         if outcome == GateOutcome::Prune {
             self.conf_prune();
@@ -1746,6 +1850,13 @@ impl Must {
     /// answers `false` through an `Option` test and nothing else.
     pub(crate) fn conf_stop_requested(&self) -> bool {
         self.conf.as_ref().is_some_and(|c| c.stop_requested())
+    }
+
+    /// `P4-GATED` G1: does this context end the run at `try_revisit`'s head
+    /// once a stop is requested (true only for the gated checker's outer run;
+    /// the closed engines are unchanged — F81)?
+    pub(crate) fn conf_stops_revisits(&self) -> bool {
+        self.conf.as_ref().is_some_and(|c| c.stops_revisits())
     }
 
     /// Record why the outer loop stopped (blocked item **B**: "the search
@@ -1878,7 +1989,8 @@ impl Must {
         // `top_sort(Some(pos))` well defined for this report (§7.1's
         // serialized half; see `report::ReplaySnapshot`). That ordering is
         // load-bearing and is asserted in `s5_tests`.
-        let outcome = ctx.report_visible_error(name, pos, events, &self.current, &self.current.graph);
+        let outcome =
+            ctx.report_visible_error(name, pos, events, &self.current, &self.current.graph);
         self.conf = Some(ctx);
         if outcome == crate::conformance::ctx::GateOutcome::Prune {
             self.conf_prune();
@@ -1962,7 +2074,8 @@ impl Must {
         // The borrow is taken and released per statement, as everything else
         // in this function does: nothing may be held across
         // `call_on_stop_on_monitors`.
-        must.borrow_mut().conf_gate(crate::conformance::ctx::Gate::Completion);
+        must.borrow_mut()
+            .conf_gate(crate::conformance::ctx::Gate::Completion);
         let maybe_block = must.borrow_mut().check_blocked();
         let exceeded_max_executions = must.borrow_mut().record_ending_telemetry(&maybe_block);
 
@@ -2052,7 +2165,13 @@ impl Must {
         if maybe_block.is_some() {
             if self.is_consistent() {
                 self.telemetry.counter(BLOCKED.to_owned()); // increment BLOCKED
-                let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
+                let event_count: usize = self
+                    .current
+                    .graph
+                    .threads
+                    .iter()
+                    .map(|t| t.labels.len())
+                    .sum();
                 if event_count > self.max_graph_events {
                     self.max_graph_events = event_count;
                 }
@@ -2064,7 +2183,13 @@ impl Must {
             }
         } else if self.is_consistent() {
             self.telemetry.counter(EXECS.to_owned()); // increment EXECS
-            let event_count: usize = self.current.graph.threads.iter().map(|t| t.labels.len()).sum();
+            let event_count: usize = self
+                .current
+                .graph
+                .threads
+                .iter()
+                .map(|t| t.labels.len())
+                .sum();
             if event_count > self.max_graph_events {
                 self.max_graph_events = event_count;
             }
@@ -2249,7 +2374,7 @@ impl Must {
             self.current.graph.change_rf(pos, None);
             // §4.1's fresh-add gate for a receive, ⊥ case: the receive is
             // installed and reads nothing.
-            self.conf_gate(crate::conformance::ctx::Gate::FreshRecv);
+            self.conf_gate_at(crate::conformance::ctx::Gate::FreshRecv, Some(pos));
             return self.current.graph.val_copy(pos);
         }
 
@@ -2302,7 +2427,7 @@ impl Must {
             // `porf`. The day anything downstream does, §7.3's triage being
             // the obvious candidate, this gate hands it a graph missing the
             // receive it just gated. Recorded for S5 rather than moved now.
-            self.conf_gate(crate::conformance::ctx::Gate::FreshRecv);
+            self.conf_gate_at(crate::conformance::ctx::Gate::FreshRecv, Some(pos));
             self.current.graph.val_copy(pos)
         } else {
             // Overwrites RecvMsg
@@ -2788,7 +2913,17 @@ impl Must {
 
     pub(crate) fn try_revisit(&mut self) -> bool {
         loop {
-            debug!("Finished execution with current rqueue {:?}", self.current.rqueue.clone());
+            // `P4-GATED` G1: a gate report or abort at `RevisitApply` must end
+            // the run here — `complete_execution`'s own stop test has already
+            // passed, and its `!more` branch would record exhaustion.
+            if self.conf_stop_requested() && self.conf_stops_revisits() {
+                self.conf_record_end(crate::conformance::report::SearchEnd::StoppedAtFirstReport);
+                return false;
+            }
+            debug!(
+                "Finished execution with current rqueue {:?}",
+                self.current.rqueue.clone()
+            );
             if self.current.rqueue.is_empty() {
                 if self.try_pop_state() {
                     continue;
@@ -2900,8 +3035,31 @@ impl Must {
                 let Some(mut ctx) = self.conf.take() else {
                     return false;
                 };
-                let outcome = ctx.gate(
+                // `P4-GATED` G1: the gate sink needs the popped position, the
+                // revisit kind, the new source and, for a backward pop, the
+                // outgoing state's carried pair (the state `backward_revisit`
+                // just pushed).
+                let source = match rev.rev() {
+                    RevisitPlacement::Default(s) => Some(*s),
+                    RevisitPlacement::Inbox(_) => None,
+                };
+                let site = match rev {
+                    RevisitEnum::ForwardRevisit(_) => crate::conformance::ctx::GateAt {
+                        at: pos,
+                        revisit: Some(crate::conformance::ctx::RevisitKind::Forward),
+                        source,
+                        outgoing_carry: None,
+                    },
+                    RevisitEnum::BackwardRevisit(_) => crate::conformance::ctx::GateAt {
+                        at: pos,
+                        revisit: Some(crate::conformance::ctx::RevisitKind::Backward),
+                        source,
+                        outgoing_carry: self.states.last().map(|st| st.conf_carry.borrow().clone()),
+                    },
+                };
+                let outcome = ctx.gate_at(
                     crate::conformance::ctx::Gate::RevisitApply,
+                    Some(site),
                     &self.current.graph,
                     &self.current,
                 );

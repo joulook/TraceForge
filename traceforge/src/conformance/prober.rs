@@ -72,6 +72,11 @@ pub(crate) fn probe_from<F>(config: Config, graph: ExecutionGraph, f: F) -> Prob
 where
     F: Fn() + Send + Sync + 'static,
 {
+    // A probe always schedules under `Ltr` (`P4-SELECTOR` S6): its parking
+    // order *is* knob B's `recorded` order, and must not follow the outer
+    // run's selector. This is the one place that may override the field.
+    let mut config = config;
+    config.selector = crate::conformance::Selector::Ltr;
     let must = Rc::new(RefCell::new(Must::with_initial_graph(config, graph)));
     must.borrow_mut().enable_probe();
     Must::set_current(Some(Rc::clone(&must)));

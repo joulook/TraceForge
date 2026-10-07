@@ -41,11 +41,13 @@ pub mod thread;
 mod vector_clock;
 
 pub use crate::msg::Val;
+/// Per-operation visibility for conformance checking (mixed visibility).
+pub use event_label::Visibility;
 // `Val` is used by monitors.
 
 use channel::{cons_to_model, self_loc_comm, thread_loc_comm, Receiver};
 use coverage::ExecutionObserver;
-use event_label::{Block, BlockType, CToss, Choice, RecvMsg, SendMsg};
+use event_label::{Annotation, Block, BlockType, CToss, Choice, RecvMsg, SendMsg};
 use loc::{CommunicationModel, Loc, RecvLoc, SendLoc};
 use msg::Message;
 
@@ -62,11 +64,11 @@ use smallvec::alloc::sync::Arc;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::Write;
 use std::iter;
 use std::rc::Rc;
 use std::time::Instant;
 use thread::{spawn_without_switch, JoinHandle, ThreadId};
-use std::io::Write;
 
 use crate::event_label::*;
 use crate::exec_pool::ExecutionPool;
@@ -229,6 +231,12 @@ pub struct Config {
     pub(crate) mode: ExplorationMode,
     pub(crate) cons_type: ConsType,
     pub(crate) schedule_policy: SchedulePolicy,
+    /// The Must selector of a conformance run or a probe (`P4-SELECTOR` knob
+    /// A); consulted only when `conf` or `probe` is set on the `Must`, so plain
+    /// `verify` never reads it. `#[serde(default)]` so that a trace recorded
+    /// before the field existed still loads.
+    #[serde(default)]
+    pub(crate) selector: conformance::Selector,
     pub(crate) max_iterations: Option<u64>,
     pub(crate) verbose: usize,
     pub(crate) seed: u64,
@@ -302,6 +310,7 @@ impl ConfigBuilder {
             mode: ExplorationMode::Verification,
             cons_type: ConsType::FIFO,
             schedule_policy: SchedulePolicy::LTR,
+            selector: conformance::Selector::Ltr,
             max_iterations: None,
             verbose: 0,
             seed: rand::rng().next_u64(),
@@ -321,7 +330,7 @@ impl ConfigBuilder {
             iterations_until_split: 100,
             state_batch_size: 1,
             keep_per_execution_coverage: false,
-	        predetermined_choices: HashMap::new(),
+            predetermined_choices: HashMap::new(),
             predetermined_global_choices: HashMap::new(),
             pretty_graph_printing: false,
             callbacks: Arc::new(Mutex::new(Vec::new())),
@@ -816,7 +825,13 @@ where
 {
     ExecutionState::with(|s| s.must.borrow().validate_monitor_spawn(&s.curr_pos()));
 
-    let jh = spawn_without_switch(monitor_function, Some("traceforge_runtime::monitor".to_string()), true, None, None);
+    let jh = spawn_without_switch(
+        monitor_function,
+        Some("traceforge_runtime::monitor".to_string()),
+        true,
+        None,
+        None,
+    );
 
     // Register the monitor before calling switch(). You need to register it before
     // calling switch() because during replay, the replay execute the monitor first, find the monitor to
@@ -895,7 +910,7 @@ pub(crate) fn select_val_block<'a, T: Message + 'static, U: Message + 'static>(
     let locs = iter::once(&primary.inner).chain(iter::once(&secondary.inner));
     // *Only* use main recv's communication model
     let comm = primary.comm;
-    recv_val_block_with_tag(locs, comm, None)
+    recv_val_block_with_tag(locs, comm, None, Annotation::Default)
 }
 
 ///
@@ -923,7 +938,7 @@ pub fn select_msg<'a, T: Message + 'static>(
     comm: CommunicationModel,
 ) -> Option<(T, usize)> {
     let locs = recvs.map(|r| &r.inner);
-    recv_msg_with_tag(locs, comm, None)
+    recv_msg_with_tag(locs, comm, None, Annotation::Default)
 }
 
 pub fn select_tagged_msg<'a, F, T>(
@@ -957,6 +972,7 @@ where
         Some(PredicateType(Arc::new(move |tid, tag| {
             f(tid, normalize_vec_tag(tag))
         }))),
+        Annotation::Default,
     )
 }
 
@@ -965,7 +981,7 @@ pub fn select_msg_block<'a, T: Message + 'static>(
     comm: CommunicationModel,
 ) -> (T, usize) {
     let locs = recvs.map(|r| &r.inner);
-    recv_msg_block_with_tag(locs, comm, None)
+    recv_msg_block_with_tag(locs, comm, None, Annotation::Default)
 }
 
 pub fn select_tagged_msg_block<'a, F, T>(
@@ -999,6 +1015,7 @@ where
         Some(PredicateType(Arc::new(move |tid, tag| {
             f(tid, normalize_vec_tag(tag))
         }))),
+        Annotation::Default,
     )
 }
 
@@ -1007,37 +1024,37 @@ where
 /// Sends to `t` the message `v`
 pub fn send_msg<T: Message + 'static>(t: ThreadId, v: T) {
     let (loc, comm) = thread_loc_comm(t);
-    send_msg_with_tag(v, None, &loc, comm, false)
+    send_msg_with_tag(v, None, &loc, comm, false, Annotation::Default)
 }
 
 /// Sends to `t` the message `v`, which can be lost
 pub fn send_lossy_msg<T: Message + 'static>(t: ThreadId, v: T) {
     let (loc, comm) = thread_loc_comm(t);
-    send_msg_with_tag(v, None, &loc, comm, true)
+    send_msg_with_tag(v, None, &loc, comm, true, Annotation::Default)
 }
 
 /// Sends to `t` the message `v` tagged with 'tag
 pub fn send_tagged_msg<T: Message + 'static>(t: ThreadId, tag: u32, v: T) {
     let (loc, comm) = thread_loc_comm(t);
-    send_msg_with_tag(v, Some(tag), &loc, comm, false)
+    send_msg_with_tag(v, Some(tag), &loc, comm, false, Annotation::Default)
 }
 
 /// Sends to `t` the message `v`, which can be lost, tagged with 'tag
 pub fn send_tagged_lossy_msg<T: Message + 'static>(t: ThreadId, tag: u32, v: T) {
     let (loc, comm) = thread_loc_comm(t);
-    send_msg_with_tag(v, Some(tag), &loc, comm, true)
+    send_msg_with_tag(v, Some(tag), &loc, comm, true, Annotation::Default)
 }
 
 /// Sends to `t` the message `v` tagged with a vector 'tag
 pub fn send_vec_tagged_msg<T: Message + 'static>(t: ThreadId, tag: Vec<u32>, v: T) {
     let (loc, comm) = thread_loc_comm(t);
-    send_msg_with_vec_tag(v, Some(tag), &loc, comm, false)
+    send_msg_with_vec_tag(v, Some(tag), &loc, comm, false, Annotation::Default)
 }
 
 /// Sends to `t` the message `v`, which can be lost, tagged with 'tag
 pub fn send_vec_tagged_lossy_msg<T: Message + 'static>(t: ThreadId, tag: Vec<u32>, v: T) {
     let (loc, comm) = thread_loc_comm(t);
-    send_msg_with_vec_tag(v, Some(tag), &loc, comm, true)
+    send_msg_with_vec_tag(v, Some(tag), &loc, comm, true, Annotation::Default)
 }
 
 /// Helper for [`send_msg`] and [`send_tagged_msg`]
@@ -1047,8 +1064,9 @@ fn send_msg_with_tag<T: Message + 'static>(
     loc: &Loc,
     comm: CommunicationModel,
     lossy: bool,
+    annotation: Annotation,
 ) {
-    send_msg_with_vec_tag(v, tag.map(|t| vec![t]), loc, comm, lossy);
+    send_msg_with_vec_tag(v, tag.map(|t| vec![t]), loc, comm, lossy, annotation);
 }
 
 /// Suspend a thread whose choice point a probe has just recorded.
@@ -1083,6 +1101,7 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
     loc: &Loc,
     comm: CommunicationModel,
     lossy: bool,
+    annotation: Annotation,
 ) {
     let tag = normalize_vec_tag(tag);
     switch();
@@ -1113,6 +1132,7 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
             monitor_msgs.len()
         );
 
+        // `P4-MIXED` M2: the annotation is recorded by the issuing thread, here.
         let slab = SendMsg::new(
             pos,
             SendLoc::new(loc, sender_tid, tag),
@@ -1120,7 +1140,8 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
             val,
             monitor_msgs,
             lossy,
-        );
+        )
+        .annotated(annotation);
 
         let maybe_stuck = s.must.borrow_mut().handle_send(slab);
         if s.must.borrow_mut().probe_take_just_parked() {
@@ -1151,7 +1172,7 @@ fn send_msg_with_vec_tag<T: Message + 'static>(
 /// Returns a message from the thread queue or times out
 pub fn recv_msg<T: Message + 'static>() -> Option<T> {
     let (loc, comm) = self_loc_comm();
-    recv_msg_with_tag(iter::once(&loc), comm, None).map(|x| x.0)
+    recv_msg_with_tag(iter::once(&loc), comm, None, Annotation::Default).map(|x| x.0)
 }
 
 /// Returns a tagged message from the thread queue or times out
@@ -1179,6 +1200,7 @@ where
         Some(PredicateType(Arc::new(move |tid, tag| {
             f(tid, normalize_vec_tag(tag))
         }))),
+        Annotation::Default,
     )
     .map(|x| x.0)
 }
@@ -1187,14 +1209,16 @@ fn recv_msg_with_tag<'a, T: Message + 'static>(
     locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
+    annotation: Annotation,
 ) -> Option<(T, usize)> {
-    recv_val_with_tag(locs, comm, tag).map(|(val, ind)| (expect_msg(val), ind))
+    recv_val_with_tag(locs, comm, tag, annotation).map(|(val, ind)| (expect_msg(val), ind))
 }
 
 fn recv_val_with_tag<'a>(
     locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
+    annotation: Annotation,
 ) -> Option<(Val, usize)> {
     let locs = locs.collect::<Vec<_>>();
     validate_locs(&locs);
@@ -1205,7 +1229,7 @@ fn recv_val_with_tag<'a>(
         let (val, ind) = ExecutionState::with(|s| {
             let pos = s.next_pos();
             s.must.borrow_mut().handle_recv(
-                RecvMsg::new(pos, RecvLoc::new(locs, tag), comm, None, true),
+                RecvMsg::new(pos, RecvLoc::new(locs, tag), comm, None, true).annotated(annotation),
                 false,
             )
         });
@@ -1228,7 +1252,7 @@ fn recv_val_with_tag<'a>(
 /// Returns a message from the queue.
 pub fn recv_msg_block<T: Message + 'static>() -> T {
     let (loc, comm) = self_loc_comm();
-    recv_msg_block_with_tag(iter::once(&loc), comm, None).0
+    recv_msg_block_with_tag(iter::once(&loc), comm, None, Annotation::Default).0
 }
 
 /// Returns a message from the queue that matches `tag`
@@ -1256,8 +1280,284 @@ where
         Some(PredicateType(Arc::new(move |tid, tag| {
             f(tid, normalize_vec_tag(tag))
         }))),
+        Annotation::Default,
     )
     .0
+}
+
+// ---------------------------------------------------------------------------
+// Mixed visibility (`P4-MIXED` M3): every send and receive constructor's twin
+// taking an explicit [`Visibility`] — the first argument after the thread —
+// otherwise identical to its unannotated twin, which records `Default`.
+// Annotations have no operational effect; conformance reads them through
+// `obs::is_visible`, and a `Visible` annotation on a thread that is not declared
+// visible is rejected at append under conformance (`obs::check_annotation`).
+// ---------------------------------------------------------------------------
+
+/// [`send_msg`] with an explicit visibility annotation: `(t, visibility, v)`.
+pub fn send_msg_as<T: Message + 'static>(t: ThreadId, visibility: Visibility, v: T) {
+    let (loc, comm) = thread_loc_comm(t);
+    send_msg_with_tag(v, None, &loc, comm, false, Annotation::Explicit(visibility))
+}
+
+/// [`send_lossy_msg`] with an explicit visibility annotation: `(t, visibility, v)`.
+pub fn send_lossy_msg_as<T: Message + 'static>(t: ThreadId, visibility: Visibility, v: T) {
+    let (loc, comm) = thread_loc_comm(t);
+    send_msg_with_tag(v, None, &loc, comm, true, Annotation::Explicit(visibility))
+}
+
+/// [`send_tagged_msg`] with an explicit visibility annotation (`t, α, tag, v`).
+pub fn send_tagged_msg_as<T: Message + 'static>(
+    t: ThreadId,
+    visibility: Visibility,
+    tag: u32,
+    v: T,
+) {
+    let (loc, comm) = thread_loc_comm(t);
+    send_msg_with_tag(
+        v,
+        Some(tag),
+        &loc,
+        comm,
+        false,
+        Annotation::Explicit(visibility),
+    )
+}
+
+/// [`send_tagged_lossy_msg`] with an explicit visibility annotation: `(t, visibility, tag, v)`.
+pub fn send_tagged_lossy_msg_as<T: Message + 'static>(
+    t: ThreadId,
+    visibility: Visibility,
+    tag: u32,
+    v: T,
+) {
+    let (loc, comm) = thread_loc_comm(t);
+    send_msg_with_tag(
+        v,
+        Some(tag),
+        &loc,
+        comm,
+        true,
+        Annotation::Explicit(visibility),
+    )
+}
+
+/// [`send_vec_tagged_msg`] with an explicit visibility annotation: `(t, visibility, tag, v)`.
+pub fn send_vec_tagged_msg_as<T: Message + 'static>(
+    t: ThreadId,
+    visibility: Visibility,
+    tag: Vec<u32>,
+    v: T,
+) {
+    let (loc, comm) = thread_loc_comm(t);
+    send_msg_with_vec_tag(
+        v,
+        Some(tag),
+        &loc,
+        comm,
+        false,
+        Annotation::Explicit(visibility),
+    )
+}
+
+/// [`send_vec_tagged_lossy_msg`] with an explicit visibility annotation: `(t, visibility, tag, v)`.
+pub fn send_vec_tagged_lossy_msg_as<T: Message + 'static>(
+    t: ThreadId,
+    visibility: Visibility,
+    tag: Vec<u32>,
+    v: T,
+) {
+    let (loc, comm) = thread_loc_comm(t);
+    send_msg_with_vec_tag(
+        v,
+        Some(tag),
+        &loc,
+        comm,
+        true,
+        Annotation::Explicit(visibility),
+    )
+}
+
+/// [`recv_msg`] with an explicit visibility annotation (`α` first).
+pub fn recv_msg_as<T: Message + 'static>(visibility: Visibility) -> Option<T> {
+    let (loc, comm) = self_loc_comm();
+    recv_msg_with_tag(
+        iter::once(&loc),
+        comm,
+        None,
+        Annotation::Explicit(visibility),
+    )
+    .map(|x| x.0)
+}
+
+/// [`recv_tagged_msg`] with an explicit visibility annotation (`α, f`).
+pub fn recv_tagged_msg_as<F, T>(visibility: Visibility, f: F) -> Option<T>
+where
+    F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    recv_vec_tagged_msg_as(visibility, move |tid, tag| {
+        let tag = tag.and_then(|tags| tags.first().copied());
+        f(tid, tag)
+    })
+}
+
+/// [`recv_vec_tagged_msg`] with an explicit visibility annotation: `(visibility, f)`.
+pub fn recv_vec_tagged_msg_as<F, T>(visibility: Visibility, f: F) -> Option<T>
+where
+    F: Fn(ThreadId, Option<Vec<u32>>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    let (loc, comm) = self_loc_comm();
+    recv_msg_with_tag(
+        iter::once(&loc),
+        comm,
+        Some(PredicateType(Arc::new(move |tid, tag| {
+            f(tid, normalize_vec_tag(tag))
+        }))),
+        Annotation::Explicit(visibility),
+    )
+    .map(|x| x.0)
+}
+
+/// [`recv_msg_block`] with an explicit visibility annotation: `(visibility)`.
+pub fn recv_msg_block_as<T: Message + 'static>(visibility: Visibility) -> T {
+    let (loc, comm) = self_loc_comm();
+    recv_msg_block_with_tag(
+        iter::once(&loc),
+        comm,
+        None,
+        Annotation::Explicit(visibility),
+    )
+    .0
+}
+
+/// [`recv_tagged_msg_block`] with an explicit visibility annotation: `(visibility, f)`.
+pub fn recv_tagged_msg_block_as<F, T>(visibility: Visibility, f: F) -> T
+where
+    F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    recv_vec_tagged_msg_block_as(visibility, move |tid, tag| {
+        let tag = tag.and_then(|tags| tags.first().copied());
+        f(tid, tag)
+    })
+}
+
+/// [`recv_vec_tagged_msg_block`] with an explicit visibility annotation: `(visibility, f)`.
+pub fn recv_vec_tagged_msg_block_as<F, T>(visibility: Visibility, f: F) -> T
+where
+    F: Fn(ThreadId, Option<Vec<u32>>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    let (loc, comm) = self_loc_comm();
+    recv_msg_block_with_tag(
+        iter::once(&loc),
+        comm,
+        Some(PredicateType(Arc::new(move |tid, tag| {
+            f(tid, normalize_vec_tag(tag))
+        }))),
+        Annotation::Explicit(visibility),
+    )
+    .0
+}
+
+/// [`select_msg`] with an explicit visibility annotation (`α` first).
+pub fn select_msg_as<'a, T: Message + 'static>(
+    visibility: Visibility,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
+    comm: CommunicationModel,
+) -> Option<(T, usize)> {
+    let locs = recvs.map(|r| &r.inner);
+    recv_msg_with_tag(locs, comm, None, Annotation::Explicit(visibility))
+}
+
+/// [`select_tagged_msg`] with an explicit visibility annotation: `(visibility, recvs, comm, f)`.
+pub fn select_tagged_msg_as<'a, F, T>(
+    visibility: Visibility,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
+    comm: CommunicationModel,
+    f: F,
+) -> Option<(T, usize)>
+where
+    F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    select_vec_tagged_msg_as(visibility, recvs, comm, move |tid, tag| {
+        let tag = tag.and_then(|tags| tags.first().copied());
+        f(tid, tag)
+    })
+}
+
+/// [`select_vec_tagged_msg`] with an explicit visibility annotation: `(visibility, recvs, comm, f)`.
+pub fn select_vec_tagged_msg_as<'a, F, T>(
+    visibility: Visibility,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
+    comm: CommunicationModel,
+    f: F,
+) -> Option<(T, usize)>
+where
+    F: Fn(ThreadId, Option<Vec<u32>>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    let locs = recvs.map(|r| &r.inner);
+    recv_msg_with_tag(
+        locs,
+        comm,
+        Some(PredicateType(Arc::new(move |tid, tag| {
+            f(tid, normalize_vec_tag(tag))
+        }))),
+        Annotation::Explicit(visibility),
+    )
+}
+
+/// [`select_msg_block`] with an explicit visibility annotation: `(visibility, recvs, comm)`.
+pub fn select_msg_block_as<'a, T: Message + 'static>(
+    visibility: Visibility,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
+    comm: CommunicationModel,
+) -> (T, usize) {
+    let locs = recvs.map(|r| &r.inner);
+    recv_msg_block_with_tag(locs, comm, None, Annotation::Explicit(visibility))
+}
+
+/// [`select_tagged_msg_block`] with an explicit visibility annotation: `(visibility, recvs, comm, f)`.
+pub fn select_tagged_msg_block_as<'a, F, T>(
+    visibility: Visibility,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
+    comm: CommunicationModel,
+    f: F,
+) -> (T, usize)
+where
+    F: Fn(ThreadId, Option<u32>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    select_vec_tagged_msg_block_as(visibility, recvs, comm, move |tid, tag| {
+        let tag = tag.and_then(|tags| tags.first().copied());
+        f(tid, tag)
+    })
+}
+
+/// [`select_vec_tagged_msg_block`] with an explicit visibility annotation: `(visibility, recvs, comm, f)`.
+pub fn select_vec_tagged_msg_block_as<'a, F, T>(
+    visibility: Visibility,
+    recvs: impl Iterator<Item = &'a &'a Receiver<T>>,
+    comm: CommunicationModel,
+    f: F,
+) -> (T, usize)
+where
+    F: Fn(ThreadId, Option<Vec<u32>>) -> bool + 'static + Send + Sync,
+    T: Message + 'static,
+{
+    let locs = recvs.map(|r| &r.inner);
+    recv_msg_block_with_tag(
+        locs,
+        comm,
+        Some(PredicateType(Arc::new(move |tid, tag| {
+            f(tid, normalize_vec_tag(tag))
+        }))),
+        Annotation::Explicit(visibility),
+    )
 }
 
 /// Helper function for [`recv_msg_block`] and [`recv_tagged_msg_block`]
@@ -1265,8 +1565,9 @@ fn recv_msg_block_with_tag<'a, T: Message + 'static>(
     locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
+    annotation: Annotation,
 ) -> (T, usize) {
-    let (val, ind) = recv_val_block_with_tag(locs, comm, tag);
+    let (val, ind) = recv_val_block_with_tag(locs, comm, tag, annotation);
     (expect_msg(val), ind)
 }
 
@@ -1274,6 +1575,7 @@ fn recv_val_block_with_tag<'a>(
     locs: impl Iterator<Item = &'a Loc>,
     comm: CommunicationModel,
     tag: Option<PredicateType>,
+    annotation: Annotation,
 ) -> (Val, usize) {
     let locs = locs.collect::<Vec<_>>();
     validate_locs(&locs);
@@ -1283,7 +1585,8 @@ fn recv_val_block_with_tag<'a>(
         let (val, ind) = ExecutionState::with(|s| {
             let pos = s.next_pos();
             s.must.borrow_mut().handle_recv(
-                RecvMsg::new(pos, RecvLoc::new(locs, tag.clone()), comm, None, false),
+                RecvMsg::new(pos, RecvLoc::new(locs, tag.clone()), comm, None, false)
+                    .annotated(annotation),
                 true,
             )
         });
@@ -1467,12 +1770,18 @@ pub fn named_nondet(name: &str) -> bool {
         if must.config.predetermined_global_choices.contains_key(name) {
             if let Some(&value) = must.global_named_choices.get(name) {
                 // Already resolved — reuse cached value
-                return must.handle_ctoss_predetermined(CToss::new(pos, value).with_name(name.to_string()), value);
+                return must.handle_ctoss_predetermined(
+                    CToss::new(pos, value).with_name(name.to_string()),
+                    value,
+                );
             }
             // First call — use the predetermined global value and cache it
             let value = must.config.predetermined_global_choices[name];
             must.global_named_choices.insert(name.to_string(), value);
-            return must.handle_ctoss_predetermined(CToss::new(pos, value).with_name(name.to_string()), value);
+            return must.handle_ctoss_predetermined(
+                CToss::new(pos, value).with_name(name.to_string()),
+                value,
+            );
         }
 
         // Use the thread's filtered_origination_vec as the map key instead of ThreadId.
@@ -1546,7 +1855,12 @@ pub fn named_nondet(name: &str) -> bool {
                 "[named_nondet] Index assignment for choice '{}': \
                  thread_idx={}, filtered_origination_vec={:?}, origination_vec={:?}, thread={}\n\
                  Graph:\n{}",
-                name, idx, filtered_origination_vec, origination_vec, pos.thread, must.print_graph(None)
+                name,
+                idx,
+                filtered_origination_vec,
+                origination_vec,
+                pos.thread,
+                must.print_graph(None)
             );
 
             idx
@@ -1575,7 +1889,10 @@ pub fn named_nondet(name: &str) -> bool {
                 value, name, thread_idx, current_occurrence
             );
             // Use handle_ctoss_predetermined which now handles both replay and handle modes
-            return must.handle_ctoss_predetermined(CToss::new(pos, value).with_name(name.to_string()), value);
+            return must.handle_ctoss_predetermined(
+                CToss::new(pos, value).with_name(name.to_string()),
+                value,
+            );
         }
 
         // Fallback to nondeterministic exploration (handles both replay and handle modes)
@@ -1590,7 +1907,8 @@ pub fn named_nondet(name: &str) -> bool {
         // assigned a new index beyond the configured predetermined range.
         if let Some(thread_choices) = must.config.predetermined_choices.get(name) {
             if thread_choices.get(thread_idx).is_none() {
-                let frozen_map_str = must.frozen_thread_index_map
+                let frozen_map_str = must
+                    .frozen_thread_index_map
                     .as_ref()
                     .map(|fm| format!("{:#?}", fm))
                     .unwrap_or_else(|| "None".to_string());
@@ -1604,7 +1922,10 @@ pub fn named_nondet(name: &str) -> bool {
                      Origination vec: {:?}\n\
                      Frozen thread index map:\n{}\n\
                      Graph:\n{}",
-                    name, thread_choices.len(), thread_idx, current_occurrence,
+                    name,
+                    thread_choices.len(),
+                    thread_idx,
+                    current_occurrence,
                     pos.thread,
                     filtered_origination_vec,
                     origination_vec,
@@ -1617,7 +1938,9 @@ pub fn named_nondet(name: &str) -> bool {
         // Release the mutable borrow so gen_bool() and handle_ctoss() can each borrow independently.
         drop(must);
         let toss = s.must.borrow_mut().gen_bool();
-        s.must.borrow_mut().handle_ctoss(CToss::new(pos, toss).with_name(name.to_string()))
+        s.must
+            .borrow_mut()
+            .handle_ctoss(CToss::new(pos, toss).with_name(name.to_string()))
     });
     if ExecutionState::with(|s| s.must.borrow_mut().probe_take_just_parked()) {
         probe_park();
@@ -1806,6 +2129,34 @@ pub fn assume_impl(cond: bool, macro_info: Option<(&str, &str, u32)>) {
 /// flag is set in the configuration.
 pub fn assert(cond: bool) {
     if !cond {
+        // `P4-ENUMERATOR` criterion 9: inside a conformance **probe** of the
+        // specification, a failed assertion is installed and the thread is
+        // suspended — nothing printed, stored, persisted or panicked. The
+        // inner search reads the `Block(Assert)` off the probe's output and
+        // aborts the run with `SpecNotAssertionSafe`. Taken ahead of the
+        // `keep_going_after_error` test and independent of it.
+        let probing = ExecutionState::with(|s| {
+            if !s.must.borrow().probe_active() {
+                return false;
+            }
+            let pos = s.next_pos();
+            s.must
+                .borrow_mut()
+                .handle_block(Block::new(pos, BlockType::Assert));
+            true
+        });
+        if probing {
+            // Suspend **without** `prev_pos` and without recording an offer:
+            // the installed `Block(Assert)` at `i == pos.index` is what keeps
+            // the thread off the schedule (`is_thread_runnable`'s `Assert`
+            // arm). `probe_park` would hand the position back and make the
+            // thread runnable forever; `ProbeCtx::record` would offer a
+            // non-choice-point. Outside the `ExecutionState` borrow, since
+            // `switch` re-enters it.
+            loop {
+                switch();
+            }
+        }
         ExecutionState::with(|s| {
             let pos = s.next_pos();
 

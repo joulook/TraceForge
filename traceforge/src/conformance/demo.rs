@@ -40,13 +40,10 @@
 //! thread on the other end.
 
 use crate::conformance::{verify, ConfBuilder, ConfVerdict};
-use crate::{nondet, recv_msg_block, send_msg, thread, ConsType, Config};
+use crate::{nondet, recv_msg_block, send_msg, thread, Config, ConsType};
 
 fn named<F: FnOnce() + Send + 'static>(n: &str, f: F) -> thread::JoinHandle<()> {
-    thread::Builder::new()
-        .name(n.to_string())
-        .spawn(f)
-        .unwrap()
+    thread::Builder::new().name(n.to_string()).spawn(f).unwrap()
 }
 
 fn conf(visible: &[&str]) -> crate::conformance::ConfConfig {
@@ -135,7 +132,10 @@ fn run(
 
     // F61: the run's seed decides the exploration order, so the violating
     // trace printed below can differ between runs of the same pair.
-    println!("  run seed:                                 {}", v.outcome().seed());
+    println!(
+        "  run seed:                                 {}",
+        v.outcome().seed()
+    );
 
     match &v {
         ConfVerdict::Conforms(_) => {
@@ -548,9 +548,21 @@ fn cross_check_naive_against_optimised() {
     println!("  {}", "-".repeat(64));
 
     let rows = [
-        ("via_relay", "direct_1", compare(cfg.clone(), &vis, via_relay, direct_1)),
-        ("direct_1", "via_relay", compare(cfg.clone(), &vis, direct_1, via_relay)),
-        ("direct_1", "direct_2", compare(cfg.clone(), &vis, direct_1, direct_2)),
+        (
+            "via_relay",
+            "direct_1",
+            compare(cfg.clone(), &vis, via_relay, direct_1),
+        ),
+        (
+            "direct_1",
+            "via_relay",
+            compare(cfg.clone(), &vis, direct_1, via_relay),
+        ),
+        (
+            "direct_1",
+            "direct_2",
+            compare(cfg.clone(), &vis, direct_1, direct_2),
+        ),
         (
             "two_free_sends",
             "two_ordered_sends",
@@ -777,15 +789,23 @@ fn le_oracle() {
     }
 }
 
-fn le_impl(n: usize, buggy: bool) -> impl Fn() + Send + Sync + Clone + 'static {
+pub(super) fn le_impl(n: usize, buggy: bool) -> impl Fn() + Send + Sync + Clone + 'static {
     move || {
         // Participants first: this is what keeps their ids equal to the
         // specification's (F41).
         let ps: Vec<crate::thread::ThreadId> = (0..n)
-            .map(|i| named(&format!("p{i}"), move || le_participant(n)).thread().id())
+            .map(|i| {
+                named(&format!("p{i}"), move || le_participant(n))
+                    .thread()
+                    .id()
+            })
             .collect();
         let es: Vec<crate::thread::ThreadId> = (0..n)
-            .map(|i| named(&format!("e{i}"), move || le_elector(buggy)).thread().id())
+            .map(|i| {
+                named(&format!("e{i}"), move || le_elector(buggy))
+                    .thread()
+                    .id()
+            })
             .collect();
         for (i, e) in es.iter().enumerate() {
             send_msg(
@@ -800,10 +820,14 @@ fn le_impl(n: usize, buggy: bool) -> impl Fn() + Send + Sync + Clone + 'static {
     }
 }
 
-fn le_spec(n: usize) -> impl Fn() + Send + Sync + Clone + 'static {
+pub(super) fn le_spec(n: usize) -> impl Fn() + Send + Sync + Clone + 'static {
     move || {
         let ps: Vec<crate::thread::ThreadId> = (0..n)
-            .map(|i| named(&format!("p{i}"), move || le_participant(n)).thread().id())
+            .map(|i| {
+                named(&format!("p{i}"), move || le_participant(n))
+                    .thread()
+                    .id()
+            })
             .collect();
         let oracle = named("oracle", le_oracle).thread().id();
         send_msg(
@@ -817,7 +841,7 @@ fn le_spec(n: usize) -> impl Fn() + Send + Sync + Clone + 'static {
     }
 }
 
-fn le_visible(n: usize) -> Vec<String> {
+pub(super) fn le_visible(n: usize) -> Vec<String> {
     (0..n).map(|i| format!("p{i}")).collect()
 }
 
@@ -843,9 +867,19 @@ fn demo_leader_2pc_conforms() {
     // (`demo_ring_2pc_conforms`) does n = 4 in 1.1 s.
     for n in 2..=3usize {
         let t = std::time::Instant::now();
-        let out = verify_conformance(le_cfg(), le_impl(n, false), le_spec(n), le_visible(n), 10_000);
+        let out = verify_conformance(
+            le_cfg(),
+            le_impl(n, false),
+            le_spec(n),
+            le_visible(n),
+            10_000,
+        );
         let secs = t.elapsed().as_secs_f64();
-        let graphs = out.stats.as_ref().map(|s| s.execs + s.block).expect("stats");
+        let graphs = out
+            .stats
+            .as_ref()
+            .map(|s| s.execs + s.block)
+            .expect("stats");
         let verdict = if out.reports.is_empty() && out.exhaustions.is_empty() {
             "conforms"
         } else {
@@ -897,13 +931,19 @@ fn diag_leader_plain_state_space() {
         let s = crate::verify(le_cfg(), le_impl(n, false));
         println!(
             "  impl n={n}: execs={} blocked={} max_events={} in {:.3}s",
-            s.execs, s.block, s.max_graph_events, t.elapsed().as_secs_f64()
+            s.execs,
+            s.block,
+            s.max_graph_events,
+            t.elapsed().as_secs_f64()
         );
         let t = std::time::Instant::now();
         let s = crate::verify(le_cfg(), le_spec(n));
         println!(
             "  spec n={n}: execs={} blocked={} max_events={} in {:.3}s",
-            s.execs, s.block, s.max_graph_events, t.elapsed().as_secs_f64()
+            s.execs,
+            s.block,
+            s.max_graph_events,
+            t.elapsed().as_secs_f64()
         );
     }
 }
@@ -1008,14 +1048,22 @@ fn ring_elector(buggy: bool) {
 }
 
 /// Implementation: `n` visible participants, `n` invisible electors in a ring.
-fn ring_impl(n: usize, buggy: bool) -> impl Fn() + Send + Sync + Clone + 'static {
+pub(super) fn ring_impl(n: usize, buggy: bool) -> impl Fn() + Send + Sync + Clone + 'static {
     move || {
         // Participants first, so their ids match the specification's (F41).
         let ps: Vec<crate::thread::ThreadId> = (0..n)
-            .map(|i| named(&format!("p{i}"), move || le_participant(n)).thread().id())
+            .map(|i| {
+                named(&format!("p{i}"), move || le_participant(n))
+                    .thread()
+                    .id()
+            })
             .collect();
         let es: Vec<crate::thread::ThreadId> = (0..n)
-            .map(|i| named(&format!("e{i}"), move || ring_elector(buggy)).thread().id())
+            .map(|i| {
+                named(&format!("e{i}"), move || ring_elector(buggy))
+                    .thread()
+                    .id()
+            })
             .collect();
         for (i, e) in es.iter().enumerate() {
             send_msg(
@@ -1061,10 +1109,19 @@ fn demo_ring_2pc_conforms() {
     println!("  ---+----------+--------------+---------+-------------+---------+------");
     for n in 2..=4usize {
         let t = std::time::Instant::now();
-        let out =
-            verify_conformance(le_cfg(), ring_impl(n, false), le_spec(n), le_visible(n), 10_000);
+        let out = verify_conformance(
+            le_cfg(),
+            ring_impl(n, false),
+            le_spec(n),
+            le_visible(n),
+            10_000,
+        );
         let secs = t.elapsed().as_secs_f64();
-        let graphs = out.stats.as_ref().map(|s| s.execs + s.block).expect("stats");
+        let graphs = out
+            .stats
+            .as_ref()
+            .map(|s| s.execs + s.block)
+            .expect("stats");
         let verdict = if out.reports.is_empty() && out.exhaustions.is_empty() {
             "conforms"
         } else {
