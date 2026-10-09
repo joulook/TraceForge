@@ -605,9 +605,42 @@ pub(super) fn x0_spec() -> Spec {
 /// The specs `eval_driver` knows by name (`EVAL_SPEC`); the campaign's specs
 /// are added here by `P5-CAMPAIGN`.
 pub(super) fn builtin_specs() -> Vec<Spec> {
-    let mut out = vec![x0_spec(), cal_spec()];
+    let mut out = vec![x0_spec(), cal_spec(), calx_spec()];
     out.extend(campaign_specs());
     out
+}
+
+/// `CALX` — the calibration's **feasibility probes** at the extension tier (D20(1),
+/// the designers' answer of 2026-10-09, `ANSWERS-calibration.md` §3; the amended
+/// tier rule: named points only, no tail implication, disclosed separately):
+/// one extended `Ltr` run per S1 k = 7 engine-point the promotion rule named —
+/// the four complete-first lines and the two gated conforming lines — and the
+/// one optional S2 probe, `share(16, 16)` on the enumerator. X1's configuration,
+/// rep 0, timed, the 3 600 s tier; keys distinct from the 600 s rows by tier.
+/// Not a campaign spec. A probe that completes is costed before any repetition
+/// or other selector runs; one that censors closes the point as a lower bound.
+pub(super) fn calx_spec() -> Spec {
+    let tier = extension_tier();
+    let probes: [(&str, GridEngine); 7] = [
+        ("synth/naive-self/k7enc1", GridEngine::CompleteFirst),
+        ("synth/naive-self/k7enc1", GridEngine::Gated),
+        ("synth/naive-self/k7enc2", GridEngine::CompleteFirst),
+        ("synth/naive-self/k7enc2", GridEngine::Gated),
+        ("ex:naive/k7/enc1", GridEngine::CompleteFirst),
+        ("ex:naive/k7/enc2", GridEngine::CompleteFirst),
+        ("synth/share/m16c16", GridEngine::Enumerator),
+    ];
+    let mut rows = Vec::new();
+    for (name, e) in probes {
+        let p = grid_point(name);
+        let mut r = p.row_spec(&x1_config(e, Selector::Ltr), &tier, RunKind::Timed, 0);
+        r.twin_key.clear();
+        rows.push(r);
+    }
+    Spec {
+        name: "CALX".to_owned(),
+        rows,
+    }
 }
 
 /// `CAL` — `P5-SYNTH` criterion 1's calibration pilot as a spec (D8, D15; the
@@ -868,7 +901,18 @@ impl RowMeta {
 /// (`vm_hwm_kb_after`, read before rendering — round 03 m3); `diag_keys` is
 /// read back from the instrumentation columns.
 pub(super) fn eval_row_of(end: &GridEnd, meta: &RowMeta) -> Row {
-    let inner = verdict_counter_fill(end, row_of_end(end));
+    let mut inner = verdict_counter_fill(end, row_of_end(end));
+    // E21 (the calibration pilot): `row_of`'s enumerator arm renders one record
+    // per `Cover` call in `per_cover_detail` (2 MB at `naive-self(7, ·)`); a
+    // timed row carries lightweight counters only (plan §0), so the column is
+    // blank there and kept on profiling and baseline rows.
+    if meta.run_kind == "timed" {
+        for (k, v) in inner.iter_mut() {
+            if *k == "per_cover_detail" {
+                v.clear();
+            }
+        }
+    }
     let (config, after) = match end {
         GridEnd::Ok(r) => (&r.config, r.vm_hwm_kb.1),
         GridEnd::Panicked { config, .. } | GridEnd::Capped { config, .. } => (config, None),
@@ -1651,6 +1695,7 @@ impl Driver {
         let path = self.store_path();
         let mut store = Store::open(&path, &host, &commit, self.allow_mixed)?;
         fs::create_dir_all(self.out_dir.join("runs")).map_err(|e| Refusal::Io(e.to_string()))?;
+        self.write_run_meta(&commit, &host)?;
         let mut summary = Summary {
             store: path.clone(),
             ..Summary::default()
@@ -2380,12 +2425,46 @@ impl FrozenLists {
         }
     }
 
+    /// `EVAL_OUT/run-meta.json` (D19, the designers' answer of 2026-10-09): the
+    /// commit, host and profile of this run, the schema, and the per-thread
+    /// event bound every row runs under — the effective value
+    /// (`CONF_THREAD_THRESHOLD`) beside TraceForge's default. Rewritten
+    /// atomically before each run's first row; one record per directory, the
+    /// latest run's (the rows carry their own commit).
+    pub(super) fn run_meta_path(out_dir: &Path) -> PathBuf {
+        out_dir.join("run-meta.json")
+    }
+
     /// The driver's record of the lists its rows were run under:
     /// `EVAL_OUT/frozen.used.json`, written **before a run's first row** with
     /// the lists the spec consumes; a later run whose lists do not extend it is
     /// refused.
     pub(super) fn used_path(out_dir: &Path) -> PathBuf {
         out_dir.join("frozen.used.json")
+    }
+}
+
+impl Driver {
+    fn write_run_meta(&self, commit: &str, host: &str) -> Result<(), Refusal> {
+        let default_threshold = crate::Config::builder().build().thread_threshold;
+        let meta = serde_json::json!({
+            "commit": commit,
+            "host": host,
+            "profile": profile_name(),
+            "schema": SCHEMA_VERSION,
+            "thread_threshold": {
+                "effective": crate::conformance::grid::CONF_THREAD_THRESHOLD,
+                "default": default_threshold,
+            },
+        });
+        let path = FrozenLists::run_meta_path(&self.out_dir);
+        let tmp = path.with_extension("json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_string_pretty(&meta).unwrap_or_default(),
+        )
+        .map_err(|e| Refusal::Io(e.to_string()))?;
+        fs::rename(&tmp, &path).map_err(|e| Refusal::Io(e.to_string()))
     }
 }
 

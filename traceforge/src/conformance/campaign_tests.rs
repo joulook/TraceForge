@@ -446,6 +446,177 @@ const CAL_ROWS: usize = 728;
 /// `GridConfig::new` rows of `5157dbec…`).
 const DERIVED_DISTINCT_WITH_CAL: usize = 22_131;
 
+/// `CALX` (D20(1), `ANSWERS-calibration.md` §3; `eval.rs` `22a20583…`): the
+/// seven feasibility probes at the extension tier — `naive-self/k7enc{1,2}` ×
+/// {CompleteFirst, Gated}, `ex:naive/k7/enc{1,2}` × CompleteFirst,
+/// `share/m16c16` × Enumerator; X1's configuration, `Ltr`, rep 0, timed. The
+/// tier name is in the key and no other spec has an extension-tier row while
+/// the extension list is empty, so the 7 keys are new: 22 131 + 7 = 22 138.
+const CALX_ROWS: usize = 7;
+const DERIVED_DISTINCT_WITH_CALX: usize = 22_138;
+const CALX_PROBES: [(&str, GridEngine); 7] = [
+    ("synth/naive-self/k7enc1", GridEngine::CompleteFirst),
+    ("synth/naive-self/k7enc1", GridEngine::Gated),
+    ("synth/naive-self/k7enc2", GridEngine::CompleteFirst),
+    ("synth/naive-self/k7enc2", GridEngine::Gated),
+    ("ex:naive/k7/enc1", GridEngine::CompleteFirst),
+    ("ex:naive/k7/enc2", GridEngine::CompleteFirst),
+    ("synth/share/m16c16", GridEngine::Enumerator),
+];
+
+/// `CALX` as data (iii): exactly the seven probes, each `x1_config(engine,
+/// Ltr)` (the enumerator memo on + `Unlimited`), rep 0, timed, the extension
+/// tier (3 600 s, 4 GiB), no twin key, `series` set; every fixture an in-grid
+/// synthetic point; no key shared with any other spec.
+#[test]
+fn calx_spec_holds_the_seven_probes() {
+    let calx = spec("CALX");
+    let got: Vec<(String, GridEngine)> = calx
+        .rows
+        .iter()
+        .map(|r| (r.fixture.clone(), r.config.engine))
+        .collect();
+    let want: Vec<(String, GridEngine)> = CALX_PROBES
+        .iter()
+        .map(|(f, e)| ((*f).to_owned(), *e))
+        .collect();
+    assert_eq!(got, want, "conformance: CALX's probes");
+    let ext = crate::conformance::eval::extension_tier();
+    assert_eq!(ext.name, "extension");
+    assert_eq!(ext.wall, Duration::from_secs(3600));
+    for r in &calx.rows {
+        assert_eq!(
+            r.config,
+            x1_config(r.config.engine, Selector::Ltr),
+            "conformance: {}",
+            r.fixture
+        );
+        assert_eq!(r.rep, 0);
+        assert_eq!(r.run_kind, RunKind::Timed);
+        assert_eq!(r.tier, ext, "conformance: {}", r.fixture);
+        assert!(r.twin_key.is_empty(), "conformance: {}", r.fixture);
+        assert!(
+            r.series.is_some(),
+            "conformance: {} has a series",
+            r.fixture
+        );
+        assert!(
+            cal_points().contains(&r.fixture),
+            "conformance: {} is in the grid",
+            r.fixture
+        );
+    }
+    for s in specs().iter().filter(|s| s.name != "CALX") {
+        assert_eq!(
+            ks("CALX").intersection(ks(&s.name)).count(),
+            0,
+            "conformance: CALX ∩ {}",
+            s.name
+        );
+    }
+}
+
+/// E21 (ii), through the runner's child on `ex:naive/k2/enc1`, enumerator, X1's
+/// configuration, 10 s tier: the header is unchanged (180 columns, schema 2);
+/// a **timed** row's `per_cover_detail` is empty, a **profiling** row's (X1P's
+/// shape: instrumented) is not, and the timed row's other enumerator counters
+/// are present. Run alone (`--ignored --exact`).
+#[test]
+#[ignore]
+fn e21_per_cover_detail_blank_on_timed_rows_only() {
+    assert_eq!(header().len(), 180, "conformance: the header");
+    assert_eq!(crate::conformance::eval::SCHEMA_VERSION, 2);
+    let dir = temp("e21");
+    let base = x1_config(GridEngine::Enumerator, Selector::Ltr);
+    let timed = row("ex:naive/k2/enc1", base.clone(), RunKind::Timed);
+    let prof_row = row(
+        "ex:naive/k2/enc1",
+        base.instrumented(true),
+        RunKind::Profiling,
+    );
+    let t = child(&timed, "", &dir.join("timed")).unwrap_or_else(|e| panic!("conformance: {e}"));
+    let p =
+        child(&prof_row, "", &dir.join("profiling")).unwrap_or_else(|e| panic!("conformance: {e}"));
+    for (what, r) in [("timed", &t), ("profiling", &p)] {
+        assert_eq!(r.len(), 180, "conformance: {what}: 180 cells");
+        assert_eq!(r["end_class"], "ok", "conformance: {what}");
+        assert_eq!(r["run_kind"], what, "conformance: {what}");
+    }
+    note!(
+        "e21: timed per_cover_detail {:?} ({} chars); profiling {} chars; timed executions {}",
+        t["per_cover_detail"],
+        t["per_cover_detail"].len(),
+        p["per_cover_detail"].len(),
+        t["executions"]
+    );
+    assert!(t["per_cover_detail"].is_empty(), "conformance: timed row");
+    assert!(
+        !p["per_cover_detail"].is_empty(),
+        "conformance: profiling row"
+    );
+    assert!(
+        !t["executions"].is_empty(),
+        "conformance: the timed row keeps its counters"
+    );
+}
+
+/// D19 / F84 (iv): `synth/chain/d512` on the stateful engine (X1's
+/// configuration, `Ltr`) **completes** in process with the conformance
+/// threshold (`CONF_THREAD_THRESHOLD` = 65 536); at TraceForge's default 1 000
+/// the main thread's 1 025 spawns stop the exploration (the pilot's S4 panics).
+/// One process, run alone under `timeout 1200`.
+#[test]
+#[ignore]
+fn d19_chain_d512_completes_on_the_stateful_engine() {
+    let f =
+        fixture_by_name("synth/chain/d512").unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let c = x1_config(GridEngine::Stateful, Selector::Ltr);
+    let t = Instant::now();
+    let end = run_row_in_process(&f, &c, false);
+    let wall = t.elapsed();
+    let summary = match &end {
+        GridEnd::Ok(r) => format!("ok; vm_hwm_kb {:?}", r.vm_hwm_kb),
+        GridEnd::Panicked { payload, .. } => format!("panicked: {payload}"),
+        GridEnd::Capped { after, .. } => format!("capped after {after:?}"),
+    };
+    note!(
+        "d19: chain/d512 stateful {summary} in {:.1} s",
+        wall.as_secs_f64()
+    );
+    assert!(
+        matches!(end, GridEnd::Ok(_)),
+        "conformance: chain/d512: {summary}"
+    );
+    let GridEnd::Ok(res) = &end else {
+        unreachable!()
+    };
+    let r = row_of(res);
+    let get = |k: &str| {
+        r.iter()
+            .find(|(c, _)| *c == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    note!(
+        "d19: impl_end {} spec_end {} reports {}",
+        get("impl_end"),
+        get("spec_end"),
+        get("reports")
+    );
+    assert_eq!(
+        get("impl_end"),
+        "StateSpaceExhausted",
+        "conformance: the Impl explored to the end"
+    );
+    assert_eq!(
+        get("spec_end"),
+        "StateSpaceExhausted",
+        "conformance: the Spec explored to the end"
+    );
+    // Pinned last, so a lowered constant is killed by the run itself.
+    assert_eq!(crate::conformance::grid::CONF_THREAD_THRESHOLD, 1 << 16);
+}
+
 /// In-grid synthetic fixtures (CAL's points).
 fn cal_points() -> BTreeSet<String> {
     synth_grid()
@@ -581,10 +752,10 @@ fn c01_builtin_specs_hold_the_campaign_and_v_is_apart() {
     let names: BTreeSet<String> = specs().iter().map(|s| s.name.clone()).collect();
     assert_eq!(
         names,
-        set(["X0", "CAL", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G",]),
+        set(["X0", "CAL", "CALX", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G",]),
         "conformance: builtin_specs()"
     );
-    assert_eq!(specs().len(), 11, "conformance: no spec twice");
+    assert_eq!(specs().len(), 12, "conformance: no spec twice");
     let v = contract_specs();
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].name, "V");
@@ -813,6 +984,7 @@ fn c01_reps_per_spec() {
         let want: BTreeSet<u32> = if s.rows.first().map(|r| r.run_kind) == Some(RunKind::Timed)
             && s.name != "X0"
             && s.name != "CAL"
+            && s.name != "CALX"
         {
             [0, 1, 2].into()
         } else {
@@ -1055,7 +1227,7 @@ fn c01_contract_rows_are_refused() {
 #[test]
 fn c01_overlaps() {
     let names = [
-        "X0", "CAL", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G",
+        "X0", "CAL", "CALX", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G",
     ];
     let mut pairs = BTreeMap::new();
     for (i, a) in names.iter().enumerate() {
@@ -1264,7 +1436,7 @@ fn t0_row_counts_as_derived() {
     // the sweeping engines ⊆ CAL ∩ X1V).
     let others: BTreeSet<&String> = key_sets()
         .iter()
-        .filter(|(n, _)| n.as_str() != "CAL")
+        .filter(|(n, _)| n.as_str() != "CAL" && n.as_str() != "CALX")
         .flat_map(|(_, k)| k.iter())
         .collect();
     assert_eq!(
@@ -1278,11 +1450,14 @@ fn t0_row_counts_as_derived() {
         "t0: CAL shares {cal_shared} keys; distinct {}",
         distinct.len()
     );
+    // CALX (2026-10-09): 7 probe rows at the extension tier, a tier no other
+    // spec uses while the extension list is empty — 7 new keys.
+    assert_eq!(ks("CALX").len(), CALX_ROWS);
     assert_eq!(
         distinct.len(),
-        DERIVED_DISTINCT_WITH_X5 + CAL_ROWS - cal_shared
+        DERIVED_DISTINCT_WITH_X5 + CAL_ROWS - cal_shared + CALX_ROWS
     );
-    assert_eq!(distinct.len(), DERIVED_DISTINCT_WITH_CAL);
+    assert_eq!(distinct.len(), DERIVED_DISTINCT_WITH_CALX);
 }
 
 // =========================================================================
@@ -1388,6 +1563,25 @@ fn c02_x3a_after_x1_and_x1v_runs_only_its_new_keys() {
         assert_eq!(sum.ran, s.rows.len(), "conformance: {}: {sum:?}", s.name);
         ran_before.extend(keys(s));
     }
+    // D19 (i): `run-meta.json` written before the first row, with the rows'
+    // commit, the schema and the effective/default thread thresholds.
+    let meta =
+        json_at(&out, "run-meta.json").expect("conformance: run-meta.json after a driver run");
+    note!("c02: run-meta {meta}");
+    let stored = read_rows(&real_driver(x1.clone(), all.clone(), &out).store_path())
+        .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    assert!(!stored.is_empty());
+    let commits: BTreeSet<&String> = stored.iter().map(|r| &r["commit"]).collect();
+    assert_eq!(commits.len(), 1, "conformance: one commit");
+    assert_eq!(meta["commit"].as_str(), commits.first().map(|c| c.as_str()));
+    assert_eq!(meta["schema"], 2);
+    assert_eq!(meta["thread_threshold"]["effective"], 65_536);
+    assert_eq!(meta["thread_threshold"]["default"], 1_000);
+    assert_eq!(meta["profile"].as_str(), Some(prof()));
+    assert!(
+        !out.join("run-meta.json.tmp").exists(),
+        "conformance: the temporary renamed"
+    );
     let shared: BTreeSet<String> = keys(&x3a).intersection(&ran_before).cloned().collect();
     let d = real_driver(x3a.clone(), all.clone(), &out);
     let sum = d
@@ -2074,10 +2268,52 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         "9f2dcb0e484e5411b70b51544f9fb729",
         "conformance: the P5-SYNTH block (its trailing blank line excluded)"
     );
+    // D19 (2026-10-09, `ANSWERS-calibration.md` §2): the only change before
+    // the P5-APPS block is `CONF_THREAD_THRESHOLD` and its use in `cfg`/`seeded`
+    // (`git diff` against 2e7e96a: 20 insertions, 3 deletions, lines 79–101).
+    // Undoing exactly those lines gives back the gate-4 prefix.
+    let prefix = lines[..camp - 2].concat();
     assert_eq!(
-        md5_hex(lines[..camp - 2].concat().as_bytes()),
+        md5_hex(prefix.as_bytes()),
+        "bb5ba533ac3b2699b3be535b9c1d0591",
+        "conformance: everything before the P5-CAMPAIGN block (D19 prefix)"
+    );
+    let undo = |t: String, new: &str, old: &str| {
+        assert_eq!(
+            t.matches(new).count(),
+            1,
+            "conformance: the D19 hunk {new:.60}"
+        );
+        t.replace(new, old)
+    };
+    let mut t = prefix.clone();
+    let c_start = t
+        .find("/// The per-thread event bound of every conformance run")
+        .expect("conformance: D19 doc");
+    let c_end = t
+        .find("pub(super) const CONF_THREAD_THRESHOLD: u32 = 1 << 16;\n\n")
+        .expect("conformance: D19 const")
+        + "pub(super) const CONF_THREAD_THRESHOLD: u32 = 1 << 16;\n\n".len();
+    t.replace_range(c_start..c_end, "");
+    t = undo(
+        t,
+        "/// names the seed it was recorded under; every run carries\n/// [`CONF_THREAD_THRESHOLD`].\n",
+        "/// names the seed it was recorded under.\n",
+    );
+    t = undo(
+        t,
+        "    Config::builder()\n        .with_cons_type(model)\n        .with_seed(0)\n        .with_thread_threshold(CONF_THREAD_THRESHOLD)\n        .build()\n",
+        "    Config::builder().with_cons_type(model).with_seed(0).build()\n",
+    );
+    t = undo(
+        t,
+        "        Some(s) => Config::builder()\n            .with_cons_type(model)\n            .with_seed(s)\n            .with_thread_threshold(CONF_THREAD_THRESHOLD)\n            .build(),\n",
+        "        Some(s) => Config::builder().with_cons_type(model).with_seed(s).build(),\n",
+    );
+    assert_eq!(
+        md5_hex(t.as_bytes()),
         "fee6f42a5263760a22beedebda3ee6cf",
-        "conformance: everything before the P5-CAMPAIGN block = the gate-4 file"
+        "conformance: the prefix without D19's lines = the gate-4 file"
     );
 }
 

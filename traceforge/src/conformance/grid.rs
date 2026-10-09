@@ -77,15 +77,32 @@ pub(super) fn vis(ns: &[&str]) -> Vec<String> {
     ns.iter().map(|s| (*s).to_string()).collect()
 }
 
+/// The per-thread event bound of every conformance run (D19, the designers'
+/// answer of 2026-10-09; F84): TraceForge's `thread_threshold` **stops** the
+/// exploration when a thread exceeds it (default 1 000), which `chain(512)`'s
+/// main thread does with its 1 025 spawns. 65 536 is comfortably above the
+/// 4 097 spawns of `chain(2048)` with the engine's own events; the effective
+/// value, the default and the commit go into the runner's `run-meta.json`.
+pub(super) const CONF_THREAD_THRESHOLD: u32 = 1 << 16;
+
 /// Every grid run is seeded `with_seed(0)` (F61, X3) unless a 2PC table row
-/// names the seed it was recorded under.
+/// names the seed it was recorded under; every run carries
+/// [`CONF_THREAD_THRESHOLD`].
 pub(super) fn cfg(model: ConsType) -> Config {
-    Config::builder().with_cons_type(model).with_seed(0).build()
+    Config::builder()
+        .with_cons_type(model)
+        .with_seed(0)
+        .with_thread_threshold(CONF_THREAD_THRESHOLD)
+        .build()
 }
 
 fn seeded(model: ConsType, seed: Option<u64>) -> Config {
     match seed {
-        Some(s) => Config::builder().with_cons_type(model).with_seed(s).build(),
+        Some(s) => Config::builder()
+            .with_cons_type(model)
+            .with_seed(s)
+            .with_thread_threshold(CONF_THREAD_THRESHOLD)
+            .build(),
         None => cfg(model),
     }
 }
