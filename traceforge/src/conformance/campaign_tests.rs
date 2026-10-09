@@ -426,6 +426,138 @@ const DERIVED_DISTINCT: usize = 21_218;
 const X5_ROWS: [(&str, usize); 2] = [("X5", 588), ("X5G", 372)];
 const DERIVED_DISTINCT_WITH_X5: usize = 21_980;
 
+/// `CAL` (`P5-SYNTH` criterion 1's calibration pilot as a spec, 2026-10-09;
+/// since `eval.rs` `ef932078…` built with `x1_config(engine, Ltr)`): every
+/// in-grid synthetic point × the four engines × `Ltr` × rep 0, timed, default
+/// tier — 182 points × 4 = 728 rows (`P5-CALIBRATION.md`'s table: S1 24, S2 36,
+/// S3 18, S4 7, S5 90, S6 7 points, 24 lines). Shared keys, derived: every tier
+/// is default while the extension list is empty, so CAL ∩ X1 = 4 engines × the
+/// 110 in-grid synthetic X1 points = 440; CAL ∩ X3A = X3A's memo-on arm (X1's
+/// enumerator keys) at those points under `Ltr` rep 0 = 110 (X3A covers every
+/// X1 point); CAL ∩ X1V = 2 sweeping engines × 68 = 136; CAL ∩ X0 = 3 (X0's
+/// stateful, complete-first and gated `Ltr` rows on `ex:naive/k2/enc1`; X0's
+/// enumerator is memo off, CAL's memo on); CAL ∩ X5 = 6 (X5's X1V partners on
+/// `ex:naive/k{2,3,4}/enc{1,2}`, complete-first `Ltr` rep 0); X2/X2P (stop),
+/// X2S (profiling), X1P, X5G: none. CAL's keys held elsewhere: 440 + 136 + 1
+/// (X0's stateful row, a violating point X1V does not run on that engine).
+const CAL_ROWS: usize = 728;
+/// The distinct count with CAL (`x1_config` rows, 2026-10-09 `ef932078…`):
+/// 21 980 + 728 − (4·110 + 2·68 + 1) = 22 131 (22 240 with the
+/// `GridConfig::new` rows of `5157dbec…`).
+const DERIVED_DISTINCT_WITH_CAL: usize = 22_131;
+
+/// In-grid synthetic fixtures (CAL's points).
+fn cal_points() -> BTreeSet<String> {
+    synth_grid()
+        .into_iter()
+        .filter(|p| p.in_grid)
+        .map(|p| p.fixture)
+        .collect()
+}
+
+/// CAL's points among the derived X1 points (derived.md §1).
+fn cal_x1_points() -> usize {
+    cal_points().intersection(&derived().x1).count()
+}
+
+/// CAL's points among the derived X1V points (derived.md §1).
+fn cal_x1v_points() -> usize {
+    cal_points().intersection(&derived().x1v).count()
+}
+
+/// `CAL` as data: 728 rows = 182 in-grid synthetic points × the four engines,
+/// every row `Ltr`, rep 0, the default tier, timed, `x1_config(engine, Ltr)`
+/// (the enumerator memo on + `Unlimited`), no twin key,
+/// `series` set; the six families' point counts of `P5-CALIBRATION.md`; the 24
+/// lines (series scope's family|line part), each under the four engines.
+#[test]
+fn cal_spec_is_the_calibration_pilot() {
+    let cal = spec("CAL");
+    assert_eq!(cal.rows.len(), CAL_ROWS);
+    assert_eq!(
+        ks("CAL").len(),
+        CAL_ROWS,
+        "conformance: CAL's keys distinct"
+    );
+    assert_eq!(fixtures(cal), cal_points(), "conformance: CAL's points");
+    assert_eq!(cal_points().len(), 182);
+    let mut per_point: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    let mut lines: BTreeSet<String> = BTreeSet::new();
+    let mut scopes: BTreeSet<String> = BTreeSet::new();
+    let mut families: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for r in &cal.rows {
+        assert_eq!(
+            r.config,
+            x1_config(r.config.engine, Selector::Ltr),
+            "conformance: CAL {}",
+            r.fixture
+        );
+        assert_eq!(r.rep, 0);
+        assert_eq!(r.tier, Tier::default_tier());
+        assert_eq!(r.run_kind, RunKind::Timed);
+        assert!(r.twin_key.is_empty(), "conformance: CAL {}", r.fixture);
+        let sr = r
+            .series
+            .as_ref()
+            .unwrap_or_else(|| panic!("conformance: CAL {} has no series", r.fixture));
+        let mut parts = sr.scope.splitn(3, '|');
+        let line = format!(
+            "{}|{}",
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default()
+        );
+        lines.insert(line);
+        scopes.insert(sr.scope.clone());
+        per_point
+            .entry(r.fixture.as_str())
+            .or_default()
+            .insert(format!("{:?}", r.config.engine));
+        families
+            .entry(r.family.clone())
+            .or_default()
+            .insert(r.fixture.as_str());
+    }
+    assert!(
+        per_point.values().all(|e| e.len() == 4),
+        "conformance: four engines per point"
+    );
+    note!("cal: lines {lines:?}");
+    assert_eq!(lines.len(), 24, "conformance: CAL's lines");
+    assert_eq!(scopes.len(), 24 * 4, "conformance: a line per engine");
+    let counts: BTreeMap<String, usize> =
+        families.iter().map(|(f, s)| (f.clone(), s.len())).collect();
+    note!("cal: points per family {counts:?}");
+    assert_eq!(
+        counts,
+        [
+            ("naive".to_owned(), 24),
+            ("share".to_owned(), 36),
+            ("commit".to_owned(), 18),
+            ("chain".to_owned(), 7),
+            ("reset".to_owned(), 90),
+            ("width".to_owned(), 7),
+        ]
+        .into(),
+        "conformance: P5-CALIBRATION.md's table"
+    );
+    // The shared points: 110 in X1 (conforming), 68 in X1V; the other four are
+    // `ex:naive/k{6,7}/enc{1,2}` (violating, exhaustive in no spec — F2).
+    assert_eq!((cal_x1_points(), cal_x1v_points()), (110, 68));
+    let rest: BTreeSet<String> = cal_points()
+        .into_iter()
+        .filter(|f| !derived().x1.contains(f) && !derived().x1v.contains(f))
+        .collect();
+    assert_eq!(
+        rest,
+        set([
+            "ex:naive/k6/enc1",
+            "ex:naive/k6/enc2",
+            "ex:naive/k7/enc1",
+            "ex:naive/k7/enc2"
+        ])
+    );
+}
+
 /// X2S's exclusions (round 02 m2): the two X2 fixtures never run on the
 /// stateful engine in Part 6 — `2pc/leader/split/n4` and `ndk3/bad_*`; the
 /// other `n = 4` 2PC pairs completed there and stay in X2S.
@@ -442,16 +574,17 @@ fn label_of(r: &RowSpec) -> String {
 // =========================================================================
 
 /// C1: the builtin specs are X0, the seven campaign specs and (since the
-/// `P5-X5` landing, 2026-10-08) `P5-X5`'s X5 and X5G; `V` is apart.
+/// `P5-X5` landing, 2026-10-08) `P5-X5`'s X5 and X5G, and (2026-10-09) `CAL`,
+/// `P5-SYNTH` criterion 1's calibration pilot (not a campaign spec); `V` is apart.
 #[test]
 fn c01_builtin_specs_hold_the_campaign_and_v_is_apart() {
     let names: BTreeSet<String> = specs().iter().map(|s| s.name.clone()).collect();
     assert_eq!(
         names,
-        set(["X0", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G"]),
+        set(["X0", "CAL", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G",]),
         "conformance: builtin_specs()"
     );
-    assert_eq!(specs().len(), 10, "conformance: no spec twice");
+    assert_eq!(specs().len(), 11, "conformance: no spec twice");
     let v = contract_specs();
     assert_eq!(v.len(), 1);
     assert_eq!(v[0].name, "V");
@@ -677,12 +810,14 @@ fn c01_reps_per_spec() {
         for r in &s.rows {
             sets.entry(r.rep_set()).or_default().insert(r.rep);
         }
-        let want: BTreeSet<u32> =
-            if s.rows.first().map(|r| r.run_kind) == Some(RunKind::Timed) && s.name != "X0" {
-                [0, 1, 2].into()
-            } else {
-                [0].into()
-            };
+        let want: BTreeSet<u32> = if s.rows.first().map(|r| r.run_kind) == Some(RunKind::Timed)
+            && s.name != "X0"
+            && s.name != "CAL"
+        {
+            [0, 1, 2].into()
+        } else {
+            [0].into()
+        };
         for (set, reps) in &sets {
             assert_eq!(reps, &want, "conformance: {}: {set}", s.name);
         }
@@ -920,7 +1055,7 @@ fn c01_contract_rows_are_refused() {
 #[test]
 fn c01_overlaps() {
     let names = [
-        "X0", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G",
+        "X0", "CAL", "X1", "X1V", "X1P", "X2", "X2P", "X2S", "X3A", "X5", "X5G",
     ];
     let mut pairs = BTreeMap::new();
     for (i, a) in names.iter().enumerate() {
@@ -939,8 +1074,18 @@ fn c01_overlaps() {
         ("X1∩X5".to_owned(), 72),
         ("X1V∩X5".to_owned(), 18),
         ("X2∩X5".to_owned(), 108),
+        ("X0∩CAL".to_owned(), 3),
+        ("CAL∩X1".to_owned(), 4 * cal_x1_points()),
+        ("CAL∩X3A".to_owned(), cal_x1_points()),
+        ("CAL∩X1V".to_owned(), 2 * cal_x1v_points()),
+        ("CAL∩X5".to_owned(), 6),
     ]
     .into();
+    note!(
+        "c01: CAL's X1 points {}, X1V points {}",
+        cal_x1_points(),
+        cal_x1v_points()
+    );
     assert_eq!(pairs, want);
     // Every shared X5 key is an `A_sweep` (cover `Sweep`, no precheck,
     // complete-first) row; the X0 one is X1V's too.
@@ -1114,8 +1259,30 @@ fn t0_row_counts_as_derived() {
         assert_eq!(spec(name).rows.len(), n, "conformance: {name}");
         assert_eq!(ks(name).len(), n, "conformance: {name}'s keys are distinct");
     }
+    // CAL (2026-10-09): 728 keys, of which those shared with another spec are
+    // the overlaps of `c01_overlaps` (CAL ∩ X5 ⊆ CAL ∩ X1V; the X0 keys on
+    // the sweeping engines ⊆ CAL ∩ X1V).
+    let others: BTreeSet<&String> = key_sets()
+        .iter()
+        .filter(|(n, _)| n.as_str() != "CAL")
+        .flat_map(|(_, k)| k.iter())
+        .collect();
+    assert_eq!(
+        others.len(),
+        DERIVED_DISTINCT_WITH_X5,
+        "conformance: without CAL"
+    );
+    let cal_shared = 4 * cal_x1_points() + 2 * cal_x1v_points() + 1;
     let distinct: BTreeSet<&String> = key_sets().values().flatten().collect();
-    assert_eq!(distinct.len(), DERIVED_DISTINCT_WITH_X5);
+    note!(
+        "t0: CAL shares {cal_shared} keys; distinct {}",
+        distinct.len()
+    );
+    assert_eq!(
+        distinct.len(),
+        DERIVED_DISTINCT_WITH_X5 + CAL_ROWS - cal_shared
+    );
+    assert_eq!(distinct.len(), DERIVED_DISTINCT_WITH_CAL);
 }
 
 // =========================================================================
@@ -1136,7 +1303,12 @@ fn c02_experiments_of_names_every_holder() {
     }
     assert_eq!(
         x0x1v,
-        [("X0+X1V".to_owned(), 5), ("X0+X1V+X5".to_owned(), 1)].into()
+        [
+            ("X0+X1V".to_owned(), 4),
+            ("X0+CAL+X1V".to_owned(), 1),
+            ("X0+CAL+X1V+X5".to_owned(), 1),
+        ]
+        .into()
     );
     let mut x5 = BTreeMap::new();
     for k in ks("X5") {
@@ -1149,8 +1321,9 @@ fn c02_experiments_of_names_every_holder() {
         [
             ("X5".to_owned(), 390),
             ("X1+X5".to_owned(), 72),
-            ("X1V+X5".to_owned(), 17),
-            ("X0+X1V+X5".to_owned(), 1),
+            ("X1V+X5".to_owned(), 12),
+            ("CAL+X1V+X5".to_owned(), 5),
+            ("X0+CAL+X1V+X5".to_owned(), 1),
             ("X2+X5".to_owned(), 108),
         ]
         .into(),
@@ -3734,8 +3907,9 @@ fn r01_every_twin_key_is_a_key_of_some_spec() {
             "X5".to_owned(),
             [
                 ("X1".to_owned(), 72),
-                ("X1V".to_owned(), 17),
-                ("X0+X1V".to_owned(), 1),
+                ("X1V".to_owned(), 12),
+                ("CAL+X1V".to_owned(), 5),
+                ("X0+CAL+X1V".to_owned(), 1),
                 ("X2".to_owned(), 108),
                 ("X5".to_owned(), 96),
             ]

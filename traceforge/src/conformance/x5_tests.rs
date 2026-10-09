@@ -537,6 +537,11 @@ fn c01_x5_lists_every_sweep_partner_and_shares_the_key() {
     }
     note!("overlaps with (X5, X5G): {over:?}");
     let want: BTreeMap<String, (usize, usize)> = [
+        // CAL (`P5-SYNTH` criterion 1's pilot as a spec: in-grid synthetic
+        // points × four engines × `x1_config(e, Ltr)` × rep 0): exactly X5's
+        // six X1V partners `ex:naive/k{2,3,4}/enc{1,2}` complete-first `Ltr`
+        // rep 0 (asserted below); X5G holds no `x1_config` key.
+        ("CAL".to_owned(), (6, 0)),
         ("X0".to_owned(), (1, 0)),
         ("X1".to_owned(), (72, 0)),
         ("X1V".to_owned(), (18, 0)),
@@ -544,6 +549,28 @@ fn c01_x5_lists_every_sweep_partner_and_shares_the_key() {
     ]
     .into();
     assert_eq!(over, want, "conformance: the overlaps with X5 and X5G");
+    let cal: BTreeSet<String> = ks("CAL").intersection(ks("X5")).cloned().collect();
+    let want_cal: BTreeSet<String> = (2..=4)
+        .flat_map(|k| (1..=2).map(move |e| format!("ex:naive/k{k}/enc{e}")))
+        .map(|f| {
+            crate::conformance::eval::key_of(
+                &f,
+                &x1_config(GridEngine::CompleteFirst, Selector::Ltr).label(),
+                0,
+                "default",
+                RunKind::Timed,
+                prof(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        cal, want_cal,
+        "conformance: CAL ∩ X5 = the six X1V partners at rep 0"
+    );
+    assert!(
+        cal.iter().all(|k| ks("X1V").contains(k)),
+        "conformance: CAL ∩ X5 ⊆ X1V"
+    );
     assert_eq!(
         ks("X5").intersection(ks("X5G")).count(),
         0,

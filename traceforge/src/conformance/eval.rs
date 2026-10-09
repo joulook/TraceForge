@@ -605,9 +605,41 @@ pub(super) fn x0_spec() -> Spec {
 /// The specs `eval_driver` knows by name (`EVAL_SPEC`); the campaign's specs
 /// are added here by `P5-CAMPAIGN`.
 pub(super) fn builtin_specs() -> Vec<Spec> {
-    let mut out = vec![x0_spec()];
+    let mut out = vec![x0_spec(), cal_spec()];
     out.extend(campaign_specs());
     out
+}
+
+/// `CAL` — `P5-SYNTH` criterion 1's calibration pilot as a spec (D8, D15; the
+/// owner's go of 2026-10-09): every in-grid synthetic point (the provisional
+/// ranges plus the extension points up to each ceiling, every point kept) ×
+/// the four engines under **X1's configuration** × `Ltr` × rep 0, timed, the
+/// default tier (the conforming points' keys are X1's, the violating points'
+/// sweeping keys X1V's, the violating points' enumerator and stateful keys
+/// the pilot's own), `series` set so
+/// rule (b) (censoring by implication per line and configuration) applies
+/// inside the pilot. Not a campaign spec: the frozen-list rules do not apply
+/// (the pilot is what the lists are frozen from), and the campaign re-runs
+/// every point into its own store (`P5-CAMPAIGN` C9), so nothing is reused by
+/// key across stores. Run per family (`EVAL_ONLY='synth/<family>/*'`) so the
+/// 6 h cap (procedure (f)) is checked per family.
+pub(super) fn cal_spec() -> Spec {
+    let tier = Tier::default_tier();
+    let mut rows = Vec::new();
+    for p in synth_grid().into_iter().filter(|p| p.in_grid) {
+        for e in CAMPAIGN_ENGINES {
+            // X1's configuration (D11: the enumerator memo on, unlimited), so
+            // every pilot row is an X1/X1V row by key and the estimate and the
+            // promotion rule read the engines X1 runs, no proxy.
+            let mut r = p.row_spec(&x1_config(e, Selector::Ltr), &tier, RunKind::Timed, 0);
+            r.twin_key.clear();
+            rows.push(r);
+        }
+    }
+    Spec {
+        name: "CAL".to_owned(),
+        rows,
+    }
 }
 
 /// The experiments whose expansion contains `key` (H1: computed at read
