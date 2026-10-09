@@ -70,7 +70,7 @@ pub enum Engine {
 /// `P4-GATED` G5: the gated checker's reporting contract.
 /// Which engine answers the **completion question** in the complete-first and
 /// gated checkers (`P4-FLAT` F4; `flat.tex` §9's drop-in paragraph): the
-/// directed sweep of Parts 4–5, or `FlatCover`, exact for a communication-flat
+/// undirected, unpruned sweep of Parts 4–5 (`P4-CFIRST` C6), or `FlatCover`, exact for a communication-flat
 /// specification and refused for any other (eligibility is decided on the
 /// §5.4 precheck's enumeration, so the knob requires the precheck — D12, D13).
 /// Gate sweeps are unchanged; the enumerator and the stateful engine do not

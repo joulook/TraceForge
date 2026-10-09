@@ -450,6 +450,24 @@ mod grid_tests;
 mod mixed_tests;
 #[cfg(test)]
 mod flat_tests;
+/// P5-HARNESS's evaluation runner (lead) and the tester's fixtures and tests.
+/// **Test-only.**
+#[cfg(test)]
+mod eval;
+#[cfg(test)]
+mod eval_tests;
+/// P5-APPS's tests (tester). **Test-only.**
+#[cfg(test)]
+mod apps_tests;
+/// P5-SYNTH's tests (tester). **Test-only.**
+#[cfg(test)]
+mod synth_tests;
+/// P5-CAMPAIGN's tests (tester). **Test-only.**
+#[cfg(test)]
+mod campaign_tests;
+/// P5-X5's tests (tester). **Test-only.**
+#[cfg(test)]
+mod x5_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
 /// truth the differential harness measures the tool against, it is the naive
 /// exponential algorithm the paper's algorithm exists to avoid, and nothing

@@ -107,6 +107,10 @@ pub(super) enum Group {
     TwoPc,
     /// `generator::corpus`.
     Corpus,
+    /// `P5-APPS`: the application-derived bounded models (never in `registry()`).
+    Apps,
+    /// `P5-SYNTH`: the synthetic families S1–S6 (never in `registry()`).
+    Synth,
 }
 
 /// The entry point a DEMO-2PC table's own code uses (criterion 7).
@@ -2206,3 +2210,2390 @@ pub(super) fn row_of_end(end: &GridEnd) -> Row {
     }
     row
 }
+
+// =========================================================================
+// P5-APPS — application-derived bounded models (lead; criteria rev 5.1)
+// =========================================================================
+//
+// Four models as fixtures: A1 two-phase commit deepened to `r` rounds (the
+// `bench.rs` shape re-coded, thread mailboxes and `Init(Vec<ThreadId>)`
+// kept under M2's spawn-order argument), A2 a key-value store with one Spec
+// and three Impls (`pb`, `pb-br`, `sh`), A3 a lock service, A4 a
+// load-balancing server with two Specs. Encodings, scripts, spawn orders and
+// the fault catalogue are `criteria/P5-APPS.md`'s; the provenance notes are
+// `log/dev/P5-APPS.models.md`. Every channel is created by `main`; clients
+// are closed-loop with their own reply channel; no `ThreadId` is in any
+// observed value of A2–A4. Invisible servers that cannot know their request
+// count (A4's servers on both sides, whose load depends on the routing or on
+// `nondet`) loop until the run ends and finish `Blocked`, which leaves the
+// graph complete (M7); every other invisible thread, the shards included,
+// loops an exact count computed from the script (gate 3 T6).
+
+/// A typed channel under `ConsType::FIFO`'s communication model (`LocalOrder`),
+/// created by the calling thread (criterion 2; `chan()`/`fifo_chan()` untouched).
+pub(super) fn typed_chan<T: Send + PartialEq + Clone + std::fmt::Debug + 'static>(
+) -> (crate::channel::Sender<T>, crate::channel::Receiver<T>) {
+    crate::channel::Builder::<T>::new()
+        .with_comm(crate::channel::cons_to_model(ConsType::FIFO))
+        .build()
+}
+
+fn apps_config() -> Config {
+    Config::builder()
+        .with_cons_type(ConsType::FIFO)
+        .with_seed(0)
+        .build()
+}
+
+fn apps_fixture(
+    name: String,
+    source: &'static str,
+    visible: &[&str],
+    imp: Prog,
+    spec: Prog,
+) -> Fixture {
+    fixture(name, source, Group::Apps, apps_config(), vis(visible), imp, spec)
+}
+
+// ---------------------------------------------------------------- A1 ----
+
+#[derive(Clone, PartialEq, Debug)]
+enum A1ToCoord {
+    Init(Vec<crate::thread::ThreadId>),
+    Yes,
+    No,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum A1ToPart {
+    Prepare(crate::thread::ThreadId),
+    Commit,
+    Abort,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum A1Coord {
+    /// Real 2PC: every vote read, commit iff all yes, the same decision to all.
+    Correct,
+    /// `bench.rs`'s bug: decide as each vote arrives (value and order faults).
+    Eager,
+    /// Broadcast `Abort` on the first `No`, then drain the round's votes (order).
+    EarlyAbort,
+    /// The decision to `p1` is never sent in the last round (status).
+    Silent,
+    /// Decisions sent in reverse participant order (the still-conforming control).
+    ControlReverse,
+}
+
+/// A participant: `r` rounds of `recv Prepare; vote; send; recv decision`.
+fn a1_participant(r: usize) {
+    for _ in 0..r {
+        let cid = match crate::recv_msg_block::<A1ToPart>() {
+            A1ToPart::Prepare(id) => id,
+            _ => return,
+        };
+        let vote = crate::nondet();
+        crate::send_msg(cid, if vote { A1ToCoord::Yes } else { A1ToCoord::No });
+        let _decision: A1ToPart = crate::recv_msg_block();
+    }
+}
+
+fn a1_coordinator(kind: A1Coord, r: usize) {
+    let ps = match crate::recv_msg_block::<A1ToCoord>() {
+        A1ToCoord::Init(ps) => ps,
+        _ => return,
+    };
+    let me = thread::current().id();
+    for round in 0..r {
+        for p in &ps {
+            crate::send_msg(*p, A1ToPart::Prepare(me));
+        }
+        match kind {
+            A1Coord::Correct | A1Coord::Silent | A1Coord::ControlReverse => {
+                let mut yes = 0usize;
+                for _ in 0..ps.len() {
+                    if let A1ToCoord::Yes = crate::recv_msg_block::<A1ToCoord>() {
+                        yes += 1;
+                    }
+                }
+                let d = if yes == ps.len() {
+                    A1ToPart::Commit
+                } else {
+                    A1ToPart::Abort
+                };
+                let order: Vec<&crate::thread::ThreadId> = if kind == A1Coord::ControlReverse {
+                    ps.iter().rev().collect()
+                } else {
+                    ps.iter().collect()
+                };
+                for (i, p) in order.into_iter().enumerate() {
+                    let silent = kind == A1Coord::Silent && round + 1 == r && i == 1;
+                    if !silent {
+                        crate::send_msg(*p, d.clone());
+                    }
+                }
+            }
+            A1Coord::Eager => {
+                let mut seen_no = false;
+                for p in &ps {
+                    if let A1ToCoord::No = crate::recv_msg_block::<A1ToCoord>() {
+                        seen_no = true;
+                    }
+                    crate::send_msg(
+                        *p,
+                        if seen_no {
+                            A1ToPart::Abort
+                        } else {
+                            A1ToPart::Commit
+                        },
+                    );
+                }
+            }
+            A1Coord::EarlyAbort => {
+                let mut read = 0usize;
+                let mut aborted = false;
+                while read < ps.len() {
+                    let v: A1ToCoord = crate::recv_msg_block();
+                    read += 1;
+                    if !aborted && v == A1ToCoord::No {
+                        aborted = true;
+                        for p in &ps {
+                            crate::send_msg(*p, A1ToPart::Abort);
+                        }
+                    }
+                }
+                if !aborted {
+                    for p in &ps {
+                        crate::send_msg(*p, A1ToPart::Commit);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The Impl: coordinator first (`t1`), then `p0..p{n-1}`; `main` sends `Init`.
+pub(super) fn a1_impl(n: usize, r: usize, kind: A1Coord) -> Prog {
+    prog(move || {
+        let coord = named("coord", move || a1_coordinator(kind, r));
+        let mut ids = Vec::with_capacity(n);
+        for i in 0..n {
+            ids.push(named(&format!("p{i}"), move || a1_participant(r)).thread().id());
+        }
+        crate::send_msg(coord.thread().id(), A1ToCoord::Init(ids));
+    })
+}
+
+/// The Spec: two participants whatever `n`; the oracle reads every vote, then
+/// chooses by `nondet()`, the same decision to both (no early abort).
+pub(super) fn a1_spec(r: usize) -> Prog {
+    prog(move || {
+        let coord = named("coord", move || {
+            let ps = match crate::recv_msg_block::<A1ToCoord>() {
+                A1ToCoord::Init(ps) => ps,
+                _ => return,
+            };
+            let me = thread::current().id();
+            for _ in 0..r {
+                for p in &ps {
+                    crate::send_msg(*p, A1ToPart::Prepare(me));
+                }
+                for _ in 0..ps.len() {
+                    let _vote: A1ToCoord = crate::recv_msg_block();
+                }
+                let d = if crate::nondet() {
+                    A1ToPart::Commit
+                } else {
+                    A1ToPart::Abort
+                };
+                for p in &ps {
+                    crate::send_msg(*p, d.clone());
+                }
+            }
+        });
+        let mut ids = Vec::with_capacity(2);
+        for i in 0..2 {
+            ids.push(named(&format!("p{i}"), move || a1_participant(r)).thread().id());
+        }
+        crate::send_msg(coord.thread().id(), A1ToCoord::Init(ids));
+    })
+}
+
+// ---------------------------------------------------------------- A2 ----
+
+#[derive(Clone, PartialEq, Debug)]
+pub(super) enum Req {
+    Put { c: usize, k: usize, v: i32 },
+    Get { c: usize, k: usize },
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub(super) enum Rep {
+    Ack,
+    Val(i32),
+    None,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+enum Internal {
+    Fwd(Req),
+    AckPut,
+}
+
+/// Client `c_i`'s op `j`: a put iff `i+j` is even, key `(⌊j/2⌋ + ⌊i/2⌋) mod 2`,
+/// value `10i+j`.
+pub(super) fn a2_op(i: usize, j: usize) -> Req {
+    let k = (j / 2 + i / 2) % 2;
+    if (i + j).is_multiple_of(2) {
+        Req::Put {
+            c: i,
+            k,
+            v: (10 * i + j) as i32,
+        }
+    } else {
+        Req::Get { c: i, k }
+    }
+}
+
+fn a2_is_put(r: &Req) -> bool {
+    matches!(r, Req::Put { .. })
+}
+
+fn a2_key(r: &Req) -> usize {
+    match r {
+        Req::Put { k, .. } | Req::Get { k, .. } => *k,
+    }
+}
+
+fn a2_client(r: &Req) -> usize {
+    match r {
+        Req::Put { c, .. } | Req::Get { c, .. } => *c,
+    }
+}
+
+type RepTx = crate::channel::Sender<Rep>;
+
+fn a2_lookup(map: &std::collections::HashMap<usize, i32>, k: usize) -> Rep {
+    map.get(&k).map_or(Rep::None, |v| Rep::Val(*v))
+}
+
+/// The closed-loop clients: `c_i` sends its script to `send_to(req)` and blocks
+/// on its reply channel after each request.
+fn a2_spawn_clients(
+    q: usize,
+    reply_rx: Vec<crate::channel::Receiver<Rep>>,
+    route: impl Fn(&Req) -> crate::channel::Sender<Req> + Send + Sync + 'static,
+) {
+    let route = Arc::new(route);
+    for (i, rx) in reply_rx.into_iter().enumerate() {
+        let route = Arc::clone(&route);
+        named(&format!("c{i}"), move || {
+            for j in 0..q {
+                let r = a2_op(i, j);
+                route(&r).send_msg(r.clone());
+                let _rep: Rep = rx.recv_msg_block();
+            }
+        });
+    }
+}
+
+fn a2_reply_channels(k: usize) -> (Vec<RepTx>, Vec<crate::channel::Receiver<Rep>>) {
+    let mut txs = Vec::with_capacity(k);
+    let mut rxs = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (tx, rx) = typed_chan::<Rep>();
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    (txs, rxs)
+}
+
+/// The Spec: one invisible `store`, serving in arrival order.
+pub(super) fn a2_spec(k: usize, q: usize) -> Prog {
+    prog(move || {
+        let (tx_req, rx_req) = typed_chan::<Req>();
+        let (reply_tx, reply_rx) = a2_reply_channels(k);
+        named("store", move || {
+            let mut map = std::collections::HashMap::new();
+            for _ in 0..k * q {
+                match rx_req.recv_msg_block() {
+                    Req::Put { c, k, v } => {
+                        map.insert(k, v);
+                        reply_tx[c].send_msg(Rep::Ack);
+                    }
+                    Req::Get { c, k } => reply_tx[c].send_msg(a2_lookup(&map, k)),
+                }
+            }
+        });
+        a2_spawn_clients(q, reply_rx, move |_| tx_req.clone());
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum A2Pb {
+    /// Primary-backup: forward, wait for the ack, reply.
+    Correct,
+    /// Reply `Ack` right after forwarding; the ack is read before the next
+    /// request (the control with primary-served gets: unobservable).
+    EarlyAck,
+    /// The primary drops every put from its map (wrong value at a later get).
+    StaleGet,
+    /// The first put the primary receives is never answered (status).
+    SilentPut,
+}
+
+/// `pb`: `primary` (request channel), `backup` (channel from the primary, a
+/// dedicated ack channel back), gets served by the primary.
+pub(super) fn a2_pb(k: usize, q: usize, kind: A2Pb) -> Prog {
+    prog(move || {
+        let (tx_req, rx_req) = typed_chan::<Req>();
+        let (tx_b, rx_b) = typed_chan::<Internal>();
+        let (tx_ack, rx_ack) = typed_chan::<Internal>();
+        let (reply_tx, reply_rx) = a2_reply_channels(k);
+        let n_puts = (0..k)
+            .flat_map(|i| (0..q).map(move |j| a2_op(i, j)))
+            .filter(a2_is_put)
+            .count();
+        named("primary", move || {
+            let mut map = std::collections::HashMap::new();
+            let mut first_put = true;
+            for _ in 0..k * q {
+                match rx_req.recv_msg_block() {
+                    r @ Req::Put { c, k, v } => {
+                        if kind != A2Pb::StaleGet {
+                            map.insert(k, v);
+                        }
+                        tx_b.send_msg(Internal::Fwd(r));
+                        if kind == A2Pb::EarlyAck {
+                            reply_tx[c].send_msg(Rep::Ack);
+                            let _ack: Internal = rx_ack.recv_msg_block();
+                        } else {
+                            let _ack: Internal = rx_ack.recv_msg_block();
+                            let silent = kind == A2Pb::SilentPut && first_put;
+                            if !silent {
+                                reply_tx[c].send_msg(Rep::Ack);
+                            }
+                        }
+                        first_put = false;
+                    }
+                    Req::Get { c, k } => reply_tx[c].send_msg(a2_lookup(&map, k)),
+                }
+            }
+        });
+        named("backup", move || {
+            let mut map = std::collections::HashMap::new();
+            for _ in 0..n_puts {
+                if let Internal::Fwd(Req::Put { k, v, .. }) = rx_b.recv_msg_block() {
+                    map.insert(k, v);
+                }
+                tx_ack.send_msg(Internal::AckPut);
+            }
+        });
+        a2_spawn_clients(q, reply_rx, move |_| tx_req.clone());
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum A2Br {
+    /// Gets go directly to the backup; the primary waits for the ack.
+    Correct,
+    /// Gets go directly to the backup; the primary replies `Ack` before the ack
+    /// (the ack-before-commit mutant: (O) at (2,1), (V) at (1,2)).
+    EarlyAck,
+    /// Gets are forwarded through the primary, early ack (the second control:
+    /// the backup reads in the primary's order — unobservable).
+    ControlForwardedEarlyAck,
+}
+
+/// `pb-br`: the backup's request channel is `typed_chan::<Req>()` fed by the
+/// primary (forwarded puts, unwrapped) and by every client (gets); the backup
+/// replies to clients directly and acks puts on `Internal::AckPut`.
+pub(super) fn a2_pb_br(k: usize, q: usize, kind: A2Br) -> Prog {
+    prog(move || {
+        let (tx_req, rx_req) = typed_chan::<Req>();
+        let (tx_bk, rx_bk) = typed_chan::<Req>();
+        let (tx_ack, rx_ack) = typed_chan::<Internal>();
+        let (reply_tx, reply_rx) = a2_reply_channels(k);
+        let reply_tx_b = reply_tx.clone();
+        let tx_bk_primary = tx_bk.clone();
+        named("primary", move || {
+            let n = (0..k)
+                .flat_map(|i| (0..q).map(move |j| a2_op(i, j)))
+                .filter(|r| a2_is_put(r) || kind == A2Br::ControlForwardedEarlyAck)
+                .count();
+            for _ in 0..n {
+                match rx_req.recv_msg_block() {
+                    r @ Req::Put { c, .. } => {
+                        tx_bk_primary.send_msg(r);
+                        if kind == A2Br::Correct {
+                            let _ack: Internal = rx_ack.recv_msg_block();
+                            reply_tx[c].send_msg(Rep::Ack);
+                        } else {
+                            reply_tx[c].send_msg(Rep::Ack);
+                            let _ack: Internal = rx_ack.recv_msg_block();
+                        }
+                    }
+                    r @ Req::Get { .. } => tx_bk_primary.send_msg(r),
+                }
+            }
+        });
+        named("backup", move || {
+            let mut map = std::collections::HashMap::new();
+            for _ in 0..k * q {
+                match rx_bk.recv_msg_block() {
+                    Req::Put { k, v, .. } => {
+                        map.insert(k, v);
+                        tx_ack.send_msg(Internal::AckPut);
+                    }
+                    Req::Get { c, k } => reply_tx_b[c].send_msg(a2_lookup(&map, k)),
+                }
+            }
+        });
+        a2_spawn_clients(q, reply_rx, move |r| {
+            if a2_is_put(r) || kind == A2Br::ControlForwardedEarlyAck {
+                tx_req.clone()
+            } else {
+                tx_bk.clone()
+            }
+        });
+    })
+}
+
+/// `sh`: a router forwards each request to shard `key mod s` (`misroute`: a
+/// get to `(key + 1) mod s`); shards reply to clients directly.
+pub(super) fn a2_sh(k: usize, q: usize, s: usize, misroute: bool) -> Prog {
+    prog(move || {
+        let (tx_req, rx_req) = typed_chan::<Req>();
+        let (reply_tx, reply_rx) = a2_reply_channels(k);
+        let mut shard_tx = Vec::with_capacity(s);
+        let mut shard_rx = Vec::with_capacity(s);
+        for _ in 0..s {
+            let (tx, rx) = typed_chan::<Req>();
+            shard_tx.push(tx);
+            shard_rx.push(rx);
+        }
+        let route = move |r: &Req| -> usize {
+            let key = a2_key(r);
+            if misroute && !a2_is_put(r) {
+                (key + 1) % s
+            } else {
+                key % s
+            }
+        };
+        let per_shard: Vec<usize> = (0..s)
+            .map(|x| {
+                (0..k)
+                    .flat_map(|i| (0..q).map(move |j| a2_op(i, j)))
+                    .filter(|r| route(r) == x)
+                    .count()
+            })
+            .collect();
+        named("router", move || {
+            for _ in 0..k * q {
+                let r = rx_req.recv_msg_block();
+                shard_tx[route(&r)].send_msg(r);
+            }
+        });
+        for (x, rx) in shard_rx.into_iter().enumerate() {
+            let reply_tx = reply_tx.clone();
+            let n = per_shard[x];
+            named(&format!("shard{x}"), move || {
+                let mut map = std::collections::HashMap::new();
+                for _ in 0..n {
+                    match rx.recv_msg_block() {
+                        Req::Put { c, k, v } => {
+                            map.insert(k, v);
+                            reply_tx[c].send_msg(Rep::Ack);
+                        }
+                        Req::Get { c, k } => reply_tx[c].send_msg(a2_lookup(&map, k)),
+                    }
+                }
+            });
+        }
+        a2_spawn_clients(q, reply_rx, move |_| tx_req.clone());
+    })
+}
+
+// ---------------------------------------------------------------- A3 ----
+
+#[derive(Clone, PartialEq, Debug)]
+pub(super) enum Msg {
+    Acq(usize),
+    Rel(usize),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub(super) struct Grant(pub(super) usize, pub(super) usize);
+
+fn a3_spawn_clients(
+    q: usize,
+    reply_rx: Vec<crate::channel::Receiver<Grant>>,
+    tx_acq: crate::channel::Sender<Msg>,
+    tx_rel: crate::channel::Sender<Msg>,
+) {
+    for (i, rx) in reply_rx.into_iter().enumerate() {
+        let tx_acq = tx_acq.clone();
+        let tx_rel = tx_rel.clone();
+        named(&format!("c{i}"), move || {
+            for _ in 0..q {
+                tx_acq.send_msg(Msg::Acq(i));
+                let _g: Grant = rx.recv_msg_block();
+                tx_rel.send_msg(Msg::Rel(i));
+            }
+        });
+    }
+}
+
+fn a3_reply_channels(
+    k: usize,
+) -> (
+    Vec<crate::channel::Sender<Grant>>,
+    Vec<crate::channel::Receiver<Grant>>,
+) {
+    let mut txs = Vec::with_capacity(k);
+    let mut rxs = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (tx, rx) = typed_chan::<Grant>();
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    (txs, rxs)
+}
+
+/// The Spec: an invisible `lock` with an acquire channel and a release
+/// channel — one holder at a time, any grant order.
+pub(super) fn a3_spec(k: usize, q: usize) -> Prog {
+    prog(move || {
+        let (tx_acq, rx_acq) = typed_chan::<Msg>();
+        let (tx_rel, rx_rel) = typed_chan::<Msg>();
+        let (reply_tx, reply_rx) = a3_reply_channels(k);
+        named("lock", move || {
+            let mut round = vec![0usize; k];
+            for _ in 0..k * q {
+                if let Msg::Acq(i) = rx_acq.recv_msg_block() {
+                    reply_tx[i].send_msg(Grant(i, round[i]));
+                    round[i] += 1;
+                    let _r: Msg = rx_rel.recv_msg_block();
+                }
+            }
+        });
+        a3_spawn_clients(q, reply_rx, tx_acq, tx_rel);
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum A3Coord {
+    Fifo,
+    /// An `Acq` is granted at once even when held (order).
+    DoubleGrant,
+    /// `c_{k-1}` is never granted from the queue (status): a direct grant when
+    /// the lock is free still happens, and a waiter queued behind `c_{k-1}` is
+    /// stranded too (the lock is left free, nothing is granted) — round 01 n3.
+    NeverGrant,
+    /// Every grant to `c_{k-1}` carries `j + 1` (value).
+    WrongRound,
+    /// A LIFO waiter stack (the control; identical to FIFO at `k = 2`).
+    Lifo,
+}
+
+/// The Impl: a coordinator with one mailbox and a waiter queue.
+pub(super) fn a3_impl(k: usize, q: usize, kind: A3Coord) -> Prog {
+    prog(move || {
+        let (tx, rx) = typed_chan::<Msg>();
+        let (reply_tx, reply_rx) = a3_reply_channels(k);
+        named("coordinator", move || {
+            let mut round = vec![0usize; k];
+            let mut held = false;
+            let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+            let grant = |i: usize, round: &mut Vec<usize>| {
+                let j = if kind == A3Coord::WrongRound && i == k - 1 {
+                    round[i] + 1
+                } else {
+                    round[i]
+                };
+                reply_tx[i].send_msg(Grant(i, j));
+                round[i] += 1;
+            };
+            for _ in 0..2 * k * q {
+                match rx.recv_msg_block() {
+                    Msg::Acq(i) => {
+                        if !held || kind == A3Coord::DoubleGrant {
+                            held = true;
+                            grant(i, &mut round);
+                        } else {
+                            queue.push_back(i);
+                        }
+                    }
+                    Msg::Rel(_) => {
+                        let next = if kind == A3Coord::Lifo {
+                            queue.pop_back()
+                        } else {
+                            queue.pop_front()
+                        };
+                        match next {
+                            Some(n) if kind == A3Coord::NeverGrant && n == k - 1 => {
+                                held = false;
+                            }
+                            Some(n) => grant(n, &mut round),
+                            None => held = false,
+                        }
+                    }
+                }
+            }
+        });
+        a3_spawn_clients(q, reply_rx, tx.clone(), tx);
+    })
+}
+
+// ---------------------------------------------------------------- A4 ----
+
+#[derive(Clone, PartialEq, Debug)]
+pub(super) struct A4Req(pub(super) usize, pub(super) usize);
+
+#[derive(Clone, PartialEq, Debug)]
+pub(super) struct A4Reply(pub(super) usize, pub(super) usize);
+
+fn a4_reply_channels(
+    k: usize,
+) -> (
+    Vec<crate::channel::Sender<A4Reply>>,
+    Vec<crate::channel::Receiver<A4Reply>>,
+) {
+    let mut txs = Vec::with_capacity(k);
+    let mut rxs = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (tx, rx) = typed_chan::<A4Reply>();
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    (txs, rxs)
+}
+
+/// The `m` servers' request channels, created by `main` before any spawn.
+fn a4_server_channels(
+    m: usize,
+) -> (
+    Vec<crate::channel::Sender<A4Req>>,
+    Vec<crate::channel::Receiver<A4Req>>,
+) {
+    let mut txs = Vec::with_capacity(m);
+    let mut rxs = Vec::with_capacity(m);
+    for _ in 0..m {
+        let (tx, rx) = typed_chan::<A4Req>();
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    (txs, rxs)
+}
+
+/// `m` servers, each on its own request channel, replying `Reply(x, j)` to
+/// the client directly; they loop until the run ends (their request count
+/// depends on the routing). Spawned **after** the balancer or dispatcher
+/// (the encoding's order; gate 3 T1).
+fn a4_spawn_servers(
+    rxs: Vec<crate::channel::Receiver<A4Req>>,
+    reply_tx: &[crate::channel::Sender<A4Reply>],
+) {
+    for (x, rx) in rxs.into_iter().enumerate() {
+        let reply_tx = reply_tx.to_vec();
+        named(&format!("s{x}"), move || loop {
+            let A4Req(i, j) = rx.recv_msg_block();
+            reply_tx[i].send_msg(A4Reply(x, j));
+        });
+    }
+}
+
+fn a4_spawn_clients(
+    q: usize,
+    reply_rx: Vec<crate::channel::Receiver<A4Reply>>,
+    tx_req: crate::channel::Sender<A4Req>,
+) {
+    for (i, rx) in reply_rx.into_iter().enumerate() {
+        let tx = tx_req.clone();
+        named(&format!("c{i}"), move || {
+            for j in 0..q {
+                tx.send_msg(A4Req(i, j));
+                let _r: A4Reply = rx.recv_msg_block();
+            }
+        });
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum A4Spec {
+    /// Affinity: one server per client, chosen by `nondet` on its first request.
+    A4a,
+    /// Relay: a server chosen by `nondet` per request.
+    A4b,
+}
+
+pub(super) fn a4_spec(k: usize, q: usize, m: usize, kind: A4Spec) -> Prog {
+    prog(move || {
+        let (tx_req, rx_req) = typed_chan::<A4Req>();
+        let (reply_tx, reply_rx) = a4_reply_channels(k);
+        let (servers, server_rx) = a4_server_channels(m);
+        named("dispatcher", move || {
+            let mut affinity: Vec<Option<usize>> = vec![None; k];
+            for _ in 0..k * q {
+                let r = rx_req.recv_msg_block();
+                let x = match kind {
+                    A4Spec::A4b => (0..m).nondet(),
+                    A4Spec::A4a => match affinity[r.0] {
+                        Some(x) => x,
+                        None => {
+                            let x = (0..m).nondet();
+                            affinity[r.0] = Some(x);
+                            x
+                        }
+                    },
+                };
+                servers[x].send_msg(r);
+            }
+        });
+        a4_spawn_servers(server_rx, &reply_tx);
+        a4_spawn_clients(q, reply_rx, tx_req);
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum A4Policy {
+    /// Request number `p` to `s_{p mod m}`.
+    RoundRobin,
+    /// `c_i` to `s_{i mod m}`.
+    Hash,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum A4Fault {
+    None,
+    /// `c_{k-1}`'s last request is dropped (status).
+    Drop,
+    /// `k = 2` only: the balancer takes both clients' `j`-th requests and
+    /// forwards the later-arrived first (the control).
+    PairSwap,
+}
+
+pub(super) fn a4_impl(k: usize, q: usize, m: usize, policy: A4Policy, fault: A4Fault) -> Prog {
+    prog(move || {
+        let (tx_req, rx_req) = typed_chan::<A4Req>();
+        let (reply_tx, reply_rx) = a4_reply_channels(k);
+        let (servers, server_rx) = a4_server_channels(m);
+        named("balancer", move || {
+            let mut p = 0usize;
+            let mut forward = |r: A4Req, servers: &Vec<crate::channel::Sender<A4Req>>| {
+                let x = match policy {
+                    A4Policy::RoundRobin => p % m,
+                    A4Policy::Hash => r.0 % m,
+                };
+                p += 1;
+                servers[x].send_msg(r);
+            };
+            match fault {
+                A4Fault::PairSwap => {
+                    for _ in 0..q {
+                        let a = rx_req.recv_msg_block();
+                        let b = rx_req.recv_msg_block();
+                        forward(b, &servers);
+                        forward(a, &servers);
+                    }
+                }
+                _ => {
+                    for _ in 0..k * q {
+                        let r = rx_req.recv_msg_block();
+                        let dropped = fault == A4Fault::Drop && r.0 == k - 1 && r.1 == q - 1;
+                        if !dropped {
+                            forward(r, &servers);
+                        }
+                    }
+                }
+            }
+        });
+        a4_spawn_servers(server_rx, &reply_tx);
+        a4_spawn_clients(q, reply_rx, tx_req);
+    })
+}
+
+// ------------------------------------------------------- the fixtures ----
+
+/// Criterion 2: every `(model, impl, spec, knobs)` of the series and every
+/// catalogue row at its listed sizes, named `apps/<model>/<impl|mutant>/<spec>/<knobs>`.
+pub(super) fn apps_fixtures() -> Vec<Fixture> {
+    const SRC: &str = "grid.rs P5-APPS (criteria rev 5.1; log/dev/P5-APPS.models.md)";
+    let mut out = Vec::new();
+
+    // A1: (n, r) over the series, five coordinators.
+    for n in 2..=4 {
+        for r in 1..=3 {
+            for (label, kind) in [
+                ("correct", A1Coord::Correct),
+                ("eager", A1Coord::Eager),
+                ("early-abort", A1Coord::EarlyAbort),
+                ("silent", A1Coord::Silent),
+                ("control-reverse", A1Coord::ControlReverse),
+            ] {
+                out.push(apps_fixture(
+                    format!("apps/a1/{label}/spec/n{n}r{r}"),
+                    SRC,
+                    &["p0", "p1"],
+                    a1_impl(n, r, kind),
+                    a1_spec(r),
+                ));
+            }
+        }
+    }
+
+    // A2: the Spec store against pb, pb-br, sh and the catalogue rows.
+    let clients = |k: usize| -> Vec<String> { (0..k).map(|i| format!("c{i}")).collect() };
+    for k in 1..=3 {
+        for q in 1..=3 {
+            let names = clients(k);
+            let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+            for (label, imp) in [
+                ("pb", a2_pb(k, q, A2Pb::Correct)),
+                ("pb-br", a2_pb_br(k, q, A2Br::Correct)),
+                ("early-ack", a2_pb_br(k, q, A2Br::EarlyAck)),
+                ("stale-get", a2_pb(k, q, A2Pb::StaleGet)),
+                ("silent-put", a2_pb(k, q, A2Pb::SilentPut)),
+                ("control-early-ack-primary", a2_pb(k, q, A2Pb::EarlyAck)),
+                ("control-early-ack-fwd", a2_pb_br(k, q, A2Br::ControlForwardedEarlyAck)),
+            ] {
+                out.push(apps_fixture(
+                    format!("apps/a2/{label}/spec/k{k}q{q}"),
+                    SRC,
+                    &vis_names,
+                    imp,
+                    a2_spec(k, q),
+                ));
+            }
+            for s in 1..=2 {
+                out.push(apps_fixture(
+                    format!("apps/a2/sh/spec/k{k}q{q}s{s}"),
+                    SRC,
+                    &vis_names,
+                    a2_sh(k, q, s, false),
+                    a2_spec(k, q),
+                ));
+                if s == 2 {
+                    out.push(apps_fixture(
+                        format!("apps/a2/misroute/spec/k{k}q{q}s{s}"),
+                        SRC,
+                        &vis_names,
+                        a2_sh(k, q, s, true),
+                        a2_spec(k, q),
+                    ));
+                }
+            }
+        }
+    }
+
+    // A3.
+    for k in 2..=3 {
+        for q in 1..=2 {
+            let names = clients(k);
+            let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+            for (label, kind) in [
+                ("fifo", A3Coord::Fifo),
+                ("double-grant", A3Coord::DoubleGrant),
+                ("never-grant", A3Coord::NeverGrant),
+                ("wrong-round", A3Coord::WrongRound),
+                ("control-lifo", A3Coord::Lifo),
+            ] {
+                out.push(apps_fixture(
+                    format!("apps/a3/{label}/spec/k{k}q{q}"),
+                    SRC,
+                    &vis_names,
+                    a3_impl(k, q, kind),
+                    a3_spec(k, q),
+                ));
+            }
+        }
+    }
+
+    // A4: hash and rr against both Specs; drop against A4b; pair-swap at k = 2.
+    for k in 1..=3 {
+        for q in 1..=2 {
+            for m in 1..=3 {
+                let names = clients(k);
+                let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+                for (spec_label, spec) in [("a4a", A4Spec::A4a), ("a4b", A4Spec::A4b)] {
+                    for (label, policy) in
+                        [("hash", A4Policy::Hash), ("rr", A4Policy::RoundRobin)]
+                    {
+                        out.push(apps_fixture(
+                            format!("apps/a4/{label}/{spec_label}/k{k}q{q}m{m}"),
+                            SRC,
+                            &vis_names,
+                            a4_impl(k, q, m, policy, A4Fault::None),
+                            a4_spec(k, q, m, spec),
+                        ));
+                    }
+                    if k == 2 {
+                        for (label, policy) in [
+                            ("pair-swap-hash", A4Policy::Hash),
+                            ("pair-swap-rr", A4Policy::RoundRobin),
+                        ] {
+                            if policy == A4Policy::RoundRobin && spec == A4Spec::A4a {
+                                continue;
+                            }
+                            out.push(apps_fixture(
+                                format!("apps/a4/{label}/{spec_label}/k{k}q{q}m{m}"),
+                                SRC,
+                                &vis_names,
+                                a4_impl(k, q, m, policy, A4Fault::PairSwap),
+                                a4_spec(k, q, m, spec),
+                            ));
+                        }
+                    }
+                }
+                out.push(apps_fixture(
+                    format!("apps/a4/drop/a4b/k{k}q{q}m{m}"),
+                    SRC,
+                    &vis_names,
+                    a4_impl(k, q, m, A4Policy::RoundRobin, A4Fault::Drop),
+                    a4_spec(k, q, m, A4Spec::A4b),
+                ));
+            }
+        }
+    }
+    out
+}
+
+// =========================================================================
+// P5-SYNTH — the synthetic families S1–S6 (lead; criteria rev 5.1)
+// =========================================================================
+//
+// Six generators as fixtures and one predeclared grid (`synth_grid`). The
+// programs are `criteria/P5-SYNTH.md`'s "The families, as programs" (N1–N7
+// are the engine facts they rest on); the knob declarations — what each knob
+// varies, what else it changes, the matched control, the "size scaling"
+// labels — are on each generator and in `log/dev/P5-SYNTH.models.md`.
+// Conventions as `P5-APPS`'s common encoding: every channel is created by
+// `main`; every spawn is `main`'s, unconditional, in the stated order,
+// before any communication; no `ThreadId` in values; visible threads are
+// named, everything else is invisible. Every bit is a `Choice`
+// (`(0..=1usize).nondet()`, explored from the range's start upward — N2),
+// never a `CToss`.
+//
+// S1 `naive(k)`'s violating pair is the registry's `ex:naive/k{k}/enc{e}`
+// (`naive_fixture`); only its conforming twin `naive-self` is built here.
+
+/// Which S1 encoding a `synth/naive-self` point uses (`naive_fixture`'s).
+fn synth_c_first(enc: u8) -> bool {
+    match enc {
+        1 => true,
+        2 => false,
+        _ => panic!("conformance: ex:naive has encodings 1 and 2"),
+    }
+}
+
+fn synth_fixture(
+    name: String,
+    model: ConsType,
+    visible: Vec<String>,
+    imp: Prog,
+    spec: Prog,
+) -> Fixture {
+    const SRC: &str = "grid.rs P5-SYNTH (criteria rev 5.3; log/dev/P5-SYNTH.models.md)";
+    fixture(name, SRC, Group::Synth, cfg(model), visible, imp, spec)
+}
+
+fn synth_names(prefix: &str, n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{prefix}{i}")).collect()
+}
+
+// ---------------------------------------------------------------- S1 ----
+
+/// **S1's conforming twin `naive-self(k, enc)`**: `ex:naive`'s `Spec_k`
+/// (`naive_d(k, 1, enc, None)`) against itself, `Bag`. Knob `k`: the number
+/// of `b` threads — Impl `k!` complete graphs, Spec `k!`; `enc` fixes the
+/// spawn order (1: `c, b1..bk, a`; 2: `b1..bk, a, c`). The violating family
+/// at the same point is the registry's `ex:naive/k{k}/enc{enc}`.
+pub(super) fn naive_self_fixture(k: usize, enc: u8) -> Fixture {
+    let c_first = synth_c_first(enc);
+    let mut f = synth_fixture(
+        format!("synth/naive-self/k{k}enc{enc}"),
+        ConsType::Bag,
+        naive_visible(k),
+        naive_d(k, 1, c_first, None),
+        naive_d(k, 1, c_first, None),
+    );
+    f.k = Some(k);
+    f.encoding = Some(enc);
+    f
+}
+
+// ---------------------------------------------------------------- S2 ----
+
+/// **S2 `share(m, c)`, the Impl**: `m` relay modules on disjoint FIFO
+/// channels, module `i` spawned `c{i}, r{i}, a{i}`. Visible `a{i}` sends 9
+/// to invisible `r{i}`; `r{i}` reads it — for `i < c` by a **non-blocking**
+/// receive followed, when it read ⊥, by a blocking one; for `i ≥ c` by one
+/// blocking receive — and sends what it read to visible `c{i}`, who receives.
+/// The choice is invisible (N3): every Impl graph has one visible word and
+/// one `vo`, so the Spec's single graph covers all `2^c`. Knob `m` is the
+/// size (modules); knob `c` is the number of modules with the choice —
+/// at fixed `m`, `c` varies sharing (`impl_graphs / |W| = 2^c`) at
+/// near-constant size; scaling `m` at fixed `c/m` is size scaling.
+pub(super) fn share_impl(m: usize, c: usize) -> Prog {
+    assert!(c <= m, "conformance: share(m, c) needs c <= m");
+    prog(move || {
+        for i in 0..m {
+            let (tx_r, rx_r) = fifo_chan();
+            let (tx_c, rx_c) = fifo_chan();
+            let _c = named(&format!("c{i}"), move || {
+                let _x: i32 = rx_c.recv_msg_block();
+            });
+            let choose = i < c;
+            let _r = named(&format!("r{i}"), move || {
+                let x: i32 = if choose {
+                    match rx_r.recv_msg() {
+                        Some(x) => x,
+                        None => rx_r.recv_msg_block(),
+                    }
+                } else {
+                    rx_r.recv_msg_block()
+                };
+                tx_c.send_msg(x);
+            });
+            let _a = named(&format!("a{i}"), move || tx_r.send_msg(9));
+        }
+    })
+}
+
+/// **S2's Spec `share-spec(m)`**: per module the relay pair's Spec, `a{i}:
+/// send(c{i}, 9) ‖ c{i}: recv()`, spawned `c{i}, a{i}`; one graph.
+pub(super) fn share_spec(m: usize) -> Prog {
+    prog(move || {
+        for i in 0..m {
+            let (tx_c, rx_c) = fifo_chan();
+            let _c = named(&format!("c{i}"), move || {
+                let _x: i32 = rx_c.recv_msg_block();
+            });
+            let _a = named(&format!("a{i}"), move || tx_c.send_msg(9));
+        }
+    })
+}
+
+/// **S2's matched control `share-ctl(m, c)`**, self-paired: the same shape
+/// with a blocking receive in every `r{i}`; the first `c` modules' `r{i}`
+/// choose `b := (0..=1usize).nondet()` (a `Choice`, N2) after the receive and
+/// send `10·i + b` to `c{i}`, the others send the fixed `10·i`. The
+/// branching is at the same point as the family's but **visible** in
+/// `c{i}`'s value: Impl = Spec = `2^c` graphs, `2^c` signatures, `|W| =
+/// 2^c`, `cache_hits = 0`, sharing 1.
+pub(super) fn share_ctl(m: usize, c: usize) -> Prog {
+    assert!(c <= m, "conformance: share-ctl(m, c) needs c <= m");
+    prog(move || {
+        for i in 0..m {
+            let (tx_r, rx_r) = fifo_chan();
+            let (tx_c, rx_c) = fifo_chan();
+            let _c = named(&format!("c{i}"), move || {
+                let _x: i32 = rx_c.recv_msg_block();
+            });
+            let choose = i < c;
+            let base = 10 * i as i32;
+            let _r = named(&format!("r{i}"), move || {
+                let _x: i32 = rx_r.recv_msg_block();
+                let b = if choose { (0..=1usize).nondet() as i32 } else { 0 };
+                tx_c.send_msg(base + b);
+            });
+            let _a = named(&format!("a{i}"), move || tx_r.send_msg(9));
+        }
+    })
+}
+
+fn share_visible(m: usize) -> Vec<String> {
+    let mut v = synth_names("a", m);
+    v.extend(synth_names("c", m));
+    v
+}
+
+/// `synth/share/m{m}c{c}`: `share_impl` against `share_spec`, FIFO.
+pub(super) fn share_fixture(m: usize, c: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/share/m{m}c{c}"),
+        ConsType::FIFO,
+        share_visible(m),
+        share_impl(m, c),
+        share_spec(m),
+    )
+}
+
+/// `synth/share-ctl/m{m}c{c}`: `share_ctl` against itself, FIFO.
+pub(super) fn share_ctl_fixture(m: usize, c: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/share-ctl/m{m}c{c}"),
+        ConsType::FIFO,
+        share_visible(m),
+        share_ctl(m, c),
+        share_ctl(m, c),
+    )
+}
+
+// ---------------------------------------------------------------- S3 ----
+
+/// **S3 `commit(n, j)`**, FIFO (N7), spawned `c, p`: visible `p` sends the
+/// common prefix `−1`, then `n` dependent sends of bits `b_i :=
+/// (0..=1usize).nondet()` (a `Choice`: invisible, order pinned); visible `c`
+/// receives `n + 1` times. The Impl (`j = None`) chooses each bit
+/// immediately before its send; the Spec (`j = Some(j)`) chooses `b_1..b_j`
+/// **before the prefix send** and the rest each before its send. Knob `n` is
+/// the size (`2^n` graphs and signatures on both sides, the `2^n` bit strings
+/// behind the prefix); knob `j` is the commitment dial — `j(j+1)/2` visible
+/// events of commitment distance, `j = 0` the aligned endpoint.
+pub(super) fn commit_prog(n: usize, j: Option<usize>) -> Prog {
+    if let Some(j) = j {
+        assert!(j <= n, "conformance: commit(n, j) needs j <= n");
+    }
+    prog(move || {
+        let (tx, rx) = fifo_chan();
+        let _c = named("c", move || {
+            for _ in 0..=n {
+                let _x: i32 = rx.recv_msg_block();
+            }
+        });
+        let _p = named("p", move || {
+            let early = j.unwrap_or(0);
+            let mut pre: Vec<i32> = Vec::with_capacity(early);
+            for _ in 0..early {
+                pre.push((0..=1usize).nondet() as i32);
+            }
+            tx.send_msg(-1);
+            for b in pre {
+                tx.send_msg(b);
+            }
+            for _ in early..n {
+                tx.send_msg((0..=1usize).nondet() as i32);
+            }
+        });
+    })
+}
+
+/// `synth/commit/n{n}j{j}`: `commit_prog(n, None)` against `commit_prog(n,
+/// Some(j))`, FIFO.
+pub(super) fn commit_fixture(n: usize, j: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/commit/n{n}j{j}"),
+        ConsType::FIFO,
+        vis(&["p", "c"]),
+        commit_prog(n, None),
+        commit_prog(n, Some(j)),
+    )
+}
+
+// ---------------------------------------------------------------- S4 ----
+
+/// **S4 `chain(d)`**, FIFO: visible `v0 … v{d}`; `v0` sends 1 along hop 1,
+/// `v{i}` (`1 ≤ i < d`) receives then sends `i + 1` along hop `i + 1`, `v{d}`
+/// receives. With `relayed`, hop `i` goes through an invisible `r{i}` that
+/// forwards what it read (the Impl, spawned `v{d}, r{d}, …, v1, r1, v0`);
+/// without, `v{i-1}` sends to `v{i}` directly (the Spec, spawned `v{d}, …,
+/// v0`). Knob `d` is the size: 1 graph, 1 signature either side; `ord` a
+/// chain of `2d` visible events over `d` hops; `4d` Impl paper events, `2d`
+/// Spec.
+pub(super) fn chain_prog(d: usize, relayed: bool) -> Prog {
+    assert!(d >= 1, "conformance: chain(d) needs d >= 1");
+    prog(move || {
+        // Hop i (1..=d) is index i - 1: the channel into v{i}, and, relayed,
+        // the channel into r{i}; the sender side of hop i belongs to v{i-1}
+        // (direct) or to r{i} (relayed).
+        let mut tx_v = Vec::with_capacity(d);
+        let mut rx_v = Vec::with_capacity(d);
+        let mut tx_r = Vec::with_capacity(d);
+        let mut rx_r = Vec::with_capacity(d);
+        for _ in 0..d {
+            let (t, r) = fifo_chan();
+            tx_v.push(Some(t));
+            rx_v.push(Some(r));
+            if relayed {
+                let (t, r) = fifo_chan();
+                tx_r.push(Some(t));
+                rx_r.push(Some(r));
+            } else {
+                tx_r.push(None);
+                rx_r.push(None);
+            }
+        }
+        for i in (0..=d).rev() {
+            let rx = if i >= 1 { rx_v[i - 1].take() } else { None };
+            let tx = if i < d {
+                if relayed {
+                    tx_r[i].take()
+                } else {
+                    tx_v[i].take()
+                }
+            } else {
+                None
+            };
+            let _v = named(&format!("v{i}"), move || {
+                if let Some(rx) = rx {
+                    let _x: i32 = rx.recv_msg_block();
+                }
+                if let Some(tx) = tx {
+                    tx.send_msg(i as i32 + 1);
+                }
+            });
+            if relayed && i >= 1 {
+                let rx_r = rx_r[i - 1].take().expect("conformance: relay in");
+                let tx_v = tx_v[i - 1].take().expect("conformance: relay out");
+                let _r = named(&format!("r{i}"), move || {
+                    let x: i32 = rx_r.recv_msg_block();
+                    tx_v.send_msg(x);
+                });
+            }
+        }
+    })
+}
+
+/// `synth/chain/d{d}`: `chain_prog(d, true)` against `chain_prog(d, false)`,
+/// FIFO, visible `v0..v{d}`.
+pub(super) fn chain_fixture(d: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/chain/d{d}"),
+        ConsType::FIFO,
+        synth_names("v", d + 1),
+        chain_prog(d, true),
+        chain_prog(d, false),
+    )
+}
+
+// ---------------------------------------------------------------- S5 ----
+
+/// The spawn order of one copy of N4's pair.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ResetOrder {
+    /// `a, c, b` — the family: `b`'s send backward-revisits `c`'s receive.
+    Acb,
+    /// `a, b, c` — the control: both sends deliverable at `c`'s receive, the
+    /// alternative source is a forward pop.
+    Abc,
+}
+
+/// **S5 `reset(k, s)`**, `Bag`: `k` copies of N4's pair on disjoint channels,
+/// copy `i` with visible `a{i}` (sends 1, tag 1), `c{i}` (receives once:
+/// any message on the Impl, `only_tag_2` false; only tag 2 on the Spec) and
+/// `b{i}` (sends 2, tag 2), in `order`, copies in index order. With `pad =
+/// Some(s)` — the **Spec side only** — an invisible padding module follows
+/// every copy: `s` invisible senders `s0..s{s-1}` of distinct values to one
+/// invisible receiver `d` that receives `s` times, spawned `s0..s{s-1}, d`:
+/// `s!` Spec graphs with one visible projection. Knob `k` is the size (Impl
+/// `2^k`, Spec `s!`, uncovered `2^k − 1`); knob `s` multiplies the work of
+/// every failing sweep after a certificate (`s!` Spec graphs each) and
+/// nothing else — it is not a size axis.
+pub(super) fn reset_prog(
+    k: usize,
+    only_tag_2: bool,
+    order: ResetOrder,
+    pad: Option<usize>,
+) -> Prog {
+    assert!(k >= 1, "conformance: reset(k, s) needs k >= 1");
+    if let Some(s) = pad {
+        assert!(s >= 1, "conformance: reset(k, s) needs s >= 1");
+    }
+    prog(move || {
+        for i in 0..k {
+            let (tx, rx) = chan();
+            let ta = tx.clone();
+            let spawn_a = move || {
+                let _a = named(&format!("a{i}"), move || ta.send_tagged_msg(1, 1));
+            };
+            let spawn_b = move || {
+                let _b = named(&format!("b{i}"), move || tx.send_tagged_msg(2, 2));
+            };
+            let spawn_c = move || {
+                let _c = named(&format!("c{i}"), move || {
+                    let _x: i32 = if only_tag_2 {
+                        rx.recv_tagged_msg_block(|t| t == Some(2))
+                    } else {
+                        rx.recv_msg_block()
+                    };
+                });
+            };
+            match order {
+                ResetOrder::Acb => {
+                    spawn_a();
+                    spawn_c();
+                    spawn_b();
+                }
+                ResetOrder::Abc => {
+                    spawn_a();
+                    spawn_b();
+                    spawn_c();
+                }
+            }
+        }
+        if let Some(s) = pad {
+            let (tx_d, rx_d) = chan();
+            for j in 0..s {
+                let t = tx_d.clone();
+                let _s = named(&format!("s{j}"), move || t.send_msg(100 + j as i32));
+            }
+            let _d = named("d", move || {
+                for _ in 0..s {
+                    let _x: i32 = rx_d.recv_msg_block();
+                }
+            });
+        }
+    })
+}
+
+fn reset_visible(k: usize) -> Vec<String> {
+    let mut v = Vec::with_capacity(3 * k);
+    for i in 0..k {
+        v.push(format!("a{i}"));
+        v.push(format!("b{i}"));
+        v.push(format!("c{i}"));
+    }
+    v
+}
+
+/// `synth/reset/k{k}s{s}` (violating): the Impl `reset_prog(k, false, Acb,
+/// None)` against the Spec `reset_prog(k, true, Acb, Some(s))`, `Bag`.
+pub(super) fn reset_fixture(k: usize, s: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/reset/k{k}s{s}"),
+        ConsType::Bag,
+        reset_visible(k),
+        reset_prog(k, false, ResetOrder::Acb, None),
+        reset_prog(k, true, ResetOrder::Acb, Some(s)),
+    )
+}
+
+/// `synth/reset-ctl/k{k}s{s}` (the size-matched, low-revisit control): the
+/// same programs with spawn order `a{i}, b{i}, c{i}` on both sides.
+pub(super) fn reset_ctl_fixture(k: usize, s: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/reset-ctl/k{k}s{s}"),
+        ConsType::Bag,
+        reset_visible(k),
+        reset_prog(k, false, ResetOrder::Abc, None),
+        reset_prog(k, true, ResetOrder::Abc, Some(s)),
+    )
+}
+
+/// `synth/reset-twin/k{k}s{s}` (conforming, RQ2(a)'s twin): the Spec against
+/// itself, `s!` graphs on both sides.
+pub(super) fn reset_twin_fixture(k: usize, s: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/reset-twin/k{k}s{s}"),
+        ConsType::Bag,
+        reset_visible(k),
+        reset_prog(k, true, ResetOrder::Acb, Some(s)),
+        reset_prog(k, true, ResetOrder::Acb, Some(s)),
+    )
+}
+
+// ---------------------------------------------------------------- S6 ----
+
+/// **S6 `width(w)`**, FIFO, spawned `c, v`: visible `v` chooses `x :=
+/// (0..w).nondet()` (a `Choice`) and sends it to visible `c`, who receives
+/// once; the same program on both sides. Knob `w` is the size: `w` graphs,
+/// `w` signatures, `|W| = w` on the sweeping engines.
+pub(super) fn width_prog(w: usize) -> Prog {
+    assert!(w >= 1, "conformance: width(w) needs w >= 1");
+    prog(move || {
+        let (tx, rx) = fifo_chan();
+        let _c = named("c", move || {
+            let _x: i32 = rx.recv_msg_block();
+        });
+        let _v = named("v", move || {
+            let x = (0..w).nondet();
+            tx.send_msg(x as i32);
+        });
+    })
+}
+
+/// `synth/width/w{w}`: `width_prog(w)` against itself, FIFO.
+pub(super) fn width_fixture(w: usize) -> Fixture {
+    synth_fixture(
+        format!("synth/width/w{w}"),
+        ConsType::FIFO,
+        vis(&["v", "c"]),
+        width_prog(w),
+        width_prog(w),
+    )
+}
+
+// ------------------------------------------------------- the grid ----
+
+/// One point of the predeclared synthetic grid (criterion 2): it maps one to
+/// one onto the runner's `RowSpec` through [`SynthPoint::row_spec`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SynthPoint {
+    /// The fixture's name (`synth/…`, or the registry's `ex:naive/…` for
+    /// S1's violating pair).
+    pub(super) fixture: String,
+    /// `naive`, `share`, `commit`, `chain`, `reset`, `width`.
+    pub(super) family: &'static str,
+    /// The knob values as a label (`m=4,c=2`).
+    pub(super) knobs: String,
+    /// The knob values in the family's order (`k1..k4`).
+    pub(super) k: [Option<i64>; 4],
+    /// `conforming`, `violating`, `control:share-ctl`, `control:reset-ctl`.
+    pub(super) variant: &'static str,
+    /// The matched twin's fixture name (S1's pair, S5's `reset`/`reset-twin`).
+    pub(super) twin: Option<String>,
+    /// The knob line (the label rule): every fixed coordinate, the variant
+    /// included, so that `(family, line)` is unique per declared line.
+    pub(super) line: &'static str,
+    /// The size axis's value at this point.
+    pub(super) size: i64,
+    /// Whether the point is in the frozen grid (else validation-only:
+    /// S5's `(1, 2)`, criterion 4).
+    pub(super) in_grid: bool,
+}
+
+impl SynthPoint {
+    /// The runner's row for this point under `config`, `tier`, `run_kind`
+    /// and `rep` (round 05 m2): `series` is `Series::of(family, line, …,
+    /// size)`, so the runner's censoring scope is exactly the line per
+    /// configuration, tier and run kind; `twin_key` is the twin's row key
+    /// under the same configuration, tier, run kind and repetition.
+    pub(super) fn row_spec(
+        &self,
+        config: &GridConfig,
+        tier: &super::eval::Tier,
+        run_kind: super::eval::RunKind,
+        rep: u32,
+    ) -> super::eval::RowSpec {
+        let twin_key = match &self.twin {
+            Some(t) => super::eval::key_of(
+                t,
+                &config.label(),
+                rep,
+                &tier.name,
+                run_kind,
+                super::eval::profile_name(),
+            ),
+            None => String::new(),
+        };
+        super::eval::RowSpec {
+            fixture: self.fixture.clone(),
+            config: config.clone(),
+            rep,
+            tier: tier.clone(),
+            run_kind,
+            family: self.family.to_owned(),
+            knobs: self.knobs.clone(),
+            k: self.k,
+            variant: self.variant.to_owned(),
+            twin_key,
+            series: Some(super::eval::Series::of(
+                self.family,
+                self.line,
+                config,
+                tier,
+                run_kind,
+                self.size,
+            )),
+        }
+    }
+}
+
+/// The provisional ranges plus the extension points up to each ceiling
+/// (criteria table and procedure (a)); every point kept.
+pub(super) const SYNTH_S1_K: [usize; 6] = [2, 3, 4, 5, 6, 7];
+pub(super) const SYNTH_S2_M: [usize; 6] = [2, 4, 8, 12, 16, 24];
+pub(super) const SYNTH_S3_N: [usize; 6] = [2, 4, 8, 12, 16, 20];
+pub(super) const SYNTH_S4_D: [usize; 7] = [2, 8, 32, 128, 512, 1024, 2048];
+pub(super) const SYNTH_S5_K: [usize; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+pub(super) const SYNTH_S5_S: [usize; 3] = [1, 3, 4];
+pub(super) const SYNTH_S6_W: [usize; 7] = [2, 8, 32, 128, 512, 1024, 2048];
+/// S5's validation-only points `(k, s)` (criterion 4; not grid points —
+/// `(2, 3)` of criterion 4's list is the grid's own `k = 2` on the `s = 3`
+/// line and is not repeated).
+pub(super) const SYNTH_S5_VALIDATION: [(usize, usize); 1] = [(1, 2)];
+
+/// The 24 knob lines, as `&'static str` labels (the label rule).
+fn s1_line(enc: u8, conforming: bool) -> &'static str {
+    match (enc, conforming) {
+        (1, false) => "naive/enc=1/violating",
+        (1, true) => "naive/enc=1/conforming",
+        (2, false) => "naive/enc=2/violating",
+        (2, true) => "naive/enc=2/conforming",
+        _ => panic!("conformance: ex:naive has encodings 1 and 2"),
+    }
+}
+
+/// `ratio` is `c/m` as 0, 1 (= 1/2) or 2 (= 1).
+fn s2_line(ratio: u8, control: bool) -> &'static str {
+    match (ratio, control) {
+        (0, false) => "share/c=0/family",
+        (1, false) => "share/c=m/2/family",
+        (2, false) => "share/c=m/family",
+        (0, true) => "share/c=0/control",
+        (1, true) => "share/c=m/2/control",
+        (2, true) => "share/c=m/control",
+        _ => panic!("conformance: share has the ratios 0, 1/2, 1"),
+    }
+}
+
+fn s3_line(ratio: u8) -> &'static str {
+    match ratio {
+        0 => "commit/j=0",
+        1 => "commit/j=n/2",
+        2 => "commit/j=n",
+        _ => panic!("conformance: commit has the ratios 0, 1/2, 1"),
+    }
+}
+
+fn s5_line(s: usize, variant: &'static str) -> &'static str {
+    match (s, variant) {
+        (1, "violating") => "reset/s=1/family",
+        (1, "control:reset-ctl") => "reset/s=1/control",
+        (1, "conforming") => "reset/s=1/twin",
+        (2, "violating") => "reset/s=2/family",
+        (2, "control:reset-ctl") => "reset/s=2/control",
+        (2, "conforming") => "reset/s=2/twin",
+        (3, "violating") => "reset/s=3/family",
+        (3, "control:reset-ctl") => "reset/s=3/control",
+        (3, "conforming") => "reset/s=3/twin",
+        (4, "violating") => "reset/s=4/family",
+        (4, "control:reset-ctl") => "reset/s=4/control",
+        (4, "conforming") => "reset/s=4/twin",
+        _ => panic!("conformance: reset has s in 1..=4 and three variants"),
+    }
+}
+
+/// The ratio code of `part` over `whole` (0, 1/2, 1), which the grid uses.
+fn synth_ratio(part: usize, whole: usize) -> u8 {
+    if part == 0 {
+        0
+    } else if 2 * part == whole {
+        1
+    } else if part == whole {
+        2
+    } else {
+        panic!("conformance: {part}/{whole} is not one of the grid's ratios")
+    }
+}
+
+/// S2's `c` values at `m`: `{0, m/2, m}` (`m` even on every grid point).
+fn s2_cs(m: usize) -> [usize; 3] {
+    assert!(m.is_multiple_of(2), "conformance: share's grid has even m");
+    [0, m / 2, m]
+}
+
+/// Every fixture of the six families at every grid and validation point
+/// (S1's violating pairs are the registry's and are not repeated here).
+pub(super) fn synth_fixtures() -> Vec<Fixture> {
+    let mut out = Vec::new();
+    for enc in [1u8, 2] {
+        for k in SYNTH_S1_K {
+            out.push(naive_self_fixture(k, enc));
+        }
+    }
+    for m in SYNTH_S2_M {
+        for c in s2_cs(m) {
+            out.push(share_fixture(m, c));
+            out.push(share_ctl_fixture(m, c));
+        }
+    }
+    for n in SYNTH_S3_N {
+        for j in [0, n / 2, n] {
+            out.push(commit_fixture(n, j));
+        }
+    }
+    for d in SYNTH_S4_D {
+        out.push(chain_fixture(d));
+    }
+    let mut s5: Vec<(usize, usize)> = Vec::new();
+    for s in SYNTH_S5_S {
+        for k in SYNTH_S5_K {
+            s5.push((k, s));
+        }
+    }
+    s5.extend(SYNTH_S5_VALIDATION);
+    for (k, s) in s5 {
+        out.push(reset_fixture(k, s));
+        out.push(reset_ctl_fixture(k, s));
+        out.push(reset_twin_fixture(k, s));
+    }
+    for w in SYNTH_S6_W {
+        out.push(width_fixture(w));
+    }
+    out
+}
+
+/// The predeclared grid (criterion 9): every frozen point once, plus S5's
+/// validation-only points flagged `in_grid = false`.
+pub(super) fn synth_grid() -> Vec<SynthPoint> {
+    let mut out = Vec::new();
+    // S1: k the size, at fixed (enc, variant); the pair are twins.
+    for enc in [1u8, 2] {
+        for k in SYNTH_S1_K {
+            let violating = format!("ex:naive/k{k}/enc{enc}");
+            let conforming = format!("synth/naive-self/k{k}enc{enc}");
+            let kk = [Some(k as i64), Some(enc as i64), None, None];
+            out.push(SynthPoint {
+                fixture: violating.clone(),
+                family: "naive",
+                knobs: format!("k={k},enc={enc}"),
+                k: kk,
+                variant: "violating",
+                twin: Some(conforming.clone()),
+                line: s1_line(enc, false),
+                size: k as i64,
+                in_grid: true,
+            });
+            out.push(SynthPoint {
+                fixture: conforming,
+                family: "naive",
+                knobs: format!("k={k},enc={enc}"),
+                k: kk,
+                variant: "conforming",
+                twin: Some(violating),
+                line: s1_line(enc, true),
+                size: k as i64,
+                in_grid: true,
+            });
+        }
+    }
+    // S2: m the size, at fixed c/m and variant.
+    for m in SYNTH_S2_M {
+        for c in s2_cs(m) {
+            let ratio = synth_ratio(c, m);
+            let kk = [Some(m as i64), Some(c as i64), None, None];
+            out.push(SynthPoint {
+                fixture: format!("synth/share/m{m}c{c}"),
+                family: "share",
+                knobs: format!("m={m},c={c}"),
+                k: kk,
+                variant: "conforming",
+                twin: None,
+                line: s2_line(ratio, false),
+                size: m as i64,
+                in_grid: true,
+            });
+            out.push(SynthPoint {
+                fixture: format!("synth/share-ctl/m{m}c{c}"),
+                family: "share",
+                knobs: format!("m={m},c={c}"),
+                k: kk,
+                variant: "control:share-ctl",
+                twin: None,
+                line: s2_line(ratio, true),
+                size: m as i64,
+                in_grid: true,
+            });
+        }
+    }
+    // S3: n the size, at fixed j/n.
+    for n in SYNTH_S3_N {
+        for j in [0, n / 2, n] {
+            out.push(SynthPoint {
+                fixture: format!("synth/commit/n{n}j{j}"),
+                family: "commit",
+                knobs: format!("n={n},j={j}"),
+                k: [Some(n as i64), Some(j as i64), None, None],
+                variant: "conforming",
+                twin: None,
+                line: s3_line(synth_ratio(j, n)),
+                size: n as i64,
+                in_grid: true,
+            });
+        }
+    }
+    // S4: d the size.
+    for d in SYNTH_S4_D {
+        out.push(SynthPoint {
+            fixture: format!("synth/chain/d{d}"),
+            family: "chain",
+            knobs: format!("d={d}"),
+            k: [Some(d as i64), None, None, None],
+            variant: "conforming",
+            twin: None,
+            line: "chain",
+            size: d as i64,
+            in_grid: true,
+        });
+    }
+    // S5: k the size, at fixed (s, variant); reset and reset-twin are twins.
+    let mut s5: Vec<(usize, usize, bool)> = Vec::new();
+    for s in SYNTH_S5_S {
+        for k in SYNTH_S5_K {
+            s5.push((k, s, true));
+        }
+    }
+    for (k, s) in SYNTH_S5_VALIDATION {
+        s5.push((k, s, false));
+    }
+    for (k, s, in_grid) in s5 {
+        let family = format!("synth/reset/k{k}s{s}");
+        let twin = format!("synth/reset-twin/k{k}s{s}");
+        let kk = [Some(k as i64), Some(s as i64), None, None];
+        let knobs = format!("k={k},s={s}");
+        out.push(SynthPoint {
+            fixture: family.clone(),
+            family: "reset",
+            knobs: knobs.clone(),
+            k: kk,
+            variant: "violating",
+            twin: Some(twin.clone()),
+            line: s5_line(s, "violating"),
+            size: k as i64,
+            in_grid,
+        });
+        out.push(SynthPoint {
+            fixture: format!("synth/reset-ctl/k{k}s{s}"),
+            family: "reset",
+            knobs: knobs.clone(),
+            k: kk,
+            variant: "control:reset-ctl",
+            twin: None,
+            line: s5_line(s, "control:reset-ctl"),
+            size: k as i64,
+            in_grid,
+        });
+        out.push(SynthPoint {
+            fixture: twin,
+            family: "reset",
+            knobs,
+            k: kk,
+            variant: "conforming",
+            twin: Some(family),
+            line: s5_line(s, "conforming"),
+            size: k as i64,
+            in_grid,
+        });
+    }
+    // S6: w the size.
+    for w in SYNTH_S6_W {
+        out.push(SynthPoint {
+            fixture: format!("synth/width/w{w}"),
+            family: "width",
+            knobs: format!("w={w}"),
+            k: [Some(w as i64), None, None, None],
+            variant: "conforming",
+            twin: None,
+            line: "width",
+            size: w as i64,
+            in_grid: true,
+        });
+    }
+    out
+}
+
+// =========================================================================
+// P5-CAMPAIGN — the predeclared application grid (lead; criteria rev 4.4 C3)
+// =========================================================================
+//
+// `apps_grid()` enumerates the A-series points of `criteria/P5-CAMPAIGN.md`
+// (rev 4.2) C3, one knob stepped at a time from each model's base point, every point
+// kept, the lines a partition (a base point belongs to its model's
+// first-listed line; the other lines start at their second point; an X2
+// line whose base point is excluded starts at its first listed point), plus
+// four joint corners as one-point lines. `apps_series_fixtures()` builds the
+// points beyond `apps_fixtures()`'s loops from the `P5-APPS` constructors;
+// the `P5-APPS` block itself is untouched. Line labels follow the label rule
+// (`P5-SYNTH` rev 5.1, round 05 m2): every fixed coordinate, the variant
+// included; they are leaked `String`s (`Box::leak`) because `SynthPoint::line`
+// is `&'static str` and the application labels are parametric — a few hundred
+// small allocations per `apps_grid()` call, test-only code.
+
+/// A leaked label (see the banner).
+fn leaked(s: String) -> &'static str {
+    Box::leak(s.into_boxed_str())
+}
+
+/// The A-series point builder: one `SynthPoint` per (fixture, line, size).
+#[allow(clippy::too_many_arguments)]
+fn apps_point(
+    fixture: String,
+    family: &'static str,
+    knobs: String,
+    k: [Option<i64>; 4],
+    variant: &'static str,
+    twin: Option<String>,
+    line: String,
+    size: i64,
+) -> SynthPoint {
+    SynthPoint {
+        fixture,
+        family,
+        knobs,
+        k,
+        variant,
+        twin,
+        line: leaked(line),
+        size,
+        in_grid: true,
+    }
+}
+
+fn a1_name(v: &str, n: usize, r: usize) -> String {
+    format!("apps/a1/{v}/spec/n{n}r{r}")
+}
+
+fn a2_name(v: &str, k: usize, q: usize) -> String {
+    match v {
+        "sh" | "misroute" => format!("apps/a2/{v}/spec/k{k}q{q}s2"),
+        _ => format!("apps/a2/{v}/spec/k{k}q{q}"),
+    }
+}
+
+fn a3_name(v: &str, k: usize, q: usize) -> String {
+    format!("apps/a3/{v}/spec/k{k}q{q}")
+}
+
+/// `v` is `<impl>-<spec>` (`hash-a4a`, `rr-a4b`, `pair-swap-hash-a4a`, …) or
+/// `drop` (always A4b).
+fn a4_name(v: &str, k: usize, q: usize, m: usize) -> String {
+    if v == "drop" {
+        return format!("apps/a4/drop/a4b/k{k}q{q}m{m}");
+    }
+    let (imp, spec) = v.rsplit_once('-').expect("conformance: an A4 variant is <impl>-<spec>");
+    format!("apps/a4/{imp}/{spec}/k{k}q{q}m{m}")
+}
+
+/// The A1 conforming and control variants, the mutants, and the twin of each.
+const A1_CONFORMING: [(&str, &str); 2] = [
+    ("correct", "conforming"),
+    ("control-reverse", "control:control-reverse"),
+];
+const A1_MUTANTS: [&str; 3] = ["eager", "early-abort", "silent"];
+const A2_CONFORMING: [(&str, &str); 5] = [
+    ("pb", "conforming"),
+    ("pb-br", "conforming"),
+    ("sh", "conforming"),
+    ("control-early-ack-primary", "control:control-early-ack-primary"),
+    ("control-early-ack-fwd", "control:control-early-ack-fwd"),
+];
+/// A2 mutant → its twin (the base Impl).
+const A2_MUTANTS: [(&str, &str); 4] = [
+    ("early-ack", "pb-br"),
+    ("stale-get", "pb"),
+    ("silent-put", "pb"),
+    ("misroute", "sh"),
+];
+const A3_CONFORMING: [(&str, &str); 2] = [
+    ("fifo", "conforming"),
+    ("control-lifo", "control:control-lifo"),
+];
+const A3_MUTANTS: [&str; 3] = ["double-grant", "wrong-round", "never-grant"];
+const A4_CONFORMING: [(&str, &str); 3] = [
+    ("hash-a4a", "conforming"),
+    ("hash-a4b", "conforming"),
+    ("rr-a4b", "conforming"),
+];
+const A4_PAIR_SWAP: [&str; 3] = [
+    "pair-swap-hash-a4a",
+    "pair-swap-hash-a4b",
+    "pair-swap-rr-a4b",
+];
+/// The four joint corners (C3), each its own one-point line.
+pub(super) const APPS_CORNERS: [(&str, &str); 4] = [
+    ("apps/a1/correct/spec/n3r2", "a1"),
+    ("apps/a2/pb/spec/k3q3", "a2"),
+    ("apps/a3/fifo/spec/k3q2", "a3"),
+    ("apps/a4/hash/a4b/k3q2m3", "a4"),
+];
+/// The corners' lines, one per entry of `APPS_CORNERS`: the line carries the
+/// variant (the label rule; round 01 n2).
+pub(super) const APPS_CORNER_LINES: [&str; 4] = [
+    "a1/correct/corner/n=3,r=2",
+    "a2/pb/corner/k=3,q=3",
+    "a3/fifo/corner/k=3,q=2",
+    "a4/hash-a4b/corner/k=3,q=2,m=3",
+];
+
+/// The predeclared application grid (criterion 3): every point once, on
+/// exactly one line.
+pub(super) fn apps_grid() -> Vec<SynthPoint> {
+    let mut out = Vec::new();
+    let k2 = |a: usize, b: usize| [Some(a as i64), Some(b as i64), None, None];
+    let k3 = |a: usize, b: usize, c: usize| [Some(a as i64), Some(b as i64), Some(c as i64), None];
+
+    // ---- A1: lines r=1 (axis n) and n=2 (axis r); the base (2,1) on r=1.
+    for (v, variant) in A1_CONFORMING {
+        let ns: &[usize] = if v == "correct" { &[2, 3, 4, 5, 6] } else { &[2, 3, 4] };
+        for &n in ns {
+            out.push(apps_point(
+                a1_name(v, n, 1),
+                "a1",
+                format!("n={n},r=1"),
+                k2(n, 1),
+                variant,
+                None,
+                format!("a1/{v}/r=1"),
+                n as i64,
+            ));
+        }
+        let rs: &[usize] = if v == "correct" { &[2, 3, 4] } else { &[2, 3] };
+        for &r in rs {
+            out.push(apps_point(
+                a1_name(v, 2, r),
+                "a1",
+                format!("n=2,r={r}"),
+                k2(2, r),
+                variant,
+                None,
+                format!("a1/{v}/n=2"),
+                r as i64,
+            ));
+        }
+    }
+    for v in A1_MUTANTS {
+        let variant = leaked(format!("mutant:{v}"));
+        for n in [2usize, 3, 4] {
+            out.push(apps_point(
+                a1_name(v, n, 1),
+                "a1",
+                format!("n={n},r=1"),
+                k2(n, 1),
+                variant,
+                Some(a1_name("correct", n, 1)),
+                format!("a1/{v}/r=1"),
+                n as i64,
+            ));
+        }
+        for r in [2usize, 3] {
+            out.push(apps_point(
+                a1_name(v, 2, r),
+                "a1",
+                format!("n=2,r={r}"),
+                k2(2, r),
+                variant,
+                Some(a1_name("correct", 2, r)),
+                format!("a1/{v}/n=2"),
+                r as i64,
+            ));
+        }
+    }
+
+    // ---- A2: lines q=1 (axis k) and k=1 (axis q); the base (1,1) on q=1.
+    for (v, variant) in A2_CONFORMING {
+        let s2 = if v == "sh" { ",s=2" } else { "" };
+        for k in 1..=5usize {
+            out.push(apps_point(
+                a2_name(v, k, 1),
+                "a2",
+                format!("k={k},q=1{s2}"),
+                k2(k, 1),
+                variant,
+                None,
+                format!("a2/{v}/q=1{s2}"),
+                k as i64,
+            ));
+        }
+        for q in 2..=5usize {
+            out.push(apps_point(
+                a2_name(v, 1, q),
+                "a2",
+                format!("k=1,q={q}{s2}"),
+                k2(1, q),
+                variant,
+                None,
+                format!("a2/{v}/k=1{s2}"),
+                q as i64,
+            ));
+        }
+    }
+    // The `sh` twin line (the twins of misroute's (2,2) and (3,2)).
+    for k in [2usize, 3] {
+        out.push(apps_point(
+            a2_name("sh", k, 2),
+            "a2",
+            format!("k={k},q=2,s=2"),
+            k2(k, 2),
+            "conforming",
+            None,
+            "a2/sh/q=2,s=2".to_owned(),
+            k as i64,
+        ));
+    }
+    for (v, twin) in A2_MUTANTS {
+        let variant = leaked(format!("mutant:{v}"));
+        let s2 = if v == "misroute" { ",s=2" } else { "" };
+        let (ks, qs): (&[usize], &[usize]) = match v {
+            "early-ack" | "stale-get" => (&[2, 3], &[2, 3]),
+            "silent-put" => (&[1, 2, 3], &[2, 3]),
+            _ => (&[1, 2, 3], &[3]), // misroute: lines q=2 (axis k) and k=1 (axis q, from q=3)
+        };
+        let q_fixed = if v == "misroute" { 2 } else { 1 };
+        for &k in ks {
+            out.push(apps_point(
+                a2_name(v, k, q_fixed),
+                "a2",
+                format!("k={k},q={q_fixed}{s2}"),
+                k2(k, q_fixed),
+                variant,
+                Some(a2_name(twin, k, q_fixed)),
+                format!("a2/{v}/q={q_fixed}{s2}"),
+                k as i64,
+            ));
+        }
+        for &q in qs {
+            out.push(apps_point(
+                a2_name(v, 1, q),
+                "a2",
+                format!("k=1,q={q}{s2}"),
+                k2(1, q),
+                variant,
+                Some(a2_name(twin, 1, q)),
+                format!("a2/{v}/k=1{s2}"),
+                q as i64,
+            ));
+        }
+    }
+
+    // ---- A3: lines q=1 (axis k) and k=2 (axis q); the base (2,1) on q=1.
+    for (v, variant) in A3_CONFORMING {
+        for k in 2..=5usize {
+            out.push(apps_point(
+                a3_name(v, k, 1),
+                "a3",
+                format!("k={k},q=1"),
+                k2(k, 1),
+                variant,
+                None,
+                format!("a3/{v}/q=1"),
+                k as i64,
+            ));
+        }
+        for q in [2usize, 3] {
+            out.push(apps_point(
+                a3_name(v, 2, q),
+                "a3",
+                format!("k=2,q={q}"),
+                k2(2, q),
+                variant,
+                None,
+                format!("a3/{v}/k=2"),
+                q as i64,
+            ));
+        }
+    }
+    for v in A3_MUTANTS {
+        let variant = leaked(format!("mutant:{v}"));
+        for k in [2usize, 3] {
+            out.push(apps_point(
+                a3_name(v, k, 1),
+                "a3",
+                format!("k={k},q=1"),
+                k2(k, 1),
+                variant,
+                Some(a3_name("fifo", k, 1)),
+                format!("a3/{v}/q=1"),
+                k as i64,
+            ));
+        }
+        out.push(apps_point(
+            a3_name(v, 2, 2),
+            "a3",
+            "k=2,q=2".to_owned(),
+            k2(2, 2),
+            variant,
+            Some(a3_name("fifo", 2, 2)),
+            format!("a3/{v}/k=2"),
+            2,
+        ));
+    }
+
+    // ---- A4: lines q=1,m=2 (axis k), k=2,m=2 (axis q), k=2,q=1 (axis m);
+    // the base (2,1,2) on the k line.
+    for (v, variant) in A4_CONFORMING {
+        for k in 1..=4usize {
+            out.push(apps_point(
+                a4_name(v, k, 1, 2),
+                "a4",
+                format!("k={k},q=1,m=2"),
+                k3(k, 1, 2),
+                variant,
+                None,
+                format!("a4/{v}/q=1,m=2"),
+                k as i64,
+            ));
+        }
+        for q in [2usize, 3] {
+            out.push(apps_point(
+                a4_name(v, 2, q, 2),
+                "a4",
+                format!("k=2,q={q},m=2"),
+                k3(2, q, 2),
+                variant,
+                None,
+                format!("a4/{v}/k=2,m=2"),
+                q as i64,
+            ));
+        }
+        for m in [3usize, 4] {
+            out.push(apps_point(
+                a4_name(v, 2, 1, m),
+                "a4",
+                format!("k=2,q=1,m={m}"),
+                k3(2, 1, m),
+                variant,
+                None,
+                format!("a4/{v}/k=2,q=1"),
+                m as i64,
+            ));
+        }
+    }
+    // The hash×A4a twin lines (the twins of rr×A4a's X2 points).
+    for k in [1usize, 3] {
+        out.push(apps_point(
+            a4_name("hash-a4a", k, 2, 2),
+            "a4",
+            format!("k={k},q=2,m=2"),
+            k3(k, 2, 2),
+            "conforming",
+            None,
+            "a4/hash-a4a/q=2,m=2".to_owned(),
+            k as i64,
+        ));
+    }
+    out.push(apps_point(
+        a4_name("hash-a4a", 1, 2, 3),
+        "a4",
+        "k=1,q=2,m=3".to_owned(),
+        k3(1, 2, 3),
+        "conforming",
+        None,
+        "a4/hash-a4a/k=1,q=2".to_owned(),
+        3,
+    ));
+    // pair-swap: A4's still-conforming control, k = 2 only; (2,1,2) on the q line.
+    for v in A4_PAIR_SWAP {
+        let variant = leaked(format!("control:{v}"));
+        for q in [1usize, 2] {
+            out.push(apps_point(
+                a4_name(v, 2, q, 2),
+                "a4",
+                format!("k=2,q={q},m=2"),
+                k3(2, q, 2),
+                variant,
+                None,
+                format!("a4/{v}/k=2,m=2"),
+                q as i64,
+            ));
+        }
+        out.push(apps_point(
+            a4_name(v, 2, 1, 3),
+            "a4",
+            "k=2,q=1,m=3".to_owned(),
+            k3(2, 1, 3),
+            variant,
+            None,
+            format!("a4/{v}/k=2,q=1"),
+            3,
+        ));
+    }
+    // rr×A4a (violates iff q ≥ 2 and m ≥ 2): lines q=2,m=2 (axis k) and k=1,q=2 (axis m).
+    for k in [1usize, 2, 3] {
+        out.push(apps_point(
+            a4_name("rr-a4a", k, 2, 2),
+            "a4",
+            format!("k={k},q=2,m=2"),
+            k3(k, 2, 2),
+            "mutant:rr-a4a",
+            Some(a4_name("hash-a4a", k, 2, 2)),
+            "a4/rr-a4a/q=2,m=2".to_owned(),
+            k as i64,
+        ));
+    }
+    out.push(apps_point(
+        a4_name("rr-a4a", 1, 2, 3),
+        "a4",
+        "k=1,q=2,m=3".to_owned(),
+        k3(1, 2, 3),
+        "mutant:rr-a4a",
+        Some(a4_name("hash-a4a", 1, 2, 3)),
+        "a4/rr-a4a/k=1,q=2".to_owned(),
+        3,
+    ));
+    // drop (rr×A4b, smallest bound (1,1,1)): the three stepped lines.
+    for k in [1usize, 2, 3] {
+        out.push(apps_point(
+            a4_name("drop", k, 1, 2),
+            "a4",
+            format!("k={k},q=1,m=2"),
+            k3(k, 1, 2),
+            "mutant:drop",
+            Some(a4_name("rr-a4b", k, 1, 2)),
+            "a4/drop/q=1,m=2".to_owned(),
+            k as i64,
+        ));
+    }
+    out.push(apps_point(
+        a4_name("drop", 2, 2, 2),
+        "a4",
+        "k=2,q=2,m=2".to_owned(),
+        k3(2, 2, 2),
+        "mutant:drop",
+        Some(a4_name("rr-a4b", 2, 2, 2)),
+        "a4/drop/k=2,m=2".to_owned(),
+        2,
+    ));
+    out.push(apps_point(
+        a4_name("drop", 2, 1, 3),
+        "a4",
+        "k=2,q=1,m=3".to_owned(),
+        k3(2, 1, 3),
+        "mutant:drop",
+        Some(a4_name("rr-a4b", 2, 1, 3)),
+        "a4/drop/k=2,q=1".to_owned(),
+        3,
+    ));
+
+    // ---- The joint corners, one-point lines.
+    let corner_k = [k2(3, 2), k2(3, 3), k2(3, 2), k3(3, 2, 3)];
+    let corner_knobs = ["n=3,r=2", "k=3,q=3", "k=3,q=2", "k=3,q=2,m=3"];
+    for (i, (fx, fam)) in APPS_CORNERS.iter().enumerate() {
+        out.push(apps_point(
+            (*fx).to_owned(),
+            fam,
+            corner_knobs[i].to_owned(),
+            corner_k[i],
+            "conforming",
+            None,
+            APPS_CORNER_LINES[i].to_owned(),
+            1,
+        ));
+    }
+    out
+}
+
+/// The grid's points beyond `apps_fixtures()`'s loops, as fixtures built by
+/// the `P5-APPS` constructors (criterion 3; the block untouched).
+pub(super) fn apps_series_fixtures() -> Vec<Fixture> {
+    const SRC: &str = "grid.rs P5-CAMPAIGN (criteria rev 4.4 C3; the P5-APPS constructors)";
+    let clients = |k: usize| -> Vec<String> { (0..k).map(|i| format!("c{i}")).collect() };
+    let mut out = Vec::new();
+    // A1 `correct` beyond n ≤ 4, r ≤ 3: (5,1), (6,1), (2,4).
+    for (n, r) in [(5usize, 1usize), (6, 1), (2, 4)] {
+        out.push(apps_fixture(
+            a1_name("correct", n, r),
+            SRC,
+            &["p0", "p1"],
+            a1_impl(n, r, A1Coord::Correct),
+            a1_spec(r),
+        ));
+    }
+    // A2 beyond k, q ≤ 3: (4,1), (5,1), (1,4), (1,5) for the five conforming variants.
+    for (k, q) in [(4usize, 1usize), (5, 1), (1, 4), (1, 5)] {
+        let names = clients(k);
+        let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+        for (label, imp) in [
+            ("pb", a2_pb(k, q, A2Pb::Correct)),
+            ("pb-br", a2_pb_br(k, q, A2Br::Correct)),
+            ("control-early-ack-primary", a2_pb(k, q, A2Pb::EarlyAck)),
+            ("control-early-ack-fwd", a2_pb_br(k, q, A2Br::ControlForwardedEarlyAck)),
+        ] {
+            out.push(apps_fixture(a2_name(label, k, q), SRC, &vis_names, imp, a2_spec(k, q)));
+        }
+        out.push(apps_fixture(
+            a2_name("sh", k, q),
+            SRC,
+            &vis_names,
+            a2_sh(k, q, 2, false),
+            a2_spec(k, q),
+        ));
+    }
+    // A3 beyond k ≤ 3, q ≤ 2: (4,1), (5,1), (2,3) for fifo and control-lifo.
+    for (k, q) in [(4usize, 1usize), (5, 1), (2, 3)] {
+        let names = clients(k);
+        let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+        for (label, kind) in [("fifo", A3Coord::Fifo), ("control-lifo", A3Coord::Lifo)] {
+            out.push(apps_fixture(
+                a3_name(label, k, q),
+                SRC,
+                &vis_names,
+                a3_impl(k, q, kind),
+                a3_spec(k, q),
+            ));
+        }
+    }
+    // A4 beyond k ≤ 3, q ≤ 2, m ≤ 3: (4,1,2), (2,3,2), (2,1,4) for hash×{A4a,A4b}, rr×A4b.
+    for (k, q, m) in [(4usize, 1usize, 2usize), (2, 3, 2), (2, 1, 4)] {
+        let names = clients(k);
+        let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+        for (label, policy, spec) in [
+            ("hash-a4a", A4Policy::Hash, A4Spec::A4a),
+            ("hash-a4b", A4Policy::Hash, A4Spec::A4b),
+            ("rr-a4b", A4Policy::RoundRobin, A4Spec::A4b),
+        ] {
+            out.push(apps_fixture(
+                a4_name(label, k, q, m),
+                SRC,
+                &vis_names,
+                a4_impl(k, q, m, policy, A4Fault::None),
+                a4_spec(k, q, m, spec),
+            ));
+        }
+    }
+    out
+}
+
+// =========================================================================
+// P5-X5 — the flat subset (lead; criteria rev 3.1 F2)
+// =========================================================================
+
+/// `P4-FLAT.tables.md`'s `communication_flat = true` fixtures minus the 12
+/// `mixed/*` (plan §6's non-goal): 62 names; the tester parses the table.
+/// Names no `apps/*`, `synth/reset*`, `synth/share-ctl*`; `ex:naive/e2/k{5,6,7}`
+/// are outside the table's domain (`registry(2..=4, …)`) and not here.
+pub(super) const FLAT_SUBSET: [&str; 62] = [
+    "R1",
+    "R2",
+    "a27",
+    "blocking/apparatus",
+    "blocking/cfirst",
+    "corpus/Identity/0x0",
+    "corpus/Identity/0x1",
+    "corpus/Identity/0x2",
+    "corpus/Identity/0x3",
+    "corpus/Identity/0x4",
+    "corpus/Identity/0x5",
+    "corpus/Identity/0x6",
+    "corpus/Identity/0x7",
+    "corpus/Identity/0xe",
+    "corpus/Identity/0xf",
+    "corpus/InvisibleRefactor/0x100000000",
+    "corpus/InvisibleRefactor/0x100000001",
+    "corpus/InvisibleRefactor/0x100000002",
+    "corpus/InvisibleRefactor/0x100000003",
+    "corpus/InvisibleRefactor/0x100000004",
+    "corpus/InvisibleRefactor/0x100000005",
+    "corpus/InvisibleRefactor/0x100000006",
+    "corpus/InvisibleRefactor/0x100000007",
+    "corpus/InvisibleRefactor/0x10000000e",
+    "corpus/InvisibleRefactor/0x10000000f",
+    "corpus/SpecBlocks/0x500000000",
+    "corpus/SpecBlocks/0x500000001",
+    "corpus/SpecBlocks/0x500000002",
+    "corpus/SpecBlocks/0x500000003",
+    "corpus/SpecBlocks/0x500000004",
+    "corpus/SpecBlocks/0x500000005",
+    "corpus/SpecBlocks/0x500000006",
+    "corpus/SpecBlocks/0x500000007",
+    "corpus/SpecBlocks/0x50000000e",
+    "corpus/SpecBlocks/0x50000000f",
+    "corpus/VisibleMutation/0x200000000",
+    "corpus/VisibleMutation/0x200000001",
+    "corpus/VisibleMutation/0x200000002",
+    "corpus/VisibleMutation/0x200000003",
+    "corpus/VisibleMutation/0x200000004",
+    "corpus/VisibleMutation/0x200000005",
+    "corpus/VisibleMutation/0x200000006",
+    "corpus/VisibleMutation/0x200000007",
+    "corpus/VisibleMutation/0x20000000e",
+    "corpus/VisibleMutation/0x20000000f",
+    "ex:cone",
+    "ex:naive/e2/k2",
+    "ex:naive/e2/k3",
+    "ex:naive/e2/k4",
+    "ex:naive/k2/enc1",
+    "ex:naive/k2/enc2",
+    "ex:naive/k3/enc1",
+    "ex:naive/k3/enc2",
+    "ex:naive/k4/enc1",
+    "ex:naive/k4/enc2",
+    "ex:rebuild",
+    "ex:restart",
+    "ex:sched",
+    "forward-pop",
+    "relay/paper",
+    "reset-pair",
+    "traces/self",
+];
