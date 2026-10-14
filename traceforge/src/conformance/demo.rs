@@ -738,6 +738,14 @@ fn le_announce(i: usize, leader: usize, ps: &[crate::thread::ThreadId]) {
 /// survives review. Each elector then takes the maximum of what it *received*,
 /// so at `n = 2` the two disagree at once (e0 elects 1, e1 elects 0).
 fn le_elector(buggy: bool) {
+    le_elector_with(buggy, false)
+}
+
+/// `P5-APPTAB` T3 (β): with `silent_winner` the elector that computes
+/// **itself** as the leader announces nothing — the winner never learns it won;
+/// every other elector announces as before. Under the correct rule that
+/// elector is `e_{n−1}`; the fault stays in the invisible part.
+fn le_elector_with(buggy: bool, silent_winner: bool) {
     let mut setup: Option<Setup> = None;
     let mut heard: Vec<usize> = Vec::new();
     let mut announced = false;
@@ -765,7 +773,11 @@ fn le_elector(buggy: bool) {
                     None => *j,
                 });
             }
-            le_announce(s.me, best.unwrap_or(s.me), &s.participants);
+            let leader = best.unwrap_or(s.me);
+            if silent_winner && leader == s.me {
+                return;
+            }
+            le_announce(s.me, leader, &s.participants);
             return;
         }
     }
@@ -790,6 +802,20 @@ fn le_oracle() {
 }
 
 pub(super) fn le_impl(n: usize, buggy: bool) -> impl Fn() + Send + Sync + Clone + 'static {
+    le_impl_with(n, buggy, false)
+}
+
+/// `P5-APPTAB`'s blocked-class mutant (criteria T3, definition (β)): the correct
+/// election, but the winner's own elector never announces `BeLeader`.
+pub(super) fn le_impl_silent(n: usize) -> impl Fn() + Send + Sync + Clone + 'static {
+    le_impl_with(n, false, true)
+}
+
+fn le_impl_with(
+    n: usize,
+    buggy: bool,
+    silent_winner: bool,
+) -> impl Fn() + Send + Sync + Clone + 'static {
     move || {
         // Participants first: this is what keeps their ids equal to the
         // specification's (F41).
@@ -802,7 +828,7 @@ pub(super) fn le_impl(n: usize, buggy: bool) -> impl Fn() + Send + Sync + Clone 
             .collect();
         let es: Vec<crate::thread::ThreadId> = (0..n)
             .map(|i| {
-                named(&format!("e{i}"), move || le_elector(buggy))
+                named(&format!("e{i}"), move || le_elector_with(buggy, silent_winner))
                     .thread()
                     .id()
             })

@@ -4543,6 +4543,273 @@ pub(super) fn apps_series_fixtures() -> Vec<Fixture> {
 }
 
 // =========================================================================
+// P5-APPTAB — the diagonal pairs beyond the registry (lead; criteria rev 3.2 T2)
+// =========================================================================
+
+/// The largest diagonal size the fixtures are built for (`schedule.json`'s
+/// `max_size` may not exceed it).
+pub(super) const APPTAB_MAX_SIZE: usize = 8;
+
+/// The fifteen pairs of `APPTAB-PLAN.md` §1: three per benchmark (conforming,
+/// a value/order mutant, a blocked-class mutant), named as the registry names
+/// them where the registry holds the size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum ApptabPair {
+    A1Correct,
+    A1Eager,
+    A1Silent,
+    A2Pb,
+    A2StaleGet,
+    A2SilentPut,
+    A3Fifo,
+    A3DoubleGrant,
+    A3NeverGrant,
+    A4Hash,
+    A4Rr,
+    A4HashDrop,
+    LeConf,
+    LeSplit,
+    LeSilent,
+}
+
+impl ApptabPair {
+    pub(super) const ALL: [ApptabPair; 15] = [
+        ApptabPair::A1Correct,
+        ApptabPair::A1Eager,
+        ApptabPair::A1Silent,
+        ApptabPair::A2Pb,
+        ApptabPair::A2StaleGet,
+        ApptabPair::A2SilentPut,
+        ApptabPair::A3Fifo,
+        ApptabPair::A3DoubleGrant,
+        ApptabPair::A3NeverGrant,
+        ApptabPair::A4Hash,
+        ApptabPair::A4Rr,
+        ApptabPair::A4HashDrop,
+        ApptabPair::LeConf,
+        ApptabPair::LeSplit,
+        ApptabPair::LeSilent,
+    ];
+
+    /// The benchmark: `a1`, `a2`, `a3`, `a4`, `le` (the row's `family`).
+    pub(super) fn family(self) -> &'static str {
+        match self {
+            ApptabPair::A1Correct | ApptabPair::A1Eager | ApptabPair::A1Silent => "a1",
+            ApptabPair::A2Pb | ApptabPair::A2StaleGet | ApptabPair::A2SilentPut => "a2",
+            ApptabPair::A3Fifo | ApptabPair::A3DoubleGrant | ApptabPair::A3NeverGrant => "a3",
+            ApptabPair::A4Hash | ApptabPair::A4Rr | ApptabPair::A4HashDrop => "a4",
+            ApptabPair::LeConf | ApptabPair::LeSplit | ApptabPair::LeSilent => "le",
+        }
+    }
+
+    /// The pair's label inside the fixture name.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ApptabPair::A1Correct => "correct",
+            ApptabPair::A1Eager => "eager",
+            ApptabPair::A1Silent => "silent",
+            ApptabPair::A2Pb => "pb",
+            ApptabPair::A2StaleGet => "stale-get",
+            ApptabPair::A2SilentPut => "silent-put",
+            ApptabPair::A3Fifo => "fifo",
+            ApptabPair::A3DoubleGrant => "double-grant",
+            ApptabPair::A3NeverGrant => "never-grant",
+            ApptabPair::A4Hash => "hash",
+            ApptabPair::A4Rr => "rr",
+            ApptabPair::A4HashDrop => "hash-drop",
+            ApptabPair::LeConf => "conf",
+            ApptabPair::LeSplit => "split",
+            ApptabPair::LeSilent => "silent",
+        }
+    }
+
+    /// `conforming`, or `mutant:<label>` (`mutant:<label>-a4a` for A4, whose
+    /// Spec is part of the pair's identity).
+    pub(super) fn variant(self) -> String {
+        match self {
+            ApptabPair::A1Correct
+            | ApptabPair::A2Pb
+            | ApptabPair::A3Fifo
+            | ApptabPair::A4Hash
+            | ApptabPair::LeConf => "conforming".to_owned(),
+            ApptabPair::A4Rr | ApptabPair::A4HashDrop => format!("mutant:{}-a4a", self.label()),
+            _ => format!("mutant:{}", self.label()),
+        }
+    }
+
+    pub(super) fn is_conforming(self) -> bool {
+        self.variant() == "conforming"
+    }
+
+    /// The conforming pair of the same benchmark.
+    pub(super) fn conforming_of(self) -> ApptabPair {
+        match self.family() {
+            "a1" => ApptabPair::A1Correct,
+            "a2" => ApptabPair::A2Pb,
+            "a3" => ApptabPair::A3Fifo,
+            "a4" => ApptabPair::A4Hash,
+            _ => ApptabPair::LeConf,
+        }
+    }
+
+    /// The fixture name at diagonal size `s` (D-T1: every knob `s`).
+    pub(super) fn name(self, s: usize) -> String {
+        match self.family() {
+            "a1" => format!("apps/a1/{}/spec/n{s}r{s}", self.label()),
+            "a2" => format!("apps/a2/{}/spec/k{s}q{s}", self.label()),
+            "a3" => format!("apps/a3/{}/spec/k{s}q{s}", self.label()),
+            "a4" => format!("apps/a4/{}/a4a/k{s}q{s}m{s}", self.label()),
+            _ => format!("2pc/leader/{}/n{s}", self.label()),
+        }
+    }
+
+    /// The knob tuple as the row prints it.
+    pub(super) fn knobs(self, s: usize) -> String {
+        match self.family() {
+            "a1" => format!("n={s},r={s}"),
+            "a2" | "a3" => format!("k={s},q={s}"),
+            "a4" => format!("k={s},q={s},m={s}"),
+            _ => format!("n={s}"),
+        }
+    }
+
+    /// The knob values `k1..k4`.
+    pub(super) fn k(self, s: usize) -> [Option<i64>; 4] {
+        let v = Some(s as i64);
+        match self.family() {
+            "a1" | "a2" | "a3" => [v, v, None, None],
+            "a4" => [v, v, v, None],
+            _ => [v, None, None, None],
+        }
+    }
+}
+
+/// The size of a diagonal knob string: `n2r2` → 2, `k3q3m3` → 3, `n4` → 4;
+/// `None` when the letters are not exactly `letters` or the values differ.
+fn apptab_diag(knobs: &str, letters: &[char]) -> Option<usize> {
+    let mut values = Vec::new();
+    let mut rest = knobs;
+    for &l in letters {
+        rest = rest.strip_prefix(l)?;
+        let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+        values.push(rest[..end].parse::<usize>().ok()?);
+        rest = &rest[end..];
+    }
+    if !rest.is_empty() || values.is_empty() || values.iter().any(|v| *v != values[0]) {
+        return None;
+    }
+    Some(values[0])
+}
+
+/// The pair and size a diagonal fixture name denotes, if it is one.
+pub(super) fn apptab_pair_of(name: &str) -> Option<(ApptabPair, usize)> {
+    let parts: Vec<&str> = name.split('/').collect();
+    for p in ApptabPair::ALL {
+        let (ok, knobs, letters): (bool, &str, &[char]) = match (p.family(), parts.as_slice()) {
+            ("a1", ["apps", "a1", l, "spec", k]) if *l == p.label() => (true, *k, &['n', 'r']),
+            ("a2", ["apps", "a2", l, "spec", k]) if *l == p.label() => (true, *k, &['k', 'q']),
+            ("a3", ["apps", "a3", l, "spec", k]) if *l == p.label() => (true, *k, &['k', 'q']),
+            ("a4", ["apps", "a4", l, "a4a", k]) if *l == p.label() => (true, *k, &['k', 'q', 'm']),
+            ("le", ["2pc", "leader", l, k]) if *l == p.label() => (true, *k, &['n']),
+            _ => (false, "", &[]),
+        };
+        if ok {
+            return apptab_diag(knobs, letters).map(|s| (p, s));
+        }
+    }
+    None
+}
+
+/// The pair's fixture at size `s`, built from the `P5-APPS` constructors and
+/// `demo::le_*` with the registry fixture of the same model as the template
+/// (`apps_fixture` → `apps_config()`, `Group::Apps`, the default thread bound;
+/// the leader pair `cfg(FIFO)` = `seeded(FIFO, None)`, `Group::TwoPc`, the raised
+/// bound `CONF_THREAD_THRESHOLD`): what the registry builds where it holds the
+/// size (criterion 3 checks the agreement), and the only builder beyond it.
+pub(super) fn apptab_build(pair: ApptabPair, s: usize) -> Fixture {
+    const SRC: &str = "grid.rs P5-APPTAB (criteria rev 3.2 T2; the P5-APPS constructors, demo::le_*)";
+    let name = pair.name(s);
+    let clients = |k: usize| -> Vec<String> { (0..k).map(|i| format!("c{i}")).collect() };
+    match pair {
+        ApptabPair::A1Correct | ApptabPair::A1Eager | ApptabPair::A1Silent => {
+            let kind = match pair {
+                ApptabPair::A1Correct => A1Coord::Correct,
+                ApptabPair::A1Eager => A1Coord::Eager,
+                _ => A1Coord::Silent,
+            };
+            apps_fixture(name, SRC, &["p0", "p1"], a1_impl(s, s, kind), a1_spec(s))
+        }
+        ApptabPair::A2Pb | ApptabPair::A2StaleGet | ApptabPair::A2SilentPut => {
+            let kind = match pair {
+                ApptabPair::A2Pb => A2Pb::Correct,
+                ApptabPair::A2StaleGet => A2Pb::StaleGet,
+                _ => A2Pb::SilentPut,
+            };
+            let names = clients(s);
+            let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+            apps_fixture(name, SRC, &vis_names, a2_pb(s, s, kind), a2_spec(s, s))
+        }
+        ApptabPair::A3Fifo | ApptabPair::A3DoubleGrant | ApptabPair::A3NeverGrant => {
+            let kind = match pair {
+                ApptabPair::A3Fifo => A3Coord::Fifo,
+                ApptabPair::A3DoubleGrant => A3Coord::DoubleGrant,
+                _ => A3Coord::NeverGrant,
+            };
+            let names = clients(s);
+            let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+            apps_fixture(name, SRC, &vis_names, a3_impl(s, s, kind), a3_spec(s, s))
+        }
+        ApptabPair::A4Hash | ApptabPair::A4Rr | ApptabPair::A4HashDrop => {
+            let (policy, fault) = match pair {
+                ApptabPair::A4Hash => (A4Policy::Hash, A4Fault::None),
+                ApptabPair::A4Rr => (A4Policy::RoundRobin, A4Fault::None),
+                _ => (A4Policy::Hash, A4Fault::Drop),
+            };
+            let names = clients(s);
+            let vis_names: Vec<&str> = names.iter().map(String::as_str).collect();
+            apps_fixture(
+                name,
+                SRC,
+                &vis_names,
+                a4_impl(s, s, s, policy, fault),
+                a4_spec(s, s, s, A4Spec::A4a),
+            )
+        }
+        ApptabPair::LeConf | ApptabPair::LeSplit | ApptabPair::LeSilent => {
+            let imp = match pair {
+                ApptabPair::LeConf => prog(demo::le_impl(s, false)),
+                ApptabPair::LeSplit => prog(demo::le_impl(s, true)),
+                _ => prog(demo::le_impl_silent(s)),
+            };
+            fixture(
+                name,
+                SRC,
+                Group::TwoPc,
+                seeded(ConsType::FIFO, None),
+                demo::le_visible(s),
+                imp,
+                prog(demo::le_spec(s)),
+            )
+        }
+    }
+}
+
+/// Every diagonal pair at `s = 2..=APPTAB_MAX_SIZE` whose name `existing`
+/// lacks (the registry's object is what `fixture_by_name` returns where the
+/// registry holds the size; criterion 2).
+pub(super) fn apptab_fixtures(existing: &std::collections::BTreeSet<String>) -> Vec<Fixture> {
+    let mut out = Vec::new();
+    for s in 2..=APPTAB_MAX_SIZE {
+        for pair in ApptabPair::ALL {
+            if !existing.contains(&pair.name(s)) {
+                out.push(apptab_build(pair, s));
+            }
+        }
+    }
+    out
+}
+
+// =========================================================================
 // P5-X5 — the flat subset (lead; criteria rev 3.1 F2)
 // =========================================================================
 

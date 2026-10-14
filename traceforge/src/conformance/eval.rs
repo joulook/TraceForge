@@ -39,9 +39,10 @@ use crate::conformance::config::{CompletionCover, GatePolicy, GatedMode};
 use crate::conformance::gated;
 use crate::conformance::grid::APPS_CORNERS;
 use crate::conformance::grid::{
-    apps_fixtures, apps_grid, apps_series_fixtures, mixed_fixtures, registry, row_of_end,
-    stack_mib_for, synth_fixtures, synth_grid, vm_hwm_kb, Budget, Fixture, GridConfig, GridEnd,
-    GridEngine, GridRaw, GridResult, Group, Row, SynthPoint, FLAT_SUBSET,
+    apps_fixtures, apps_grid, apps_series_fixtures, apptab_fixtures, apptab_pair_of,
+    mixed_fixtures, registry, row_of_end, stack_mib_for, synth_fixtures, synth_grid, vm_hwm_kb,
+    ApptabPair, Budget, Fixture, GridConfig, GridEnd, GridEngine, GridRaw, GridResult, Group, Row,
+    SynthPoint, FLAT_SUBSET,
 };
 use crate::conformance::search::SearchOpts;
 use crate::conformance::selector::{InnerOrder, Selector};
@@ -702,10 +703,21 @@ pub(super) fn all_fixtures() -> Vec<Fixture> {
     out
 }
 
+/// The resolution domain: the campaign's fixtures and, beyond them, the
+/// `P5-APPTAB` diagonal pairs at the sizes no earlier family holds (T2).
+/// Kept apart from `all_fixtures()` so that the campaign's derivations
+/// (its point sets, §6 points, twins, row counts) do not see them.
+pub(super) fn fixture_domain() -> Vec<Fixture> {
+    let mut out = all_fixtures();
+    let names: BTreeSet<String> = out.iter().map(|f| f.name.clone()).collect();
+    out.extend(apptab_fixtures(&names));
+    out
+}
+
 /// H2: resolution by name over the whole domain, which must be free of
 /// duplicate names (`Refusal::DuplicateName`).
 pub(super) fn fixture_by_name(name: &str) -> Result<Fixture, Refusal> {
-    let all = all_fixtures();
+    let all = fixture_domain();
     let mut seen = BTreeSet::new();
     for f in &all {
         if !seen.insert(f.name.clone()) {
@@ -1499,6 +1511,7 @@ pub(super) fn child_row(spec: &RowSpec, commit: &str) -> Result<Row, Refusal> {
         match export.as_str() {
             "first_report" => export_first_report(&end, &fixture.visible, Path::new(&dir))?,
             "spec_words" => export_spec_words(&end, &fixture.visible, Path::new(&dir))?,
+            "flat_witness" => export_flat_witness(&end, &fixture.visible, Path::new(&dir))?,
             _ => {}
         }
     }
@@ -1566,7 +1579,16 @@ impl Driver {
     pub(super) fn from_env() -> Result<Driver, Refusal> {
         let name =
             std::env::var("EVAL_SPEC").map_err(|_| Refusal::Spec("EVAL_SPEC unset".into()))?;
-        let specs = builtin_specs();
+        // The campaign's built-in list is unchanged; the `P5-APPTAB` specs
+        // are reachable only through the driver, and only when named
+        // (gate 4 m4): the schedule file is parsed here first, so a
+        // malformed file is a refusal, never a panic, and a campaign spec
+        // never reads it.
+        let mut specs = builtin_specs();
+        if APPTAB_SPEC_NAMES.contains(&name.as_str()) {
+            Schedule::check()?;
+            specs.extend(apptab_specs());
+        }
         let spec = specs
             .iter()
             .find(|s| s.name == name)
@@ -1681,6 +1703,21 @@ impl Driver {
                 .map_err(|e| Refusal::Io(e.to_string()))?;
             fs::rename(&tmp, &used_path).map_err(|e| Refusal::Io(e.to_string()))?;
         }
+        // `P5-APPTAB` T6: the schedule is the frozen plan — refused when absent,
+        // its reuse batches validated against the campaign store and its record
+        // written before the first row.
+        if apptab_family(&self.spec.name) {
+            let Some(sch) = schedule() else {
+                return Err(Refusal::Spec(format!(
+                    "{} is not runnable: no schedule file (EVAL_SCHEDULE, else EVAL_OUT/schedule.json)",
+                    self.spec.name
+                )));
+            };
+            if self.spec.name == "APPTAB" {
+                sch.validate_reuse()?;
+            }
+            sch.record_used(&self.out_dir)?;
+        }
         let (commit, dirty) = (self.probes.git)();
         let commit = if dirty {
             format!("{commit}+dirty")
@@ -1720,7 +1757,7 @@ impl Driver {
             let key = spec.key(profile);
             if store
                 .end_class_of(&key)
-                .is_some_and(|c| c.starts_with("capped_"))
+                .is_some_and(|c| series_ending_class(&self.spec.name, &c))
             {
                 censored_reps.insert(spec.rep_set());
                 if let Some(series) = &spec.series {
@@ -1789,9 +1826,17 @@ impl Driver {
             }
             let out = self.spawn_child(&spec, &key, &commit)?;
             let row = self.classify(&spec, &mut meta, &out);
+            let class = row
+                .iter()
+                .find(|(c, _)| *c == "end_class")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default();
             if meta.censored {
                 summary.censored += 1;
                 censored_reps.insert(spec.rep_set());
+            }
+            // H5 (2), and `P5-APPTAB` T6's error rows for that spec alone.
+            if series_ending_class(&self.spec.name, &class) {
                 if let Some(series) = &spec.series {
                     let e = censored_scopes
                         .entry(series.scope.clone())
@@ -2502,6 +2547,10 @@ pub(super) fn exports_of(spec: &str) -> Option<&'static str> {
     match spec {
         "X2P" => Some("first_report"),
         "X2S" => Some("spec_words"),
+        // `P5-APPTAB` T7: no timed row exports; the companions do.
+        "APPTABP" => Some("first_report"),
+        "APPTABS" => Some("spec_words"),
+        "APPTABW" => Some("flat_witness"),
         _ => None,
     }
 }
@@ -3633,4 +3682,1205 @@ pub(super) fn x5g_spec() -> Spec {
         sweep(s, stop).cover(CompletionCover::Flat)
     }
     x5_rows("X5G", sweep, flat, false)
+}
+
+// =========================================================================
+// P5-APPTAB — the §16 application tables (lead; criteria rev 3.4 T1–T10,
+// against `APPTAB-PLAN.md` revision 4)
+// =========================================================================
+//
+// `APPTAB`: the diagonal rows of `schedule.json` (the frozen, fully expanded
+// plan beside the store), at the default tier (600 s, the owner's ruling of
+// 2026-10-13: a campaign key is an APPTAB key), one rep, `Ltr`, exhaustive
+// (X1's configuration) on the conforming pairs and the mutants' all-reports
+// rows, first report (X2's) on the mutants; the series scope is the
+// (benchmark, pair, engine, mode) with every knob blanked, so the driver's
+// censored-scope rule is D-T2's stop. `APPTABP`: the profiling twins of the
+// runnable first-report rows (the certification artefact, as X2P). `APPTABS`:
+// one stateful `Ltr` profiling row per (benchmark, size) on the conforming
+// pair, the Spec observations (as X2S). `APPTABW`: the five flat witnesses
+// at `s = 2`. `EDPROBE`: the six memo-off `ex:naive/enc2` rows (its own store).
+
+/// The specs that need the schedule file.
+fn apptab_family(name: &str) -> bool {
+    matches!(name, "APPTAB" | "APPTABP" | "APPTABS")
+}
+
+/// H5 (2) for every spec (`capped_*`), and `P5-APPTAB` T6's error rows for
+/// `APPTAB` alone: a `panicked` or `crashed(…)` row ends its series too.
+fn series_ending_class(spec: &str, class: &str) -> bool {
+    class.starts_with("capped_")
+        || (spec == "APPTAB" && (class == "panicked" || class.starts_with("crashed")))
+}
+
+/// The benchmarks in the balanced order's benchmark position.
+const APPTAB_FAMILIES: [&str; 5] = ["a1", "a2", "a3", "a4", "le"];
+
+/// The five specs of this part, reachable through the driver only (E-AT-4).
+/// D-T6's hard cap (plan revision 4; criterion 10).
+const APPTAB_BUDGET_H: u64 = 60;
+
+const APPTAB_SPEC_NAMES: [&str; 5] = ["APPTAB", "APPTABP", "APPTABS", "APPTABW", "EDPROBE"];
+
+/// The engines in the balanced order's engine position (the generator's
+/// `ENGINES`; the all-reports rows of a mutant omit the enumerator). T6 has
+/// these four and no other (gate 4 m1).
+const APPTAB_ENGINE_ORDER: [&str; 4] = ["Enumerator", "Stateful", "CompleteFirst", "Gated"];
+const APPTAB_ENGINES: [GridEngine; 4] = [
+    GridEngine::Enumerator,
+    GridEngine::Stateful,
+    GridEngine::CompleteFirst,
+    GridEngine::Gated,
+];
+
+/// A row's position in plan §6's balanced order (criterion 6; gate 3 T1):
+/// size, benchmark, the pair within its benchmark (`ApptabPair::ALL`'s order:
+/// conforming, then the two mutants), the mode (`first` before `exhaustive`),
+/// the engine.
+fn balanced_position(
+    s: usize,
+    pair: crate::conformance::grid::ApptabPair,
+    mode: &str,
+    engine: &str,
+) -> (usize, usize, usize, usize, usize) {
+    use crate::conformance::grid::ApptabPair;
+    let family = APPTAB_FAMILIES
+        .iter()
+        .position(|f| *f == pair.family())
+        .unwrap_or(usize::MAX);
+    let pair_pos = ApptabPair::ALL
+        .iter()
+        .position(|p| *p == pair)
+        .unwrap_or(usize::MAX);
+    let mode_pos = usize::from(mode != "first");
+    let engine_pos = APPTAB_ENGINE_ORDER
+        .iter()
+        .position(|e| *e == engine)
+        .unwrap_or(usize::MAX);
+    (s, family, pair_pos, mode_pos, engine_pos)
+}
+
+/// The deterministic counters a reused batch must agree on (criterion 8).
+const APPTAB_COUNTERS: [&str; 5] = [
+    "executions",
+    "reports",
+    "sweep_graphs",
+    "spec_graphs",
+    "spec_visit_calls",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ScheduleRow {
+    pub(super) key: String,
+    pub(super) benchmark: String,
+    pub(super) pair: String,
+    pub(super) engine: String,
+    /// `exhaustive` | `first`.
+    pub(super) mode: String,
+    pub(super) size: usize,
+    pub(super) series: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Reused {
+    pub(super) key: String,
+    /// The campaign keys: this key at reps `0..reps`.
+    pub(super) batch: Vec<String>,
+    pub(super) reps: usize,
+    /// The batch has a censored rep (`capped_*`; plan §5, revision 4: reused
+    /// as is, *mixed* when a completed rep precedes the censor), and the
+    /// series ends at this size (an `ended` entry says so).
+    pub(super) ends_series: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Ended {
+    pub(super) series: String,
+    pub(super) size: usize,
+    pub(super) reason: String,
+}
+
+/// One profiling invocation of the schedule (plan §7 item 2, revision 4):
+/// `APPTABW` (the witnesses, before size 2), `APPTABS` (the Spec observations
+/// per (benchmark, size)), `APPTABP` (the twin of a runnable first-report
+/// row), each with its dependencies and the condition under which it runs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ProfilingEntry {
+    pub(super) spec: String,
+    pub(super) key: String,
+    pub(super) depends_on: Vec<String>,
+    pub(super) condition: String,
+}
+
+/// The run conditions the schedule must state verbatim.
+const COND_W: &str = "no dependency; runs before size 2 (plan §7 item 5)";
+const COND_S: &str = "runs after the (benchmark, size) timed block whatever its outcomes; \
+certifies the block's complete first reports (plan §3)";
+const COND_P: &str = "runs only when its timed row completed (end_class ok) with reports >= 1; \
+a missing, failed, censored or budget-skipped twin leaves the report unclassified (plan §7 item 5)";
+
+/// The frozen, fully expanded schedule (T6): `EVAL_SCHEDULE`, else
+/// `EVAL_OUT/schedule.json`; absent = no APPTAB row (the driver refuses).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Schedule {
+    pub(super) date: String,
+    pub(super) source: String,
+    pub(super) commit: String,
+    pub(super) max_size: usize,
+    pub(super) wall_ms: u64,
+    pub(super) mem_kb: u64,
+    pub(super) budget_h: u64,
+    pub(super) reuse_store: PathBuf,
+    pub(super) rows: Vec<ScheduleRow>,
+    pub(super) reused: Vec<Reused>,
+    pub(super) ended: Vec<Ended>,
+    /// Every profiling invocation (validated equal to the derivation).
+    pub(super) profiling: Vec<ProfilingEntry>,
+    /// The file's text, for the used record.
+    pub(super) text: String,
+}
+
+impl Schedule {
+    pub(super) fn path() -> Option<PathBuf> {
+        if let Some(p) = std::env::var_os("EVAL_SCHEDULE") {
+            return Some(PathBuf::from(p));
+        }
+        std::env::var_os("EVAL_OUT").map(|d| PathBuf::from(d).join("schedule.json"))
+    }
+
+    pub(super) fn used_path(out_dir: &Path) -> PathBuf {
+        out_dir.join("schedule.used.json")
+    }
+
+    /// Parse and **validate** the file (criterion 6): strict keys; every row key
+    /// a well-formed APPTAB key — a diagonal fixture of a known pair, the
+    /// `default` tier, `timed`, rep 0, the label of `x1_config`/`x2_config` for its
+    /// mode and engine, no enumerator all-reports row, no first-report row on
+    /// a conforming pair, the series string as T6 defines it, the size ≤
+    /// `max_size` ≤ `APPTAB_MAX_SIZE`; the rows in the balanced order (size,
+    /// benchmark, pair, mode, engine — gate 3 T1); every reused key among the
+    /// rows.
+    pub(super) fn parse(text: &str) -> Result<Schedule, Refusal> {
+        let bad = |what: String| Refusal::Spec(format!("the schedule is malformed: {what}"));
+        let v: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| Refusal::Spec(format!("the schedule does not parse: {e}")))?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| bad("not an object".to_owned()))?;
+        let allowed = [
+            "date",
+            "source",
+            "commit",
+            "max_size",
+            "limits",
+            "reuse_store",
+            "rows",
+            "reused",
+            "ended",
+            "extension_reuse",
+            "profiling",
+        ];
+        for k in obj.keys() {
+            if !allowed.contains(&k.as_str()) {
+                return Err(bad(format!("unknown key `{k}`")));
+            }
+        }
+        let text_field =
+            |o: &serde_json::Map<String, serde_json::Value>, f: &str| -> Result<String, Refusal> {
+                let t = o.get(f).and_then(|v| v.as_str()).unwrap_or_default();
+                if t.is_empty() {
+                    return Err(bad(format!("missing or empty `{f}`")));
+                }
+                Ok(t.to_owned())
+            };
+        let num =
+            |o: &serde_json::Map<String, serde_json::Value>, f: &str| -> Result<u64, Refusal> {
+                o.get(f)
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| bad(format!("missing or non-numeric `{f}`")))
+            };
+        let date = text_field(obj, "date")?;
+        let source = text_field(obj, "source")?;
+        let commit = text_field(obj, "commit")?;
+        let max_size = num(obj, "max_size")? as usize;
+        if !(2..=crate::conformance::grid::APPTAB_MAX_SIZE).contains(&max_size) {
+            return Err(bad(format!(
+                "max_size {max_size} outside 2..={}",
+                crate::conformance::grid::APPTAB_MAX_SIZE
+            )));
+        }
+        let limits = obj
+            .get("limits")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| bad("missing `limits`".to_owned()))?;
+        for k in limits.keys() {
+            if !matches!(k.as_str(), "wall_ms" | "mem_kb" | "budget_h") {
+                return Err(bad(format!("limits: unknown key `{k}`")));
+            }
+        }
+        let wall_ms = num(limits, "wall_ms")?;
+        let mem_kb = num(limits, "mem_kb")?;
+        let budget_h = num(limits, "budget_h")?;
+        // The owner's ruling of 2026-10-13: APPTAB runs at the campaign's
+        // default tier (600 s / 4 GiB), so a campaign key is an APPTAB key.
+        let tier = Tier::default_tier();
+        if wall_ms != tier.wall.as_millis() as u64 || mem_kb != tier.mem_kb {
+            return Err(bad(format!(
+                "limits {wall_ms} ms / {mem_kb} kB are not the default tier's"
+            )));
+        }
+        if budget_h != APPTAB_BUDGET_H {
+            return Err(bad(format!(
+                "limits budget_h {budget_h} is not D-T6's hard cap of {APPTAB_BUDGET_H} h"
+            )));
+        }
+        let reuse_store = PathBuf::from(text_field(obj, "reuse_store")?);
+        // The rows.
+        let arr = obj
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("`rows` is not an array".to_owned()))?;
+        let mut rows = Vec::with_capacity(arr.len());
+        let mut keys = BTreeSet::new();
+        let mut last: Option<(usize, usize, usize, usize, usize)> = None;
+        let mut profile: Option<String> = None;
+        for (i, item) in arr.iter().enumerate() {
+            let o = item
+                .as_object()
+                .ok_or_else(|| bad(format!("rows[{i}] is not an object")))?;
+            for k in o.keys() {
+                if !matches!(
+                    k.as_str(),
+                    "key" | "benchmark" | "pair" | "engine" | "mode" | "size" | "series"
+                ) {
+                    return Err(bad(format!("rows[{i}]: unknown key `{k}`")));
+                }
+            }
+            let row = ScheduleRow {
+                key: text_field(o, "key")?,
+                benchmark: text_field(o, "benchmark")?,
+                pair: text_field(o, "pair")?,
+                engine: text_field(o, "engine")?,
+                mode: text_field(o, "mode")?,
+                size: num(o, "size")? as usize,
+                series: text_field(o, "series")?,
+            };
+            let (pair, s, row_profile) = Self::check_row(&row, max_size)
+                .map_err(|why| bad(format!("rows[{i}] `{}`: {why}", row.key)))?;
+            match &profile {
+                None => profile = Some(row_profile),
+                Some(p) if *p != row_profile => {
+                    return Err(bad(format!(
+                        "rows[{i}] `{}`: build profile `{row_profile}` differs from rows[0]'s `{p}`",
+                        row.key
+                    )));
+                }
+                Some(_) => {}
+            }
+            let pos = balanced_position(s, pair, &row.mode, &row.engine);
+            if last.is_some_and(|l| pos <= l) {
+                return Err(bad(format!(
+                    "rows[{i}] `{}` is out of the balanced order (size, benchmark, pair, mode, \
+                     engine) or repeats a cell",
+                    row.key
+                )));
+            }
+            last = Some(pos);
+            if !keys.insert(row.key.clone()) {
+                return Err(bad(format!("rows[{i}] `{}` listed twice", row.key)));
+            }
+            rows.push(row);
+        }
+        // The reused batches.
+        let arr = obj
+            .get("reused")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("`reused` is not an array".to_owned()))?;
+        let mut reused = Vec::with_capacity(arr.len());
+        for (i, item) in arr.iter().enumerate() {
+            let o = item
+                .as_object()
+                .ok_or_else(|| bad(format!("reused[{i}] is not an object")))?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "key" | "batch" | "reps" | "ends_series") {
+                    return Err(bad(format!("reused[{i}]: unknown key `{k}`")));
+                }
+            }
+            let key = text_field(o, "key")?;
+            if !keys.contains(&key) {
+                return Err(bad(format!(
+                    "reused[{i}] `{key}` is not a row of the schedule"
+                )));
+            }
+            if reused.iter().any(|r: &Reused| r.key == key) {
+                return Err(bad(format!("reused[{i}] `{key}` listed twice")));
+            }
+            let batch: Vec<String> = o
+                .get("batch")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| bad(format!("reused[{i}]: `batch` is not an array")))?
+                .iter()
+                .map(|b| {
+                    b.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| bad(format!("reused[{i}]: a non-string batch key")))
+                })
+                .collect::<Result<_, _>>()?;
+            let ends_series = match o.get("ends_series") {
+                None => false,
+                Some(v) => v
+                    .as_bool()
+                    .ok_or_else(|| bad(format!("reused[{i}]: `ends_series` is not a bool")))?,
+            };
+            let reps = num(o, "reps")? as usize;
+            if reps == 0 || batch.len() != reps {
+                return Err(bad(format!(
+                    "reused[{i}] `{key}`: batch of {} keys, reps {reps}",
+                    batch.len()
+                )));
+            }
+            reused.push(Reused {
+                key,
+                batch,
+                reps,
+                ends_series,
+            });
+        }
+        // The ended series.
+        let arr = obj
+            .get("ended")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("`ended` is not an array".to_owned()))?;
+        let mut ended = Vec::with_capacity(arr.len());
+        for (i, item) in arr.iter().enumerate() {
+            let o = item
+                .as_object()
+                .ok_or_else(|| bad(format!("ended[{i}] is not an object")))?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "series" | "size" | "reason") {
+                    return Err(bad(format!("ended[{i}]: unknown key `{k}`")));
+                }
+            }
+            let e = Ended {
+                series: text_field(o, "series")?,
+                size: num(o, "size")? as usize,
+                reason: text_field(o, "reason")?,
+            };
+            if ended
+                .iter()
+                .any(|x: &Ended| x.series == e.series && x.size == e.size)
+            {
+                return Err(bad(format!(
+                    "ended[{i}] `{}` at {} listed twice",
+                    e.series, e.size
+                )));
+            }
+            ended.push(e);
+        }
+        // An ended series is exactly a reused batch censored in the campaign
+        // (the owner's ruling: a campaign row censored at 600 s ends its
+        // series; a new row's censor is the driver's own store rule).
+        let at = |key: &str| {
+            rows.iter()
+                .find(|r| r.key == key)
+                .map(|r| (r.series.clone(), r.size))
+        };
+        for r in reused.iter().filter(|r| r.ends_series) {
+            let (series, size) = at(&r.key).expect("conformance: a reused key is a row");
+            if !ended.iter().any(|e| e.series == series && e.size == size) {
+                return Err(bad(format!(
+                    "reused `{}` ends its series but `ended` has no entry at ({series}, {size})",
+                    r.key
+                )));
+            }
+        }
+        for e in &ended {
+            let declared = reused.iter().any(|r| {
+                r.ends_series && at(&r.key).is_some_and(|(s, z)| s == e.series && z == e.size)
+            });
+            if !declared {
+                return Err(bad(format!(
+                    "ended ({}, {}) names no reused batch censored there",
+                    e.series, e.size
+                )));
+            }
+        }
+        // Completeness (gate 4 m1): the file lists every T6 cell for
+        // `s = 2..=max_size` less the rows an `ended` series drops — the
+        // frozen file is the experiment's definition, so a missing cell is a
+        // refusal, not an absence. The keys carry the rows' build profile
+        // (every row's, checked equal above).
+        let ended_before =
+            |series: &str, size: usize| ended.iter().any(|e| e.series == series && size > e.size);
+        // The file omits the rows an ended series drops (the generator's rule; the
+        // criteria's 625): a listed row above its series' end is refused by name.
+        for (i, r) in rows.iter().enumerate() {
+            if ended_before(&r.series, r.size) {
+                let z = ended
+                    .iter()
+                    .find(|e| e.series == r.series)
+                    .map_or(0, |e| e.size);
+                return Err(bad(format!(
+                    "rows[{i}] `{}` lies above its series' end at {z} (`ended`); the file omits \
+                     such rows",
+                    r.key
+                )));
+            }
+        }
+        let key_profile = profile.clone().unwrap_or_else(|| "release".to_owned());
+        let mut expected = 0usize;
+        for s in 2..=max_size {
+            for pair in ApptabPair::ALL {
+                let modes: &[&str] = if pair.is_conforming() {
+                    &["exhaustive"]
+                } else {
+                    &["first", "exhaustive"]
+                };
+                for mode in modes {
+                    for engine in APPTAB_ENGINES {
+                        if !pair.is_conforming()
+                            && *mode == "exhaustive"
+                            && engine == GridEngine::Enumerator
+                        {
+                            continue;
+                        }
+                        let config = if *mode == "first" {
+                            x2_config(engine, Selector::Ltr)
+                        } else {
+                            x1_config(engine, Selector::Ltr)
+                        };
+                        let label = config.label();
+                        let series = format!(
+                            "{}|{}|diag|{label}|default|timed",
+                            pair.family(),
+                            pair.variant()
+                        );
+                        if ended_before(&series, s) {
+                            continue;
+                        }
+                        expected += 1;
+                        let key = format!("{}|{label}|0|default|timed|{key_profile}", pair.name(s));
+                        if !keys.contains(&key) {
+                            return Err(bad(format!(
+                                "rows is incomplete: `{key}` (size {s}, {} {} {mode} {engine:?}) is \
+                                 missing; {} of {expected}+ rows listed",
+                                pair.family(),
+                                pair.label(),
+                                rows.len()
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+        if rows.len() != expected {
+            return Err(bad(format!(
+                "rows lists {} rows but T6 derives {expected} for max_size {max_size}",
+                rows.len()
+            )));
+        }
+        // The extension-tier reuse mapping (plan §5, revision 4) is explicit
+        // and frozen. The campaign store holds no extension-tier row on any
+        // diagonal cell (verified over `rows.csv`, 2026-10-13), so the mapping
+        // is empty by construction; a non-empty one is refused as unsupported
+        // (landing erratum E-AT-5) rather than half-implemented.
+        let ext = obj
+            .get("extension_reuse")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("`extension_reuse` is not an array".to_owned()))?;
+        if !ext.is_empty() {
+            return Err(bad(format!(
+                "extension_reuse lists {} entries; the mapping is unsupported (no extension-tier \
+                 row matches a cell; E-AT-5)",
+                ext.len()
+            )));
+        }
+        // Every profiling invocation (plan §7 item 2), with its dependencies and
+        // its run condition, and exactly the derivation (`expected_profiling`).
+        let arr = obj
+            .get("profiling")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("`profiling` is not an array".to_owned()))?;
+        let mut profiling = Vec::with_capacity(arr.len());
+        for (i, item) in arr.iter().enumerate() {
+            let o = item
+                .as_object()
+                .ok_or_else(|| bad(format!("profiling[{i}] is not an object")))?;
+            for k in o.keys() {
+                if !matches!(k.as_str(), "spec" | "key" | "depends_on" | "condition") {
+                    return Err(bad(format!("profiling[{i}]: unknown key `{k}`")));
+                }
+            }
+            let depends_on: Vec<String> = o
+                .get("depends_on")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| bad(format!("profiling[{i}]: `depends_on` is not an array")))?
+                .iter()
+                .map(|d| {
+                    d.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| bad(format!("profiling[{i}]: a non-string dependency")))
+                })
+                .collect::<Result<_, _>>()?;
+            profiling.push(ProfilingEntry {
+                spec: text_field(o, "spec")?,
+                key: text_field(o, "key")?,
+                depends_on,
+                condition: text_field(o, "condition")?,
+            });
+        }
+        let expected = Self::expected_profiling(&rows, &reused, &ended);
+        if profiling != expected {
+            let i = profiling
+                .iter()
+                .zip(&expected)
+                .position(|(a, b)| a != b)
+                .unwrap_or(expected.len().min(profiling.len()));
+            return Err(bad(format!(
+                "profiling[{i}] is not the derivation's ({} listed, {} derived): listed {:?}, \
+                 derived {:?}",
+                profiling.len(),
+                expected.len(),
+                profiling.get(i),
+                expected.get(i)
+            )));
+        }
+        Ok(Schedule {
+            date,
+            source,
+            commit,
+            max_size,
+            wall_ms,
+            mem_kb,
+            budget_h,
+            reuse_store,
+            rows,
+            reused,
+            ended,
+            profiling,
+            text: text.to_owned(),
+        })
+    }
+
+    /// The profiling invocations the schedule must list (plan §7 item 2), in
+    /// the runner's order: `APPTABW`'s five witness rows (rep 1, size 2), then
+    /// per (size, benchmark) block in the rows' order the `APPTABS` row of the
+    /// conforming pair and the `APPTABP` twin of every runnable first-report
+    /// row (a reused first-report cell keeps the campaign's X2P artefact and
+    /// has no twin). The keys carry the rows' build profile.
+    fn expected_profiling(
+        rows: &[ScheduleRow],
+        reused: &[Reused],
+        ended: &[Ended],
+    ) -> Vec<ProfilingEntry> {
+        let Some(first) = rows.first() else {
+            return Vec::new();
+        };
+        let profile = parse_key(&first.key)
+            .map(|k| k.5)
+            .unwrap_or_else(|| "release".to_owned());
+        let stateful = x1_config(GridEngine::Stateful, Selector::Ltr).label();
+        let mut out = Vec::new();
+        for pair in [
+            ApptabPair::A1Correct,
+            ApptabPair::A2Pb,
+            ApptabPair::A3Fifo,
+            ApptabPair::A4Hash,
+            ApptabPair::LeConf,
+        ] {
+            out.push(ProfilingEntry {
+                spec: "APPTABW".to_owned(),
+                key: format!("{}|{stateful}|1|default|profiling|{profile}", pair.name(2)),
+                depends_on: Vec::new(),
+                condition: COND_W.to_owned(),
+            });
+        }
+        let is_reused = |key: &str| reused.iter().any(|r| r.key == key);
+        let ended_before =
+            |series: &str, size: usize| ended.iter().any(|e| e.series == series && size > e.size);
+        let mut seen = BTreeSet::new();
+        for r in rows {
+            let (fixture, _, _, _, _, _) =
+                parse_key(&r.key).expect("conformance: a validated schedule key");
+            let (pair, s) =
+                apptab_pair_of(&fixture).expect("conformance: a validated schedule fixture");
+            let conf = pair.conforming_of();
+            if seen.insert((conf, s)) {
+                out.push(ProfilingEntry {
+                    spec: "APPTABS".to_owned(),
+                    key: format!("{}|{stateful}|0|default|profiling|{profile}", conf.name(s)),
+                    depends_on: Vec::new(),
+                    condition: COND_S.to_owned(),
+                });
+            }
+            if r.mode == "first" && !is_reused(&r.key) && !ended_before(&r.series, r.size) {
+                out.push(ProfilingEntry {
+                    spec: "APPTABP".to_owned(),
+                    key: r.key.replacen("|timed|", "|profiling|", 1),
+                    depends_on: vec![r.key.clone()],
+                    condition: COND_P.to_owned(),
+                });
+            }
+        }
+        out
+    }
+
+    /// One row's well-formedness (T6); the pair and size it denotes.
+    fn check_row(
+        row: &ScheduleRow,
+        max_size: usize,
+    ) -> Result<(ApptabPair, usize, String), String> {
+        let (fixture, config, rep, tier, run_kind, profile) =
+            parse_key(&row.key).ok_or_else(|| "the key does not parse".to_owned())?;
+        let (pair, s) = apptab_pair_of(&fixture)
+            .ok_or_else(|| format!("`{fixture}` is not a diagonal fixture of a known pair"))?;
+        if s != row.size {
+            return Err(format!("size {} but the fixture is at {s}", row.size));
+        }
+        if s < 2 || s > max_size {
+            return Err(format!("size {s} outside 2..={max_size}"));
+        }
+        if tier != "default" || run_kind != RunKind::Timed || rep != 0 {
+            return Err("not `default`, `timed`, rep 0".to_owned());
+        }
+        if row.benchmark != pair.family() {
+            return Err(format!(
+                "benchmark `{}` but the fixture is {}",
+                row.benchmark,
+                pair.family()
+            ));
+        }
+        if row.pair != pair.label() {
+            return Err(format!(
+                "pair `{}` but the fixture is `{}`",
+                row.pair,
+                pair.label()
+            ));
+        }
+        let engine = format!("{:?}", config.engine);
+        if !APPTAB_ENGINE_ORDER.contains(&engine.as_str()) {
+            return Err(format!("engine {engine} is not one of the table's four"));
+        }
+        if row.engine != engine {
+            return Err(format!(
+                "engine `{}` but the label says {engine}",
+                row.engine
+            ));
+        }
+        let expected = match row.mode.as_str() {
+            "exhaustive" => x1_config(config.engine, Selector::Ltr),
+            "first" => x2_config(config.engine, Selector::Ltr),
+            other => return Err(format!("mode `{other}` is not `exhaustive` | `first`")),
+        };
+        if config.label() != expected.label() {
+            return Err(format!(
+                "the label is not {}'s for mode {}: {}",
+                engine,
+                row.mode,
+                config.label()
+            ));
+        }
+        if pair.is_conforming() && row.mode == "first" {
+            return Err("a first-report row on a conforming pair".to_owned());
+        }
+        if !pair.is_conforming()
+            && row.mode == "exhaustive"
+            && config.engine == GridEngine::Enumerator
+        {
+            return Err("an all-reports row on the enumerator (it decides, plan §3)".to_owned());
+        }
+        let series = format!(
+            "{}|{}|diag|{}|default|timed",
+            pair.family(),
+            pair.variant(),
+            config.label()
+        );
+        if row.series != series {
+            return Err(format!("series `{}` is not `{series}`", row.series));
+        }
+        Ok((pair, s, profile))
+    }
+
+    /// The file in force parsed as a refusal (gate 4 m4), before any spec is
+    /// built: `Ok(())` without a file; a read error is `Refusal::Io`, a
+    /// malformed file the parser's refusal by name. `Driver::from_env` calls
+    /// it for the five specs of this part, so `load`'s panic path is never
+    /// reached through the driver.
+    pub(super) fn check() -> Result<(), Refusal> {
+        let Some(p) = Self::path() else {
+            return Ok(());
+        };
+        if !p.exists() {
+            return Ok(());
+        }
+        let text = fs::read_to_string(&p)
+            .map_err(|e| Refusal::Io(format!("reading {}: {e}", p.display())))?;
+        Self::parse(&text).map(|_| ())
+    }
+
+    /// The lists in force: the file if present, else none.
+    fn load() -> Option<Schedule> {
+        let p = Self::path()?;
+        if !p.exists() {
+            return None;
+        }
+        let text = fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("conformance: reading {}: {e}", p.display()));
+        Some(Self::parse(&text).unwrap_or_else(|e| panic!("conformance: {}", e.text())))
+    }
+
+    /// Whether a row of `series` at `size` is dropped by an `ended` entry.
+    fn ended_before(&self, series: &str, size: usize) -> bool {
+        self.ended
+            .iter()
+            .any(|e| e.series == series && size > e.size)
+    }
+
+    pub(super) fn is_reused(&self, key: &str) -> bool {
+        self.reused.iter().any(|r| r.key == key)
+    }
+
+    /// The rows the driver runs: not reused, not beyond an ended series.
+    pub(super) fn runnable(&self) -> Vec<&ScheduleRow> {
+        self.rows
+            .iter()
+            .filter(|r| !self.is_reused(&r.key) && !self.ended_before(&r.series, r.size))
+            .collect()
+    }
+
+    /// Criterion 8 (rev 3.4; plan §5 revision 4): every reused batch exists in
+    /// the campaign store **under the APPTAB key itself** (fixture, label, tier
+    /// `default`, `timed`, `release`; the batch is that key at reps `0..r−1`)
+    /// and is either completed on every rep, or censored — the reps before the
+    /// first `capped_*` rep `ok` (a *mixed* batch), the reps after it
+    /// `skipped_rep` (the campaign's rep rule) — reused as is and ending its
+    /// series, which the entry declares (`ends_series`). The deterministic
+    /// counters are compared across the completed reps only; a censored rep's
+    /// partial counters are never compared. Checked **before** the record and
+    /// the first row.
+    pub(super) fn validate_reuse(&self) -> Result<(), Refusal> {
+        if self.reused.is_empty() {
+            return Ok(());
+        }
+        let rows = read_rows(&self.reuse_store)?;
+        let hdr = header();
+        let by_key: BTreeMap<&str, &BTreeMap<String, String>> = rows
+            .iter()
+            .filter_map(|r| r.get("key").map(|k| (k.as_str(), r)))
+            .collect();
+        let refuse = |key: &str, why: String| {
+            Refusal::Spec(format!("the schedule reuses `{key}` but {why}"))
+        };
+        for r in &self.reused {
+            let (fixture, config, _, tier, _, _) = parse_key(&r.key)
+                .ok_or_else(|| refuse(&r.key, "the key does not parse".to_owned()))?;
+            let mut counters: Vec<BTreeSet<String>> = vec![BTreeSet::new(); APPTAB_COUNTERS.len()];
+            let mut classes: BTreeMap<u32, String> = BTreeMap::new();
+            for bk in &r.batch {
+                let row = by_key.get(bk.as_str()).ok_or_else(|| {
+                    refuse(
+                        &r.key,
+                        format!(
+                            "batch key `{bk}` is absent from {}",
+                            self.reuse_store.display()
+                        ),
+                    )
+                })?;
+                let (bf, bc, brep, btier, brk, bprofile) = parse_key(bk)
+                    .ok_or_else(|| refuse(&r.key, format!("batch key `{bk}` does not parse")))?;
+                if bf != fixture
+                    || bc.label() != config.label()
+                    || btier != tier
+                    || brk != RunKind::Timed
+                    || bprofile != "release"
+                {
+                    return Err(refuse(
+                        &r.key,
+                        format!("batch key `{bk}` is not that key at another rep"),
+                    ));
+                }
+                let class = row.get("end_class").cloned().unwrap_or_default();
+                if class == "ok" {
+                    for (i, c) in APPTAB_COUNTERS.iter().enumerate() {
+                        if hdr.contains(c) {
+                            counters[i].insert(row.get(*c).cloned().unwrap_or_default());
+                        }
+                    }
+                }
+                if classes.insert(brep, class).is_some() {
+                    return Err(refuse(&r.key, format!("rep {brep} is listed twice")));
+                }
+            }
+            let reps: Vec<u32> = classes.keys().copied().collect();
+            if reps != (0..r.reps as u32).collect::<Vec<_>>() {
+                return Err(refuse(
+                    &r.key,
+                    format!("the batch's reps are {reps:?}, not 0..{}", r.reps),
+                ));
+            }
+            // The shape: `ok`* then, if censored, one `capped_*` rep and
+            // `skipped_rep`* (the campaign's rep rule); anything else refuses.
+            let censored = classes.values().any(|c| c.starts_with("capped_"));
+            let mut after_censor = false;
+            for (rep, class) in &classes {
+                if class.starts_with("capped_") {
+                    if after_censor {
+                        return Err(refuse(
+                            &r.key,
+                            format!("rep {rep} is {class} after an earlier censored rep"),
+                        ));
+                    }
+                    after_censor = true;
+                } else if after_censor && class.as_str() != "skipped_rep" {
+                    return Err(refuse(
+                        &r.key,
+                        format!("rep {rep} is {class} after the censored rep, not skipped_rep"),
+                    ));
+                } else if !after_censor && class.as_str() != "ok" {
+                    return Err(refuse(
+                        &r.key,
+                        format!("rep {rep} did not complete ({class})"),
+                    ));
+                }
+            }
+            if censored != r.ends_series {
+                let why = if censored {
+                    "the batch has a censored rep but the entry does not end its series"
+                } else {
+                    "the entry ends its series but the batch completed"
+                };
+                return Err(refuse(&r.key, why.to_owned()));
+            }
+            for (i, c) in APPTAB_COUNTERS.iter().enumerate() {
+                if counters[i].len() > 1 {
+                    return Err(refuse(
+                        &r.key,
+                        format!("`{c}` differs across the completed reps: {:?}", counters[i]),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The record `EVAL_OUT/schedule.used.json`, written before the first row;
+    /// a later run under a different file is refused.
+    pub(super) fn record_used(&self, out_dir: &Path) -> Result<(), Refusal> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.text.hash(&mut h);
+        let digest = format!("{:016x}", h.finish());
+        let path = Self::used_path(out_dir);
+        if path.exists() {
+            let prev = fs::read_to_string(&path).map_err(|e| Refusal::Io(e.to_string()))?;
+            let v: serde_json::Value = serde_json::from_str(&prev)
+                .map_err(|e| Refusal::Spec(format!("schedule.used.json does not parse: {e}")))?;
+            let same = v["digest"].as_str() == Some(digest.as_str())
+                && v["len"].as_u64() == Some(self.text.len() as u64);
+            if !same {
+                return Err(Refusal::Spec(format!(
+                    "the schedule changed under rows already run (see {})",
+                    path.display()
+                )));
+            }
+            return Ok(());
+        }
+        fs::create_dir_all(out_dir).map_err(|e| Refusal::Io(e.to_string()))?;
+        let rec = serde_json::json!({
+            "digest": digest,
+            "len": self.text.len(),
+            "date": self.date,
+            "source": self.source,
+            "commit": self.commit,
+            "rows": self.rows.len(),
+            "reused": self.reused.len(),
+            "ended": self.ended.len(),
+            "profiling": self.profiling.len(),
+            "extension_reuse": 0,
+        });
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, rec.to_string()).map_err(|e| Refusal::Io(e.to_string()))?;
+        fs::rename(&tmp, &path).map_err(|e| Refusal::Io(e.to_string()))
+    }
+}
+
+/// The schedule for this process (read once).
+pub(super) fn schedule() -> Option<&'static Schedule> {
+    static S: std::sync::OnceLock<Option<Schedule>> = std::sync::OnceLock::new();
+    S.get_or_init(Schedule::load).as_ref()
+}
+
+/// A `RowSpec` for a pair at size `s` under `config`, `tier`, `run_kind`:
+/// the APPTAB meta (family, knobs, variant) and the diagonal series when
+/// `with_series`.
+fn apptab_row(
+    pair: ApptabPair,
+    s: usize,
+    config: &GridConfig,
+    tier: &Tier,
+    run_kind: RunKind,
+    rep: u32,
+    with_series: bool,
+) -> RowSpec {
+    let series = with_series.then(|| {
+        Series::of(
+            &format!("{}|{}", pair.family(), pair.variant()),
+            "diag",
+            config,
+            tier,
+            run_kind,
+            s as i64,
+        )
+    });
+    RowSpec {
+        fixture: pair.name(s),
+        config: config.clone(),
+        rep,
+        tier: tier.clone(),
+        run_kind,
+        family: pair.family().to_owned(),
+        knobs: pair.knobs(s),
+        k: pair.k(s),
+        variant: pair.variant(),
+        twin_key: String::new(),
+        series,
+    }
+}
+
+/// `APPTAB` (T6): the schedule's runnable rows, in its order.
+pub(super) fn apptab_spec() -> Spec {
+    let rows = schedule()
+        .map(|sch| {
+            sch.runnable()
+                .into_iter()
+                .map(|r| {
+                    let (fixture, config, _, _, _, _) =
+                        parse_key(&r.key).expect("conformance: a validated schedule key");
+                    let (pair, s) = apptab_pair_of(&fixture)
+                        .expect("conformance: a validated schedule fixture");
+                    apptab_row(
+                        pair,
+                        s,
+                        &config,
+                        &Tier::default_tier(),
+                        RunKind::Timed,
+                        0,
+                        true,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Spec {
+        name: "APPTAB".to_owned(),
+        rows,
+    }
+}
+
+/// `APPTABP` (T7): the profiling twins of the runnable first-report rows; the
+/// script runs one only when its timed row completed with a report.
+pub(super) fn apptabp_spec() -> Spec {
+    let rows = apptab_spec()
+        .rows
+        .into_iter()
+        .filter(|r| r.config.stop_at_first_report)
+        .map(|mut r| {
+            r.run_kind = RunKind::Profiling;
+            r.series = None;
+            r
+        })
+        .collect();
+    Spec {
+        name: "APPTABP".to_owned(),
+        rows,
+    }
+}
+
+/// `APPTABS` (T7): one stateful `Ltr` profiling row per (benchmark, size) of
+/// the schedule, on the conforming pair, exporting the Spec observations.
+pub(super) fn apptabs_spec() -> Spec {
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::new();
+    if let Some(sch) = schedule() {
+        for r in &sch.rows {
+            let (fixture, _, _, _, _, _) =
+                parse_key(&r.key).expect("conformance: a validated schedule key");
+            let (pair, s) =
+                apptab_pair_of(&fixture).expect("conformance: a validated schedule fixture");
+            let conf = pair.conforming_of();
+            if seen.insert((conf, s)) {
+                rows.push(apptab_row(
+                    conf,
+                    s,
+                    &x1_config(GridEngine::Stateful, Selector::Ltr),
+                    &Tier::default_tier(),
+                    RunKind::Profiling,
+                    0,
+                    false,
+                ));
+            }
+        }
+    }
+    Spec {
+        name: "APPTABS".to_owned(),
+        rows,
+    }
+}
+
+/// `APPTABW` (T8): the five conforming pairs at `s = 2`, stateful `Ltr`
+/// profiling rows exporting the flat witness — **rep 1**, so that the key
+/// differs from the `APPTABS` row of the same point (same fixture, label,
+/// tier and run kind; landing erratum E-AT-2).
+pub(super) fn apptabw_spec() -> Spec {
+    let rows = [
+        ApptabPair::A1Correct,
+        ApptabPair::A2Pb,
+        ApptabPair::A3Fifo,
+        ApptabPair::A4Hash,
+        ApptabPair::LeConf,
+    ]
+    .into_iter()
+    .map(|pair| {
+        apptab_row(
+            pair,
+            2,
+            &x1_config(GridEngine::Stateful, Selector::Ltr),
+            &Tier::default_tier(),
+            RunKind::Profiling,
+            1,
+            false,
+        )
+    })
+    .collect();
+    Spec {
+        name: "APPTABW".to_owned(),
+        rows,
+    }
+}
+
+/// `EDPROBE` (T10): `ex:naive/k{2..7}/enc2`, the enumerator, `Ltr`, `stop`,
+/// memo **off**, unlimited budget, the default tier, timed, one rep; its own
+/// store (`log/eval/edprobe-1/`), the prediction pre-registered.
+pub(super) fn edprobe_spec() -> Spec {
+    let rows = (2..=7usize)
+        .map(|k| RowSpec {
+            fixture: format!("ex:naive/k{k}/enc2"),
+            config: GridConfig::new(GridEngine::Enumerator)
+                .selector(Selector::Ltr)
+                .stop(true)
+                .memo(false)
+                .budget(Budget::Unlimited),
+            rep: 0,
+            tier: Tier::default_tier(),
+            run_kind: RunKind::Timed,
+            family: "naive".to_owned(),
+            knobs: format!("k={k},enc=2"),
+            k: [Some(k as i64), Some(2), None, None],
+            variant: "violating".to_owned(),
+            twin_key: String::new(),
+            series: None,
+        })
+        .collect();
+    Spec {
+        name: "EDPROBE".to_owned(),
+        rows,
+    }
+}
+
+pub(super) fn apptab_specs() -> Vec<Spec> {
+    vec![
+        apptab_spec(),
+        apptabp_spec(),
+        apptabs_spec(),
+        apptabw_spec(),
+        edprobe_spec(),
+    ]
+}
+
+/// T8: the flat witness, **value-based**. On the first kept complete Impl
+/// graph of a stateful profiling row: every visible receive of a non-⊥ value
+/// with its concrete `rf` source (informative) and the visible send
+/// observations of an equal value in the same graph (`Val` equality, the
+/// observation comparison); a receive is a witness iff that list is empty.
+fn export_flat_witness(end: &GridEnd, visible: &[String], dir: &Path) -> Result<(), Refusal> {
+    use crate::conformance::obs::{wobs, Obs};
+    use crate::conformance::report::obs_text;
+    use crate::event_label::LabelEnum;
+    let GridEnd::Ok(r) = end else { return Ok(()) };
+    let GridRaw::Stateful(o) = &r.raw else {
+        return Ok(());
+    };
+    fs::create_dir_all(dir).map_err(|e| Refusal::Io(e.to_string()))?;
+    let out = dir.join("flat_witness.json");
+    let Some(g) = o.kept_impl_graphs.first() else {
+        fs::write(
+            &out,
+            serde_json::json!({ "error": "no kept Impl graph" }).to_string(),
+        )
+        .map_err(|e| Refusal::Io(e.to_string()))?;
+        return Ok(());
+    };
+    let w = match wobs(g, visible) {
+        Ok(w) => w,
+        Err(e) => {
+            fs::write(
+                &out,
+                serde_json::json!({ "error": format!("{e:?}") }).to_string(),
+            )
+            .map_err(|e| Refusal::Io(e.to_string()))?;
+            return Ok(());
+        }
+    };
+    // Every visible send observation of the graph.
+    let mut sends = Vec::new();
+    for name in visible {
+        for (e, obs) in w.of(name) {
+            if let Obs::Send(v) = obs {
+                sends.push((name.clone(), e.index, v));
+            }
+        }
+    }
+    let mut receives = Vec::new();
+    let mut first_witness = serde_json::Value::Null;
+    for name in visible {
+        for (e, obs) in w.of(name) {
+            let Obs::Recv(Some(v)) = obs else { continue };
+            let source = match g.label(*e) {
+                LabelEnum::RecvMsg(l) => l.rf(),
+                _ => None,
+            };
+            let source_thread = source
+                .and_then(|s| g.get_thread_tclab(s.thread).name().clone())
+                .unwrap_or_default();
+            let source_visible = visible.contains(&source_thread);
+            let matching: Vec<serde_json::Value> = sends
+                .iter()
+                .filter(|(_, _, sv)| **sv == *v)
+                .map(|(n, i, _)| serde_json::json!({ "thread": n, "index": i }))
+                .collect();
+            let witness = matching.is_empty();
+            let rec = serde_json::json!({
+                "thread": name,
+                "index": e.index,
+                "value": obs_text(obs),
+                "source_thread": source_thread,
+                "source_visible": source_visible,
+                "visible_sends_of_value": matching,
+                "witness": witness,
+            });
+            if witness && first_witness.is_null() {
+                first_witness = rec.clone();
+            }
+            receives.push(rec);
+        }
+    }
+    let doc = serde_json::json!({
+        "graph": 0,
+        "kept_impl_graphs": o.kept_impl_graphs.len(),
+        "visible": visible,
+        "receives": receives,
+        "first_witness": first_witness,
+    });
+    fs::write(&out, doc.to_string()).map_err(|e| Refusal::Io(e.to_string()))?;
+    Ok(())
 }
