@@ -462,6 +462,9 @@ mod apps_tests;
 /// P5-APPTAB's tests (tester). **Test-only.**
 #[cfg(test)]
 mod apptab_tests;
+/// P5-CFCFG's tests (tester). **Test-only.**
+#[cfg(test)]
+mod cfcfg_tests;
 /// P5-SYNTH's tests (tester). **Test-only.**
 #[cfg(test)]
 mod synth_tests;

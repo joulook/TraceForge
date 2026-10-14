@@ -1966,6 +1966,9 @@ fn l6_the_sweeping_engines_ignore_the_search_budget() {
                         c.outer_wall_time_ms = 0;
                         c.sweep_wall_time_ms = 0;
                         c.precheck_wall_time_ms = 0;
+                        // P5-CFCFG re-pin: F2's first-report wall and memory.
+                        c.wall_ms_at_first_report = None;
+                        c.vmhwm_kb_at_first_report = None;
                         format!("{c:?} {:?}", o.impl_end)
                     }
                     GridRaw::Gated(o) => {

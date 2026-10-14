@@ -484,6 +484,23 @@ impl CanonSet {
         self.buckets.get(&g.key()).is_some_and(|b| b.contains(g))
     }
 
+    /// Remove; `false` if no equal graph was present (`P5-CFCFG` F1: the
+    /// witness cache's FIFO eviction forgets the evicted entry).
+    pub(crate) fn remove(&mut self, g: &CanonicalGraph) -> bool {
+        let Some(bucket) = self.buckets.get_mut(&g.key()) else {
+            return false;
+        };
+        let Some(i) = bucket.iter().position(|h| h == g) else {
+            return false;
+        };
+        bucket.remove(i);
+        if bucket.is_empty() {
+            self.buckets.remove(&g.key());
+        }
+        self.len -= 1;
+        true
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.len
     }

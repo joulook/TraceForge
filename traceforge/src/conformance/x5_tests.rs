@@ -1220,8 +1220,9 @@ fn run_rec(name: &str, config: GridConfig) -> Rec {
 /// compared column declared.
 #[test]
 fn c02_verdict_rows_carry_the_run_with_counters() {
-    assert_eq!(SCHEMA_VERSION, 2, "conformance: the schema version");
-    assert_eq!(header().len(), 180, "conformance: the header's width");
+    // P5-CFCFG re-pin (2026-10-14): schema 3, 185 columns.
+    assert_eq!(SCHEMA_VERSION, 3, "conformance: the schema version");
+    assert_eq!(header().len(), 185, "conformance: the header's width");
     for c in CFIRST_COUNTER_COLUMNS
         .iter()
         .chain(GATED_COUNTER_COLUMNS.iter())

@@ -2275,8 +2275,8 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "bb5ba533ac3b2699b3be535b9c1d0591",
-        "conformance: everything before the P5-CAMPAIGN block (D19 prefix)"
+        "a804ed4cd5ccc734d7c9352e031cedd3",
+        "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
         assert_eq!(
@@ -2286,7 +2286,33 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         );
         t.replace(new, old)
     };
+    // P5-CFCFG (2026-10-14, tester re-pin): the only change to the prefix is
+    // `git diff 6036802 -- grid.rs`'s ten hunks (the `Capacity` import, the
+    // `witness_cache`/`quiet` fields, setters and `conf_config` lines, the
+    // label's two fields, `capacity_field`/`parse_capacity`, `push_opt`, the
+    // five `row_of` columns), each with one line of context. Undoing exactly
+    // them gives back the D19 prefix, byte for byte.
+    const CFCFG_HUNKS: [(&str, &str); 10] = [
+        ("use crate::conformance::cfirst::{self, CFirstOutcome, SweepEnd};\nuse crate::conformance::config::{\n    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode,\n};\n", "use crate::conformance::cfirst::{self, CFirstOutcome, SweepEnd};\nuse crate::conformance::config::{CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode};\n"),
+        ("    pub(super) completion_cover: CompletionCover,\n    /// `P5-CFCFG` F1/F4: the complete-first witness cache's capacity\n    /// (`w=0` | `w=<n>` | `w=inf` in the label); carried unchanged by the\n    /// other engines.\n    pub(super) witness_cache: Capacity,\n    /// `P5-CFCFG` F3/F4: the complete-first sweeps' quiet flag\n    /// (`quiet=<bool>` in the label).\n    pub(super) quiet: bool,\n", "    pub(super) completion_cover: CompletionCover,\n"),
+        ("            completion_cover: CompletionCover::Sweep,\n            witness_cache: Capacity::Unbounded,\n            quiet: false,\n", "            completion_cover: CompletionCover::Sweep,\n"),
+        ("        }\n    }\n\n    /// `P5-CFCFG` F1: the complete-first witness cache's capacity.\n    pub(super) fn witness_cache(mut self, c: Capacity) -> Self {\n        self.witness_cache = c;\n        self\n    }\n\n    /// `P5-CFCFG` F3: the complete-first sweeps' quiet flag.\n    pub(super) fn quiet(mut self, b: bool) -> Self {\n        self.quiet = b;\n        self\n", "        }\n"),
+        ("            .completion_cover(self.completion_cover)\n            .witness_cache(self.witness_cache)\n            .quiet_sweeps(self.quiet)\n", "            .completion_cover(self.completion_cover)\n"),
+        ("    pub(super) fn label(&self) -> String {\n        let eleven = format!(\n", "    pub(super) fn label(&self) -> String {\n        format!(\n"),
+        ("            self.completion_cover\n        );\n        // `P5-CFCFG` F4 (landing erratum E-CF-1): the eleven-field form is\n        // kept byte for byte while both new knobs are at their defaults, so\n        // every key of the campaign and APPTAB stores and schedules stays the\n        // key the driver derives; a non-default knob prints the two fields.\n        if self.witness_cache == Capacity::Unbounded && !self.quiet {\n            eleven\n        } else {\n            format!(\"{eleven}/{}/quiet={}\", capacity_field(self.witness_cache), self.quiet)\n        }\n", "            self.completion_cover\n        )\n"),
+        ("    }\n}\n\n/// `P5-CFCFG` F4: the label's capacity field (`w=0` | `w=<n>` | `w=inf`).\npub(super) fn capacity_field(c: Capacity) -> String {\n    match c {\n        Capacity::Zero => \"w=0\".to_owned(),\n        Capacity::Bounded(n) => format!(\"w={n}\"),\n        Capacity::Unbounded => \"w=inf\".to_owned(),\n    }\n}\n\n/// The inverse of [`capacity_field`]; `w=0` is `Zero`, never `Bounded(0)`.\npub(super) fn parse_capacity(s: &str) -> Option<Capacity> {\n    let v = s.strip_prefix(\"w=\")?;\n    if v == \"inf\" {\n        return Some(Capacity::Unbounded);\n    }\n    let n: usize = v.parse().ok()?;\n    Some(if n == 0 { Capacity::Zero } else { Capacity::Bounded(n) })\n", "    }\n"),
+        ("\n/// `P5-CFCFG` F5: an optional counter prints its value or nothing (never\n/// `Some(…)`/`None`), so a cell is a number or blank.\nfn push_opt<T: std::fmt::Display>(row: &mut Row, k: &'static str, v: Option<T>) {\n    row.push((k, v.map(|x| x.to_string()).unwrap_or_default()));\n}\n\n", "\n"),
+        ("            push_d(&mut row, \"witnesses\", c.witnesses);\n            // `P5-CFCFG` F5: the five columns after `witnesses`.\n            push_d(&mut row, \"admissions\", c.admissions);\n            push_d(&mut row, \"evictions\", c.evictions);\n            push_d(&mut row, \"readmissions\", c.readmissions);\n            push_opt(&mut row, \"wall_ms_at_first_report\", c.wall_ms_at_first_report);\n            push_opt(&mut row, \"vmhwm_kb_at_first_report\", c.vmhwm_kb_at_first_report);\n", "            push_d(&mut row, \"witnesses\", c.witnesses);\n"),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in CFCFG_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "bb5ba533ac3b2699b3be535b9c1d0591",
+        "conformance: the prefix without P5-CFCFG's hunks = the D19 prefix"
+    );
     let c_start = t
         .find("/// The per-thread event bound of every conformance run")
         .expect("conformance: D19 doc");

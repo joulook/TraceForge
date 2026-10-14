@@ -35,14 +35,14 @@ use std::time::{Duration, Instant};
 
 use crate::channel::cons_to_model;
 use crate::conformance::cfirst;
-use crate::conformance::config::{CompletionCover, GatePolicy, GatedMode};
+use crate::conformance::config::{Capacity, CompletionCover, GatePolicy, GatedMode};
 use crate::conformance::gated;
 use crate::conformance::grid::APPS_CORNERS;
 use crate::conformance::grid::{
     apps_fixtures, apps_grid, apps_series_fixtures, apptab_fixtures, apptab_pair_of,
-    mixed_fixtures, registry, row_of_end, stack_mib_for, synth_fixtures, synth_grid, vm_hwm_kb,
-    ApptabPair, Budget, Fixture, GridConfig, GridEnd, GridEngine, GridRaw, GridResult, Group, Row,
-    SynthPoint, FLAT_SUBSET,
+    capacity_field, mixed_fixtures, parse_capacity, registry, row_of_end, stack_mib_for,
+    synth_fixtures, synth_grid, vm_hwm_kb, ApptabPair, Budget, Fixture, GridConfig, GridEnd,
+    GridEngine, GridRaw, GridResult, Group, Row, SynthPoint, FLAT_SUBSET,
 };
 use crate::conformance::search::SearchOpts;
 use crate::conformance::selector::{InnerOrder, Selector};
@@ -56,7 +56,11 @@ use crate::conformance::{verify, verify_conformance_with_opts};
 /// Bumped whenever a column is added or `GridConfig::label()`'s format
 /// changes (round 03 m1: the tester's pinning test ties `LABEL_PIN` and
 /// `header()` to this constant).
-pub(super) const SCHEMA_VERSION: u32 = 2;
+/// `P5-CFCFG` F5: schema 3 adds the five complete-first columns after
+/// `witnesses` (`admissions`, `evictions`, `readmissions`,
+/// `wall_ms_at_first_report`, `vmhwm_kb_at_first_report`); a schema-2 store is
+/// refused as any other schema, without override.
+pub(super) const SCHEMA_VERSION: u32 = 3;
 
 /// `GridConfig::new(GridEngine::Enumerator).label()` at this schema version.
 pub(super) const LABEL_PIN: &str =
@@ -192,6 +196,11 @@ pub(super) const ROW_OF_COLUMNS: &[&str] = &[
     "sweep_graphs",
     "sweep_graphs_max",
     "witnesses",
+    "admissions",
+    "evictions",
+    "readmissions",
+    "wall_ms_at_first_report",
+    "vmhwm_kb_at_first_report",
     "witness_duplicates",
     "cut_reports",
     "precheck_ran",
@@ -479,13 +488,22 @@ pub(super) fn parse_key(key: &str) -> Option<(String, GridConfig, u32, String, R
 /// The inverse of `GridConfig::label()` (every field prints as `Debug`).
 pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     let p: Vec<&str> = label.split('/').collect();
-    if p.len() != 11 {
+    // `P5-CFCFG` F4: eleven fields (the campaign's form: the unbounded cache,
+    // sweeps not quiet) or thirteen (`w=…`, `quiet=…`); any other count fails.
+    if p.len() != 11 && p.len() != 13 {
         return None;
     }
     fn flag(s: &str, name: &str) -> Option<bool> {
         s.strip_prefix(name)?.strip_prefix('=')?.parse().ok()
     }
-    Some(GridConfig {
+    let (witness_cache, quiet) = if p.len() == 13 {
+        (parse_capacity(p[11])?, flag(p[12], "quiet")?)
+    } else {
+        (Capacity::Unbounded, false)
+    };
+    let parsed = GridConfig {
+        witness_cache,
+        quiet,
         engine: parse_engine(p[0])?,
         selector: parse_selector(p[1])?,
         stop_at_first_report: flag(p[2], "stop")?,
@@ -497,7 +515,11 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         instrumented: flag(p[8], "instr")?,
         early_error_cut: flag(p[9], "cut")?,
         completion_cover: parse_cover(p[10].strip_prefix("cover=")?)?,
-    })
+    };
+    // `P5-CFCFG` F4 (gate 4 n1): only `label()`'s own spelling parses — the
+    // thirteen-field form at the defaults, `w=08`, `w=+8` and the like are
+    // refused, so a stored key is always the key the driver derives.
+    (parsed.label() == label).then_some(parsed)
 }
 
 pub(super) fn parse_engine(s: &str) -> Option<GridEngine> {
@@ -990,7 +1012,18 @@ pub(super) fn eval_row_of(end: &GridEnd, meta: &RowMeta) -> Row {
     p("cut", config.early_error_cut.to_string());
     p("inner_order", "Recorded".to_owned());
     p("comm_model", meta.comm_model.clone());
-    p("cache", if sweeping { "on" } else { "n/a" }.to_owned());
+    // `P5-CFCFG` F1 (gate 4 M2; E-CF-8): the column follows the knob on
+    // complete-first rows — `off` under `Zero`, `bounded(n)` under
+    // `Bounded(n)`, `on` under `Unbounded`; the gated checker's cache is `on`.
+    p(
+        "cache",
+        match (config.engine, config.witness_cache) {
+            (GridEngine::CompleteFirst, Capacity::Zero) => "off".to_owned(),
+            (GridEngine::CompleteFirst, Capacity::Bounded(n)) => format!("bounded({n})"),
+            _ if sweeping => "on".to_owned(),
+            _ => "n/a".to_owned(),
+        },
+    );
     p(
         "carry",
         if config.engine == GridEngine::Gated {
@@ -1379,6 +1412,17 @@ impl Store {
         self.keys.contains(key)
     }
 
+    /// The stored row's cell in `column`, if the key is held (`P5-CFCFG` F7).
+    pub(super) fn cell_of(&self, key: &str, column: &str) -> Option<String> {
+        let hdr = header();
+        let key_idx = hdr.iter().position(|c| *c == "key")?;
+        let idx = hdr.iter().position(|c| *c == column)?;
+        self.rows
+            .iter()
+            .find(|r| r[key_idx] == key)
+            .map(|r| r[idx].clone())
+    }
+
     pub(super) fn rows(&self) -> &[Vec<String>] {
         &self.rows
     }
@@ -1409,12 +1453,22 @@ impl Store {
 /// read-time columns `experiments` and `mixed`).
 pub(super) fn read_rows(path: &Path) -> Result<Vec<BTreeMap<String, String>>, Refusal> {
     let text = fs::read_to_string(path).map_err(|e| Refusal::Io(e.to_string()))?;
-    let hdr = header();
+    // `P5-CFCFG` F5 (E-CF-6): a store is **read by its own header line**, so a
+    // store of an earlier schema (the campaign's, APPTAB's) stays readable by
+    // column name — the closed parts' tests and the reuse validation read
+    // them — while `Store::open` (the write path) still refuses another
+    // schema by name. A file whose first line is not a header is refused.
+    let mut lines = text.lines();
+    let hdr: Vec<String> = lines
+        .next()
+        .and_then(parse_csv_line)
+        .filter(|h| h.first().map(String::as_str) == Some("key"))
+        .ok_or(Refusal::Header)?;
     let mut out = Vec::new();
-    for l in text.lines().skip(2) {
+    for l in lines.skip(1) {
         if let Some(cells) = parse_csv_line(l) {
             if cells.len() == hdr.len() {
-                out.push(hdr.iter().map(|c| (*c).to_owned()).zip(cells).collect());
+                out.push(hdr.iter().cloned().zip(cells).collect());
             }
         }
     }
@@ -1561,6 +1615,8 @@ pub(super) struct Summary {
     pub(super) skipped_present: usize,
     pub(super) skipped_rep: usize,
     pub(super) skipped_after_censor: usize,
+    /// `P5-CFCFG` F7: bounded rows written `skipped_dep`.
+    pub(super) skipped_dep: usize,
     pub(super) censored: usize,
     pub(super) store: PathBuf,
 }
@@ -1588,6 +1644,11 @@ impl Driver {
         if APPTAB_SPEC_NAMES.contains(&name.as_str()) {
             Schedule::check()?;
             specs.extend(apptab_specs());
+        }
+        // `P5-CFCFG` F6: likewise, only when named.
+        if name == CFCFG_SPEC_NAME {
+            CfcfgSchedule::check()?;
+            specs.push(cfcfg_spec());
         }
         let spec = specs
             .iter()
@@ -1625,6 +1686,14 @@ impl Driver {
     /// then by fixture, label, rep.
     fn ordered_rows(&self) -> Vec<RowSpec> {
         let mut rows = self.spec.rows.clone();
+        // `P5-CFCFG` F6/F7: the frozen file's order (configuration, size,
+        // benchmark, pair) is kept as validated — it is ascending in size
+        // within every scope, and it puts a cell's `w=inf` row before its
+        // bounded rows, which the dependency rule reads from the store. A
+        // sort by scope would put `w=inf` after `w=1`/`w=8`/`w=64`.
+        if self.spec.name == CFCFG_SPEC_NAME {
+            return rows;
+        }
         rows.sort_by(|a, b| {
             let sa = a.series.as_ref().map(|s| (s.scope.clone(), s.size));
             let sb = b.series.as_ref().map(|s| (s.scope.clone(), s.size));
@@ -1716,6 +1785,16 @@ impl Driver {
             if self.spec.name == "APPTAB" {
                 sch.validate_reuse()?;
             }
+            sch.record_used(&self.out_dir)?;
+        }
+        // `P5-CFCFG` F6: its own frozen schedule, recorded before the first row.
+        if self.spec.name == CFCFG_SPEC_NAME {
+            let Some(sch) = cfcfg_schedule() else {
+                return Err(Refusal::Spec(format!(
+                    "{} is not runnable: no schedule file (EVAL_SCHEDULE, else EVAL_OUT/schedule.json)",
+                    self.spec.name
+                )));
+            };
             sch.record_used(&self.out_dir)?;
         }
         let (commit, dirty) = (self.probes.git)();
@@ -1821,6 +1900,23 @@ impl Driver {
                     };
                     store.append(&skipped_row(&end, &meta))?;
                     summary.skipped_after_censor += 1;
+                    continue;
+                }
+            }
+            // `P5-CFCFG` F7: a bounded row runs iff the unbounded row of its
+            // cell completed with `witnesses ≥ 2`; otherwise `skipped_dep`
+            // with its cause, charge 0, the series alive.
+            if self.spec.name == CFCFG_SPEC_NAME {
+                if let Some(cause) = cfcfg_dependency(&store, &spec, profile) {
+                    meta.end_class = "skipped_dep".to_owned();
+                    meta.censor_via = cause.to_owned();
+                    let end = GridEnd::Capped {
+                        fixture: spec.fixture.clone(),
+                        config: spec.config.clone(),
+                        after: Duration::ZERO,
+                    };
+                    store.append(&skipped_row(&end, &meta))?;
+                    summary.skipped_dep += 1;
                     continue;
                 }
             }
@@ -2065,12 +2161,13 @@ fn eval_driver() {
     writeln!(
         out,
         "eval_driver: spec {}: ran {}, present {}, skipped_rep {}, skipped_after_censor {}, \
-         censored {}, store {}",
+         skipped_dep {}, censored {}, store {}",
         driver.spec.name,
         summary.ran,
         summary.skipped_present,
         summary.skipped_rep,
         summary.skipped_after_censor,
+        summary.skipped_dep,
         summary.censored,
         summary.store.display()
     )
@@ -3340,6 +3437,23 @@ fn verdict_counter_fill(end: &GridEnd, mut inner: Row) -> Row {
             c.sweep_graphs_max.to_string(),
         );
         push(&mut inner, "witnesses", c.witnesses.to_string());
+        push(&mut inner, "admissions", c.admissions.to_string());
+        push(&mut inner, "evictions", c.evictions.to_string());
+        push(&mut inner, "readmissions", c.readmissions.to_string());
+        push(
+            &mut inner,
+            "wall_ms_at_first_report",
+            c.wall_ms_at_first_report
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        );
+        push(
+            &mut inner,
+            "vmhwm_kb_at_first_report",
+            c.vmhwm_kb_at_first_report
+                .map(|v| v.to_string())
+                .unwrap_or_default(),
+        );
         push(
             &mut inner,
             "witness_duplicates",
@@ -3710,7 +3824,8 @@ fn apptab_family(name: &str) -> bool {
 /// `APPTAB` alone: a `panicked` or `crashed(…)` row ends its series too.
 fn series_ending_class(spec: &str, class: &str) -> bool {
     class.starts_with("capped_")
-        || (spec == "APPTAB" && (class == "panicked" || class.starts_with("crashed")))
+        || ((spec == "APPTAB" || spec == CFCFG_SPEC_NAME)
+            && (class == "panicked" || class.starts_with("crashed")))
 }
 
 /// The benchmarks in the balanced order's benchmark position.
@@ -4883,4 +4998,547 @@ fn export_flat_witness(end: &GridEnd, visible: &[String], dir: &Path) -> Result<
     });
     fs::write(&out, doc.to_string()).map_err(|e| Refusal::Io(e.to_string()))?;
     Ok(())
+}
+
+// =========================================================================
+// `P5-CFCFG` (criteria/P5-CFCFG.md F6–F7): the complete-first configurations
+// =========================================================================
+//
+// `CFCFG`: the two application tables complete-first only, on the fifteen
+// APPTAB pairs, in five configurations of the witness cache (`w=0` the
+// vanilla algorithm, `w=inf` the unbounded cache run fresh under the quiet
+// flag, `w=1`, `w=8`, `w=64` the bounded cache with FIFO eviction), one
+// exhaustive quiet row per cell, from its own frozen schedule file, into its
+// own store (schema 3). A series is (benchmark, pair, configuration); a
+// bounded row depends on its cell's unbounded row (F7).
+
+/// The spec's name; reachable through the driver only, when named.
+const CFCFG_SPEC_NAME: &str = "CFCFG";
+
+/// The five configurations in the schedule's order (F6).
+const CFCFG_CONFIGS: [Capacity; 5] = [
+    Capacity::Zero,
+    Capacity::Unbounded,
+    Capacity::Bounded(1),
+    Capacity::Bounded(8),
+    Capacity::Bounded(64),
+];
+
+/// The configuration of every `CFCFG` row: X1's complete-first configuration
+/// (`Ltr`, exhaustive, no precheck, the cut off, the sweep) with the capacity
+/// and the quiet flag (F3, F6).
+pub(super) fn cfcfg_config(cap: Capacity) -> GridConfig {
+    x1_config(GridEngine::CompleteFirst, Selector::Ltr)
+        .witness_cache(cap)
+        .quiet(true)
+}
+
+/// A row's position in F6's order (the designers' ruling of 2026-10-14
+/// afternoon: configuration-major across every size): configuration, size,
+/// benchmark, pair.
+fn cfcfg_position(s: usize, cap: Capacity, pair: ApptabPair) -> (usize, usize, usize, usize) {
+    let cfg = CFCFG_CONFIGS
+        .iter()
+        .position(|c| *c == cap)
+        .unwrap_or(usize::MAX);
+    let family = APPTAB_FAMILIES
+        .iter()
+        .position(|f| *f == pair.family())
+        .unwrap_or(usize::MAX);
+    let pair_pos = ApptabPair::ALL
+        .iter()
+        .position(|p| *p == pair)
+        .unwrap_or(usize::MAX);
+    (cfg, s, family, pair_pos)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CfcfgRow {
+    pub(super) key: String,
+    pub(super) benchmark: String,
+    pub(super) pair: String,
+    pub(super) variant: String,
+    pub(super) config: String,
+    pub(super) size: usize,
+    pub(super) series: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CfcfgEnded {
+    pub(super) series: String,
+    pub(super) size: usize,
+}
+
+/// The frozen plan of `CFCFG` (F6), parsed strictly.
+#[derive(Clone, Debug)]
+pub(super) struct CfcfgSchedule {
+    pub(super) date: String,
+    pub(super) source: String,
+    pub(super) commit: String,
+    pub(super) max_size: usize,
+    pub(super) rows: Vec<CfcfgRow>,
+    pub(super) ended: Vec<CfcfgEnded>,
+    pub(super) text: String,
+}
+
+impl CfcfgSchedule {
+    pub(super) fn path() -> Option<PathBuf> {
+        Schedule::path()
+    }
+
+    pub(super) fn used_path(out_dir: &Path) -> PathBuf {
+        Schedule::used_path(out_dir)
+    }
+
+    /// Parse and validate (criterion 8): strict keys; `limits` the default tier
+    /// and D-T6's cap; `configurations` exactly the five; every row a
+    /// well-formed `CFCFG` key — a diagonal fixture of a known pair at its
+    /// size, the `default` tier, `timed`, rep 0, the label of `cfcfg_config`
+    /// for its configuration (`quiet=true`), the series `family|variant|w`; the
+    /// rows in F6's order (configuration, size, benchmark, pair), no
+    /// duplicate, one build profile; `ended` entries on known series, no
+    /// duplicate; the row set complete and exact (every cell of
+    /// `CFCFG_CONFIGS × ApptabPair::ALL × 2..=max_size` less the rows an ended
+    /// series drops, and nothing else); no `reused`, `profiling` or
+    /// `extension_reuse` key.
+    pub(super) fn parse(text: &str) -> Result<CfcfgSchedule, Refusal> {
+        let bad = |what: String| Refusal::Spec(format!("the CFCFG schedule is malformed: {what}"));
+        let v: serde_json::Value = serde_json::from_str(text)
+            .map_err(|e| Refusal::Spec(format!("the CFCFG schedule does not parse: {e}")))?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| bad("not an object".to_owned()))?;
+        let allowed = [
+            "date",
+            "source",
+            "commit",
+            "max_size",
+            "limits",
+            "configurations",
+            "rows",
+            "ended",
+        ];
+        for k in obj.keys() {
+            if !allowed.contains(&k.as_str()) {
+                return Err(bad(format!("unknown key `{k}`")));
+            }
+        }
+        let text_field =
+            |o: &serde_json::Map<String, serde_json::Value>, f: &str| -> Result<String, Refusal> {
+                let t = o.get(f).and_then(|v| v.as_str()).unwrap_or_default();
+                if t.is_empty() {
+                    return Err(bad(format!("missing or empty `{f}`")));
+                }
+                Ok(t.to_owned())
+            };
+        let num =
+            |o: &serde_json::Map<String, serde_json::Value>, f: &str| -> Result<u64, Refusal> {
+                o.get(f)
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| bad(format!("missing or non-numeric `{f}`")))
+            };
+        let date = text_field(obj, "date")?;
+        let source = text_field(obj, "source")?;
+        let commit = text_field(obj, "commit")?;
+        let max_size = num(obj, "max_size")? as usize;
+        if !(2..=crate::conformance::grid::APPTAB_MAX_SIZE).contains(&max_size) {
+            return Err(bad(format!(
+                "max_size {max_size} outside 2..={}",
+                crate::conformance::grid::APPTAB_MAX_SIZE
+            )));
+        }
+        let limits = obj
+            .get("limits")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| bad("missing `limits`".to_owned()))?;
+        for k in limits.keys() {
+            if !matches!(k.as_str(), "wall_ms" | "mem_kb" | "budget_h") {
+                return Err(bad(format!("limits: unknown key `{k}`")));
+            }
+        }
+        let wall_ms = num(limits, "wall_ms")?;
+        let mem_kb = num(limits, "mem_kb")?;
+        let budget_h = num(limits, "budget_h")?;
+        let tier = Tier::default_tier();
+        if wall_ms != tier.wall.as_millis() as u64 || mem_kb != tier.mem_kb {
+            return Err(bad(format!(
+                "limits {wall_ms} ms / {mem_kb} kB are not the default tier's"
+            )));
+        }
+        if budget_h != APPTAB_BUDGET_H {
+            return Err(bad(format!(
+                "limits budget_h {budget_h} is not D-T6's hard cap of {APPTAB_BUDGET_H} h"
+            )));
+        }
+        let cfgs = obj
+            .get("configurations")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("`configurations` is not an array".to_owned()))?;
+        let expected_cfgs: Vec<String> = CFCFG_CONFIGS.iter().map(|c| capacity_field(*c)).collect();
+        let listed: Vec<String> = cfgs
+            .iter()
+            .map(|c| c.as_str().unwrap_or_default().to_owned())
+            .collect();
+        if listed != expected_cfgs {
+            return Err(bad(format!(
+                "configurations {listed:?} are not {expected_cfgs:?}"
+            )));
+        }
+        // The rows.
+        let arr = obj
+            .get("rows")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| bad("`rows` is not an array".to_owned()))?;
+        let mut rows = Vec::with_capacity(arr.len());
+        let mut keys = BTreeSet::new();
+        let mut series_names = BTreeSet::new();
+        let mut last: Option<(usize, usize, usize, usize)> = None;
+        let mut profile: Option<String> = None;
+        for (i, item) in arr.iter().enumerate() {
+            let o = item
+                .as_object()
+                .ok_or_else(|| bad(format!("rows[{i}] is not an object")))?;
+            for k in o.keys() {
+                if !matches!(
+                    k.as_str(),
+                    "key" | "benchmark" | "pair" | "variant" | "config" | "size" | "series"
+                ) {
+                    return Err(bad(format!("rows[{i}]: unknown key `{k}`")));
+                }
+            }
+            let row = CfcfgRow {
+                key: text_field(o, "key")?,
+                benchmark: text_field(o, "benchmark")?,
+                pair: text_field(o, "pair")?,
+                variant: text_field(o, "variant")?,
+                config: text_field(o, "config")?,
+                size: num(o, "size")? as usize,
+                series: text_field(o, "series")?,
+            };
+            let (pair, s, cap, row_profile) = Self::check_row(&row, max_size)
+                .map_err(|why| bad(format!("rows[{i}] `{}`: {why}", row.key)))?;
+            match &profile {
+                None => profile = Some(row_profile),
+                Some(p) if *p != row_profile => {
+                    return Err(bad(format!(
+                        "rows[{i}] `{}`: build profile `{row_profile}` differs from rows[0]'s `{p}`",
+                        row.key
+                    )));
+                }
+                Some(_) => {}
+            }
+            let pos = cfcfg_position(s, cap, pair);
+            if last.is_some_and(|l| pos <= l) {
+                return Err(bad(format!(
+                    "rows[{i}] `{}` is out of the order (configuration, size, benchmark, pair) \
+                     or repeats a cell",
+                    row.key
+                )));
+            }
+            last = Some(pos);
+            if !keys.insert(row.key.clone()) {
+                return Err(bad(format!("rows[{i}] `{}` listed twice", row.key)));
+            }
+            series_names.insert(row.series.clone());
+            rows.push(row);
+        }
+        // `ended`.
+        let mut ended = Vec::new();
+        let mut ended_keys = BTreeSet::new();
+        if let Some(e) = obj.get("ended") {
+            let arr = e
+                .as_array()
+                .ok_or_else(|| bad("`ended` is not an array".to_owned()))?;
+            for (i, item) in arr.iter().enumerate() {
+                let o = item
+                    .as_object()
+                    .ok_or_else(|| bad(format!("ended[{i}] is not an object")))?;
+                for k in o.keys() {
+                    if !matches!(k.as_str(), "series" | "size" | "reason") {
+                        return Err(bad(format!("ended[{i}]: unknown key `{k}`")));
+                    }
+                }
+                let en = CfcfgEnded {
+                    series: text_field(o, "series")?,
+                    size: num(o, "size")? as usize,
+                };
+                if !series_names.contains(&en.series) {
+                    return Err(bad(format!(
+                        "ended[{i}] names a series no row has: `{}`",
+                        en.series
+                    )));
+                }
+                if !ended_keys.insert((en.series.clone(), en.size)) {
+                    return Err(bad(format!(
+                        "ended[{i}] `{}` at {} listed twice",
+                        en.series, en.size
+                    )));
+                }
+                ended.push(en);
+            }
+        }
+        let sch = CfcfgSchedule {
+            date,
+            source,
+            commit,
+            max_size,
+            rows,
+            ended,
+            text: text.to_owned(),
+        };
+        // Completeness and exactness of the row set (F6; criterion 8).
+        let profile = profile.unwrap_or_else(|| "release".to_owned());
+        let tier = Tier::default_tier();
+        let mut expected: BTreeSet<String> = BTreeSet::new();
+        for s in 2..=sch.max_size {
+            for cap in CFCFG_CONFIGS {
+                for pair in ApptabPair::ALL {
+                    let series = format!(
+                        "{}|{}|{}",
+                        pair.family(),
+                        pair.variant(),
+                        capacity_field(cap)
+                    );
+                    if sch.ended_before(&series, s) {
+                        continue;
+                    }
+                    let config = cfcfg_config(cap);
+                    expected.insert(
+                        apptab_row(pair, s, &config, &tier, RunKind::Timed, 0, true).key(&profile),
+                    );
+                }
+            }
+        }
+        for row in &sch.rows {
+            if sch.ended_before(&row.series, row.size) {
+                return Err(bad(format!(
+                    "rows `{}` lies above its series' end (`ended`); the file omits such rows",
+                    row.key
+                )));
+            }
+        }
+        for k in &expected {
+            if !keys.contains(k) {
+                return Err(bad(format!("rows is incomplete: `{k}` is missing")));
+            }
+        }
+        if keys.len() != expected.len() {
+            return Err(bad(format!(
+                "rows lists {} keys but the schedule derives {}",
+                keys.len(),
+                expected.len()
+            )));
+        }
+        Ok(sch)
+    }
+
+    fn check_row(
+        row: &CfcfgRow,
+        max_size: usize,
+    ) -> Result<(ApptabPair, usize, Capacity, String), String> {
+        let (fixture, config, rep, tier, run_kind, profile) =
+            parse_key(&row.key).ok_or_else(|| "the key does not parse".to_owned())?;
+        let (pair, s) = apptab_pair_of(&fixture)
+            .ok_or_else(|| format!("`{fixture}` is not a diagonal fixture of a known pair"))?;
+        if s != row.size {
+            return Err(format!("size {} but the fixture is at {s}", row.size));
+        }
+        if s < 2 || s > max_size {
+            return Err(format!("size {s} outside 2..={max_size}"));
+        }
+        if tier != "default" || run_kind != RunKind::Timed || rep != 0 {
+            return Err("not `default`, `timed`, rep 0".to_owned());
+        }
+        if row.benchmark != pair.family() {
+            return Err(format!(
+                "benchmark `{}` but the fixture is {}",
+                row.benchmark,
+                pair.family()
+            ));
+        }
+        if row.pair != pair.label() {
+            return Err(format!(
+                "pair `{}` but the fixture is `{}`",
+                row.pair,
+                pair.label()
+            ));
+        }
+        if row.variant != pair.variant() {
+            return Err(format!(
+                "variant `{}` but the pair is `{}`",
+                row.variant,
+                pair.variant()
+            ));
+        }
+        let cap = CFCFG_CONFIGS
+            .iter()
+            .copied()
+            .find(|c| capacity_field(*c) == row.config)
+            .ok_or_else(|| format!("config `{}` is not one of the five", row.config))?;
+        if config.engine != GridEngine::CompleteFirst {
+            return Err(format!("engine {:?} is not CompleteFirst", config.engine));
+        }
+        let expected = cfcfg_config(cap);
+        if config.label() != expected.label() {
+            return Err(format!(
+                "the label is not the configuration's ({}): {}",
+                expected.label(),
+                config.label()
+            ));
+        }
+        let series = format!("{}|{}|{}", pair.family(), pair.variant(), row.config);
+        if row.series != series {
+            return Err(format!("series `{}` is not `{series}`", row.series));
+        }
+        Ok((pair, s, cap, profile))
+    }
+
+    /// The file in force parsed as a refusal (as `Schedule::check`).
+    pub(super) fn check() -> Result<(), Refusal> {
+        let Some(p) = Self::path() else {
+            return Ok(());
+        };
+        if !p.exists() {
+            return Ok(());
+        }
+        let text = fs::read_to_string(&p)
+            .map_err(|e| Refusal::Io(format!("reading {}: {e}", p.display())))?;
+        Self::parse(&text).map(|_| ())
+    }
+
+    fn load() -> Option<CfcfgSchedule> {
+        let p = Self::path()?;
+        if !p.exists() {
+            return None;
+        }
+        let text = fs::read_to_string(&p)
+            .unwrap_or_else(|e| panic!("conformance: reading {}: {e}", p.display()));
+        Some(Self::parse(&text).unwrap_or_else(|e| panic!("conformance: {}", e.text())))
+    }
+
+    fn ended_before(&self, series: &str, size: usize) -> bool {
+        self.ended
+            .iter()
+            .any(|e| e.series == series && size > e.size)
+    }
+
+    /// The rows the driver runs: every listed row (the file omits the dropped ones).
+    pub(super) fn runnable(&self) -> Vec<&CfcfgRow> {
+        self.rows.iter().collect()
+    }
+
+    /// As `Schedule::record_used`: the file's digest and length written before
+    /// the first row; a change under rows already run is refused.
+    pub(super) fn record_used(&self, out_dir: &Path) -> Result<(), Refusal> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.text.hash(&mut h);
+        let digest = format!("{:016x}", h.finish());
+        let path = Self::used_path(out_dir);
+        if path.exists() {
+            let prev = fs::read_to_string(&path).map_err(|e| Refusal::Io(e.to_string()))?;
+            let v: serde_json::Value = serde_json::from_str(&prev)
+                .map_err(|e| Refusal::Spec(format!("schedule.used.json does not parse: {e}")))?;
+            let same = v["digest"].as_str() == Some(digest.as_str())
+                && v["len"].as_u64() == Some(self.text.len() as u64);
+            if !same {
+                return Err(Refusal::Spec(format!(
+                    "the CFCFG schedule changed under rows already run (see {})",
+                    path.display()
+                )));
+            }
+            return Ok(());
+        }
+        fs::create_dir_all(out_dir).map_err(|e| Refusal::Io(e.to_string()))?;
+        let rec = serde_json::json!({
+            "digest": digest,
+            "len": self.text.len(),
+            "date": self.date,
+            "source": self.source,
+            "commit": self.commit,
+            "rows": self.rows.len(),
+            "ended": self.ended.len(),
+            "configurations": CFCFG_CONFIGS.len(),
+        });
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, rec.to_string()).map_err(|e| Refusal::Io(e.to_string()))?;
+        fs::rename(&tmp, &path).map_err(|e| Refusal::Io(e.to_string()))
+    }
+}
+
+/// The `CFCFG` schedule for this process (read once).
+pub(super) fn cfcfg_schedule() -> Option<&'static CfcfgSchedule> {
+    static S: std::sync::OnceLock<Option<CfcfgSchedule>> = std::sync::OnceLock::new();
+    S.get_or_init(CfcfgSchedule::load).as_ref()
+}
+
+/// `CFCFG` (F6): the schedule's rows in its order, each with its series.
+pub(super) fn cfcfg_spec() -> Spec {
+    let rows = cfcfg_schedule()
+        .map(|sch| {
+            sch.runnable()
+                .into_iter()
+                .map(|r| {
+                    let (fixture, config, _, _, _, _) =
+                        parse_key(&r.key).expect("conformance: a validated schedule key");
+                    let (pair, s) = apptab_pair_of(&fixture)
+                        .expect("conformance: a validated schedule fixture");
+                    apptab_row(
+                        pair,
+                        s,
+                        &config,
+                        &Tier::default_tier(),
+                        RunKind::Timed,
+                        0,
+                        true,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Spec {
+        name: CFCFG_SPEC_NAME.to_owned(),
+        rows,
+    }
+}
+
+/// F7: `Some(cause)` when a bounded row must be written `skipped_dep`:
+/// `unbounded_missing` (no `w=inf` row of the cell in the store),
+/// `unbounded_censored` (it exists but did not complete), `unbounded_error`
+/// (it was aborted by a specification assertion failure — E-CF-7), `w_le_1`
+/// (it completed with `witnesses ≤ 1`); `None` when the row runs. Unbounded and
+/// vanilla rows always run.
+fn cfcfg_dependency(store: &Store, spec: &RowSpec, profile: &str) -> Option<&'static str> {
+    if !matches!(spec.config.witness_cache, Capacity::Bounded(_)) {
+        return None;
+    }
+    let mut inf = spec.clone();
+    inf.config = spec.config.clone().witness_cache(Capacity::Unbounded);
+    let inf_key = inf.key(profile);
+    let Some(class) = store.cell_of(&inf_key, "end_class") else {
+        return Some("unbounded_missing");
+    };
+    if class != "ok" {
+        return Some("unbounded_censored");
+    }
+    // Gate 4 m4 (E-CF-7): an E1-aborted unbounded row (`ok` / `spec_errors ≥ 1`
+    // / `aborted = true`) did not complete either; its own cause.
+    let aborted = store
+        .cell_of(&inf_key, "aborted")
+        .is_some_and(|v| v == "true")
+        || store
+            .cell_of(&inf_key, "spec_errors")
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|n| n > 0);
+    if aborted {
+        return Some("unbounded_error");
+    }
+    let witnesses: usize = store
+        .cell_of(&inf_key, "witnesses")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if witnesses <= 1 {
+        return Some("w_le_1");
+    }
+    None
 }

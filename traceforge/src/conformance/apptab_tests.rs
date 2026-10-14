@@ -2213,8 +2213,9 @@ fn c11_edprobe_rows() {
 /// beside this module in the full suites (E-AT-4's invariance check).
 #[test]
 fn c12_the_pins_that_must_not_move() {
-    assert_eq!(SCHEMA_VERSION, 2, "conformance: schema");
-    assert_eq!(header().len(), 180, "conformance: header");
+    // P5-CFCFG re-pin (2026-10-14): schema 3, five columns after `witnesses`.
+    assert_eq!(SCHEMA_VERSION, 3, "conformance: schema");
+    assert_eq!(header().len(), 185, "conformance: header");
     assert_eq!(
         LABEL_PIN,
         GridConfig::new(GridEngine::Enumerator).label(),

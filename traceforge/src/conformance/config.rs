@@ -279,6 +279,26 @@ pub struct ConfConfig {
     pub(crate) gate_policy: GatePolicy,
     /// `P4-FLAT` F4.
     pub(crate) completion_cover: CompletionCover,
+    /// `P5-CFCFG` F1: the witness cache's capacity (complete-first only; the
+    /// gated checker's cache is always unbounded).
+    pub(crate) witness_cache: Capacity,
+    /// `P5-CFCFG` F3: silence the sweeps' progress lines (complete-first only).
+    pub(crate) quiet_sweeps: bool,
+}
+
+/// `P5-CFCFG` F1: the capacity of the complete-first witness cache `W`
+/// (`alg.tex` §8.5's `c_W`). `Zero` is the vanilla algorithm (NaiveVerify,
+/// §8.4): nothing is ever admitted and no probe is ever answered. `Bounded(n)`
+/// keeps at most `n` witnesses, evicting the oldest (FIFO over admission
+/// order) when full; an evicted witness may be admitted again. `Unbounded` is
+/// CVerify as Parts 4–5 landed it. `Bounded(0)` is refused by the engine
+/// (`cfirst::run`): `Zero` is its spelling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Capacity {
+    Zero,
+    Bounded(usize),
+    #[default]
+    Unbounded,
 }
 
 impl ConfConfig {
@@ -336,6 +356,8 @@ pub struct ConfBuilder {
     gated_mode: GatedMode,
     gate_policy: GatePolicy,
     completion_cover: CompletionCover,
+    witness_cache: Capacity,
+    quiet_sweeps: bool,
 }
 
 impl Default for ConfBuilder {
@@ -369,6 +391,10 @@ impl ConfBuilder {
             gate_policy: GatePolicy::Always,
             // `P4-FLAT` F4: the sweep, as Parts 4–5 landed it.
             completion_cover: CompletionCover::Sweep,
+            // `P5-CFCFG` F1/F3: today's engine — the unbounded cache, the
+            // sweeps' progress lines printed.
+            witness_cache: Capacity::Unbounded,
+            quiet_sweeps: false,
             // `P4-ENUMERATOR` criterion 4: memo off until D7 is decided.
             memo: false,
             engine: Engine::Enumerator,
@@ -394,6 +420,26 @@ impl ConfBuilder {
     /// Off by default.
     pub fn early_error_cut(mut self, on: bool) -> Self {
         self.early_error_cut = on;
+        self
+    }
+
+    /// `P5-CFCFG` F1: the complete-first witness cache's capacity
+    /// ([`Capacity`]). Default `Unbounded`. Read by [`Engine::CompleteFirst`]
+    /// only; the gated checker's cache stays unbounded. `Bounded(0)` is refused
+    /// by the engine, not here (gate 3 T1; E-CF-2): `cfirst::run` returns
+    /// `ConfError::KnobConflict` and `cfirst::run_with` panics — `Zero` is its
+    /// spelling.
+    pub fn witness_cache(mut self, c: Capacity) -> Self {
+        self.witness_cache = c;
+        self
+    }
+
+    /// `P5-CFCFG` F3: silence the complete-first sweeps' progress lines (the
+    /// sweep's `Config` gets `progress_report = usize::MAX`). Default `false`.
+    /// The outer run's lines are untouched. Read by [`Engine::CompleteFirst`]
+    /// only.
+    pub fn quiet_sweeps(mut self, on: bool) -> Self {
+        self.quiet_sweeps = on;
         self
     }
 
@@ -552,6 +598,8 @@ impl ConfBuilder {
             gated_mode: self.gated_mode,
             gate_policy: self.gate_policy,
             completion_cover: self.completion_cover,
+            witness_cache: self.witness_cache,
+            quiet_sweeps: self.quiet_sweeps,
         })
     }
 }

@@ -1324,6 +1324,18 @@ pub struct CFirstCounters {
     pub invisible_ops_of_visible_threads: usize,
     /// `P4-FLAT` F6: `FlatCover`'s counters, `Some` iff `completion_cover = Flat`.
     pub(crate) flat: Option<FlatCounters>,
+    /// `P5-CFCFG` F1: stored admissions to `W` (re-admissions included),
+    /// evictions (`Bounded(n)` only) and re-admissions of an evicted graph;
+    /// `witnesses = admissions − evictions` at the end of a run.
+    pub admissions: usize,
+    pub evictions: usize,
+    pub readmissions: usize,
+    /// `P5-CFCFG` F2: the elapsed wall since the outer run started, and the
+    /// process's `VmHWM` (kB, from `/proc/self/status`), both read at the
+    /// first uncovered completion of the run; `None` on a run with no report
+    /// (or, for the memory, when the file cannot be read). Never reset.
+    pub wall_ms_at_first_report: Option<u128>,
+    pub vmhwm_kb_at_first_report: Option<u64>,
 }
 
 /// A conformance certificate: the "conforms" case, and the **only** one.

@@ -43,7 +43,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::conformance::cfirst::{self, CFirstOutcome, SweepEnd};
-use crate::conformance::config::{CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode};
+use crate::conformance::config::{
+    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode,
+};
 use crate::conformance::gated::{self, GatedOutcome, ReportSite};
 use crate::conformance::search::SearchOpts;
 use crate::conformance::selector::{paper_events, InnerOrder, Selector};
@@ -1330,6 +1332,13 @@ pub(super) struct GridConfig {
     /// gated checkers; `Flat` runs only with `precheck` and on those engines
     /// (refused by `run_grid` otherwise).
     pub(super) completion_cover: CompletionCover,
+    /// `P5-CFCFG` F1/F4: the complete-first witness cache's capacity
+    /// (`w=0` | `w=<n>` | `w=inf` in the label); carried unchanged by the
+    /// other engines.
+    pub(super) witness_cache: Capacity,
+    /// `P5-CFCFG` F3/F4: the complete-first sweeps' quiet flag
+    /// (`quiet=<bool>` in the label).
+    pub(super) quiet: bool,
 }
 
 impl GridConfig {
@@ -1349,7 +1358,21 @@ impl GridConfig {
             instrumented: false,
             early_error_cut: false,
             completion_cover: CompletionCover::Sweep,
+            witness_cache: Capacity::Unbounded,
+            quiet: false,
         }
+    }
+
+    /// `P5-CFCFG` F1: the complete-first witness cache's capacity.
+    pub(super) fn witness_cache(mut self, c: Capacity) -> Self {
+        self.witness_cache = c;
+        self
+    }
+
+    /// `P5-CFCFG` F3: the complete-first sweeps' quiet flag.
+    pub(super) fn quiet(mut self, b: bool) -> Self {
+        self.quiet = b;
+        self
     }
 
     pub(super) fn cover(mut self, c: CompletionCover) -> Self {
@@ -1416,6 +1439,8 @@ impl GridConfig {
             .gate_policy(self.gate_policy)
             .early_error_cut(self.early_error_cut)
             .completion_cover(self.completion_cover)
+            .witness_cache(self.witness_cache)
+            .quiet_sweeps(self.quiet)
             .skip_spec_errfree_check(!self.precheck)
             .triage(self.engine == GridEngine::Verify);
         b.build()
@@ -1424,7 +1449,7 @@ impl GridConfig {
 
     /// One line naming every knob, for a table row.
     pub(super) fn label(&self) -> String {
-        format!(
+        let eleven = format!(
             "{:?}/{:?}/stop={}/{:?}/{:?}/memo={}/{:?}/precheck={}/instr={}/cut={}/cover={:?}",
             self.engine,
             self.selector,
@@ -1437,8 +1462,36 @@ impl GridConfig {
             self.instrumented,
             self.early_error_cut,
             self.completion_cover
-        )
+        );
+        // `P5-CFCFG` F4 (landing erratum E-CF-1): the eleven-field form is
+        // kept byte for byte while both new knobs are at their defaults, so
+        // every key of the campaign and APPTAB stores and schedules stays the
+        // key the driver derives; a non-default knob prints the two fields.
+        if self.witness_cache == Capacity::Unbounded && !self.quiet {
+            eleven
+        } else {
+            format!("{eleven}/{}/quiet={}", capacity_field(self.witness_cache), self.quiet)
+        }
     }
+}
+
+/// `P5-CFCFG` F4: the label's capacity field (`w=0` | `w=<n>` | `w=inf`).
+pub(super) fn capacity_field(c: Capacity) -> String {
+    match c {
+        Capacity::Zero => "w=0".to_owned(),
+        Capacity::Bounded(n) => format!("w={n}"),
+        Capacity::Unbounded => "w=inf".to_owned(),
+    }
+}
+
+/// The inverse of [`capacity_field`]; `w=0` is `Zero`, never `Bounded(0)`.
+pub(super) fn parse_capacity(s: &str) -> Option<Capacity> {
+    let v = s.strip_prefix("w=")?;
+    if v == "inf" {
+        return Some(Capacity::Unbounded);
+    }
+    let n: usize = v.parse().ok()?;
+    Some(if n == 0 { Capacity::Zero } else { Capacity::Bounded(n) })
 }
 
 /// The raw engine outcome, whole (X3: the tester reads `spec_error` /
@@ -1823,6 +1876,12 @@ fn push_d<T: std::fmt::Display>(row: &mut Row, k: &'static str, v: T) {
     row.push((k, v.to_string()));
 }
 
+/// `P5-CFCFG` F5: an optional counter prints its value or nothing (never
+/// `Some(…)`/`None`), so a cell is a number or blank.
+fn push_opt<T: std::fmt::Display>(row: &mut Row, k: &'static str, v: Option<T>) {
+    row.push((k, v.map(|x| x.to_string()).unwrap_or_default()));
+}
+
 /// The settings columns every row starts with.
 fn settings_columns(fixture: &str, config: &GridConfig, row: &mut Row) {
     push_d(row, "fixture", fixture);
@@ -2039,6 +2098,12 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "sweep_graphs", c.sweep_graphs);
             push_d(&mut row, "sweep_graphs_max", c.sweep_graphs_max);
             push_d(&mut row, "witnesses", c.witnesses);
+            // `P5-CFCFG` F5: the five columns after `witnesses`.
+            push_d(&mut row, "admissions", c.admissions);
+            push_d(&mut row, "evictions", c.evictions);
+            push_d(&mut row, "readmissions", c.readmissions);
+            push_opt(&mut row, "wall_ms_at_first_report", c.wall_ms_at_first_report);
+            push_opt(&mut row, "vmhwm_kb_at_first_report", c.vmhwm_kb_at_first_report);
             push_d(&mut row, "witness_duplicates", c.witness_duplicates);
             push_d(&mut row, "counter_reports", c.reports);
             push_d(&mut row, "cut_reports", c.cut_reports);

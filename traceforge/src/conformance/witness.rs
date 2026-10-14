@@ -38,6 +38,7 @@
 //! pairs from its counters.
 
 use crate::conformance::canon::{CanonSet, CanonicalGraph};
+use crate::conformance::config::Capacity;
 use crate::conformance::morphism::CompleteExecution;
 use crate::conformance::obs::{wobs, ObsError, Wobs};
 use crate::conformance::sig::{cone_from, covered, ord, Summary, VisOrder};
@@ -52,6 +53,10 @@ pub(crate) struct Witness {
     graph: ExecutionGraph,
     wobs: Wobs,
     summary: Summary,
+    /// `P5-CFCFG` F1 (gate 4 M1/m1): under `Bounded(n)` only, a 128-bit
+    /// fingerprint of the canonical form, so that an eviction can record it
+    /// in the evicted set without keeping a graph copy; `None` otherwise.
+    fingerprint: Option<u128>,
 }
 
 impl Witness {
@@ -111,20 +116,74 @@ impl FlatWitness {
 }
 
 /// `W`.
+///
+/// **`P5-CFCFG` F1 — the capacity.** `Unbounded` is Parts 4–5's cache. `Zero`
+/// admits nothing and answers no probe (the vanilla algorithm). `Bounded(n)`
+/// holds at most `n` entries in admission order; when full, an admission
+/// evicts the oldest entry (FIFO) and forgets it in the deduplication set, so
+/// the same graph may be admitted again later (a *re-admission*). The probe
+/// order is unchanged: admission order, first hit. The invariant `W ⊆
+/// Graphs(Spec)` is untouched: eviction only removes.
 #[derive(Clone, Debug)]
 pub(crate) struct WitnessCache {
     entries: Vec<Witness>,
     seen: CanonSet,
     visible: Vec<String>,
+    capacity: Capacity,
+    /// `Bounded(n)` only: the fingerprints of every graph evicted so far in
+    /// the run (re-admission is detected here; gate 4 M1 — 16 bytes per
+    /// distinct evicted graph, never a graph copy, so a bounded run's
+    /// workspace is the `n` entries as the paper states).
+    evicted: std::collections::HashSet<u128>,
+    admissions: usize,
+    evictions: usize,
+    readmissions: usize,
 }
 
 impl WitnessCache {
     pub(crate) fn new(visible: Vec<String>) -> Self {
+        Self::with_capacity(visible, Capacity::Unbounded)
+    }
+
+    /// `P5-CFCFG` F1. `Bounded(0)` is refused by the engine before any cache
+    /// exists (`cfirst::run`); here it behaves as `Zero`.
+    pub(crate) fn with_capacity(visible: Vec<String>, capacity: Capacity) -> Self {
         Self {
             entries: Vec::new(),
             seen: CanonSet::new(),
             visible,
+            capacity,
+            evicted: std::collections::HashSet::new(),
+            admissions: 0,
+            evictions: 0,
+            readmissions: 0,
         }
+    }
+
+    pub(crate) fn capacity(&self) -> Capacity {
+        self.capacity
+    }
+
+    /// `P5-CFCFG` F1 (gate 4 M1): the canonical forms a bounded cache retains
+    /// are exactly its held entries' (`seen`), never the evicted ones' — the
+    /// tester pins `retained_canonical_forms() ≤ n`.
+    pub(crate) fn retained_canonical_forms(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// Stored admissions so far, re-admissions included (`P5-CFCFG` F1).
+    pub(crate) fn admissions(&self) -> usize {
+        self.admissions
+    }
+
+    /// Evictions so far (`Bounded(n)` only).
+    pub(crate) fn evictions(&self) -> usize {
+        self.evictions
+    }
+
+    /// Admissions of a graph that was held earlier in the run and evicted.
+    pub(crate) fn readmissions(&self) -> usize {
+        self.readmissions
     }
 
     /// Admit a graph a sweep of Spec produced. Returns `false` when an equal
@@ -140,6 +199,10 @@ impl WitnessCache {
         &mut self,
         exec: CompleteExecution<'_>,
     ) -> Result<bool, ObsError> {
+        // `P5-CFCFG` F1: `Zero` (and the refused `Bounded(0)`) admits nothing.
+        if matches!(self.capacity, Capacity::Zero | Capacity::Bounded(0)) {
+            return Ok(false);
+        }
         let graph = exec.graph();
         let canon = CanonicalGraph::of(graph, &self.visible)?;
         if self.seen.contains(&canon) {
@@ -150,15 +213,41 @@ impl WitnessCache {
         // for a graph `W` does not hold (tester finding P4-APPARATUS-T1).
         let w = wobs(graph, &self.visible)?;
         let summary = Summary::of(exec, &w, &self.visible)?;
+        // FIFO eviction when full (`Bounded(n)`): the oldest entry leaves,
+        // is forgotten by `seen` (its canonical form recomputed from the
+        // graph, which succeeded at its admission) and remembered by
+        // `evicted` as a fingerprint.
+        let fingerprint = matches!(self.capacity, Capacity::Bounded(_)).then(|| fingerprint_of(&canon));
+        if let Capacity::Bounded(n) = self.capacity {
+            if self.entries.len() >= n {
+                let old = self.entries.remove(0);
+                let forgotten = CanonicalGraph::of(&old.graph, &self.visible)
+                    .map(|c| self.seen.remove(&c))
+                    .unwrap_or(false);
+                debug_assert!(
+                    forgotten,
+                    "conformance: W's seen-set did not hold an evicted witness"
+                );
+                if let Some(fp) = old.fingerprint {
+                    self.evicted.insert(fp);
+                }
+                self.evictions += 1;
+            }
+        }
+        if fingerprint.is_some_and(|fp| self.evicted.contains(&fp)) {
+            self.readmissions += 1;
+        }
         let inserted = self.seen.insert(canon);
         debug_assert!(
             inserted,
             "conformance: W's seen-set changed under a single admission"
         );
+        self.admissions += 1;
         self.entries.push(Witness {
             graph: graph.clone(),
             wobs: w,
             summary,
+            fingerprint,
         });
         Ok(true)
     }
@@ -228,4 +317,25 @@ impl WitnessCache {
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// `P5-CFCFG` F1 (gate 4 M1): a 128-bit fingerprint of a canonical form — two
+/// 64-bit hashes of its `Debug` rendering under different seeds. Precondition
+/// (gate 4 round 02 n2): the `Debug` rendering of every message value is a
+/// function of its `PartialEq` class — true of derived impls on plain data,
+/// which every fixture of the experiment uses; a value whose rendering varies
+/// within its equality class (a map with per-instance iteration order, a
+/// `PartialEq` that ignores a field) can only **undercount** `readmissions`.
+/// Collisions (negligible at 128 bits) are the other inexactness; the held
+/// entries are still deduplicated exactly through `seen`.
+fn fingerprint_of(canon: &CanonicalGraph) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let text = format!("{canon:?}");
+    let mut a = std::collections::hash_map::DefaultHasher::new();
+    0x5f3759dfu64.hash(&mut a);
+    text.hash(&mut a);
+    let mut b = std::collections::hash_map::DefaultHasher::new();
+    0x9e3779b97f4a7c15u64.hash(&mut b);
+    text.hash(&mut b);
+    ((a.finish() as u128) << 64) | b.finish() as u128
 }

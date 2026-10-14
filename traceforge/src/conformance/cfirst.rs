@@ -51,7 +51,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::conformance::config::{CompletionCover, ConfConfig, Engine};
+use crate::conformance::config::{Capacity, CompletionCover, ConfConfig, Engine};
 use crate::conformance::flat;
 use crate::conformance::report::FlatCounters;
 use crate::conformance::ctx::{
@@ -206,6 +206,13 @@ pub(crate) fn run(
 ) -> Result<ConfVerdict, ConfError> {
     let started = Instant::now();
     let flat = cc.completion_cover == CompletionCover::Flat;
+    // `P5-CFCFG` F1: `Bounded(0)` is refused — `Zero` is its spelling.
+    if cc.witness_cache == Capacity::Bounded(0) {
+        return Err(ConfError::KnobConflict {
+            knob: "witness_cache(Bounded(0))",
+            conflicts_with: "Capacity::Zero, which is its spelling",
+        });
+    }
     // `P4-FLAT` F5/D13: eligibility needs the precheck.
     if flat && cc.skip_spec_errfree_check {
         return Err(ConfError::KnobConflict {
@@ -348,10 +355,14 @@ pub(crate) fn run_with(
 ) -> CFirstOutcome {
     // §9's config-time layer, before any engine exists.
     crate::conformance::assert_config_in_scope(&cc.config, "complete-first");
+    assert!(
+        cc.witness_cache != Capacity::Bounded(0),
+        "conformance: witness_cache(Bounded(0)) is not a configuration; Capacity::Zero is its spelling"
+    );
     let visible = cc.visible.clone();
 
     let state = Rc::new(RefCell::new(SinkState {
-        witnesses: WitnessCache::new(visible.clone()),
+        witnesses: WitnessCache::with_capacity(visible.clone(), cc.witness_cache),
         counters: CFirstCounters::default(),
         sweep_time: std::time::Duration::ZERO,
         reports: Vec::new(),
@@ -373,6 +384,12 @@ pub(crate) fn run_with(
         let config = cc.config.clone();
         let specification = Arc::clone(specification);
         let stop_at_first_report = cc.stop_at_first_report;
+        // `P5-CFCFG` F1–F3: the capacity (the admission assertion is void
+        // under `Zero`), the quiet flag for the sweeps, the outer start for
+        // the first-report wall.
+        let capacity = cc.witness_cache;
+        let quiet = cc.quiet_sweeps;
+        let started = outer_started;
         let flat_ctx = (cc.completion_cover == CompletionCover::Flat)
             .then(|| flat::FlatCtx::new(&config, &visible, &specification));
         Box::new(move |g: &ExecutionGraph, must_state: &MustState| {
@@ -430,19 +447,22 @@ pub(crate) fn run_with(
                         let inserted = flat::admit(&mut st.witnesses, w).unwrap_or_else(|e| {
                             panic!("conformance: the specification program is not a valid input: {e}")
                         });
-                        if !inserted {
-                            st.counters.witness_duplicates += 1;
+                        if capacity != Capacity::Zero {
+                            if !inserted {
+                                st.counters.witness_duplicates += 1;
+                            }
+                            assert!(
+                                inserted,
+                                "conformance: the complete-first engine admitted a FlatCover witness W \
+                                 currently holds; the cache probe should have hit"
+                            );
                         }
-                        assert!(
-                            inserted,
-                            "conformance: the complete-first engine admitted a FlatCover witness W \
-                             already holds; the cache probe should have hit"
-                        );
                         st.counters.witnesses = st.witnesses.len();
                         SinkVerdict::Continue
                     }
                     None => {
                         st.counters.reports += 1;
+                        note_first_report(&mut st.counters, started);
                         let snapshot = replay_snapshot(g, must_state, &config, None);
                         st.reports.push((g.clone(), snapshot));
                         if stop_at_first_report {
@@ -456,7 +476,7 @@ pub(crate) fn run_with(
 
             // ln:csweep — Must on Spec, unpruned, on its own thread (C2).
             let sweep_started = Instant::now();
-            let swept = sweep(
+            let swept = sweep_with(
                 &config,
                 &visible,
                 &specification,
@@ -464,6 +484,7 @@ pub(crate) fn run_with(
                 None,
                 keep_graphs,
                 ConfMode::CFirstSweep,
+                quiet,
             );
             let mut st = state.borrow_mut();
             st.counters.sweeps += 1;
@@ -492,14 +513,19 @@ pub(crate) fn run_with(
                     let inserted = st.witnesses.admit_from_sweep(exec).unwrap_or_else(|e| {
                         panic!("conformance: the specification program is not a valid input: {e}")
                     });
-                    if !inserted {
-                        st.counters.witness_duplicates += 1;
+                    // `P5-CFCFG` F1: under `Zero` nothing is admitted by
+                    // design; otherwise a witness W **currently holds** is
+                    // never admitted twice (the probe would have hit).
+                    if capacity != Capacity::Zero {
+                        if !inserted {
+                            st.counters.witness_duplicates += 1;
+                        }
+                        assert!(
+                            inserted,
+                            "conformance: the complete-first engine admitted a witness W currently \
+                             holds; the cache probe should have hit"
+                        );
                     }
-                    assert!(
-                        inserted,
-                        "conformance: the complete-first engine admitted a witness W already \
-                         holds; the cache probe should have hit"
-                    );
                     st.counters.sweeps_successful += 1;
                     st.counters.witnesses = st.witnesses.len();
                     st.sweep_ends.push(SweepEnd::Witness);
@@ -509,6 +535,7 @@ pub(crate) fn run_with(
                     st.counters.sweeps_failing += 1;
                     st.sweep_ends.push(SweepEnd::Exhausted);
                     st.counters.reports += 1;
+                    note_first_report(&mut st.counters, started);
                     let snapshot = replay_snapshot(g, must_state, &config, None);
                     st.reports.push((g.clone(), snapshot));
                     if stop_at_first_report {
@@ -543,6 +570,10 @@ pub(crate) fn run_with(
     st.counters.outer_wall_time_ms = outer_started.elapsed().as_millis();
     st.counters.sweep_wall_time_ms = st.sweep_time.as_millis();
     st.counters.cut_reports = outer.reports.len();
+    // `P5-CFCFG` F1: the cache's own tallies.
+    st.counters.admissions = st.witnesses.admissions();
+    st.counters.evictions = st.witnesses.evictions();
+    st.counters.readmissions = st.witnesses.readmissions();
 
     CFirstOutcome {
         reports: st.reports,
@@ -612,8 +643,49 @@ pub(crate) fn sweep(
     keep_graphs: bool,
     mode: ConfMode,
 ) -> Swept {
+    sweep_with(config, visible, specification, test, limit, keep_graphs, mode, false)
+}
+
+/// `P5-CFCFG` F2: at the first uncovered completion of a run, the elapsed
+/// wall since the outer run started and the process's `VmHWM`. Later reports
+/// leave both as they are.
+fn note_first_report(c: &mut CFirstCounters, started: Instant) {
+    if c.wall_ms_at_first_report.is_none() {
+        c.wall_ms_at_first_report = Some(started.elapsed().as_millis());
+        c.vmhwm_kb_at_first_report = vm_hwm_kb();
+    }
+}
+
+/// The process's `VmHWM` in kB from `/proc/self/status`; `None` when the
+/// file or the line cannot be read (never a panic).
+fn vm_hwm_kb() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = text.lines().find(|l| l.starts_with("VmHWM:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// [`sweep`] with the quiet flag (`P5-CFCFG` F3): under `quiet` the sweep's
+/// `Config` gets `progress_report = usize::MAX`, so no progress line can be
+/// printed at any count ≥ 1 (E-CF-10: `must.rs` would print one at count 0 on
+/// an inconsistent first ending, which incremental consistency makes
+/// unreachable); nothing else differs. The gated checker calls [`sweep`], which
+/// passes `false`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sweep_with(
+    config: &Config,
+    visible: &[String],
+    specification: &Arc<dyn Fn() + Send + Sync>,
+    test: SweepTest,
+    limit: Option<usize>,
+    keep_graphs: bool,
+    mode: ConfMode,
+    quiet: bool,
+) -> Swept {
     let mut spec_config = config.clone();
     spec_config.max_iterations = None;
+    if quiet {
+        spec_config.progress_report = usize::MAX;
+    }
     // `P4-CFIRST-CODE` round 01 m4: a sweep is a whole exploration nested
     // inside one outer execution, so it gets no observers (a fresh, empty
     // `callbacks`) and no trace/dot outputs — the user's observers and files
