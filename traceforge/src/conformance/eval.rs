@@ -529,6 +529,7 @@ pub(super) fn parse_engine(s: &str) -> Option<GridEngine> {
         "CompleteFirst" => GridEngine::CompleteFirst,
         "Gated" => GridEngine::Gated,
         "Verify" => GridEngine::Verify,
+        "Explore" => GridEngine::Explore,
         _ => return None,
     })
 }
@@ -756,7 +757,9 @@ pub(super) fn fixture_by_name(name: &str) -> Result<Fixture, Refusal> {
 // =========================================================================
 
 /// The engine call, as `grid.rs::call` but with `keep_graphs` a parameter
-/// (round 02 M2: the grid's `true` retains every graph).
+/// (round 02 M2: the grid's `true` retains every graph) and, on the
+/// `Explore` arm, the split line written to the child's stdout (`P5-XBASE`
+/// F2; `call`'s arm writes nothing).
 fn call_with(fixture: &Fixture, config: &GridConfig, keep_graphs: bool) -> GridRaw {
     let imp = fixture.implementation.clone();
     let spec = fixture.specification.clone();
@@ -801,6 +804,27 @@ fn call_with(fixture: &Fixture, config: &GridConfig, keep_graphs: bool) -> GridR
         GridEngine::Verify => {
             let cc = config.conf_config(fixture);
             GridRaw::Verdict(verify(cc, move || imp(), move || spec()))
+        }
+        GridEngine::Explore => {
+            // `P5-XBASE` F1: the fixture's own `Config` with the one field
+            // conformance forces (`Must::enable_conformance`): no stop at an
+            // error. The specification closure is never called. F2: the split
+            // is written once to the child's stdout for the run directory —
+            // machine-facing, emitted as the driver's sentinel is (gate 3 T2:
+            // S5 allows no `println!` outside `report.rs`).
+            let mut cfg = fixture.config.clone();
+            cfg.keep_going_after_error = true;
+            let s = crate::verify(cfg, move || imp());
+            let line = format!(
+                "xbase: execs={} block={} max_graph_events={}\n",
+                s.execs, s.block, s.max_graph_events
+            );
+            let mut out = std::io::stdout().lock();
+            out.write_all(line.as_bytes())
+                .expect("conformance: writing the xbase split line");
+            out.flush()
+                .expect("conformance: flushing the xbase split line");
+            GridRaw::Explore(s)
         }
     }
 }
@@ -1649,6 +1673,10 @@ impl Driver {
         if name == CFCFG_SPEC_NAME {
             CfcfgSchedule::check()?;
             specs.push(cfcfg_spec());
+        }
+        // `P5-XBASE` F3: likewise, only when named; no schedule file.
+        if name == XBASE_SPEC_NAME {
+            specs.push(xbase_spec());
         }
         let spec = specs
             .iter()
@@ -3339,7 +3367,7 @@ fn export_first_report(end: &GridEnd, visible: &[String], dir: &Path) -> Result<
                 .collect::<Vec<_>>());
             j
         }),
-        GridRaw::Verdict(_) => None,
+        GridRaw::Verdict(_) | GridRaw::Explore(_) => None,
     };
     if let Some(v) = v {
         fs::create_dir_all(dir).map_err(|e| Refusal::Io(e.to_string()))?;
@@ -5541,4 +5569,81 @@ fn cfcfg_dependency(store: &Store, spec: &RowSpec, profile: &str) -> Option<&'st
         return Some("w_le_1");
     }
     None
+}
+
+// =========================================================================
+// P5-XBASE — the exploration baseline (lead; criteria rev 1.10)
+// =========================================================================
+
+const XBASE_SPEC_NAME: &str = "XBASE";
+
+/// F3: three repetitions per instance (the designers' §2; D2).
+const XBASE_REPS: u32 = 3;
+
+/// F3: the baseline's per-pair largest size, derived from `cfirst-1` by one
+/// rule — the largest size at which any of the five `CFCFG` configurations
+/// has a row of `end_class` `ok` or `capped_*` for the pair (the P5-CFIRST
+/// digest's Tables C and V, 2026-10-15; the owner's O1: the cells at which
+/// some configuration ran, timeouts included, no walk beyond them). The
+/// tester re-derives it from the store.
+const XBASE_MAX_SIZE: [(ApptabPair, usize); 15] = [
+    (ApptabPair::A1Correct, 4),
+    (ApptabPair::A1Eager, 3),
+    (ApptabPair::A1Silent, 3),
+    (ApptabPair::A2Pb, 4),
+    (ApptabPair::A2StaleGet, 4),
+    (ApptabPair::A2SilentPut, 4),
+    (ApptabPair::A3Fifo, 3),
+    (ApptabPair::A3DoubleGrant, 3),
+    (ApptabPair::A3NeverGrant, 3),
+    (ApptabPair::A4Hash, 3),
+    (ApptabPair::A4Rr, 3),
+    (ApptabPair::A4HashDrop, 3),
+    (ApptabPair::LeConf, 5),
+    (ApptabPair::LeSplit, 4),
+    (ApptabPair::LeSilent, 4),
+];
+
+/// F3: every `XBASE` row's configuration — `Explore` with the ten inert knobs
+/// at their defaults (the eleven-field label).
+pub(super) fn xbase_config() -> GridConfig {
+    GridConfig::new(GridEngine::Explore)
+}
+
+/// F3: `ApptabPair::ALL × 2..=max(pair) × {0, 1, 2}`, the vector in the order
+/// size → benchmark → pair → rep (the driver sorts it pair-major; the
+/// size-major walk is the runner's blocks), each row with the APPTAB series
+/// scope so H5's rep and series rules apply.
+pub(super) fn xbase_spec() -> Spec {
+    let tier = Tier::default_tier();
+    let config = xbase_config();
+    let max_size = XBASE_MAX_SIZE.iter().map(|(_, m)| *m).max().unwrap_or(2);
+    let mut rows = Vec::new();
+    for s in 2..=max_size {
+        for pair in ApptabPair::ALL {
+            let m = XBASE_MAX_SIZE
+                .iter()
+                .find(|(p, _)| *p == pair)
+                .map(|(_, m)| *m)
+                .unwrap_or(0);
+            if s > m {
+                continue;
+            }
+            for rep in 0..XBASE_REPS {
+                rows.push(apptab_row(
+                    pair,
+                    s,
+                    &config,
+                    &tier,
+                    RunKind::Timed,
+                    rep,
+                    true,
+                ));
+            }
+        }
+    }
+    Spec {
+        name: XBASE_SPEC_NAME.to_owned(),
+        rows,
+    }
 }

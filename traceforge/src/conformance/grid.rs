@@ -1284,6 +1284,10 @@ pub(super) enum GridEngine {
     /// `verify(cc, impl, spec)` as a DEMO-2PC violating table calls it
     /// (`stop_at_first_report(true)`, `triage(true)`; criterion 7).
     Verify,
+    /// `P5-XBASE` F1: TraceForge's plain model checker on the implementation
+    /// closure alone — `crate::verify(config, impl)`, no conformance mode, the
+    /// specification never called. The ten knobs after the engine are inert.
+    Explore,
 }
 
 /// The enumerator's search budget (X3: the default-budget arm and the
@@ -1425,6 +1429,11 @@ impl GridConfig {
             GridEngine::Stateful => Engine::Stateful,
             GridEngine::CompleteFirst => Engine::CompleteFirst,
             GridEngine::Gated => Engine::Gated,
+            // `P5-XBASE` F1: never reached — the `Explore` arms of `call` and
+            // `call_with` do not build a conformance configuration.
+            GridEngine::Explore => {
+                panic!("conformance: `Explore` has no conformance configuration (P5-XBASE F1)")
+            }
         };
         let b = ConfBuilder::new()
             .config(fixture.config.clone())
@@ -1505,6 +1514,9 @@ pub(super) enum GridRaw {
     /// `cfirst::run` / `gated::run` (the precheck arm) and the `Verify`
     /// engine: the rendered route's verdict.
     Verdict(Result<ConfVerdict, ConfError>),
+    /// `P5-XBASE` F2: plain `verify`'s `Stats` (`execs` finished normally,
+    /// `block` blocked; the maximal graphs are their sum).
+    Explore(crate::Stats),
 }
 
 impl std::fmt::Debug for GridRaw {
@@ -1539,6 +1551,11 @@ impl std::fmt::Debug for GridRaw {
                 .field("spec_errors", &o.spec_errors.len())
                 .finish(),
             GridRaw::Verdict(v) => f.debug_tuple("Verdict").field(v).finish(),
+            GridRaw::Explore(s) => f
+                .debug_struct("Explore")
+                .field("execs", &s.execs)
+                .field("block", &s.block)
+                .finish(),
         }
     }
 }
@@ -1662,6 +1679,14 @@ fn call(fixture: &Fixture, config: &GridConfig) -> GridRaw {
         GridEngine::Verify => {
             let cc = config.conf_config(fixture);
             GridRaw::Verdict(verify(cc, move || imp(), move || spec()))
+        }
+        GridEngine::Explore => {
+            // `P5-XBASE` F1: the fixture's own `Config` with the one field
+            // conformance forces (`Must::enable_conformance`): no stop at an
+            // error. The specification closure is never called.
+            let mut cfg = fixture.config.clone();
+            cfg.keep_going_after_error = true;
+            GridRaw::Explore(crate::verify(cfg, move || imp()))
         }
     }
 }
@@ -2260,6 +2285,14 @@ pub(super) fn row_of(r: &GridResult) -> Row {
                 push_d(&mut row, "communication_flat", false);
                 push_d(&mut row, "refused_at", format!("{thread} @ {pos}"));
             }
+        }
+        GridRaw::Explore(s) => {
+            // `P5-XBASE` F2 (gate 1 round 01 B1): the conformance `executions`
+            // is the completion-gate count — every ending, blocked ones
+            // included — so the baseline's is `execs + block`; the second
+            // column is the enumerator's spelling of the same sum.
+            push_d(&mut row, "executions", s.execs + s.block);
+            push(&mut row, "outer_graphs(execs+block)", Some(s.execs + s.block));
         }
     }
     row

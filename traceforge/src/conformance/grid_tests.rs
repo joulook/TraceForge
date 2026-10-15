@@ -187,7 +187,7 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 site: format!("{site:?}"),
             })
             .collect(),
-        GridRaw::Verdict(_) => Vec::new(),
+        GridRaw::Verdict(_) | GridRaw::Explore(_) => Vec::new(),
     }
 }
 
@@ -197,7 +197,7 @@ fn kept_impl(r: &GridResult) -> &[ExecutionGraph] {
         GridRaw::Stateful(o) => &o.kept_impl_graphs,
         GridRaw::CompleteFirst(o) => &o.kept_impl_graphs,
         GridRaw::Gated(o) => &o.kept_impl_graphs,
-        GridRaw::Enumerator(_) | GridRaw::Verdict(_) => &[],
+        GridRaw::Enumerator(_) | GridRaw::Verdict(_) | GridRaw::Explore(_) => &[],
     }
 }
 
@@ -242,6 +242,13 @@ fn status(r: &GridResult) -> Status {
             end: o.impl_end,
             failure: (o.aborted || !o.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", o.aborted, o.spec_errors)),
+        },
+        // P5-XBASE: a plain Must run (no Spec) has no conformance status.
+        GridRaw::Explore(_) => Status {
+            reports: 0,
+            exhaustions: 0,
+            end: SearchEnd::Unknown,
+            failure: Some("an Explore (plain Must) run has no conformance status".to_owned()),
         },
         GridRaw::Verdict(v) => match v {
             Ok(v) => {
@@ -2922,7 +2929,7 @@ fn inner_work(r: &GridResult) -> Option<usize> {
             o.counters.gate_sweep_sizes.iter().sum::<usize>()
                 + o.counters.completion_sweep_sizes.iter().sum::<usize>(),
         ),
-        GridRaw::Verdict(_) => None,
+        GridRaw::Verdict(_) | GridRaw::Explore(_) => None,
     }
 }
 

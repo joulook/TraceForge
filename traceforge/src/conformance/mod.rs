@@ -465,6 +465,9 @@ mod apptab_tests;
 /// P5-CFCFG's tests (tester). **Test-only.**
 #[cfg(test)]
 mod cfcfg_tests;
+/// P5-XBASE's tests (tester). **Test-only.**
+#[cfg(test)]
+mod xbase_tests;
 /// P5-SYNTH's tests (tester). **Test-only.**
 #[cfg(test)]
 mod synth_tests;

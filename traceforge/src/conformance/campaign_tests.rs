@@ -2275,8 +2275,8 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "a804ed4cd5ccc734d7c9352e031cedd3",
-        "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG prefix)"
+        "f0f8648a41a3127f580c1fc545ac30f6",
+        "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
         assert_eq!(
@@ -2304,7 +2304,28 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         ("\n/// `P5-CFCFG` F5: an optional counter prints its value or nothing (never\n/// `Some(…)`/`None`), so a cell is a number or blank.\nfn push_opt<T: std::fmt::Display>(row: &mut Row, k: &'static str, v: Option<T>) {\n    row.push((k, v.map(|x| x.to_string()).unwrap_or_default()));\n}\n\n", "\n"),
         ("            push_d(&mut row, \"witnesses\", c.witnesses);\n            // `P5-CFCFG` F5: the five columns after `witnesses`.\n            push_d(&mut row, \"admissions\", c.admissions);\n            push_d(&mut row, \"evictions\", c.evictions);\n            push_d(&mut row, \"readmissions\", c.readmissions);\n            push_opt(&mut row, \"wall_ms_at_first_report\", c.wall_ms_at_first_report);\n            push_opt(&mut row, \"vmhwm_kb_at_first_report\", c.vmhwm_kb_at_first_report);\n", "            push_d(&mut row, \"witnesses\", c.witnesses);\n"),
     ];
+    // P5-XBASE (2026-10-15, tester re-pin): the lead's six `grid.rs` hunks
+    // (`GridEngine::Explore`, the `conf_config` arm, `GridRaw::Explore` and
+    // its Debug arm, the `call` arm, the `row_of` arm), all inside the
+    // prefix, each with one line of context; undoing them gives back the
+    // P5-CFCFG prefix, byte for byte.
+    const XBASE_HUNKS: [(&str, &str); 6] = [
+        ("    Verify,\n    /// `P5-XBASE` F1: TraceForge's plain model checker on the implementation\n    /// closure alone — `crate::verify(config, impl)`, no conformance mode, the\n    /// specification never called. The ten knobs after the engine are inert.\n    Explore,\n", "    Verify,\n"),
+        ("            GridEngine::Gated => Engine::Gated,\n            // `P5-XBASE` F1: never reached — the `Explore` arms of `call` and\n            // `call_with` do not build a conformance configuration.\n            GridEngine::Explore => {\n                panic!(\"conformance: `Explore` has no conformance configuration (P5-XBASE F1)\")\n            }\n", "            GridEngine::Gated => Engine::Gated,\n"),
+        ("    Verdict(Result<ConfVerdict, ConfError>),\n    /// `P5-XBASE` F2: plain `verify`'s `Stats` (`execs` finished normally,\n    /// `block` blocked; the maximal graphs are their sum).\n    Explore(crate::Stats),\n", "    Verdict(Result<ConfVerdict, ConfError>),\n"),
+        ("            GridRaw::Verdict(v) => f.debug_tuple(\"Verdict\").field(v).finish(),\n            GridRaw::Explore(s) => f\n                .debug_struct(\"Explore\")\n                .field(\"execs\", &s.execs)\n                .field(\"block\", &s.block)\n                .finish(),\n", "            GridRaw::Verdict(v) => f.debug_tuple(\"Verdict\").field(v).finish(),\n"),
+        ("            GridRaw::Verdict(verify(cc, move || imp(), move || spec()))\n        }\n        GridEngine::Explore => {\n            // `P5-XBASE` F1: the fixture's own `Config` with the one field\n            // conformance forces (`Must::enable_conformance`): no stop at an\n            // error. The specification closure is never called.\n            let mut cfg = fixture.config.clone();\n            cfg.keep_going_after_error = true;\n            GridRaw::Explore(crate::verify(cfg, move || imp()))\n", "            GridRaw::Verdict(verify(cc, move || imp(), move || spec()))\n"),
+        ("            }\n        }\n        GridRaw::Explore(s) => {\n            // `P5-XBASE` F2 (gate 1 round 01 B1): the conformance `executions`\n            // is the completion-gate count — every ending, blocked ones\n            // included — so the baseline's is `execs + block`; the second\n            // column is the enumerator's spelling of the same sum.\n            push_d(&mut row, \"executions\", s.execs + s.block);\n            push(&mut row, \"outer_graphs(execs+block)\", Some(s.execs + s.block));\n", "            }\n"),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in XBASE_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "a804ed4cd5ccc734d7c9352e031cedd3",
+        "conformance: the prefix without P5-XBASE's hunks = the P5-CFCFG prefix"
+    );
     for (new, old) in CFCFG_HUNKS {
         t = undo(t, new, old);
     }

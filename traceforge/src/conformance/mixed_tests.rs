@@ -364,7 +364,7 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 },
             })
             .collect(),
-        GridRaw::Verdict(_) => Vec::new(),
+        GridRaw::Verdict(_) | GridRaw::Explore(_) => Vec::new(),
     }
 }
 
@@ -376,6 +376,9 @@ fn grid_counter(r: &GridResult) -> usize {
         GridRaw::CompleteFirst(o) => o.counters.invisible_ops_of_visible_threads,
         GridRaw::Gated(o) => o.counters.invisible_ops_of_visible_threads,
         GridRaw::Verdict(v) => invisible_ops(v),
+        GridRaw::Explore(_) => {
+            unreachable!("conformance: Explore (plain Must) carries no conformance counters")
+        }
     }
 }
 
@@ -1424,7 +1427,7 @@ fn raw_notes(r: &GridResult) -> Vec<String> {
         GridRaw::Stateful(o) => &o.impl_notes,
         GridRaw::CompleteFirst(o) => &o.impl_notes,
         GridRaw::Gated(o) => &o.impl_notes,
-        GridRaw::Verdict(_) => return Vec::new(),
+        GridRaw::Verdict(_) | GridRaw::Explore(_) => return Vec::new(),
     };
     ds.iter()
         .map(|d| format!("{:?}@{}", d.reason, d.thread))

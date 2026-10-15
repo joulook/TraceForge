@@ -974,7 +974,7 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 serialized: serialized(s),
             })
             .collect(),
-        GridRaw::Verdict(_) => Vec::new(),
+        GridRaw::Verdict(_) | GridRaw::Explore(_) => Vec::new(),
     }
 }
 
@@ -1016,6 +1016,13 @@ fn st(r: &GridResult) -> St {
             end: o.impl_end,
             failure: (o.aborted || !o.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", o.aborted, o.spec_errors)),
+        },
+        // P5-XBASE: a plain Must run (no Spec) has no conformance status.
+        GridRaw::Explore(_) => St {
+            reports: 0,
+            exhaustions: 0,
+            end: SearchEnd::Unknown,
+            failure: Some("an Explore (plain Must) run has no conformance status".to_owned()),
         },
         GridRaw::Verdict(_) => St {
             reports: 0,
