@@ -41,7 +41,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::conformance::config::{ConfConfig, Engine};
+use crate::conformance::compact::{CompactIndex, CompactSummary, Covers, Inserted, OrdCounts, SigHash};
+use crate::conformance::config::{ConfConfig, Engine, IndexKind};
 use crate::conformance::ctx::{
     CompletionSink, ConfCtx, ConfMode, Diagnostic, DiagnosticReason, Gate, GateSink, Report,
     ReportKind, SinkVerdict,
@@ -67,7 +68,11 @@ pub(crate) struct StatefulOutcome {
     /// completion.
     pub(crate) reports: Vec<(ExecutionGraph, ReplaySnapshot)>,
     pub(crate) counters: StatefulCounters,
+    /// The index under `IndexKind::Current`; empty under `Compact`.
     pub(crate) index: SigBuckets<BTreeSet<VisOrder>>,
+    /// `COMPACT-INDEX` §5.1 item 4(a): the bucket index, `Some` iff
+    /// `index = Compact`.
+    pub(crate) compact_index: Option<CompactIndex>,
     /// Every Impl graph, in completion order — empty unless `keep_graphs`.
     pub(crate) kept_impl_graphs: Vec<ExecutionGraph>,
     /// Every Spec graph, in completion order — empty unless `keep_graphs`.
@@ -91,6 +96,15 @@ pub(crate) struct StatefulOutcome {
 #[derive(Default)]
 struct SinkState {
     index: SigBuckets<BTreeSet<VisOrder>>,
+    /// `COMPACT-INDEX` §5.1 item 4(a): `Some` iff `index = Compact`; then
+    /// `index` above stays empty.
+    compact: Option<CompactIndex>,
+    /// `COMPACT-INDEX` step 0 under `Current` (frozen §6): the distinct
+    /// implementation summaries, exact `(Sig, ord)`, in the engine's own
+    /// structure.
+    impl_seen: SigBuckets<BTreeSet<VisOrder>>,
+    /// Step 0 under `Compact`: the same count by `(SigHash, OrdCounts)`.
+    impl_seen_compact: std::collections::HashSet<(SigHash, OrdCounts)>,
     counters: StatefulCounters,
     reports: Vec<(ExecutionGraph, ReplaySnapshot)>,
     kept: Vec<ExecutionGraph>,
@@ -207,17 +221,27 @@ pub(crate) fn run_with(
     let mut spec_config = cc.config.clone();
     spec_config.max_iterations = None;
     let state = Rc::new(RefCell::new(SinkState::default()));
+    // `COMPACT-INDEX` §5.1 item 4(a): the bucket index in place of
+    // `SigBuckets` when asked for (frozen C1, §4).
+    if cc.index == IndexKind::Compact {
+        state.borrow_mut().compact = Some(CompactIndex::new(cc.antichain));
+    }
     let spec_started = Instant::now();
     let spec_sink = {
         let state = Rc::clone(&state);
         let visible = visible.clone();
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
-            let summary = summarise(g, &visible, "specification");
             let mut st = state.borrow_mut();
-            let inserted = st
-                .index
-                .entry(summary.sig, BTreeSet::new)
-                .insert(summary.ord);
+            let inserted = if st.compact.is_some() {
+                let s = CompactSummary::at_completion(g, &visible, "specification");
+                let ci = st.compact.as_mut().expect("conformance: the compact index is set");
+                matches!(ci.insert(&s), Inserted::Stored(_))
+            } else {
+                let summary = summarise(g, &visible, "specification");
+                st.index
+                    .entry(summary.sig, BTreeSet::new)
+                    .insert(summary.ord)
+            };
             st.counters.spec_graphs += 1;
             if inserted {
                 st.counters.orders_held += 1;
@@ -245,6 +269,12 @@ pub(crate) fn run_with(
         st.counters.spec_wall_time_ms = spec_started.elapsed().as_millis();
         st.counters.sig_key_buckets = st.index.key_buckets();
         st.counters.signatures = st.index.len();
+        if let Some(ci) = st.compact.as_ref() {
+            // Under `Compact` both are the live buckets (frozen §7).
+            let buckets = ci.stats().buckets;
+            st.counters.sig_key_buckets = buckets;
+            st.counters.signatures = buckets;
+        }
     }
     assert!(
         spec_run.end == SearchEnd::StateSpaceExhausted,
@@ -268,11 +298,15 @@ pub(crate) fn run_with(
             .map(|d| (d.thread.clone(), d.pos, false)),
     );
     if !spec_errors.is_empty() {
-        let st = std::mem::take(&mut *state.borrow_mut());
+        let mut st = std::mem::take(&mut *state.borrow_mut());
+        if let Some(ci) = st.compact.as_ref() {
+            st.counters.compact = Some(ci.stats().clone());
+        }
         return StatefulOutcome {
             reports: Vec::new(),
             counters: st.counters,
             index: st.index,
+            compact_index: st.compact,
             kept_impl_graphs: Vec::new(),
             kept_spec_graphs,
             impl_end: SearchEnd::Unknown,
@@ -292,7 +326,11 @@ pub(crate) fn run_with(
         let config = cc.config.clone();
         let stop_at_first_report = cc.stop_at_first_report;
         Box::new(move |g: &ExecutionGraph, must_state: &MustState| {
-            let summary = summarise(g, &visible, "implementation");
+            // `COMPACT-INDEX` §5.1 item 4(a): under `Compact` the compact
+            // summary is the only one built; under `Current` today's.
+            let compact_on = state.borrow().compact.is_some();
+            let cs = compact_on.then(|| CompactSummary::at_completion(g, &visible, "implementation"));
+            let current = (!compact_on).then(|| summarise(g, &visible, "implementation"));
             let mut st = state.borrow_mut();
             st.executions += 1;
             let paper: usize = g.thread_ids().into_iter().map(|t| paper_events(g, t)).sum();
@@ -310,31 +348,69 @@ pub(crate) fn run_with(
             // `BTreeSet` order, short-circuiting at the first containing `Q`.
             // Split the borrow: the index is read, the counters written.
             let SinkState {
-                index, counters, ..
+                index,
+                compact,
+                impl_seen,
+                impl_seen_compact,
+                counters,
+                ..
             } = &mut *st;
-            let covered = match index.get(&summary.sig) {
-                None => {
-                    counters.lookups_signature_miss += 1;
-                    false
+            let covered = if let Some(s) = cs.as_ref() {
+                // `COMPACT-INDEX` frozen §4.2, §6: the bucket query, and
+                // step 0's count under the compact identity.
+                if impl_seen_compact.insert(s.key()) {
+                    counters.impl_distinct_summaries += 1;
                 }
-                Some(orders) => {
-                    counters.lookups_containment_tested += 1;
-                    let mut found = false;
-                    let mut tests = 0;
-                    for q in orders {
-                        tests += 1;
-                        if q.is_subset(&summary.ord) {
-                            found = true;
-                            break;
-                        }
+                let ci = compact.as_mut().expect("conformance: the compact index is set");
+                match ci.covers(s) {
+                    Covers::NoBucket => {
+                        counters.lookups_signature_miss += 1;
+                        false
                     }
-                    counters.containment_tests += tests;
-                    if found {
+                    Covers::Found(_) => {
+                        counters.lookups_containment_tested += 1;
                         counters.lookups_succeeded += 1;
-                    } else {
-                        counters.lookups_failed_after_tests += 1;
+                        true
                     }
-                    found
+                    Covers::NotFound => {
+                        counters.lookups_containment_tested += 1;
+                        counters.lookups_failed_after_tests += 1;
+                        false
+                    }
+                }
+            } else {
+                let summary = current.as_ref().expect("conformance: the current summary is set");
+                // `COMPACT-INDEX` step 0 (frozen §6): exact `(Sig, ord)`.
+                if impl_seen
+                    .entry(summary.sig.clone(), BTreeSet::new)
+                    .insert(summary.ord.clone())
+                {
+                    counters.impl_distinct_summaries += 1;
+                }
+                match index.get(&summary.sig) {
+                    None => {
+                        counters.lookups_signature_miss += 1;
+                        false
+                    }
+                    Some(orders) => {
+                        counters.lookups_containment_tested += 1;
+                        let mut found = false;
+                        let mut tests = 0;
+                        for q in orders {
+                            tests += 1;
+                            if q.is_subset(&summary.ord) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        counters.containment_tests += tests;
+                        if found {
+                            counters.lookups_succeeded += 1;
+                        } else {
+                            counters.lookups_failed_after_tests += 1;
+                        }
+                        found
+                    }
                 }
             };
             if covered {
@@ -366,11 +442,20 @@ pub(crate) fn run_with(
     );
     let mut st = std::mem::take(&mut *state.borrow_mut());
     st.counters.impl_wall_time_ms = impl_started.elapsed().as_millis();
+    if let Some(ci) = st.compact.as_ref() {
+        // `COMPACT-INDEX` frozen §7: the index's counters; `containment_tests`
+        // is the queries' comparisons under `Compact`.
+        let mut stats = ci.stats().clone();
+        stats.impl_distinct_summaries = st.counters.impl_distinct_summaries;
+        st.counters.containment_tests = stats.containment_tests;
+        st.counters.compact = Some(stats);
+    }
 
     StatefulOutcome {
         reports: st.reports,
         counters: st.counters,
         index: st.index,
+        compact_index: st.compact,
         kept_impl_graphs: st.kept,
         kept_spec_graphs,
         impl_end: impl_run.end,

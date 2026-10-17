@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use crate::conformance::cfirst::{self, CFirstOutcome, SweepEnd};
 use crate::conformance::config::{
-    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode,
+    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode, IndexKind,
 };
 use crate::conformance::gated::{self, GatedOutcome, ReportSite};
 use crate::conformance::search::SearchOpts;
@@ -1343,6 +1343,14 @@ pub(super) struct GridConfig {
     /// `P5-CFCFG` F3/F4: the complete-first sweeps' quiet flag
     /// (`quiet=<bool>` in the label).
     pub(super) quiet: bool,
+    /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and
+    /// complete-first engines (`index=compact` in the label when `Compact`;
+    /// the label is today's byte for byte under `Current`).
+    pub(super) index: IndexKind,
+    /// `COMPACT-INDEX` §5.1 item 3 (`anti=<bool>`; printed under `Compact`).
+    pub(super) antichain: bool,
+    /// `COMPACT-INDEX` §5.1 item 4(b) (`pmemo=<bool>`; printed under `Compact`).
+    pub(super) probe_memo: bool,
 }
 
 impl GridConfig {
@@ -1364,12 +1372,33 @@ impl GridConfig {
             completion_cover: CompletionCover::Sweep,
             witness_cache: Capacity::Unbounded,
             quiet: false,
+            index: IndexKind::Current,
+            antichain: true,
+            probe_memo: true,
         }
     }
 
     /// `P5-CFCFG` F1: the complete-first witness cache's capacity.
     pub(super) fn witness_cache(mut self, c: Capacity) -> Self {
         self.witness_cache = c;
+        self
+    }
+
+    /// `COMPACT-INDEX` §5: the index kind.
+    pub(super) fn index(mut self, k: IndexKind) -> Self {
+        self.index = k;
+        self
+    }
+
+    /// `COMPACT-INDEX` §5.1 item 3: the antichain knob.
+    pub(super) fn antichain(mut self, b: bool) -> Self {
+        self.antichain = b;
+        self
+    }
+
+    /// `COMPACT-INDEX` §5.1 item 4(b): the probe memo knob.
+    pub(super) fn probe_memo(mut self, b: bool) -> Self {
+        self.probe_memo = b;
         self
     }
 
@@ -1450,6 +1479,9 @@ impl GridConfig {
             .completion_cover(self.completion_cover)
             .witness_cache(self.witness_cache)
             .quiet_sweeps(self.quiet)
+            .index(self.index)
+            .antichain(self.antichain)
+            .probe_memo(self.probe_memo)
             .skip_spec_errfree_check(!self.precheck)
             .triage(self.engine == GridEngine::Verify);
         b.build()
@@ -1476,11 +1508,30 @@ impl GridConfig {
         // kept byte for byte while both new knobs are at their defaults, so
         // every key of the campaign and APPTAB stores and schedules stays the
         // key the driver derives; a non-default knob prints the two fields.
-        if self.witness_cache == Capacity::Unbounded && !self.quiet {
+        // `COMPACT-INDEX` frozen §8: under `Compact` the thirteen-field form
+        // followed by the three knobs; under `Current` nothing changes.
+        if self.index == IndexKind::Compact {
+            format!(
+                "{eleven}/{}/quiet={}/index=compact/anti={}/pmemo={}",
+                capacity_field(self.witness_cache),
+                self.quiet,
+                self.antichain,
+                self.probe_memo
+            )
+        } else if self.witness_cache == Capacity::Unbounded && !self.quiet {
             eleven
         } else {
             format!("{eleven}/{}/quiet={}", capacity_field(self.witness_cache), self.quiet)
         }
+    }
+}
+
+/// `COMPACT-INDEX` frozen §7: the `index_kind` column.
+fn index_kind_field(compact: bool) -> &'static str {
+    if compact {
+        "compact"
+    } else {
+        "current"
     }
 }
 
@@ -1941,6 +1992,30 @@ fn flat_columns(row: &mut Row, fc: Option<&crate::conformance::FlatCounters>) {
     push_d(row, "flat_wall_time_ms", fc.wall_time_ms);
 }
 
+/// `COMPACT-INDEX` §5.1 item 5 (frozen §7): the bucket index's columns,
+/// absent under `IndexKind::Current`; `containment_tests` and
+/// `impl_distinct_summaries` are pushed by the engine arms themselves.
+fn compact_columns(row: &mut Row, cs: Option<&crate::conformance::compact::CompactStats>) {
+    let Some(cs) = cs else {
+        return;
+    };
+    push_d(row, "antichain_effective", cs.antichain_effective);
+    push_d(row, "entries", cs.entries);
+    push_d(row, "buckets", cs.buckets);
+    push_d(row, "bucket_max", cs.bucket_max);
+    push_d(row, "admitted", cs.admitted);
+    push_d(row, "duplicates", cs.duplicates);
+    push_d(row, "antichain_dropped_new", cs.antichain_dropped_new);
+    push_d(row, "antichain_dropped_old", cs.antichain_dropped_old);
+    push_d(row, "insert_tests", cs.insert_tests);
+    push_d(row, "summary_bytes", cs.summary_bytes);
+    push_d(row, "sig_bytes", cs.sig_bytes);
+    push_d(row, "memo_on", cs.memo_on);
+    push_d(row, "memo_hits", cs.memo_hits);
+    push_d(row, "memo_entries", cs.memo_entries);
+    push_d(row, "memo_clears", cs.memo_clears);
+}
+
 fn sweep_split(ends: &[SweepEnd]) -> String {
     let n = |e: SweepEnd| ends.iter().filter(|x| **x == e).count();
     format!(
@@ -2087,6 +2162,10 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "counter_reports", c.reports);
             push_d(&mut row, "spec_wall_time_ms", c.spec_wall_time_ms);
             push_d(&mut row, "impl_wall_time_ms", c.impl_wall_time_ms);
+            // `COMPACT-INDEX` §5.1 items 1 and 5.
+            push_d(&mut row, "impl_distinct_summaries", c.impl_distinct_summaries);
+            push_d(&mut row, "index_kind", index_kind_field(c.compact.is_some()));
+            compact_columns(&mut row, c.compact.as_ref());
         }
         GridRaw::CompleteFirst(o) => {
             push_d(&mut row, "reports", o.reports.len());
@@ -2137,6 +2216,19 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "outer_wall_time_ms", c.outer_wall_time_ms);
             push_d(&mut row, "sweep_wall_time_ms", c.sweep_wall_time_ms);
             flat_columns(&mut row, c.flat.as_ref());
+            // `COMPACT-INDEX` §5.1 item 5: the Impl phase is the outer run
+            // minus the sweeps; the index columns under `Compact`.
+            push_d(
+                &mut row,
+                "impl_phase_wall_ms",
+                c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),
+            );
+            push_d(&mut row, "index_kind", index_kind_field(c.compact.is_some()));
+            if let Some(cs) = c.compact.as_ref() {
+                push_d(&mut row, "containment_tests", cs.containment_tests);
+                push_d(&mut row, "impl_distinct_summaries", cs.impl_distinct_summaries);
+            }
+            compact_columns(&mut row, c.compact.as_ref());
         }
         GridRaw::Gated(o) => {
             push_d(&mut row, "reports", o.reports.len());

@@ -2355,7 +2355,14 @@ fn c11_the_entry_point_fields() {
         impl_notes,
         executions,
         max_paper_events,
+        compact_cache,
     } = rw(&cc, &naive(2, 0), &naive(2, 1), false);
+    // COMPACT-INDEX: `None` under the default `IndexKind::Current`.
+    let compact_cache: Option<crate::conformance::compact::CompactCache> = compact_cache;
+    assert!(
+        compact_cache.is_none(),
+        "conformance: no compact cache under Current"
+    );
     let reports: Vec<(ExecutionGraph, ReplaySnapshot)> = reports;
     let cut_reports: Vec<Report> = cut_reports;
     let counters: CFirstCounters = counters;

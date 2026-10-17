@@ -884,9 +884,12 @@ fn c06_every_stored_key_parses() {
 /// the five columns absent).
 #[test]
 fn c07_schema_three() {
-    assert_eq!(SCHEMA_VERSION, 3, "conformance: schema");
+    // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, 202 columns;
+    // the five schema-3 columns stay right after `witnesses`, and a schema-3
+    // store (a copy of `cfirst-1/rows.csv`) is now refused as well.
+    assert_eq!(SCHEMA_VERSION, 4, "conformance: schema");
     let h = header();
-    assert_eq!(h.len(), 185, "conformance: header width");
+    assert_eq!(h.len(), 202, "conformance: header width");
     let i = h.iter().position(|c| *c == "witnesses").unwrap();
     assert_eq!(
         &h[i + 1..i + 6],
@@ -907,6 +910,15 @@ fn c07_schema_three() {
             Err(Refusal::Header) | Err(Refusal::Schema(_)) => {}
             Err(e) => panic!("conformance: another refusal: {}", e.text()),
             Ok(_) => panic!("conformance: a schema-2 store opened (allow_mixed {allow})"),
+        }
+    }
+    let copy3 = d.join("rows3.csv");
+    fs::copy(plan("log/eval/cfirst-1/rows.csv"), &copy3).unwrap();
+    for allow in [false, true] {
+        match Store::open(&copy3, "cfcfg-tests-host", "cfcfg-tests", allow) {
+            Err(Refusal::Header) | Err(Refusal::Schema(_)) => {}
+            Err(e) => panic!("conformance: another refusal: {}", e.text()),
+            Ok(_) => panic!("conformance: a schema-3 store opened (allow_mixed {allow})"),
         }
     }
     let rows = read_rows(&copy).unwrap_or_else(|e| panic!("conformance: {}", e.text()));

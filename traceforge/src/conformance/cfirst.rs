@@ -51,7 +51,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::conformance::config::{Capacity, CompletionCover, ConfConfig, Engine};
+use crate::conformance::compact::{CompactCache, CompactSummary, OrdCounts, Probe, SigHash};
+use crate::conformance::config::{Capacity, CompletionCover, ConfConfig, Engine, IndexKind};
 use crate::conformance::flat;
 use crate::conformance::report::FlatCounters;
 use crate::conformance::ctx::{
@@ -144,7 +145,11 @@ pub(crate) struct CFirstOutcome {
     /// in the order raised; empty with the cut off.
     pub(crate) cut_reports: Vec<Report>,
     pub(crate) counters: CFirstCounters,
+    /// `W` under `IndexKind::Current`; empty under `Compact`.
     pub(crate) witnesses: WitnessCache,
+    /// `COMPACT-INDEX` §5.1 item 4(b): `W` on the bucket index, `Some` iff
+    /// `index = Compact`.
+    pub(crate) compact_cache: Option<CompactCache>,
     /// Every outer completion, in completion order; empty unless asked for.
     pub(crate) kept_impl_graphs: Vec<ExecutionGraph>,
     /// One `Vec` per sweep, in sweep order, each in completion order; empty
@@ -172,6 +177,12 @@ pub(crate) struct CFirstOutcome {
 /// (`Rc::try_unwrap` would fail while `CURRENT_MUST` still holds the `Must`).
 struct SinkState {
     witnesses: WitnessCache,
+    /// `COMPACT-INDEX` §5.1 item 4(b): `Some` iff `index = Compact`; then
+    /// `witnesses` above stays empty.
+    compact: Option<CompactCache>,
+    /// `COMPACT-INDEX` frozen §6: distinct implementation summaries by
+    /// `(SigHash, OrdCounts)`, `Compact` only.
+    impl_seen: std::collections::HashSet<(SigHash, OrdCounts)>,
     counters: CFirstCounters,
     /// Summed as a `Duration` and converted once (truncating per sweep would
     /// undercount sub-millisecond sweeps).
@@ -211,6 +222,15 @@ pub(crate) fn run(
         return Err(ConfError::KnobConflict {
             knob: "witness_cache(Bounded(0))",
             conflicts_with: "Capacity::Zero, which is its spelling",
+        });
+    }
+    // `COMPACT-INDEX` frozen §0: `FlatCover` is not modified in the slice,
+    // and its admissions go to `WitnessCache`; the compact cache cannot serve
+    // a `Flat` run.
+    if flat && cc.index == IndexKind::Compact {
+        return Err(ConfError::KnobConflict {
+            knob: "index(Compact)",
+            conflicts_with: "completion_cover(Flat)",
         });
     }
     // `P4-FLAT` F5/D13: eligibility needs the precheck.
@@ -359,10 +379,19 @@ pub(crate) fn run_with(
         cc.witness_cache != Capacity::Bounded(0),
         "conformance: witness_cache(Bounded(0)) is not a configuration; Capacity::Zero is its spelling"
     );
+    assert!(
+        !(cc.index == IndexKind::Compact && cc.completion_cover == CompletionCover::Flat),
+        "conformance: index(Compact) with completion_cover(Flat) is not a configuration (COMPACT-INDEX frozen §0)"
+    );
     let visible = cc.visible.clone();
 
     let state = Rc::new(RefCell::new(SinkState {
         witnesses: WitnessCache::with_capacity(visible.clone(), cc.witness_cache),
+        // `COMPACT-INDEX` §5.1 item 4(b): the bucket index with the capacity
+        // rules and the memo; the antichain off under `Bounded(n)` (frozen §4.3).
+        compact: (cc.index == IndexKind::Compact)
+            .then(|| CompactCache::new(cc.witness_cache, cc.antichain, cc.probe_memo)),
+        impl_seen: std::collections::HashSet::new(),
         counters: CFirstCounters::default(),
         sweep_time: std::time::Duration::ZERO,
         reports: Vec::new(),
@@ -393,10 +422,24 @@ pub(crate) fn run_with(
         let flat_ctx = (cc.completion_cover == CompletionCover::Flat)
             .then(|| flat::FlatCtx::new(&config, &visible, &specification));
         Box::new(move |g: &ExecutionGraph, must_state: &MustState| {
-            let summary = summarise(g, &visible, "implementation");
+            // `COMPACT-INDEX` §5.1 item 4(b): under `Compact` the compact
+            // summary is built first and the `Summary` (for the sweep's test,
+            // which is unchanged) only on a miss; under `Current` today's.
+            let compact_on = state.borrow().compact.is_some();
+            let cs = compact_on.then(|| CompactSummary::at_completion(g, &visible, "implementation"));
+            let mut lazy: Option<Summary> =
+                (!compact_on).then(|| summarise(g, &visible, "implementation"));
             {
                 let mut st = state.borrow_mut();
                 st.counters.impl_graphs += 1;
+                if let Some(s) = cs.as_ref() {
+                    if st.impl_seen.insert(s.key()) {
+                        st.counters
+                            .compact
+                            .get_or_insert_with(Default::default)
+                            .impl_distinct_summaries += 1;
+                    }
+                }
                 // `P4-MIXED` M8, in the implementation completion sink.
                 let inv = crate::conformance::ctx::invisible_ops_of_visible_threads(g, &visible);
                 st.counters.invisible_ops_of_visible_threads =
@@ -409,10 +452,20 @@ pub(crate) fn run_with(
             // ln:ccache — W first.
             let hit = {
                 let mut st = state.borrow_mut();
-                let (found, tests) = st.witnesses.probe_covered_counted(&summary);
-                let hit = found.is_some();
                 st.counters.cache_probes += 1;
-                st.counters.cache_tests += tests;
+                let hit = if let Some(s) = cs.as_ref() {
+                    // `COMPACT-INDEX` frozen §5, §4.2: the memo, then the
+                    // bucket query; `cache_tests` is read off the index at
+                    // the end of the run.
+                    let cache = st.compact.as_mut().expect("conformance: the compact cache is set");
+                    matches!(cache.probe(s), Probe::MemoHit | Probe::Hit)
+                } else {
+                    let summary = lazy.as_ref().expect("conformance: the current summary is set");
+                    let (found, tests) = st.witnesses.probe_covered_counted(summary);
+                    let hit = found.is_some();
+                    st.counters.cache_tests += tests;
+                    hit
+                };
                 if hit {
                     st.counters.cache_hits += 1;
                 }
@@ -421,6 +474,7 @@ pub(crate) fn run_with(
             if hit {
                 return SinkVerdict::Continue;
             }
+            let summary = lazy.get_or_insert_with(|| summarise(g, &visible, "implementation"));
             if let Some(fctx) = flat_ctx.as_ref() {
                 // `P4-FLAT` F4: the adapter — `FlatCover` in place of the
                 // completion sweep, on its own thread; a witness is admitted
@@ -509,13 +563,27 @@ pub(crate) fn run_with(
                     // ln:cfound — the stopping witness joins W. The graph is
                     // the sweep's completion-gate capture, one thread later,
                     // which is what `assume_finished_at_gate` asks for.
-                    let exec = CompleteExecution::assume_finished_at_gate(&m);
-                    let inserted = st.witnesses.admit_from_sweep(exec).unwrap_or_else(|e| {
-                        panic!("conformance: the specification program is not a valid input: {e}")
-                    });
+                    let inserted = if let Some(s) = cs.as_ref() {
+                        // `COMPACT-INDEX` frozen §4.3, §5: the witness's
+                        // compact summary joins the index; the probed
+                        // implementation summary joins the memo.
+                        let ws = CompactSummary::at_completion(&m, &visible, "specification");
+                        st.compact
+                            .as_mut()
+                            .expect("conformance: the compact cache is set")
+                            .admit(&ws, s)
+                    } else {
+                        let exec = CompleteExecution::assume_finished_at_gate(&m);
+                        st.witnesses.admit_from_sweep(exec).unwrap_or_else(|e| {
+                            panic!("conformance: the specification program is not a valid input: {e}")
+                        })
+                    };
                     // `P5-CFCFG` F1: under `Zero` nothing is admitted by
                     // design; otherwise a witness W **currently holds** is
-                    // never admitted twice (the probe would have hit).
+                    // never admitted twice (the probe would have hit). Under
+                    // `Compact` the refusal is also a held entry that
+                    // dominates the witness (`COMPACT-INDEX` frozen §4.3,
+                    // tester D3), which the probe would have answered too.
                     if capacity != Capacity::Zero {
                         if !inserted {
                             st.counters.witness_duplicates += 1;
@@ -523,11 +591,15 @@ pub(crate) fn run_with(
                         assert!(
                             inserted,
                             "conformance: the complete-first engine admitted a witness W currently \
-                             holds; the cache probe should have hit"
+                             holds{}; the cache probe should have hit",
+                            if cs.is_some() { " or dominates" } else { "" }
                         );
                     }
                     st.counters.sweeps_successful += 1;
-                    st.counters.witnesses = st.witnesses.len();
+                    st.counters.witnesses = st
+                        .compact
+                        .as_ref()
+                        .map_or(st.witnesses.len(), CompactCache::len);
                     st.sweep_ends.push(SweepEnd::Witness);
                     SinkVerdict::Continue
                 }
@@ -574,12 +646,29 @@ pub(crate) fn run_with(
     st.counters.admissions = st.witnesses.admissions();
     st.counters.evictions = st.witnesses.evictions();
     st.counters.readmissions = st.witnesses.readmissions();
+    if let Some(cache) = st.compact.as_ref() {
+        // `COMPACT-INDEX` frozen §7: the compact cache's tallies; `cache_tests`
+        // is the bucket queries' comparisons; `witnesses` the held entries.
+        st.counters.admissions = cache.admissions();
+        st.counters.evictions = cache.evictions();
+        st.counters.readmissions = cache.readmissions();
+        let mut stats = cache.stats();
+        stats.impl_distinct_summaries = st
+            .counters
+            .compact
+            .as_ref()
+            .map_or(0, |c| c.impl_distinct_summaries);
+        st.counters.cache_tests = stats.containment_tests;
+        st.counters.witnesses = cache.len();
+        st.counters.compact = Some(stats);
+    }
 
     CFirstOutcome {
         reports: st.reports,
         cut_reports: outer.reports,
         counters: st.counters,
         witnesses: st.witnesses,
+        compact_cache: st.compact,
         kept_impl_graphs: st.kept_impl,
         kept_spec_graphs: st.kept_spec,
         sweep_ends: st.sweep_ends,
@@ -598,6 +687,8 @@ impl Default for SinkState {
     fn default() -> Self {
         Self {
             witnesses: WitnessCache::new(Vec::new()),
+            compact: None,
+            impl_seen: std::collections::HashSet::new(),
             counters: CFirstCounters::default(),
             sweep_time: std::time::Duration::ZERO,
             reports: Vec::new(),

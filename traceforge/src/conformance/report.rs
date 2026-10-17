@@ -927,6 +927,13 @@ pub struct StatefulCounters {
     /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`];
     /// computed in this engine's implementation completion sink.
     pub invisible_ops_of_visible_threads: usize,
+    /// `COMPACT-INDEX` §5.1 item 1 (step 0): distinct implementation
+    /// summaries `(Sig, ord)` over the Impl run, under both index kinds
+    /// (frozen §6).
+    pub impl_distinct_summaries: usize,
+    /// `COMPACT-INDEX` §5.1 item 5: the bucket index's counters, `Some` iff
+    /// `index = Compact`.
+    pub(crate) compact: Option<crate::conformance::compact::CompactStats>,
 }
 
 /// The counters of one conformance run (`P4-ENUMERATOR` criterion 13; plan
@@ -1336,6 +1343,10 @@ pub struct CFirstCounters {
     /// (or, for the memory, when the file cannot be read). Never reset.
     pub wall_ms_at_first_report: Option<u128>,
     pub vmhwm_kb_at_first_report: Option<u64>,
+    /// `COMPACT-INDEX` §5.1 item 5: the compact cache's counters, `Some` iff
+    /// `index = Compact` (frozen §7); `cache_tests` then counts the bucket
+    /// queries' comparisons and `witnesses` the held entries.
+    pub(crate) compact: Option<crate::conformance::compact::CompactStats>,
 }
 
 /// A conformance certificate: the "conforms" case, and the **only** one.

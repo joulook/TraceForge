@@ -284,6 +284,27 @@ pub struct ConfConfig {
     pub(crate) witness_cache: Capacity,
     /// `P5-CFCFG` F3: silence the sweeps' progress lines (complete-first only).
     pub(crate) quiet_sweeps: bool,
+    /// `COMPACT-INDEX` §5 (frozen C1): which index the stateful and
+    /// complete-first engines use. `Current` is today's code path byte for
+    /// byte; `Compact` is the bucket index of `compact.rs`.
+    pub(crate) index: IndexKind,
+    /// `COMPACT-INDEX` §5.1 item 3: the antichain per bucket (`Compact` only;
+    /// forced off by the complete-first engine under `Bounded(n)`).
+    pub(crate) antichain: bool,
+    /// `COMPACT-INDEX` §5.1 item 4(b): the complete-first probe memo
+    /// (`Compact` and complete-first only).
+    pub(crate) probe_memo: bool,
+}
+
+/// `COMPACT-INDEX` §5 (frozen C1): the index behind the stateful engine's
+/// `I` and the complete-first engine's `W`. `Current` is Parts 4–5's code
+/// (`SigBuckets<BTreeSet<VisOrder>>`, `WitnessCache`); `Compact` is the
+/// bucket index of counts (`compact.rs`). The gated engine reads neither.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum IndexKind {
+    #[default]
+    Current,
+    Compact,
 }
 
 /// `P5-CFCFG` F1: the capacity of the complete-first witness cache `W`
@@ -358,6 +379,9 @@ pub struct ConfBuilder {
     completion_cover: CompletionCover,
     witness_cache: Capacity,
     quiet_sweeps: bool,
+    index: IndexKind,
+    antichain: bool,
+    probe_memo: bool,
 }
 
 impl Default for ConfBuilder {
@@ -395,6 +419,11 @@ impl ConfBuilder {
             // sweeps' progress lines printed.
             witness_cache: Capacity::Unbounded,
             quiet_sweeps: false,
+            // `COMPACT-INDEX` §5 (frozen C1, §4, §5): today's index; the
+            // antichain and the probe memo on wherever `Compact` reads them.
+            index: IndexKind::Current,
+            antichain: true,
+            probe_memo: true,
             // `P4-ENUMERATOR` criterion 4: memo off until D7 is decided.
             memo: false,
             engine: Engine::Enumerator,
@@ -440,6 +469,31 @@ impl ConfBuilder {
     /// only.
     pub fn quiet_sweeps(mut self, on: bool) -> Self {
         self.quiet_sweeps = on;
+        self
+    }
+
+    /// `COMPACT-INDEX` §5 (frozen C1): the index behind `I` and `W`
+    /// ([`IndexKind`]). Default `Current`. Read by [`Engine::Stateful`] and
+    /// [`Engine::CompleteFirst`]; `Compact` with `completion_cover(Flat)` is
+    /// refused by the complete-first engine (`ConfError::KnobConflict`).
+    pub fn index(mut self, k: IndexKind) -> Self {
+        self.index = k;
+        self
+    }
+
+    /// `COMPACT-INDEX` §5.1 item 3: the antichain per bucket. Default
+    /// `true`. Read under `IndexKind::Compact` only; the complete-first
+    /// engine forces it off under `Capacity::Bounded(n)` (frozen §4.3).
+    pub fn antichain(mut self, on: bool) -> Self {
+        self.antichain = on;
+        self
+    }
+
+    /// `COMPACT-INDEX` §5.1 item 4(b): the complete-first probe memo.
+    /// Default `true`. Read under `IndexKind::Compact` by
+    /// [`Engine::CompleteFirst`] only.
+    pub fn probe_memo(mut self, on: bool) -> Self {
+        self.probe_memo = on;
         self
     }
 
@@ -600,6 +654,9 @@ impl ConfBuilder {
             completion_cover: self.completion_cover,
             witness_cache: self.witness_cache,
             quiet_sweeps: self.quiet_sweeps,
+            index: self.index,
+            antichain: self.antichain,
+            probe_memo: self.probe_memo,
         })
     }
 }

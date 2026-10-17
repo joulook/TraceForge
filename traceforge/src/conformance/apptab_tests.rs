@@ -2214,8 +2214,10 @@ fn c11_edprobe_rows() {
 #[test]
 fn c12_the_pins_that_must_not_move() {
     // P5-CFCFG re-pin (2026-10-14): schema 3, five columns after `witnesses`.
-    assert_eq!(SCHEMA_VERSION, 3, "conformance: schema");
-    assert_eq!(header().len(), 185, "conformance: header");
+    // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, seventeen
+    // columns after `flat_wall_time_ms` (202).
+    assert_eq!(SCHEMA_VERSION, 4, "conformance: schema");
+    assert_eq!(header().len(), 202, "conformance: header");
     assert_eq!(
         LABEL_PIN,
         GridConfig::new(GridEngine::Enumerator).label(),

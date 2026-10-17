@@ -2022,7 +2022,14 @@ fn c12_the_entry_point_fields() {
         impl_notes,
         executions,
         max_paper_events,
+        compact_index,
     } = rw(&cc, &naive(2, 0), &naive(2, 1), false);
+    // COMPACT-INDEX: `None` under the default `IndexKind::Current`.
+    let compact_index: Option<crate::conformance::compact::CompactIndex> = compact_index;
+    assert!(
+        compact_index.is_none(),
+        "conformance: no compact index under Current"
+    );
     let reports: Vec<(ExecutionGraph, ReplaySnapshot)> = reports;
     let counters: StatefulCounters = counters;
     let index: SigBuckets<BTreeSet<VisOrder>> = index;

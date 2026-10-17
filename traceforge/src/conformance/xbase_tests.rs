@@ -372,8 +372,9 @@ fn c03_the_label_and_the_key() {
 /// unchanged), and the stack is 32 MiB for an APPTAB fixture under `Explore`.
 #[test]
 fn c04_the_header_and_the_stack() {
-    assert_eq!(SCHEMA_VERSION, 3, "conformance: schema");
-    assert_eq!(header().len(), 185, "conformance: header width");
+    // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, 202 columns.
+    assert_eq!(SCHEMA_VERSION, 4, "conformance: schema");
+    assert_eq!(header().len(), 202, "conformance: header width");
     for name in [
         "apps/a4/hash/a4a/k2q2m2",
         "2pc/leader/conf/n2",
@@ -595,12 +596,23 @@ fn c05_the_spec() {
     .into_iter()
     .collect();
     let rule = max_from_cfirst();
+    // O7 (owner, 2026-10-16; COMPACT-INDEX gate 3 F3, tester re-pin
+    // 2026-10-17): the committed `XBASE_MAX_SIZE` fixes A3 fifo's series at 3
+    // while `cfirst-1` keeps the later rerun's `apps/a3/fifo/spec/k4q4` w=inf
+    // `capped_wall` row, so the rule reads 4 there. That one value is the
+    // ruled exception; every other pair still equals the rule.
+    let o7: (&str, &str, Option<usize>) = ("a3", "fifo", Some(4));
     for p in ApptabPair::ALL {
         let d = derived[&(p.family(), p.label())];
         let r = rule
             .get(&(p.label().to_owned() + "@" + p.family()))
             .copied();
-        if r != Some(d) {
+        let want = if (p.family(), p.label()) == (o7.0, o7.1) {
+            o7.2
+        } else {
+            Some(d)
+        };
+        if r != want {
             bad.push(format!(
                 "{} {}: derived {d} rule {r:?}",
                 p.family(),

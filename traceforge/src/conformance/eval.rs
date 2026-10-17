@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use crate::channel::cons_to_model;
 use crate::conformance::cfirst;
-use crate::conformance::config::{Capacity, CompletionCover, GatePolicy, GatedMode};
+use crate::conformance::config::{Capacity, CompletionCover, GatePolicy, GatedMode, IndexKind};
 use crate::conformance::gated;
 use crate::conformance::grid::APPS_CORNERS;
 use crate::conformance::grid::{
@@ -60,7 +60,13 @@ use crate::conformance::{verify, verify_conformance_with_opts};
 /// `witnesses` (`admissions`, `evictions`, `readmissions`,
 /// `wall_ms_at_first_report`, `vmhwm_kb_at_first_report`); a schema-2 store is
 /// refused as any other schema, without override.
-pub(super) const SCHEMA_VERSION: u32 = 3;
+/// `COMPACT-INDEX` §5.1 item 5 (tester F1): schema 4 adds the seventeen
+/// columns after `flat_wall_time_ms` (`impl_distinct_summaries`, `index_kind`,
+/// `impl_phase_wall_ms`, and the bucket index's fourteen); the label at the
+/// defaults is unchanged (`LABEL_PIN`), so every key of a schema-3 store is
+/// still the key the driver derives, but a schema-3 store is refused by the
+/// driver as any other schema (the scripts read it; `compact-1` is schema 4).
+pub(super) const SCHEMA_VERSION: u32 = 4;
 
 /// `GridConfig::new(GridEngine::Enumerator).label()` at this schema version.
 pub(super) const LABEL_PIN: &str =
@@ -261,6 +267,24 @@ pub(super) const ROW_OF_COLUMNS: &[&str] = &[
     "flat_witnesses",
     "flat_max_depth",
     "flat_wall_time_ms",
+    // `COMPACT-INDEX` §5.1 item 5 (frozen §7).
+    "impl_distinct_summaries",
+    "index_kind",
+    "impl_phase_wall_ms",
+    "antichain_effective",
+    "entries",
+    "buckets",
+    "bucket_max",
+    "admitted",
+    "duplicates",
+    "antichain_dropped_new",
+    "antichain_dropped_old",
+    "insert_tests",
+    "summary_bytes",
+    "sig_bytes",
+    "memo_on",
+    "memo_entries",
+    "memo_clears",
 ];
 
 /// The declared header: the runner's columns, then every `row_of` column.
@@ -489,21 +513,34 @@ pub(super) fn parse_key(key: &str) -> Option<(String, GridConfig, u32, String, R
 pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     let p: Vec<&str> = label.split('/').collect();
     // `P5-CFCFG` F4: eleven fields (the campaign's form: the unbounded cache,
-    // sweeps not quiet) or thirteen (`w=…`, `quiet=…`); any other count fails.
-    if p.len() != 11 && p.len() != 13 {
+    // sweeps not quiet) or thirteen (`w=…`, `quiet=…`); `COMPACT-INDEX`
+    // frozen §8: sixteen (`index=compact`, `anti=…`, `pmemo=…`); any other
+    // count fails.
+    if p.len() != 11 && p.len() != 13 && p.len() != 16 {
         return None;
     }
     fn flag(s: &str, name: &str) -> Option<bool> {
         s.strip_prefix(name)?.strip_prefix('=')?.parse().ok()
     }
-    let (witness_cache, quiet) = if p.len() == 13 {
+    let (witness_cache, quiet) = if p.len() >= 13 {
         (parse_capacity(p[11])?, flag(p[12], "quiet")?)
     } else {
         (Capacity::Unbounded, false)
     };
+    let (index, antichain, probe_memo) = if p.len() == 16 {
+        if p[13] != "index=compact" {
+            return None;
+        }
+        (IndexKind::Compact, flag(p[14], "anti")?, flag(p[15], "pmemo")?)
+    } else {
+        (IndexKind::Current, true, true)
+    };
     let parsed = GridConfig {
         witness_cache,
         quiet,
+        index,
+        antichain,
+        probe_memo,
         engine: parse_engine(p[0])?,
         selector: parse_selector(p[1])?,
         stop_at_first_report: flag(p[2], "stop")?,
@@ -1677,6 +1714,10 @@ impl Driver {
         // `P5-XBASE` F3: likewise, only when named; no schedule file.
         if name == XBASE_SPEC_NAME {
             specs.push(xbase_spec());
+        }
+        // `COMPACT-INDEX` §5.3: likewise, only when named; no schedule file.
+        if name == COMPACT_SPEC_NAME {
+            specs.push(compact_spec());
         }
         let spec = specs
             .iter()
@@ -5644,6 +5685,68 @@ pub(super) fn xbase_spec() -> Spec {
     }
     Spec {
         name: XBASE_SPEC_NAME.to_owned(),
+        rows,
+    }
+}
+
+// =========================================================================
+// COMPACT-INDEX — the Monday slice (lead; §5.3)
+// =========================================================================
+
+const COMPACT_SPEC_NAME: &str = "COMPACT";
+
+/// §5.3: the ten cells — the five conforming pairs at sizes 2 and 3.
+const COMPACT_CELLS: [(ApptabPair, usize); 10] = [
+    (ApptabPair::A1Correct, 2),
+    (ApptabPair::A2Pb, 2),
+    (ApptabPair::A3Fifo, 2),
+    (ApptabPair::A4Hash, 2),
+    (ApptabPair::LeConf, 2),
+    (ApptabPair::A1Correct, 3),
+    (ApptabPair::A2Pb, 3),
+    (ApptabPair::A3Fifo, 3),
+    (ApptabPair::A4Hash, 3),
+    (ApptabPair::LeConf, 3),
+];
+
+/// §5.3 and frozen §8: the four configurations of every cell, in run order —
+/// step 0 (the current stateful engine, apptab-1's configuration, for
+/// `impl_distinct_summaries`), then the three new rows: `SVerify-S` compact
+/// with the antichain on; complete-first compact `Unbounded`, antichain on,
+/// memo on; complete-first compact `Bounded(64)`, antichain off, memo on.
+/// The complete-first rows are `CFCFG`'s configuration (quiet sweeps).
+pub(super) fn compact_configs() -> [GridConfig; 4] {
+    [
+        x1_config(GridEngine::Stateful, Selector::Ltr),
+        x1_config(GridEngine::Stateful, Selector::Ltr)
+            .index(IndexKind::Compact)
+            .antichain(true)
+            .probe_memo(true),
+        cfcfg_config(Capacity::Unbounded)
+            .index(IndexKind::Compact)
+            .antichain(true)
+            .probe_memo(true),
+        cfcfg_config(Capacity::Bounded(64))
+            .index(IndexKind::Compact)
+            .antichain(false)
+            .probe_memo(true),
+    ]
+}
+
+/// `COMPACT` (§5.3): the ten cells × the four configurations, one
+/// repetition, timed, the default tier, the APPTAB series scope; no schedule
+/// file (the cells are the spec's own list, no mutant, no size 4).
+pub(super) fn compact_spec() -> Spec {
+    let tier = Tier::default_tier();
+    let configs = compact_configs();
+    let mut rows = Vec::new();
+    for (pair, s) in COMPACT_CELLS {
+        for config in &configs {
+            rows.push(apptab_row(pair, s, config, &tier, RunKind::Timed, 0, true));
+        }
+    }
+    Spec {
+        name: COMPACT_SPEC_NAME.to_owned(),
         rows,
     }
 }

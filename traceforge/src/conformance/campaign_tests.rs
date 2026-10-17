@@ -2272,11 +2272,13 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // the P5-APPS block is `CONF_THREAD_THRESHOLD` and its use in `cfg`/`seeded`
     // (`git diff` against 2e7e96a: 20 insertions, 3 deletions, lines 79–101).
     // Undoing exactly those lines gives back the gate-4 prefix.
+    // COMPACT-INDEX (2026-10-17, tester re-pin, gate 3 F2): the prefix moves
+    // from `f0f8648a…` (P5-XBASE) to `fd3183e9…` (grid.rs md5 `3379cdc8…`).
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "f0f8648a41a3127f580c1fc545ac30f6",
-        "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE prefix)"
+        "fd3183e9af7de7aaf938406e9b7177bc",
+        "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
         assert_eq!(
@@ -2317,7 +2319,34 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         ("            GridRaw::Verdict(verify(cc, move || imp(), move || spec()))\n        }\n        GridEngine::Explore => {\n            // `P5-XBASE` F1: the fixture's own `Config` with the one field\n            // conformance forces (`Must::enable_conformance`): no stop at an\n            // error. The specification closure is never called.\n            let mut cfg = fixture.config.clone();\n            cfg.keep_going_after_error = true;\n            GridRaw::Explore(crate::verify(cfg, move || imp()))\n", "            GridRaw::Verdict(verify(cc, move || imp(), move || spec()))\n"),
         ("            }\n        }\n        GridRaw::Explore(s) => {\n            // `P5-XBASE` F2 (gate 1 round 01 B1): the conformance `executions`\n            // is the completion-gate count — every ending, blocked ones\n            // included — so the baseline's is `execs + block`; the second\n            // column is the enumerator's spelling of the same sum.\n            push_d(&mut row, \"executions\", s.execs + s.block);\n            push(&mut row, \"outer_graphs(execs+block)\", Some(s.execs + s.block));\n", "            }\n"),
     ];
+    // COMPACT-INDEX (2026-10-17, tester re-pin, gate 3 F2): the lead's ten
+    // `grid.rs` hunks (`git diff -U1 1be6b0f -- grid.rs`: the `IndexKind`
+    // import, the `index`/`antichain`/`probe_memo` fields, defaults and
+    // setters, the `conf_config` lines, the label's `/index=compact/...`
+    // suffix, `index_kind_field`, `compact_columns`, and the `row_of`
+    // columns), all inside the prefix, each with one line of context; undoing
+    // them gives back the P5-XBASE prefix, byte for byte.
+    const COMPACT_HUNKS: [(&str, &str); 10] = [
+        ("use crate::conformance::config::{\n    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode, IndexKind,\n};\n", "use crate::conformance::config::{\n    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode,\n};\n"),
+        ("    pub(super) quiet: bool,\n    /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and\n    /// complete-first engines (`index=compact` in the label when `Compact`;\n    /// the label is today's byte for byte under `Current`).\n    pub(super) index: IndexKind,\n    /// `COMPACT-INDEX` §5.1 item 3 (`anti=<bool>`; printed under `Compact`).\n    pub(super) antichain: bool,\n    /// `COMPACT-INDEX` §5.1 item 4(b) (`pmemo=<bool>`; printed under `Compact`).\n    pub(super) probe_memo: bool,\n}\n", "    pub(super) quiet: bool,\n}\n"),
+        ("            quiet: false,\n            index: IndexKind::Current,\n            antichain: true,\n            probe_memo: true,\n        }\n", "            quiet: false,\n        }\n"),
+        ("\n    /// `COMPACT-INDEX` §5: the index kind.\n    pub(super) fn index(mut self, k: IndexKind) -> Self {\n        self.index = k;\n        self\n    }\n\n    /// `COMPACT-INDEX` §5.1 item 3: the antichain knob.\n    pub(super) fn antichain(mut self, b: bool) -> Self {\n        self.antichain = b;\n        self\n    }\n\n    /// `COMPACT-INDEX` §5.1 item 4(b): the probe memo knob.\n    pub(super) fn probe_memo(mut self, b: bool) -> Self {\n        self.probe_memo = b;\n        self\n    }\n\n    /// `P5-CFCFG` F3: the complete-first sweeps' quiet flag.\n", "\n    /// `P5-CFCFG` F3: the complete-first sweeps' quiet flag.\n"),
+        ("            .quiet_sweeps(self.quiet)\n            .index(self.index)\n            .antichain(self.antichain)\n            .probe_memo(self.probe_memo)\n            .skip_spec_errfree_check(!self.precheck)\n", "            .quiet_sweeps(self.quiet)\n            .skip_spec_errfree_check(!self.precheck)\n"),
+        ("        // key the driver derives; a non-default knob prints the two fields.\n        // `COMPACT-INDEX` frozen §8: under `Compact` the thirteen-field form\n        // followed by the three knobs; under `Current` nothing changes.\n        if self.index == IndexKind::Compact {\n            format!(\n                \"{eleven}/{}/quiet={}/index=compact/anti={}/pmemo={}\",\n                capacity_field(self.witness_cache),\n                self.quiet,\n                self.antichain,\n                self.probe_memo\n            )\n        } else if self.witness_cache == Capacity::Unbounded && !self.quiet {\n            eleven\n", "        // key the driver derives; a non-default knob prints the two fields.\n        if self.witness_cache == Capacity::Unbounded && !self.quiet {\n            eleven\n"),
+        ("\n/// `COMPACT-INDEX` frozen §7: the `index_kind` column.\nfn index_kind_field(compact: bool) -> &'static str {\n    if compact {\n        \"compact\"\n    } else {\n        \"current\"\n    }\n}\n\n/// `P5-CFCFG` F4: the label's capacity field (`w=0` | `w=<n>` | `w=inf`).\n", "\n/// `P5-CFCFG` F4: the label's capacity field (`w=0` | `w=<n>` | `w=inf`).\n"),
+        ("\n/// `COMPACT-INDEX` §5.1 item 5 (frozen §7): the bucket index's columns,\n/// absent under `IndexKind::Current`; `containment_tests` and\n/// `impl_distinct_summaries` are pushed by the engine arms themselves.\nfn compact_columns(row: &mut Row, cs: Option<&crate::conformance::compact::CompactStats>) {\n    let Some(cs) = cs else {\n        return;\n    };\n    push_d(row, \"antichain_effective\", cs.antichain_effective);\n    push_d(row, \"entries\", cs.entries);\n    push_d(row, \"buckets\", cs.buckets);\n    push_d(row, \"bucket_max\", cs.bucket_max);\n    push_d(row, \"admitted\", cs.admitted);\n    push_d(row, \"duplicates\", cs.duplicates);\n    push_d(row, \"antichain_dropped_new\", cs.antichain_dropped_new);\n    push_d(row, \"antichain_dropped_old\", cs.antichain_dropped_old);\n    push_d(row, \"insert_tests\", cs.insert_tests);\n    push_d(row, \"summary_bytes\", cs.summary_bytes);\n    push_d(row, \"sig_bytes\", cs.sig_bytes);\n    push_d(row, \"memo_on\", cs.memo_on);\n    push_d(row, \"memo_hits\", cs.memo_hits);\n    push_d(row, \"memo_entries\", cs.memo_entries);\n    push_d(row, \"memo_clears\", cs.memo_clears);\n}\n\nfn sweep_split(ends: &[SweepEnd]) -> String {\n", "\nfn sweep_split(ends: &[SweepEnd]) -> String {\n"),
+        ("            push_d(&mut row, \"impl_wall_time_ms\", c.impl_wall_time_ms);\n            // `COMPACT-INDEX` §5.1 items 1 and 5.\n            push_d(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            compact_columns(&mut row, c.compact.as_ref());\n        }\n", "            push_d(&mut row, \"impl_wall_time_ms\", c.impl_wall_time_ms);\n        }\n"),
+        ("            flat_columns(&mut row, c.flat.as_ref());\n            // `COMPACT-INDEX` §5.1 item 5: the Impl phase is the outer run\n            // minus the sweeps; the index columns under `Compact`.\n            push_d(\n                &mut row,\n                \"impl_phase_wall_ms\",\n                c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),\n            );\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            if let Some(cs) = c.compact.as_ref() {\n                push_d(&mut row, \"containment_tests\", cs.containment_tests);\n                push_d(&mut row, \"impl_distinct_summaries\", cs.impl_distinct_summaries);\n            }\n            compact_columns(&mut row, c.compact.as_ref());\n        }\n", "            flat_columns(&mut row, c.flat.as_ref());\n        }\n"),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in COMPACT_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "f0f8648a41a3127f580c1fc545ac30f6",
+        "conformance: the prefix without COMPACT-INDEX's hunks = the P5-XBASE prefix"
+    );
     for (new, old) in XBASE_HUNKS {
         t = undo(t, new, old);
     }

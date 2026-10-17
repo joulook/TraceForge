@@ -251,6 +251,7 @@
 pub(crate) mod canon;
 pub(crate) mod cert;
 pub(crate) mod cfirst;
+pub(crate) mod compact;
 pub(crate) mod config;
 pub(crate) mod ctx;
 pub(crate) mod diagnose;
@@ -468,6 +469,9 @@ mod cfcfg_tests;
 /// P5-XBASE's tests (tester). **Test-only.**
 #[cfg(test)]
 mod xbase_tests;
+/// COMPACT-INDEX's tests (tester). **Test-only.**
+#[cfg(test)]
+mod compact_tests;
 /// P5-SYNTH's tests (tester). **Test-only.**
 #[cfg(test)]
 mod synth_tests;
