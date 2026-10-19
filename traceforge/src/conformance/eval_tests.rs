@@ -464,11 +464,20 @@ fn parse_u64(s: &str) -> Option<u64> {
 /// `admissions,evictions,readmissions,wall_ms_at_first_report,vmhwm_kb_at_first_report`
 /// inserted after `witnesses` (185).
 const HEADER_PIN_V4_TAIL: &str = "impl_distinct_summaries,index_kind,impl_phase_wall_ms,antichain_effective,entries,buckets,bucket_max,admitted,duplicates,antichain_dropped_new,antichain_dropped_old,insert_tests,summary_bytes,sig_bytes,memo_on,memo_entries,memo_clears";
+const HEADER_PIN_V5_TAIL: &str = "impl_distinct_summaries,index_kind,impl_phase_wall_ms,antichain_effective,entries,buckets,bucket_max,admitted,duplicates,antichain_dropped_new,antichain_dropped_old,insert_tests,summary_bytes,sig_bytes_est,signatures_seen,sig_tests,sig_aliases,coordinates_compared,inverted_used,inverted_words,trie_nodes_visited,memo_on,memo_entries,memo_clears";
 const HEADER_PIN_V3: &str = "key,run_kind,profile,commit,rep,tier,end_class,censor_via,censored,proc_wall_ms,pid,rss_sampled_hwm_kb,rss_child_hwm_kb,run_dir,diag_keys,diag_bytes_est,family,knobs,k1,k2,k3,k4,variant,twin_key,cut,inner_order,comm_model,cache,carry,direction,fixture,engine,selector,stop,gated_mode,policy,memo,budget,precheck,instrumented,cover,flat_calls,flat_visits,flat_nd_branches,wall_ms,vm_hwm_kb_before,vm_hwm_kb_after,tainted_at_start,stack_mib,reports,exhaustions,diagnostics,end,skipped_gates,inert_gates,seed,spec_error,outer_graphs(execs+block),gate_invocations,gate_skipped_inert,gate_skipped_replay,gate_skipped_pruned,gate_skipped_disabled,gate_skipped_aborted,cover_calls,cover_exhaustions,rebuilds_taken,rebuilds_skipped_initial_seed,rebuilds_skipped_exhausted_seed,spec_visit_calls,spec_visit_calls_extend,spec_visit_calls_rebuild,memo_hits,per_cover,distinct_keys_run_wide,f63_distinct_run_wide,explored_complete_keys,report_keys,max_paper_events_per_execution,paper_events_at_first_report,executions,engine_wall_time_ms,per_cover_detail,impl_end,spec_end,spec_errors,impl_notes,max_paper_events,kept_impl_graphs,kept_spec_graphs,spec_graphs,impl_graphs,sig_key_buckets,signatures,orders_held,lookups,lookups_signature_miss,lookups_containment_tested,lookups_succeeded,lookups_failed_after_tests,containment_tests,counter_reports,spec_wall_time_ms,impl_wall_time_ms,cut_reports_list,aborted,witness_cache_len,sweep_ends,paper_events_at_first_report(grid),cache_probes,cache_hits,cache_tests,sweeps,sweeps_successful,sweeps_failing,sweeps_aborted,sweep_sizes,sweep_graphs,sweep_graphs_max,witnesses,admissions,evictions,readmissions,wall_ms_at_first_report,vmhwm_kb_at_first_report,witness_duplicates,cut_reports,precheck_ran,precheck_wall_time_ms,outer_wall_time_ms,sweep_wall_time_ms,reports_at_gates,reports_at_completion,abort_gate_at,first_failure_mode,gates,gates_inert,gates_skipped_replay,gates_skipped_certified,gates_declined,c1_tests_carried,carried_hits,c1_tests_cache,gate_cache_hits,c1_tests_sweep,gate_sweeps,gate_sweeps_successful,gate_sweeps_failing,gate_sweeps_budgeted,gate_sweeps_aborted,gate_sweep_sizes,certificates_set,certificate_resets,states_pushed,certified_states_revisited,reports_certified,reports_by_completion_test,completion_probes,completion_cache_hits,completion_cache_tests,completion_sweeps,completion_sweeps_successful,completion_sweeps_failing,completion_sweeps_aborted,completion_sweep_sizes,verdict,notes,rendered_engine,spec_errfree,communication_flat,thread_flat,spec_graphs_scanned,first_invisible,refused_at,payload,cap_ms,flat_source_branches,flat_source_recursions,flat_send_kills,flat_slot_kills,flat_source_kills,flat_done_kills,flat_witnesses,flat_max_depth,flat_wall_time_ms";
 
 /// **Label pinning** (H1, round 03 m1): `LABEL_PIN` is today's
 /// `GridConfig::new(GridEngine::Enumerator).label()`, and `header()` is the
-/// pinned list, both beside `SCHEMA_VERSION == 4`.
+/// pinned list, both beside `SCHEMA_VERSION == 5`.
+///
+/// Schema 5 (`COMPACT-INDEX` phase 2, P2-frozen §1–§2, §5; tester re-pin
+/// 2026-10-19): schema 4's tail with `sig_bytes` replaced by `sig_bytes_est`,
+/// `signatures_seen`, `sig_tests`, `coordinates_compared`, `inverted_used`,
+/// `inverted_words`, `trie_nodes_visited` ([`HEADER_PIN_V5_TAIL`], 23
+/// columns after `flat_wall_time_ms`; 208 in all); `LABEL_PIN` unchanged.
+/// Fix round P3 (P2-frozen §7; tester re-pin 2026-10-19, schema 5 still
+/// uncommitted): `sig_aliases` after `sig_tests` (24 columns; 209).
 ///
 /// Schema 4 (`COMPACT-INDEX` §5.1 item 5, frozen §7; tester re-pin
 /// 2026-10-17, gate 3 F1): schema 3's 185 columns followed by the seventeen
@@ -477,7 +486,7 @@ const HEADER_PIN_V3: &str = "key,run_kind,profile,commit,rep,tier,end_class,cens
 #[test]
 fn pin_the_label_format_and_the_header_beside_the_schema_version() {
     assert_eq!(
-        SCHEMA_VERSION, 4,
+        SCHEMA_VERSION, 5,
         "conformance: bump the pins with the version"
     );
     assert_eq!(
@@ -491,12 +500,22 @@ fn pin_the_label_format_and_the_header_beside_the_schema_version() {
     );
     assert_eq!(
         header().join(","),
-        format!("{HEADER_PIN_V3},{HEADER_PIN_V4_TAIL}"),
+        format!("{HEADER_PIN_V3},{HEADER_PIN_V5_TAIL}"),
         "conformance: the header changed; bump SCHEMA_VERSION"
     );
     assert_eq!(HEADER_PIN_V3.split(',').count(), 185);
     assert_eq!(HEADER_PIN_V4_TAIL.split(',').count(), 17);
-    assert_eq!(header().len(), 202);
+    assert_eq!(HEADER_PIN_V5_TAIL.split(',').count(), 24);
+    // Schema 5 = schema 4 with `sig_bytes` replaced by eight columns.
+    assert_eq!(
+        HEADER_PIN_V5_TAIL,
+        HEADER_PIN_V4_TAIL.replace(
+            ",sig_bytes,",
+            ",sig_bytes_est,signatures_seen,sig_tests,sig_aliases,coordinates_compared,\
+             inverted_used,inverted_words,trie_nodes_visited,"
+        )
+    );
+    assert_eq!(header().len(), 209);
 }
 
 /// H1: every label the grid builds parses back to the same configuration

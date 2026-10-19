@@ -2274,11 +2274,17 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // Undoing exactly those lines gives back the gate-4 prefix.
     // COMPACT-INDEX (2026-10-17, tester re-pin, gate 3 F2): the prefix moves
     // from `f0f8648a…` (P5-XBASE) to `fd3183e9…` (grid.rs md5 `3379cdc8…`).
+    // COMPACT-INDEX phase 2 (2026-10-19, tester re-pin): to `b2b797db…`
+    // (grid.rs md5 `9a69ccbe…`); `COMPACT_P2_HUNKS` undo it to `fd3183e9…`.
+    // Fix round P3/P7 (2026-10-19, tester re-pin): to `008ec948…` (grid.rs md5
+    // `b93188a9…`); the hunks regenerated from the whole phase-2 diff.
+    // Items 4, 5, 7 (2026-10-19, tester re-pin): to `e1a0ca73…` (grid.rs md5
+    // `3c6f6c61…`); the hunks regenerated again.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "fd3183e9af7de7aaf938406e9b7177bc",
-        "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX prefix)"
+        "e1a0ca73b0aaf6256f044a74a8ed533c",
+        "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
         assert_eq!(
@@ -2338,7 +2344,33 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         ("            push_d(&mut row, \"impl_wall_time_ms\", c.impl_wall_time_ms);\n            // `COMPACT-INDEX` §5.1 items 1 and 5.\n            push_d(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            compact_columns(&mut row, c.compact.as_ref());\n        }\n", "            push_d(&mut row, \"impl_wall_time_ms\", c.impl_wall_time_ms);\n        }\n"),
         ("            flat_columns(&mut row, c.flat.as_ref());\n            // `COMPACT-INDEX` §5.1 item 5: the Impl phase is the outer run\n            // minus the sweeps; the index columns under `Compact`.\n            push_d(\n                &mut row,\n                \"impl_phase_wall_ms\",\n                c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),\n            );\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            if let Some(cs) = c.compact.as_ref() {\n                push_d(&mut row, \"containment_tests\", cs.containment_tests);\n                push_d(&mut row, \"impl_distinct_summaries\", cs.impl_distinct_summaries);\n            }\n            compact_columns(&mut row, c.compact.as_ref());\n        }\n", "            flat_columns(&mut row, c.flat.as_ref());\n        }\n"),
     ];
+    // COMPACT-INDEX phase 2 (2026-10-19, tester re-pin): the lead's nine
+    // `grid.rs` hunks for items 1–3 (`git diff -U1 99b844c -- grid.rs`: the
+    // `impl_distinct` field, default, setter and `conf_config` line, the
+    // label's `/distinct=on`, and the schema-5 columns in `compact_columns`
+    // and `row_of`), all inside the prefix, each with one line of context;
+    // undoing them gives back the COMPACT-INDEX prefix, byte for byte.
+    const COMPACT_P2_HUNKS: [(&str, &str); 10] = [
+        ("use crate::conformance::config::{\n    BucketKind, Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode, IndexKind,\n};\n", "use crate::conformance::config::{\n    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode, IndexKind,\n};\n"),
+        ("    pub(super) probe_memo: bool,\n    /// `COMPACT-INDEX` phase 2 D6 (`distinct=on`; printed only when on).\n    pub(super) impl_distinct: bool,\n    /// `COMPACT-INDEX` phase 2 item 7 (`bucket=inverted:<t>` or\n    /// `bucket=trie`, printed under `Compact`; nothing for the scan).\n    pub(super) bucket: BucketKind,\n}\n", "    pub(super) probe_memo: bool,\n}\n"),
+        ("            probe_memo: true,\n            impl_distinct: false,\n            bucket: BucketKind::Scan,\n        }\n", "            probe_memo: true,\n        }\n"),
+        ("\n    /// `COMPACT-INDEX` phase 2 D6: the step-0 counter's knob.\n    pub(super) fn impl_distinct(mut self, b: bool) -> Self {\n        self.impl_distinct = b;\n        self\n    }\n\n    /// `COMPACT-INDEX` phase 2 item 7: the slot structure.\n    pub(super) fn bucket(mut self, k: BucketKind) -> Self {\n        self.bucket = k;\n        self\n    }\n\n    /// `P5-CFCFG` F3: the complete-first sweeps' quiet flag.\n", "\n    /// `P5-CFCFG` F3: the complete-first sweeps' quiet flag.\n"),
+        ("            .probe_memo(self.probe_memo)\n            .impl_distinct(self.impl_distinct)\n            .bucket(self.bucket)\n            .skip_spec_errfree_check(!self.precheck)\n", "            .probe_memo(self.probe_memo)\n            .skip_spec_errfree_check(!self.precheck)\n"),
+        ("        // followed by the three knobs; under `Current` nothing changes.\n        // Phase 2 D6: `/distinct=on` appended only when the knob is on, so\n        // every key with it off is the slice's key; P7: and only where it has\n        // effect (the stateful engine, either index; complete-first under\n        // `Compact`).\n        let base = if self.index == IndexKind::Compact {\n            format!(\n", "        // followed by the three knobs; under `Current` nothing changes.\n        if self.index == IndexKind::Compact {\n            format!(\n"),
+        ("            format!(\"{eleven}/{}/quiet={}\", capacity_field(self.witness_cache), self.quiet)\n        };\n        // Phase 2 item 7 (P2-frozen §6): the slot structure after the\n        // compact fields, under `Compact` only; nothing for the scan, so every\n        // scan key is the slice's.\n        let base = match (self.index, self.bucket) {\n            (IndexKind::Compact, BucketKind::Inverted(t)) => format!(\"{base}/bucket=inverted:{t}\"),\n            (IndexKind::Compact, BucketKind::Trie) => format!(\"{base}/bucket=trie\"),\n            _ => base,\n        };\n        let distinct_effective = self.engine == GridEngine::Stateful\n            || (self.engine == GridEngine::CompleteFirst && self.index == IndexKind::Compact);\n        if self.impl_distinct && distinct_effective {\n            format!(\"{base}/distinct=on\")\n        } else {\n            base\n        }\n", "            format!(\"{eleven}/{}/quiet={}\", capacity_field(self.witness_cache), self.quiet)\n        }\n"),
+        ("    push_d(row, \"summary_bytes\", cs.summary_bytes);\n    // Phase 2 D1 (P2-frozen §1): `sig_bytes` replaced by the estimate and\n    // the slot counts; D4's coordinate count. (`signatures` is pushed by the\n    // engine arms: the stateful engine's counter carries it.)\n    push_d(row, \"sig_bytes_est\", cs.sig_bytes_est);\n    push_d(row, \"signatures_seen\", cs.signatures_seen);\n    push_d(row, \"sig_tests\", cs.sig_tests);\n    push_d(row, \"sig_aliases\", cs.sig_aliases);\n    push_d(row, \"coordinates_compared\", cs.coordinates_compared);\n    // Items 4, 5: blank unless the row's slot structure is that one.\n    push_opt(row, \"inverted_used\", cs.inverted_used);\n    push_opt(row, \"inverted_words\", cs.inverted_words);\n    push_opt(row, \"trie_nodes_visited\", cs.trie_nodes_visited);\n    push_d(row, \"memo_on\", cs.memo_on);\n", "    push_d(row, \"summary_bytes\", cs.summary_bytes);\n    push_d(row, \"sig_bytes\", cs.sig_bytes);\n    push_d(row, \"memo_on\", cs.memo_on);\n"),
+        ("            // `COMPACT-INDEX` §5.1 items 1 and 5.\n            push_opt(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n", "            // `COMPACT-INDEX` §5.1 items 1 and 5.\n            push_d(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n"),
+        ("                push_d(&mut row, \"containment_tests\", cs.containment_tests);\n                push_opt(&mut row, \"impl_distinct_summaries\", cs.impl_distinct_summaries);\n                push_d(&mut row, \"signatures\", cs.signatures);\n            }\n", "                push_d(&mut row, \"containment_tests\", cs.containment_tests);\n                push_d(&mut row, \"impl_distinct_summaries\", cs.impl_distinct_summaries);\n            }\n"),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in COMPACT_P2_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "fd3183e9af7de7aaf938406e9b7177bc",
+        "conformance: the prefix without phase 2's hunks = the COMPACT-INDEX prefix"
+    );
     for (new, old) in COMPACT_HUNKS {
         t = undo(t, new, old);
     }

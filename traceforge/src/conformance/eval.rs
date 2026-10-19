@@ -35,7 +35,9 @@ use std::time::{Duration, Instant};
 
 use crate::channel::cons_to_model;
 use crate::conformance::cfirst;
-use crate::conformance::config::{Capacity, CompletionCover, GatePolicy, GatedMode, IndexKind};
+use crate::conformance::config::{
+    BucketKind, Capacity, CompletionCover, GatePolicy, GatedMode, IndexKind,
+};
 use crate::conformance::gated;
 use crate::conformance::grid::APPS_CORNERS;
 use crate::conformance::grid::{
@@ -66,7 +68,13 @@ use crate::conformance::{verify, verify_conformance_with_opts};
 /// defaults is unchanged (`LABEL_PIN`), so every key of a schema-3 store is
 /// still the key the driver derives, but a schema-3 store is refused by the
 /// driver as any other schema (the scripts read it; `compact-1` is schema 4).
-pub(super) const SCHEMA_VERSION: u32 = 4;
+/// `COMPACT-INDEX` phase 2 (D1, D4; P2-frozen §1–§2): schema 5 replaces
+/// `sig_bytes` by `sig_bytes_est` and adds `signatures_seen`, `sig_tests`,
+/// `sig_aliases` (P3), `coordinates_compared`, and the three columns of items 4–5
+/// (`inverted_used`, `inverted_words`, `trie_nodes_visited`), which only a
+/// row with `bucket` other than the scan fills; the label at the defaults is
+/// unchanged.
+pub(super) const SCHEMA_VERSION: u32 = 5;
 
 /// `GridConfig::new(GridEngine::Enumerator).label()` at this schema version.
 pub(super) const LABEL_PIN: &str =
@@ -281,7 +289,14 @@ pub(super) const ROW_OF_COLUMNS: &[&str] = &[
     "antichain_dropped_old",
     "insert_tests",
     "summary_bytes",
-    "sig_bytes",
+    "sig_bytes_est",
+    "signatures_seen",
+    "sig_tests",
+    "sig_aliases",
+    "coordinates_compared",
+    "inverted_used",
+    "inverted_words",
+    "trie_nodes_visited",
     "memo_on",
     "memo_entries",
     "memo_clears",
@@ -511,7 +526,23 @@ pub(super) fn parse_key(key: &str) -> Option<(String, GridConfig, u32, String, R
 
 /// The inverse of `GridConfig::label()` (every field prints as `Debug`).
 pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
-    let p: Vec<&str> = label.split('/').collect();
+    let mut p: Vec<&str> = label.split('/').collect();
+    // `COMPACT-INDEX` phase 2 D6: a trailing `distinct=on` is the knob on;
+    // it is stripped before the fields below are counted.
+    let impl_distinct = p.last() == Some(&"distinct=on");
+    if impl_distinct {
+        p.pop();
+    }
+    // Phase 2 item 7: a trailing `bucket=…` (printed under `Compact` only;
+    // the round trip below refuses it anywhere else).
+    let bucket = match p.last().copied().and_then(|f| f.strip_prefix("bucket=")) {
+        Some(b) => {
+            let k = parse_bucket(b)?;
+            p.pop();
+            k
+        }
+        None => BucketKind::Scan,
+    };
     // `P5-CFCFG` F4: eleven fields (the campaign's form: the unbounded cache,
     // sweeps not quiet) or thirteen (`w=…`, `quiet=…`); `COMPACT-INDEX`
     // frozen §8: sixteen (`index=compact`, `anti=…`, `pmemo=…`); any other
@@ -531,7 +562,11 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         if p[13] != "index=compact" {
             return None;
         }
-        (IndexKind::Compact, flag(p[14], "anti")?, flag(p[15], "pmemo")?)
+        (
+            IndexKind::Compact,
+            flag(p[14], "anti")?,
+            flag(p[15], "pmemo")?,
+        )
     } else {
         (IndexKind::Current, true, true)
     };
@@ -541,6 +576,8 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         index,
         antichain,
         probe_memo,
+        impl_distinct,
+        bucket,
         engine: parse_engine(p[0])?,
         selector: parse_selector(p[1])?,
         stop_at_first_report: flag(p[2], "stop")?,
@@ -557,6 +594,16 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     // thirteen-field form at the defaults, `w=08`, `w=+8` and the like are
     // refused, so a stored key is always the key the driver derives.
     (parsed.label() == label).then_some(parsed)
+}
+
+/// Phase 2 item 7: `trie` or `inverted:<t>`.
+fn parse_bucket(s: &str) -> Option<BucketKind> {
+    if s == "trie" {
+        return Some(BucketKind::Trie);
+    }
+    Some(BucketKind::Inverted(
+        s.strip_prefix("inverted:")?.parse().ok()?,
+    ))
 }
 
 pub(super) fn parse_engine(s: &str) -> Option<GridEngine> {
@@ -1718,6 +1765,10 @@ impl Driver {
         // `COMPACT-INDEX` §5.3: likewise, only when named; no schedule file.
         if name == COMPACT_SPEC_NAME {
             specs.push(compact_spec());
+        }
+        // `COMPACT-INDEX` phase 2 (PHASE2 §6): likewise.
+        if name == COMPACT2_SPEC_NAME {
+            specs.push(compact2_spec());
         }
         let spec = specs
             .iter()
@@ -5747,6 +5798,70 @@ pub(super) fn compact_spec() -> Spec {
     }
     Spec {
         name: COMPACT_SPEC_NAME.to_owned(),
+        rows,
+    }
+}
+
+// =========================================================================
+// COMPACT-INDEX phase 2 — the justification runs (lead; PHASE2 §6)
+// =========================================================================
+
+const COMPACT2_SPEC_NAME: &str = "COMPACT2";
+
+/// PHASE2 §6 block 1: the six cells at sizes 4 and 5.
+const COMPACT2_SIZE_CELLS: [(ApptabPair, usize); 6] = [
+    (ApptabPair::A1Correct, 4),
+    (ApptabPair::A2Pb, 4),
+    (ApptabPair::A3Fifo, 4),
+    (ApptabPair::A4Hash, 4),
+    (ApptabPair::LeConf, 4),
+    (ApptabPair::LeConf, 5),
+];
+
+/// PHASE2 §6 block 2: the two ablation cells.
+const COMPACT2_ABLATION_CELLS: [(ApptabPair, usize); 2] =
+    [(ApptabPair::A3Fifo, 3), (ApptabPair::A4Hash, 3)];
+
+/// PHASE2 §6 block 2's seven new configurations, each one change from the
+/// slice's `SVerify-S` compact row (antichain on, scan) or complete-first
+/// compact `w=inf` row (antichain on, memo on, scan): the inverted index at
+/// threshold 0 and the trie on both, the antichain off on both, the memo off
+/// on complete-first. The two scan rows are the slice's (`compact-1`), reused.
+/// `impl_distinct` stays off (D6).
+pub(super) fn compact2_ablation_configs() -> [GridConfig; 7] {
+    let [_, sverify, cfirst_inf, _] = compact_configs();
+    [
+        sverify.clone().bucket(BucketKind::Inverted(0)),
+        sverify.clone().bucket(BucketKind::Trie),
+        sverify.antichain(false),
+        cfirst_inf.clone().bucket(BucketKind::Inverted(0)),
+        cfirst_inf.clone().bucket(BucketKind::Trie),
+        cfirst_inf.clone().antichain(false),
+        cfirst_inf.probe_memo(false),
+    ]
+}
+
+/// `COMPACT2` (PHASE2 §6): block 1 — the six cells × the slice's four
+/// configurations (`compact_configs`: `SVerify-S` current, `SVerify-S`
+/// compact, complete-first compact `w=inf` and `w=64`), with the APPTAB
+/// series scope, so a capped row ends its configuration's series — then block
+/// 2 — the two ablation cells × the seven configurations. One repetition,
+/// timed, the default tier; no schedule file.
+pub(super) fn compact2_spec() -> Spec {
+    let tier = Tier::default_tier();
+    let mut rows = Vec::new();
+    for (pair, s) in COMPACT2_SIZE_CELLS {
+        for config in &compact_configs() {
+            rows.push(apptab_row(pair, s, config, &tier, RunKind::Timed, 0, true));
+        }
+    }
+    for (pair, s) in COMPACT2_ABLATION_CELLS {
+        for config in &compact2_ablation_configs() {
+            rows.push(apptab_row(pair, s, config, &tier, RunKind::Timed, 0, true));
+        }
+    }
+    Spec {
+        name: COMPACT2_SPEC_NAME.to_owned(),
         rows,
     }
 }

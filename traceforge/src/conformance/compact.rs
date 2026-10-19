@@ -1,6 +1,7 @@
-//! `COMPACT-INDEX` §5 (the Monday slice; frozen semantics in
-//! `plan/traceForge/log/dev/COMPACT-INDEX.frozen.md`): the compact summary,
-//! the bucket index, and the complete-first cache built on it.
+//! `COMPACT-INDEX` (the Monday slice, §5; phase 2, `COMPACT-INDEX-PHASE2.md`
+//! §1 items 1–3; frozen semantics in `plan/traceForge/log/dev/
+//! COMPACT-INDEX.frozen.md` and `COMPACT-INDEX-P2.frozen.md`): the compact
+//! summary, the bucket index, and the complete-first cache built on it.
 //!
 //! **The compact summary** (§5.1 item 2; frozen §3). A complete graph's
 //! [`Sig`] is kept with its values; its visible order is kept as counts:
@@ -13,62 +14,125 @@
 //! pairs are po on both sides of any equal-`Sig` comparison and are not
 //! stored. Layout: `n · (T − 1)` counts, event-major (threads in sorted
 //! declared-name order, the `BTreeMap` order of `Sig`), `u8` unless some
-//! thread has more than 255 visible events, then `u16` throughout.
+//! thread has more than 255 visible events, then `u16` throughout; a thread
+//! beyond `u16::MAX` visible events is refused (gate 4 B2).
 //!
-//! **The bucket key** is a 128-bit hash of the `Debug` rendering of the
-//! signature, used **only** to find the bucket; equality inside a bucket is
-//! `Sig ==` (`msg_equals`). A bucket whose signature differs from a query's or
-//! an insertion's is a 128-bit collision and a panic (frozen C2): no verdict
-//! is ever answered from another signature's bucket. Precondition, the spec's
-//! own: the `Debug` rendering of a message value is a function of its
-//! `PartialEq` class (true of derived impls on plain data).
+//! **The bucket key** (phase 2 D1, P2-frozen §1) is a 128-bit hash of the
+//! signature's **shape**, [`SigKey`] (`sig.rs`: per thread the observation
+//! shapes and the status), through its derived `Hash` — never of a rendering.
+//! `sig(a) == sig(b)` implies `key(a) == key(b)`, so equal signatures always
+//! meet in one bucket; unequal signatures of one shape share it, each in its
+//! own **slot**, resolved by `Sig ==` (`msg_equals`) at every insertion and
+//! every query. A query whose signature matches no slot holding an order is a
+//! signature miss, never an answer. A 128-bit collision between two shapes
+//! only puts them in one bucket, where `Sig ==` still separates them.
 //!
-//! **The bucket index** (§5.1 item 3; frozen §4). `HashMap<SigHash, Bucket>`,
-//! `Bucket { sig, orders: Vec<_> }`; a query scans the bucket in insertion
-//! order and the first entry `q ≤ g` answers. The antichain knob (default on):
-//! an insertion dominated by a held entry (`held ≤ new`) is dropped; held
-//! entries dominated by the new one (`new ≤ held`) are removed. Sound for the
-//! yes/no probe: if `c^{M₁} ≤ c^{M₂} ≤ c^G` then `M₁` covers `G`. Exact
-//! duplicates are refused before any antichain action. No inverted index in
-//! the slice; `bucket_max` is exported instead.
+//! **The rendering hint** (P3, P2-frozen §7). Each bucket maps a 64-bit hash
+//! of a signature's `Debug` rendering to slot indices; resolution tries the
+//! hinted slots first and then the others, all by `Sig ==`, so the hint
+//! orders candidates and decides nothing. A slot found only by the second
+//! pass is an alias (equal signatures, different renderings), recorded in the
+//! hint and counted. Under the `print_vals` feature only; without it there is
+//! no rendering and resolution is the plain scan.
+//!
+//! **Signature ids** (P1, P2; P2-frozen §7). Only an insertion creates a slot,
+//! with a run-wide `sig_id` (allocation checked); a query never creates one.
+//! Slots are never removed (an emptied slot keeps its signature and its id),
+//! so the memo and the eviction history key on the exact `(sig_id,
+//! OrdCounts)`.
+//!
+//! **The query** (§5.1 item 3; frozen §4.2; phase 2 D4) scans the slot's
+//! orders in admission order; the first held order `q ≤ g` answers. `≤` reads
+//! coordinates left to right and stops at the first one where the held count
+//! exceeds the query's (`coordinates_compared` counts the reads).
+//!
+//! **The slot structures** (phase 2 items 4, 5, 7; P2-frozen §6, §6.1), the
+//! [`BucketKind`] knob: the scan above; the **inverted index** (built once the
+//! slot first holds `max(t, 1)` orders, kept from then on: per coordinate `i`
+//! and value `v` the bitset `Ex[i][v]` of positions whose count at `i`
+//! exceeds `v`, a `live` bitset, positions in admission order never reused;
+//! a query's answer is the lowest live position outside `⋃_i Ex[i][q_i]`);
+//! the **multiset trie** (a trie over the coordinates in order, each node
+//! holding the smallest live `seq` below it; a query descends only into
+//! children whose value is `≤` the query's and whose smallest `seq` beats the
+//! best found). All three answer with the live order `≤` the query that has
+//! the smallest admission number, which is the scan's answer; the duplicate
+//! check and the antichain stay the scan's `cmp` over the slot's vector.
+//!
+//! **The antichain** (knob, default on): an insertion dominated by a held
+//! order of its slot (`held ≤ new`) is dropped; held orders dominated by the
+//! new one are removed. Sound for the yes/no probe: if `c^{M₁} ≤ c^{M₂} ≤ c^G`
+//! then `M₁` covers `G`. Exact duplicates are refused before any antichain
+//! action.
 //!
 //! **The complete-first cache** (§5.1 item 4(b); frozen §4.3, §5): the index
 //! with the capacity rules (`Zero` admits nothing; `Bounded(n)` FIFO over the
 //! global admission order, the antichain **off**; `Unbounded`), and the probe
-//! memo — the implementation summaries whose probe hit, consulted before the
-//! bucket query, extended at a bucket hit and at an admission, cleared on
-//! every eviction. Only hits are memoised: a miss may become a hit after a
-//! sweep admits a witness. The memo holds the exact `(SigHash, OrdCounts)`
-//! (frozen C3), never a hash of the counts.
+//! memo — the implementation summaries whose probe hit, consulted after the
+//! signature is resolved and before the order query, extended at a hit and at
+//! an admission, cleared on every eviction. Only hits are memoised: a miss may
+//! become a hit after a sweep admits a witness.
 //!
 //! Everything here is a pure function of graphs and their `Wobs` rows, as
 //! `sig.rs` is; nothing consults engine stamps or insertion order beyond the
-//! bucket vectors' own.
+//! slots' own admission order.
 
 use std::cmp::Ordering;
-use std::collections::hash_map::{DefaultHasher, Entry as MapEntry};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 
-use crate::conformance::config::Capacity;
+use crate::conformance::config::{BucketKind, Capacity};
 use crate::conformance::morphism::CompleteExecution;
 use crate::conformance::obs::{wobs, Wobs};
-use crate::conformance::sig::Sig;
+use crate::conformance::sig::{Sig, SigKey};
 use crate::exec_graph::ExecutionGraph;
 
-/// The bucket key: a 128-bit hash of the signature's rendering (frozen §3.3).
+/// The bucket key: a 128-bit hash of the signature's shape (P2-frozen §1).
 pub(crate) type SigHash = u128;
 
-/// Two seeded 64-bit `DefaultHasher` values of `text` (the construction of
-/// `witness.rs::fingerprint_of`).
-fn hash128(text: &str) -> u128 {
+/// A signature's run-wide id (P2-frozen §1).
+pub(crate) type SigId = u32;
+
+/// The memo's and the eviction history's identity: the exact `(sig_id,
+/// counts)` (P2-frozen §1, §7).
+pub(crate) type MemoKey = (SigId, OrdCounts);
+
+/// Two seeded 64-bit `DefaultHasher` values of the shape `key` through its
+/// derived `Hash` (the seeds of `witness.rs::fingerprint_of`).
+fn hash128(key: &SigKey) -> u128 {
     let mut a = DefaultHasher::new();
     0x5f3759dfu64.hash(&mut a);
-    text.hash(&mut a);
+    key.hash(&mut a);
     let mut b = DefaultHasher::new();
     0x9e3779b97f4a7c15u64.hash(&mut b);
-    text.hash(&mut b);
+    key.hash(&mut b);
     ((a.finish() as u128) << 64) | b.finish() as u128
+}
+
+/// P3 (P2-frozen §7): a 64-bit hash of the signature's `Debug` rendering,
+/// written straight into a seeded `DefaultHasher` (SipHash reads a byte
+/// stream, so this is the hash of the rendered text; no string is built).
+/// Only under `print_vals`, where a value renders through `Debug`.
+#[cfg(feature = "print_vals")]
+fn render_hash(sig: &Sig) -> Option<u64> {
+    struct Sink(DefaultHasher);
+    impl std::fmt::Write for Sink {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.write(s.as_bytes());
+            Ok(())
+        }
+    }
+    let mut sink = Sink(DefaultHasher::new());
+    0x5f3759dfu64.hash(&mut sink.0);
+    std::fmt::write(&mut sink, format_args!("{sig:?}")).expect("conformance: a signature renders");
+    Some(sink.0.finish())
+}
+
+/// Without `print_vals` no rendering exists: no hint, the plain scan.
+#[cfg(not(feature = "print_vals"))]
+fn render_hash(_sig: &Sig) -> Option<u64> {
+    None
 }
 
 /// The visible order of a complete graph as counts (frozen §3.2).
@@ -81,7 +145,7 @@ pub(crate) enum OrdCounts {
 /// `a ≤ b` with some coordinate strictly less is `Less`; `a ≥ b` with some
 /// strictly greater is `Greater`; equal is `Equal`; both directions strict
 /// somewhere is `None` (incomparable). Exits at the first coordinate that
-/// settles `None`.
+/// settles `None`. Used by the antichain at insertion.
 fn cmp_counts<T: Ord>(a: &[T], b: &[T]) -> Option<Ordering> {
     assert_eq!(
         a.len(),
@@ -106,6 +170,23 @@ fn cmp_counts<T: Ord>(a: &[T], b: &[T]) -> Option<Ordering> {
         (false, true) => Ordering::Greater,
         (true, true) => unreachable!("conformance: settled above"),
     })
+}
+
+/// Phase 2 D4: `a ≤ b` pointwise, `false` at the first coordinate where
+/// `a` exceeds `b`; `coords` gains the number of coordinates read.
+fn le_counts<T: Ord>(a: &[T], b: &[T], coords: &mut usize) -> bool {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "conformance: OrdCounts of different signatures compared"
+    );
+    for (x, y) in a.iter().zip(b) {
+        *coords += 1;
+        if x > y {
+            return false;
+        }
+    }
+    true
 }
 
 impl OrdCounts {
@@ -178,9 +259,20 @@ impl OrdCounts {
         }
     }
 
-    /// `self ≤ other` pointwise.
+    /// `self ≤ other` pointwise, exiting at the first exceeding coordinate
+    /// (D4); `coords` gains the coordinates read.
+    pub(crate) fn le_counted(&self, other: &Self, coords: &mut usize) -> bool {
+        match (self, other) {
+            (OrdCounts::U8(a), OrdCounts::U8(b)) => le_counts(a, b, coords),
+            (OrdCounts::U16(a), OrdCounts::U16(b)) => le_counts(a, b, coords),
+            _ => panic!("conformance: OrdCounts of different widths compared"),
+        }
+    }
+
+    /// `self ≤ other` pointwise (D4's exit; the read count discarded).
     pub(crate) fn le(&self, other: &Self) -> bool {
-        matches!(self.cmp(other), Some(Ordering::Equal | Ordering::Less))
+        let mut coords = 0;
+        self.le_counted(other, &mut coords)
     }
 
     /// The payload bytes, headers excluded: `n · (T − 1)` times the width.
@@ -202,15 +294,25 @@ impl OrdCounts {
     pub(crate) fn is_wide(&self) -> bool {
         matches!(self, OrdCounts::U16(_))
     }
+
+    /// The count at coordinate `i`.
+    pub(crate) fn at(&self, i: usize) -> u16 {
+        match self {
+            OrdCounts::U8(v) => u16::from(v[i]),
+            OrdCounts::U16(v) => v[i],
+        }
+    }
 }
 
 /// What the index reads of a complete graph: the signature with its values,
-/// its bucket hash, the rendering's length (for `sig_bytes`), and the counts.
+/// its shape's bucket hash, its estimated byte size (P2-frozen §1), and the
+/// counts.
 #[derive(Clone, Debug)]
 pub(crate) struct CompactSummary {
     pub(crate) hash: SigHash,
     pub(crate) sig: Sig,
-    pub(crate) sig_len: usize,
+    /// `32 × Σ_t |w_t| + 16 × T` (P2-frozen §1).
+    pub(crate) sig_est: usize,
     pub(crate) ord: OrdCounts,
 }
 
@@ -223,12 +325,15 @@ impl CompactSummary {
         visible: &[String],
     ) -> Result<Self, crate::conformance::obs::ObsError> {
         let sig = Sig::of(exec, wobs, visible)?;
-        let text = format!("{sig:?}");
+        let mut names: Vec<&str> = visible.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names.dedup();
+        let observations: usize = names.iter().map(|n| wobs.of(n).len()).sum();
         let ord = OrdCounts::of(exec.graph(), wobs, visible);
         Ok(Self {
-            hash: hash128(&text),
+            hash: hash128(&sig.key()),
             sig,
-            sig_len: text.len(),
+            sig_est: 32 * observations + 16 * names.len(),
             ord,
         })
     }
@@ -244,11 +349,6 @@ impl CompactSummary {
             panic!("conformance: the {program} program is not a valid input: {e}")
         })
     }
-
-    /// The memo and deduplication identity.
-    pub(crate) fn key(&self) -> (SigHash, OrdCounts) {
-        (self.hash, self.ord.clone())
-    }
 }
 
 /// One held order with its run-wide admission number.
@@ -258,26 +358,322 @@ pub(crate) struct Entry {
     pub(crate) ord: OrdCounts,
 }
 
-/// One signature's bucket: the values once, the orders as counts.
+/// One signature's slot in its shape's bucket: the values once, the orders
+/// as counts in admission order. Never removed (P2-frozen §1).
 #[derive(Clone, Debug)]
-pub(crate) struct Bucket {
+pub(crate) struct SigSlot {
+    pub(crate) sig_id: SigId,
     pub(crate) sig: Sig,
-    sig_len: usize,
+    sig_est: usize,
     pub(crate) orders: Vec<Entry>,
+    /// Item 4: `Some` once built (`BucketKind::Inverted` only).
+    inverted: Option<Inverted>,
+    /// Item 5: `Some` from the first order (`BucketKind::Trie` only).
+    trie: Option<Trie>,
 }
 
-/// The index's own counters (frozen §7); the engines add theirs.
+impl SigSlot {
+    /// Items 4, 5: index the slot's newest order; the inverted index is built
+    /// over every held order when the slot first holds `max(t, 1)`.
+    fn index_newest(&mut self, kind: BucketKind) {
+        let e = self
+            .orders
+            .last()
+            .expect("conformance: an order was just stored");
+        match kind {
+            BucketKind::Scan => {}
+            BucketKind::Inverted(t) => match self.inverted.as_mut() {
+                Some(inv) => inv.push(e.seq, &e.ord),
+                None if self.orders.len() >= t.max(1) => {
+                    let mut inv = Inverted::new(e.ord.len());
+                    for held in &self.orders {
+                        inv.push(held.seq, &held.ord);
+                    }
+                    self.inverted = Some(inv);
+                }
+                None => {}
+            },
+            BucketKind::Trie => self
+                .trie
+                .get_or_insert_with(|| Trie::new(e.ord.len()))
+                .insert(e.seq, &e.ord),
+        }
+    }
+
+    /// Items 4, 5: a removed order leaves the slot's structures.
+    fn unindex(&mut self, e: &Entry) {
+        if let Some(inv) = self.inverted.as_mut() {
+            inv.remove(e.seq, &e.ord);
+        }
+        if let Some(trie) = self.trie.as_mut() {
+            trie.remove(e.seq, &e.ord);
+        }
+    }
+}
+
+/// Item 4 (P2-frozen §6, §6.1): one slot's inverted index. Positions are
+/// allocated in admission order from the build and never reused; every bitset
+/// is dense, `⌈P/64⌉` words.
+#[derive(Clone, Debug)]
+struct Inverted {
+    /// The `seq` of each position, ascending.
+    seq_of: Vec<u64>,
+    /// `⌈P/64⌉`.
+    words: usize,
+    live: Vec<u64>,
+    /// `ex[i][v]`: the positions whose count at coordinate `i` exceeds `v`,
+    /// for `v` below the largest count seen at `i`.
+    ex: Vec<Vec<Vec<u64>>>,
+}
+
+impl Inverted {
+    fn new(coords: usize) -> Self {
+        Self {
+            seq_of: Vec::new(),
+            words: 0,
+            live: Vec::new(),
+            ex: vec![Vec::new(); coords],
+        }
+    }
+
+    fn push(&mut self, seq: u64, ord: &OrdCounts) {
+        let p = self.seq_of.len();
+        self.seq_of.push(seq);
+        if p / 64 + 1 > self.words {
+            self.words = p / 64 + 1;
+            self.live.resize(self.words, 0);
+            for row in &mut self.ex {
+                for bits in row.iter_mut() {
+                    bits.resize(self.words, 0);
+                }
+            }
+        }
+        let (w, bit) = (p / 64, 1u64 << (p % 64));
+        self.live[w] |= bit;
+        for (i, row) in self.ex.iter_mut().enumerate() {
+            let c = usize::from(ord.at(i));
+            while row.len() < c {
+                row.push(vec![0; self.words]);
+            }
+            for bits in &mut row[..c] {
+                bits[w] |= bit;
+            }
+        }
+    }
+
+    fn remove(&mut self, seq: u64, ord: &OrdCounts) {
+        let p = self
+            .seq_of
+            .binary_search(&seq)
+            .expect("conformance: a held order has a position");
+        let (w, bit) = (p / 64, 1u64 << (p % 64));
+        self.live[w] &= !bit;
+        for (i, row) in self.ex.iter_mut().enumerate() {
+            for bits in &mut row[..usize::from(ord.at(i))] {
+                bits[w] &= !bit;
+            }
+        }
+    }
+
+    /// The live order `≤ q` with the smallest `seq`: the union of the
+    /// `Ex[i][q_i]` (every word of each), then the lowest set bit of `live ∧
+    /// ¬excluded`, read word by word up to the first survivor. `words` counts
+    /// the stored words read (P2-frozen §6.1).
+    fn query(&self, q: &OrdCounts, words: &mut usize) -> Option<u64> {
+        let mut excluded = vec![0u64; self.words];
+        for (i, row) in self.ex.iter().enumerate() {
+            if let Some(bits) = row.get(usize::from(q.at(i))) {
+                for (x, b) in excluded.iter_mut().zip(bits) {
+                    *x |= b;
+                }
+                *words += self.words;
+            }
+        }
+        for (w, (live, x)) in self.live.iter().zip(&excluded).enumerate() {
+            *words += 1;
+            let survivors = live & !x;
+            if survivors != 0 {
+                return Some(self.seq_of[w * 64 + survivors.trailing_zeros() as usize]);
+            }
+        }
+        None
+    }
+}
+
+/// Item 5 (P2-frozen §6): one slot's multiset trie, an arena of nodes. A node
+/// at depth `d < L` has children keyed by the count at coordinate `d`,
+/// ascending; a node at depth `L` is one order's leaf. Every node holds the
+/// smallest live `seq` below it (`u64::MAX` when none).
+#[derive(Clone, Debug)]
+struct Trie {
+    depth: usize,
+    nodes: Vec<TrieNode>,
+    free: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct TrieNode {
+    children: Vec<(u16, usize)>,
+    min_seq: u64,
+}
+
+impl TrieNode {
+    fn empty() -> Self {
+        Self {
+            children: Vec::new(),
+            min_seq: u64::MAX,
+        }
+    }
+}
+
+impl Trie {
+    fn new(depth: usize) -> Self {
+        Self {
+            depth,
+            nodes: vec![TrieNode::empty()],
+            free: Vec::new(),
+        }
+    }
+
+    fn alloc(&mut self) -> usize {
+        match self.free.pop() {
+            Some(n) => {
+                self.nodes[n] = TrieNode::empty();
+                n
+            }
+            None => {
+                self.nodes.push(TrieNode::empty());
+                self.nodes.len() - 1
+            }
+        }
+    }
+
+    fn child(&self, node: usize, v: u16) -> Result<usize, usize> {
+        self.nodes[node]
+            .children
+            .binary_search_by_key(&v, |&(k, _)| k)
+    }
+
+    /// Exact duplicates are refused before this (the scan's `cmp`), so every
+    /// leaf holds one order.
+    fn insert(&mut self, seq: u64, ord: &OrdCounts) {
+        let mut cur = 0;
+        self.nodes[0].min_seq = self.nodes[0].min_seq.min(seq);
+        for d in 0..self.depth {
+            let v = ord.at(d);
+            cur = match self.child(cur, v) {
+                Ok(j) => self.nodes[cur].children[j].1,
+                Err(j) => {
+                    let n = self.alloc();
+                    self.nodes[cur].children.insert(j, (v, n));
+                    n
+                }
+            };
+            self.nodes[cur].min_seq = self.nodes[cur].min_seq.min(seq);
+        }
+    }
+
+    /// Delete the order's leaf, prune the emptied nodes, recompute `min_seq`
+    /// up the path.
+    fn remove(&mut self, seq: u64, ord: &OrdCounts) {
+        let mut path = Vec::with_capacity(self.depth + 1);
+        let mut cur = 0;
+        path.push(cur);
+        for d in 0..self.depth {
+            let j = self
+                .child(cur, ord.at(d))
+                .expect("conformance: a held order's path is in the trie");
+            cur = self.nodes[cur].children[j].1;
+            path.push(cur);
+        }
+        debug_assert_eq!(self.nodes[cur].min_seq, seq);
+        if self.depth == 0 {
+            self.nodes[0].min_seq = u64::MAX;
+            return;
+        }
+        let mut dropped = true;
+        for d in (0..self.depth).rev() {
+            let node = path[d];
+            if dropped {
+                let j = self
+                    .child(node, ord.at(d))
+                    .expect("conformance: a held order's path is in the trie");
+                self.nodes[node].children.remove(j);
+                self.free.push(path[d + 1]);
+            }
+            dropped = d > 0 && self.nodes[node].children.is_empty();
+            if !dropped {
+                let m = self.nodes[node]
+                    .children
+                    .iter()
+                    .map(|&(_, c)| self.nodes[c].min_seq)
+                    .min()
+                    .unwrap_or(u64::MAX);
+                self.nodes[node].min_seq = m;
+            }
+        }
+    }
+
+    /// The live order `≤ q` with the smallest `seq`; `visited` counts the
+    /// nodes entered, the root included.
+    fn query(&self, q: &OrdCounts, visited: &mut usize) -> Option<u64> {
+        let mut best = u64::MAX;
+        self.descend(0, 0, q, &mut best, visited);
+        (best != u64::MAX).then_some(best)
+    }
+
+    fn descend(&self, node: usize, d: usize, q: &OrdCounts, best: &mut u64, visited: &mut usize) {
+        *visited += 1;
+        if d == self.depth {
+            *best = (*best).min(self.nodes[node].min_seq);
+            return;
+        }
+        let qd = q.at(d);
+        for &(v, c) in &self.nodes[node].children {
+            if v > qd {
+                break;
+            }
+            if self.nodes[c].min_seq < *best {
+                self.descend(c, d + 1, q, best, visited);
+            }
+        }
+    }
+}
+
+/// One shape's bucket: a slot per distinct signature of the shape, in the
+/// order the signatures were first inserted.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Bucket {
+    pub(crate) slots: Vec<SigSlot>,
+    /// Slots holding at least one order.
+    occupied: usize,
+    /// P3: rendering hash → slot indices (creations, then aliases).
+    hint: HashMap<u64, Vec<usize>>,
+}
+
+/// The index's own counters (frozen §7, P2-frozen §1–§3); the engines add
+/// theirs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactStats {
     /// The antichain flag the index ran with (forced off under `Bounded(n)`).
     pub antichain_effective: bool,
-    /// Held entries at the end.
+    /// Held orders at the end.
     pub entries: usize,
-    /// Live buckets at the end.
+    /// Buckets (shapes) with at least one held order at the end.
     pub buckets: usize,
-    /// The largest bucket size reached at any time.
+    /// The largest number of orders one signature's slot held at any time.
     pub bucket_max: usize,
-    /// Insertions that stored an entry.
+    /// Slots (signatures) with at least one held order at the end.
+    pub signatures: usize,
+    /// Every slot created: signatures inserted at least once (P1).
+    pub signatures_seen: usize,
+    /// `Sig ==` comparisons started in slot resolution (insertions and
+    /// queries; the hinted slots and the rest, P3).
+    pub sig_tests: usize,
+    /// Slots found only by the scan after the hinted ones: equal signatures
+    /// with different renderings, each then recorded in the hint (P3).
+    pub sig_aliases: usize,
+    /// Insertions that stored an order.
     pub admitted: usize,
     /// Insertions refused as exact duplicates.
     pub duplicates: usize,
@@ -285,20 +681,28 @@ pub struct CompactStats {
     pub antichain_dropped_old: usize,
     /// `cmp` calls started by insertions (the duplicate scan included).
     pub insert_tests: usize,
-    /// `cmp` calls started by queries.
+    /// `≤` tests started by queries.
     pub containment_tests: usize,
-    /// Σ payload bytes of the held entries at the end.
+    /// Coordinates read by the queries' `≤` tests (D4).
+    pub coordinates_compared: usize,
+    /// Item 4: queries answered through an inverted index, and the stored
+    /// 64-bit words they read; `Some` iff `BucketKind::Inverted`.
+    pub inverted_used: Option<usize>,
+    pub inverted_words: Option<usize>,
+    /// Item 5: trie nodes entered by queries; `Some` iff `BucketKind::Trie`.
+    pub trie_nodes_visited: Option<usize>,
+    /// Σ payload bytes of the held orders at the end.
     pub summary_bytes: usize,
-    /// Σ rendering length of the live buckets' signatures.
-    pub sig_bytes: usize,
+    /// Σ `32 × Σ_t |w_t| + 16 × T` over the occupied slots at the end.
+    pub sig_bytes_est: usize,
     /// Complete-first only (zero on the stateful engine).
     pub memo_on: bool,
     pub memo_hits: usize,
     pub memo_entries: usize,
     pub memo_clears: usize,
-    /// Distinct implementation summaries over the run, by `(SigHash,
-    /// OrdCounts)` (step 0's counter under the compact identity).
-    pub impl_distinct_summaries: usize,
+    /// Distinct implementation summaries over the run by the exact `(Sig,
+    /// OrdCounts)`, `Some` iff the `impl_distinct` knob is on (D6, P1).
+    pub impl_distinct_summaries: Option<usize>,
 }
 
 /// The outcome of an insertion (frozen §4.1).
@@ -309,34 +713,51 @@ pub(crate) enum Inserted {
     DroppedNew,
 }
 
-/// The outcome of a query (frozen §4.2).
+/// The outcome of a query (frozen §4.2, P2-frozen §1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Covers {
-    /// No bucket for the signature.
+    /// No bucket for the shape (no insertion of that shape so far).
     NoBucket,
-    /// The bucket exists; the answering entry's `seq`.
+    /// The shape's bucket exists, but the signature has no slot or an
+    /// emptied one.
+    NoSig,
+    /// The answering order's `seq`.
     Found(u64),
-    /// The bucket exists; no held entry is `≤` the query.
+    /// The signature's slot holds orders; none is `≤` the query.
     NotFound,
 }
 
-/// The bucket index (§5.1 item 3).
+/// The bucket index (§5.1 item 3, phase 2 items 1–2).
 #[derive(Clone, Debug)]
 pub(crate) struct CompactIndex {
     buckets: HashMap<SigHash, Bucket>,
     antichain: bool,
+    /// Items 4, 5, 7: the slot structure.
+    bucket: BucketKind,
     next_seq: u64,
+    next_sig_id: SigId,
     stats: CompactStats,
 }
 
 impl CompactIndex {
+    /// The slice's scan.
     pub(crate) fn new(antichain: bool) -> Self {
+        Self::with_bucket(antichain, BucketKind::Scan)
+    }
+
+    pub(crate) fn with_bucket(antichain: bool, bucket: BucketKind) -> Self {
+        let inverted = matches!(bucket, BucketKind::Inverted(_));
         Self {
             buckets: HashMap::new(),
             antichain,
+            bucket,
             next_seq: 0,
+            next_sig_id: 0,
             stats: CompactStats {
                 antichain_effective: antichain,
+                inverted_used: inverted.then_some(0),
+                inverted_words: inverted.then_some(0),
+                trie_nodes_visited: (bucket == BucketKind::Trie).then_some(0),
                 ..CompactStats::default()
             },
         }
@@ -354,7 +775,7 @@ impl CompactIndex {
         &mut self.stats
     }
 
-    /// Held entries.
+    /// Held orders.
     pub(crate) fn len(&self) -> usize {
         self.stats.entries
     }
@@ -371,114 +792,251 @@ impl CompactIndex {
         self.buckets.iter()
     }
 
-    /// Frozen §4.1. Panics on a 128-bit collision (C2).
-    pub(crate) fn insert(&mut self, s: &CompactSummary) -> Inserted {
-        let antichain = self.antichain;
-        let stats = &mut self.stats;
-        let bucket = match self.buckets.entry(s.hash) {
-            MapEntry::Occupied(e) => {
-                let b = e.into_mut();
-                assert!(
-                    b.sig == s.sig,
-                    "conformance: 128-bit signature hash collision at an insertion"
-                );
-                b
-            }
-            MapEntry::Vacant(e) => {
-                stats.buckets += 1;
-                stats.sig_bytes += s.sig_len;
-                e.insert(Bucket {
-                    sig: s.sig.clone(),
-                    sig_len: s.sig_len,
-                    orders: Vec::new(),
-                })
-            }
+    /// P3 (P2-frozen §7): the slot of `sig` in `bucket` by `Sig ==`, the
+    /// hinted slots of its rendering hash `r` first, then the others in slot
+    /// order; a slot found by the second pass is an alias, appended to `r`'s
+    /// list. Every comparison counts in `sig_tests`. Creates nothing.
+    fn find_in(
+        stats: &mut CompactStats,
+        bucket: &mut Bucket,
+        sig: &Sig,
+        r: Option<u64>,
+    ) -> Option<usize> {
+        let hinted: &[usize] = match r {
+            Some(r) => bucket.hint.get(&r).map_or(&[][..], Vec::as_slice),
+            None => &[],
         };
+        for &i in hinted {
+            stats.sig_tests += 1;
+            if bucket.slots[i].sig == *sig {
+                return Some(i);
+            }
+        }
+        let mut found = None;
+        for (i, slot) in bucket.slots.iter().enumerate() {
+            if hinted.contains(&i) {
+                continue;
+            }
+            stats.sig_tests += 1;
+            if slot.sig == *sig {
+                found = Some(i);
+                break;
+            }
+        }
+        let i = found?;
+        if let Some(r) = r {
+            bucket.hint.entry(r).or_default().push(i);
+            stats.sig_aliases += 1;
+        }
+        Some(i)
+    }
+
+    /// P1: a query's resolution, never creating — whether the shape's bucket
+    /// exists, and the signature's slot if it has one.
+    fn find(&mut self, s: &CompactSummary) -> (bool, Option<usize>) {
+        let Some(bucket) = self.buckets.get_mut(&s.hash) else {
+            return (false, None);
+        };
+        let r = render_hash(&s.sig);
+        (true, Self::find_in(&mut self.stats, bucket, &s.sig, r))
+    }
+
+    /// An insertion's resolution: the signature's slot, created (bucket and
+    /// slot, with a fresh checked id, P2) when absent.
+    fn slot_for_insert(&mut self, s: &CompactSummary) -> usize {
+        let r = render_hash(&s.sig);
+        let bucket = self.buckets.entry(s.hash).or_default();
+        if let Some(i) = Self::find_in(&mut self.stats, bucket, &s.sig, r) {
+            return i;
+        }
+        let sig_id = self.next_sig_id;
+        self.next_sig_id = sig_id
+            .checked_add(1)
+            .expect("conformance: more than u32::MAX signatures (SigId overflow)");
+        bucket.slots.push(SigSlot {
+            sig_id,
+            sig: s.sig.clone(),
+            sig_est: s.sig_est,
+            orders: Vec::new(),
+            inverted: None,
+            trie: None,
+        });
+        let i = bucket.slots.len() - 1;
+        if let Some(r) = r {
+            bucket.hint.entry(r).or_default().push(i);
+        }
+        self.stats.signatures_seen += 1;
+        i
+    }
+
+    /// Book a slot's change of occupancy (empty ↔ holding orders).
+    fn occupancy(stats: &mut CompactStats, bucket: &mut Bucket, sig_est: usize, filled: bool) {
+        if filled {
+            stats.signatures += 1;
+            stats.sig_bytes_est += sig_est;
+            if bucket.occupied == 0 {
+                stats.buckets += 1;
+            }
+            bucket.occupied += 1;
+        } else {
+            stats.signatures -= 1;
+            stats.sig_bytes_est -= sig_est;
+            bucket.occupied -= 1;
+            if bucket.occupied == 0 {
+                stats.buckets -= 1;
+            }
+        }
+    }
+
+    /// Frozen §4.1 inside the signature's slot; returns the signature's id
+    /// with the outcome.
+    pub(crate) fn insert(&mut self, s: &CompactSummary) -> (SigId, Inserted) {
+        let si = self.slot_for_insert(s);
+        let antichain = self.antichain;
+        let kind = self.bucket;
+        let stats = &mut self.stats;
+        let bucket = self
+            .buckets
+            .get_mut(&s.hash)
+            .expect("conformance: a resolved bucket exists");
+        let sig_id = bucket.slots[si].sig_id;
         let mut dominated: Vec<usize> = Vec::new();
-        for (i, held) in bucket.orders.iter().enumerate() {
+        for (i, held) in bucket.slots[si].orders.iter().enumerate() {
             stats.insert_tests += 1;
             match held.ord.cmp(&s.ord) {
                 Some(Ordering::Equal) => {
                     stats.duplicates += 1;
-                    return Inserted::Duplicate;
+                    return (sig_id, Inserted::Duplicate);
                 }
                 Some(Ordering::Less) if antichain => {
                     stats.antichain_dropped_new += 1;
-                    return Inserted::DroppedNew;
+                    return (sig_id, Inserted::DroppedNew);
                 }
                 Some(Ordering::Greater) if antichain => dominated.push(i),
                 _ => {}
             }
         }
+        let was_empty = bucket.slots[si].orders.is_empty();
         if !dominated.is_empty() {
-            let mut i = 0;
+            let slot = &mut bucket.slots[si];
             let mut removed_bytes = 0;
-            bucket.orders.retain(|e| {
-                let keep = !dominated.contains(&i);
-                if !keep {
+            let mut kept = Vec::with_capacity(slot.orders.len() - dominated.len());
+            for (i, e) in std::mem::take(&mut slot.orders).into_iter().enumerate() {
+                if dominated.contains(&i) {
                     removed_bytes += e.ord.payload_bytes();
+                    slot.unindex(&e);
+                } else {
+                    kept.push(e);
                 }
-                i += 1;
-                keep
-            });
+            }
+            slot.orders = kept;
             stats.antichain_dropped_old += dominated.len();
             stats.entries -= dominated.len();
             stats.summary_bytes -= removed_bytes;
         }
         let seq = self.next_seq;
-        self.next_seq += 1;
-        bucket.orders.push(Entry {
+        self.next_seq = seq
+            .checked_add(1)
+            .expect("conformance: more than u64::MAX insertions (seq overflow)");
+        let slot = &mut bucket.slots[si];
+        slot.orders.push(Entry {
             seq,
             ord: s.ord.clone(),
         });
+        slot.index_newest(kind);
+        let (len, sig_est) = (slot.orders.len(), slot.sig_est);
         stats.admitted += 1;
         stats.entries += 1;
         stats.summary_bytes += s.ord.payload_bytes();
-        stats.bucket_max = stats.bucket_max.max(bucket.orders.len());
-        Inserted::Stored(seq)
+        stats.bucket_max = stats.bucket_max.max(len);
+        if was_empty {
+            Self::occupancy(stats, bucket, sig_est, true);
+        }
+        (sig_id, Inserted::Stored(seq))
     }
 
-    /// Frozen §4.2: the first held entry `≤` the query answers.
-    pub(crate) fn covers(&mut self, s: &CompactSummary) -> Covers {
-        let Some(bucket) = self.buckets.get(&s.hash) else {
-            return Covers::NoBucket;
+    /// Frozen §4.2 inside the signature's slot: the first held order `≤` the
+    /// query answers (D4's exit). Returns the signature's id, `None` when it
+    /// has no slot (P1: the query creates none), with the outcome.
+    pub(crate) fn covers(&mut self, s: &CompactSummary) -> (Option<SigId>, Covers) {
+        let (existed, si) = self.find(s);
+        self.query_slot(s, existed, si)
+    }
+
+    /// The order query in an already resolved slot (one resolution per
+    /// probe, P2-frozen §1, §7).
+    fn query_slot(
+        &mut self,
+        s: &CompactSummary,
+        existed: bool,
+        si: Option<usize>,
+    ) -> (Option<SigId>, Covers) {
+        if !existed {
+            return (None, Covers::NoBucket);
+        }
+        let Some(si) = si else {
+            return (None, Covers::NoSig);
         };
-        assert!(
-            bucket.sig == s.sig,
-            "conformance: 128-bit signature hash collision at a query"
-        );
-        for held in &bucket.orders {
-            self.stats.containment_tests += 1;
-            if held.ord.le(&s.ord) {
-                return Covers::Found(held.seq);
+        let stats = &mut self.stats;
+        let slot = &self.buckets[&s.hash].slots[si];
+        if slot.orders.is_empty() {
+            return (Some(slot.sig_id), Covers::NoSig);
+        }
+        // Items 4, 5: a built structure answers, starting no `≤` test.
+        let answered = |found: Option<u64>| found.map_or(Covers::NotFound, Covers::Found);
+        if let Some(inv) = &slot.inverted {
+            let mut words = 0;
+            let found = inv.query(&s.ord, &mut words);
+            bump(&mut stats.inverted_used, 1);
+            bump(&mut stats.inverted_words, words);
+            return (Some(slot.sig_id), answered(found));
+        }
+        if let Some(trie) = &slot.trie {
+            let mut visited = 0;
+            let found = trie.query(&s.ord, &mut visited);
+            bump(&mut stats.trie_nodes_visited, visited);
+            return (Some(slot.sig_id), answered(found));
+        }
+        for held in &slot.orders {
+            stats.containment_tests += 1;
+            if held.ord.le_counted(&s.ord, &mut stats.coordinates_compared) {
+                return (Some(slot.sig_id), Covers::Found(held.seq));
             }
         }
-        Covers::NotFound
+        (Some(slot.sig_id), Covers::NotFound)
     }
 
-    /// Remove one entry by its bucket and admission number (eviction); the
-    /// bucket is dropped when it empties.
-    pub(crate) fn remove(&mut self, hash: SigHash, seq: u64) -> Option<OrdCounts> {
+    /// Remove one order by its bucket, signature id and admission number
+    /// (eviction). The slot and the bucket stay, possibly empty (P2-frozen §1).
+    pub(crate) fn remove(&mut self, hash: SigHash, sig_id: SigId, seq: u64) -> Option<OrdCounts> {
         let bucket = self.buckets.get_mut(&hash)?;
-        let i = bucket.orders.iter().position(|e| e.seq == seq)?;
-        let removed = bucket.orders.remove(i);
+        let si = bucket.slots.iter().position(|s| s.sig_id == sig_id)?;
+        let i = bucket.slots[si].orders.iter().position(|e| e.seq == seq)?;
+        let removed = bucket.slots[si].orders.remove(i);
+        bucket.slots[si].unindex(&removed);
         self.stats.entries -= 1;
         self.stats.summary_bytes -= removed.ord.payload_bytes();
-        if bucket.orders.is_empty() {
-            self.stats.sig_bytes -= bucket.sig_len;
-            self.stats.buckets -= 1;
-            self.buckets.remove(&hash);
+        if bucket.slots[si].orders.is_empty() {
+            let sig_est = bucket.slots[si].sig_est;
+            Self::occupancy(&mut self.stats, bucket, sig_est, false);
         }
         Some(removed.ord)
+    }
+}
+
+/// Add to a counter that exists only under its structure.
+fn bump(counter: &mut Option<usize>, n: usize) {
+    if let Some(c) = counter.as_mut() {
+        *c += n;
     }
 }
 
 /// The outcome of a cache probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Probe {
-    /// Answered by the memo; no bucket query.
+    /// Answered by the memo; no order query.
     MemoHit,
-    /// Answered by the bucket query (the summary joins the memo).
+    /// Answered by the order query (the summary joins the memo).
     Hit,
     Miss,
 }
@@ -489,11 +1047,11 @@ pub(crate) struct CompactCache {
     index: CompactIndex,
     capacity: Capacity,
     /// `Bounded(n)` only: the global admission order.
-    fifo: VecDeque<(SigHash, u64)>,
+    fifo: VecDeque<(SigHash, SigId, u64)>,
     /// `Bounded(n)` only: every summary evicted so far (re-admission detection).
-    evicted: HashSet<(SigHash, OrdCounts)>,
+    evicted: HashSet<MemoKey>,
     /// `Some` when the knob is on.
-    memo: Option<HashSet<(SigHash, OrdCounts)>>,
+    memo: Option<HashSet<MemoKey>>,
     admissions: usize,
     evictions: usize,
     readmissions: usize,
@@ -505,9 +1063,19 @@ impl CompactCache {
     /// The antichain runs only when requested **and** the capacity is not
     /// `Bounded(n)` (frozen §4.3).
     pub(crate) fn new(capacity: Capacity, antichain: bool, probe_memo: bool) -> Self {
+        Self::with_bucket(capacity, antichain, probe_memo, BucketKind::Scan)
+    }
+
+    /// With the slot structure of items 4, 5, 7.
+    pub(crate) fn with_bucket(
+        capacity: Capacity,
+        antichain: bool,
+        probe_memo: bool,
+        bucket: BucketKind,
+    ) -> Self {
         let effective = antichain && !matches!(capacity, Capacity::Bounded(_));
         Self {
-            index: CompactIndex::new(effective),
+            index: CompactIndex::with_bucket(effective, bucket),
             capacity,
             fifo: VecDeque::new(),
             evicted: HashSet::new(),
@@ -566,58 +1134,56 @@ impl CompactCache {
         self.index.stats_mut()
     }
 
-    /// Frozen §5 then §4.2: the memo first, then the bucket query; a bucket
-    /// hit extends the memo.
-    pub(crate) fn probe(&mut self, s: &CompactSummary) -> Probe {
-        if let Some(memo) = self.memo.as_ref() {
-            if memo.contains(&s.key()) {
-                // Gate 4 B1: the memo's identity is the hash, so a memo hit
-                // is answered only after the bucket of that hash — which
-                // every memo entry has, since the memo is extended at a hit
-                // or an admission and cleared on every eviction — carries
-                // the query's signature (frozen C2: a collision panics, it
-                // never answers).
-                let bucket = self
-                    .index
-                    .bucket(s.hash)
-                    .expect("conformance: a memoised summary has no bucket");
-                assert!(
-                    bucket.sig == s.sig,
-                    "conformance: 128-bit signature hash collision at a memo hit"
-                );
+    /// P2-frozen §1, §7, frozen §5, §4.2: the signature resolved in its
+    /// bucket (never created, P1), then — when it has a slot — the memo by
+    /// the exact `(sig_id, counts)`, then the order query; a hit extends the
+    /// memo. Returns the outcome and the signature's id, `None` when it has no
+    /// slot.
+    pub(crate) fn probe(&mut self, s: &CompactSummary) -> (Probe, Option<SigId>) {
+        let (existed, si) = self.index.find(s);
+        let sig_id = si.map(|i| self.index.buckets[&s.hash].slots[i].sig_id);
+        if let (Some(memo), Some(id)) = (self.memo.as_ref(), sig_id) {
+            if memo.contains(&(id, s.ord.clone())) {
                 self.memo_hits += 1;
-                return Probe::MemoHit;
+                return (Probe::MemoHit, sig_id);
             }
         }
-        match self.index.covers(s) {
+        let (_, covers) = self.index.query_slot(s, existed, si);
+        match covers {
             Covers::Found(_) => {
+                let id = sig_id.expect("conformance: a found order has a slot");
                 if let Some(memo) = self.memo.as_mut() {
-                    memo.insert(s.key());
+                    memo.insert((id, s.ord.clone()));
                 }
-                Probe::Hit
+                (Probe::Hit, sig_id)
             }
-            Covers::NoBucket | Covers::NotFound => Probe::Miss,
+            Covers::NoBucket | Covers::NoSig | Covers::NotFound => (Probe::Miss, sig_id),
         }
     }
 
     /// Admit a sweep's witness `witness`, found for the implementation
-    /// summary `probed`. `false` when nothing was stored: under `Zero`
-    /// (nothing is ever admitted), or because the index already holds an
-    /// equal or dominating entry — which the caller treats as today's "the
-    /// probe should have hit" assertion. Under `Bounded(n)` the oldest entry
-    /// is evicted first when the cache is full, and every eviction clears the
-    /// memo; the admission then extends the memo with `probed`.
+    /// summary `probed` (whose probe missed). `false` when nothing was stored:
+    /// under `Zero` (nothing is ever admitted), or because the index already
+    /// holds an equal or dominating order — which the caller treats as today's
+    /// "the probe should have hit" assertion. Under `Bounded(n)` the oldest
+    /// order is evicted first when the cache is full, and every eviction
+    /// clears the memo; the admission then extends the memo with `(the
+    /// witness's sig_id, probed's counts)` (R1's order; P1, P2-frozen §7).
     pub(crate) fn admit(&mut self, witness: &CompactSummary, probed: &CompactSummary) -> bool {
+        debug_assert!(
+            witness.sig == probed.sig,
+            "conformance: a sweep's witness has the probed summary's signature"
+        );
         if matches!(self.capacity, Capacity::Zero | Capacity::Bounded(0)) {
             return false;
         }
         if let Capacity::Bounded(n) = self.capacity {
             while self.index.len() >= n {
-                let Some((hash, seq)) = self.fifo.pop_front() else {
+                let Some((hash, sig_id, seq)) = self.fifo.pop_front() else {
                     break;
                 };
-                if let Some(ord) = self.index.remove(hash, seq) {
-                    self.evicted.insert((hash, ord));
+                if let Some(ord) = self.index.remove(hash, sig_id, seq) {
+                    self.evicted.insert((sig_id, ord));
                     self.evictions += 1;
                     if let Some(memo) = self.memo.as_mut() {
                         memo.clear();
@@ -626,19 +1192,19 @@ impl CompactCache {
                 }
             }
         }
-        let seq = match self.index.insert(witness) {
-            Inserted::Stored(seq) => seq,
-            Inserted::Duplicate | Inserted::DroppedNew => return false,
+        let (sig_id, seq) = match self.index.insert(witness) {
+            (id, Inserted::Stored(seq)) => (id, seq),
+            (_, Inserted::Duplicate | Inserted::DroppedNew) => return false,
         };
         self.admissions += 1;
         if matches!(self.capacity, Capacity::Bounded(_)) {
-            if self.evicted.contains(&witness.key()) {
+            if self.evicted.contains(&(sig_id, witness.ord.clone())) {
                 self.readmissions += 1;
             }
-            self.fifo.push_back((witness.hash, seq));
+            self.fifo.push_back((witness.hash, sig_id, seq));
         }
         if let Some(memo) = self.memo.as_mut() {
-            memo.insert(probed.key());
+            memo.insert((sig_id, probed.ord.clone()));
         }
         true
     }

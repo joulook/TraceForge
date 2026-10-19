@@ -51,7 +51,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::conformance::compact::{CompactCache, CompactSummary, OrdCounts, Probe, SigHash};
+use crate::conformance::compact::{CompactCache, CompactSummary, OrdCounts, Probe};
 use crate::conformance::config::{Capacity, CompletionCover, ConfConfig, Engine, IndexKind};
 use crate::conformance::flat;
 use crate::conformance::report::FlatCounters;
@@ -65,7 +65,7 @@ use crate::conformance::report::{
     build_report_for, replay_snapshot, CFirstCounters, ConfCounters, ConfError, ConfNote,
     ConfOutcome, ConfReport, ConfVerdict, Diagnostics, ReplaySnapshot, SearchEnd, SpecErrFreedom,
 };
-use crate::conformance::sig::{cone_from, covered, Summary, VisOrder};
+use crate::conformance::sig::{cone_from, covered, SigBuckets, Summary, VisOrder};
 use crate::conformance::stateful::{enumerate, summarise, EnumRun, Enumerated};
 use crate::conformance::witness::WitnessCache;
 use crate::event::Event;
@@ -180,9 +180,12 @@ struct SinkState {
     /// `COMPACT-INDEX` §5.1 item 4(b): `Some` iff `index = Compact`; then
     /// `witnesses` above stays empty.
     compact: Option<CompactCache>,
-    /// `COMPACT-INDEX` frozen §6: distinct implementation summaries by
-    /// `(SigHash, OrdCounts)`, `Compact` only.
-    impl_seen: std::collections::HashSet<(SigHash, OrdCounts)>,
+    /// `COMPACT-INDEX` frozen §6: distinct implementation summaries by the
+    /// exact `(Sig, OrdCounts)` (phase 2 P1), `Compact` only.
+    impl_seen: SigBuckets<std::collections::HashSet<OrdCounts>>,
+    /// Phase 2 D6: the distinct count, `Some` iff `index = Compact` and the
+    /// `impl_distinct` knob is on.
+    impl_distinct: Option<usize>,
     counters: CFirstCounters,
     /// Summed as a `Duration` and converted once (truncating per sweep would
     /// undercount sub-millisecond sweeps).
@@ -390,8 +393,11 @@ pub(crate) fn run_with(
         // `COMPACT-INDEX` §5.1 item 4(b): the bucket index with the capacity
         // rules and the memo; the antichain off under `Bounded(n)` (frozen §4.3).
         compact: (cc.index == IndexKind::Compact)
-            .then(|| CompactCache::new(cc.witness_cache, cc.antichain, cc.probe_memo)),
-        impl_seen: std::collections::HashSet::new(),
+            .then(|| {
+                CompactCache::with_bucket(cc.witness_cache, cc.antichain, cc.probe_memo, cc.bucket)
+            }),
+        impl_seen: SigBuckets::new(),
+        impl_distinct: (cc.index == IndexKind::Compact && cc.impl_distinct).then_some(0),
         counters: CFirstCounters::default(),
         sweep_time: std::time::Duration::ZERO,
         reports: Vec::new(),
@@ -432,14 +438,6 @@ pub(crate) fn run_with(
             {
                 let mut st = state.borrow_mut();
                 st.counters.impl_graphs += 1;
-                if let Some(s) = cs.as_ref() {
-                    if st.impl_seen.insert(s.key()) {
-                        st.counters
-                            .compact
-                            .get_or_insert_with(Default::default)
-                            .impl_distinct_summaries += 1;
-                    }
-                }
                 // `P4-MIXED` M8, in the implementation completion sink.
                 let inv = crate::conformance::ctx::invisible_ops_of_visible_threads(g, &visible);
                 st.counters.invisible_ops_of_visible_threads =
@@ -449,7 +447,8 @@ pub(crate) fn run_with(
                 }
             }
 
-            // ln:ccache — W first.
+            // ln:ccache — W first. Under `Compact` an admission for this
+            // probe extends the memo with the probed summary `cs` (P1).
             let hit = {
                 let mut st = state.borrow_mut();
                 st.counters.cache_probes += 1;
@@ -458,7 +457,16 @@ pub(crate) fn run_with(
                     // bucket query; `cache_tests` is read off the index at
                     // the end of the run.
                     let cache = st.compact.as_mut().expect("conformance: the compact cache is set");
-                    matches!(cache.probe(s), Probe::MemoHit | Probe::Hit)
+                    let (outcome, _) = cache.probe(s);
+                    if st.impl_distinct.is_some()
+                        && st
+                            .impl_seen
+                            .entry(s.sig.clone(), std::collections::HashSet::new)
+                            .insert(s.ord.clone())
+                    {
+                        *st.impl_distinct.as_mut().expect("conformance: the count is on") += 1;
+                    }
+                    matches!(outcome, Probe::MemoHit | Probe::Hit)
                 } else {
                     let summary = lazy.as_ref().expect("conformance: the current summary is set");
                     let (found, tests) = st.witnesses.probe_covered_counted(summary);
@@ -563,7 +571,7 @@ pub(crate) fn run_with(
                     // ln:cfound — the stopping witness joins W. The graph is
                     // the sweep's completion-gate capture, one thread later,
                     // which is what `assume_finished_at_gate` asks for.
-                    let inserted = if let Some(s) = cs.as_ref() {
+                    let inserted = if cs.is_some() {
                         // `COMPACT-INDEX` frozen §4.3, §5: the witness's
                         // compact summary joins the index; the probed
                         // implementation summary joins the memo.
@@ -571,7 +579,11 @@ pub(crate) fn run_with(
                         st.compact
                             .as_mut()
                             .expect("conformance: the compact cache is set")
-                            .admit(&ws, s)
+                            .admit(
+                                &ws,
+                                cs.as_ref()
+                                    .expect("conformance: a compact probe preceded the sweep"),
+                            )
                     } else {
                         let exec = CompleteExecution::assume_finished_at_gate(&m);
                         st.witnesses.admit_from_sweep(exec).unwrap_or_else(|e| {
@@ -653,11 +665,7 @@ pub(crate) fn run_with(
         st.counters.evictions = cache.evictions();
         st.counters.readmissions = cache.readmissions();
         let mut stats = cache.stats();
-        stats.impl_distinct_summaries = st
-            .counters
-            .compact
-            .as_ref()
-            .map_or(0, |c| c.impl_distinct_summaries);
+        stats.impl_distinct_summaries = st.impl_distinct;
         st.counters.cache_tests = stats.containment_tests;
         st.counters.witnesses = cache.len();
         st.counters.compact = Some(stats);
@@ -688,7 +696,8 @@ impl Default for SinkState {
         Self {
             witnesses: WitnessCache::new(Vec::new()),
             compact: None,
-            impl_seen: std::collections::HashSet::new(),
+            impl_seen: SigBuckets::new(),
+            impl_distinct: None,
             counters: CFirstCounters::default(),
             sweep_time: std::time::Duration::ZERO,
             reports: Vec::new(),

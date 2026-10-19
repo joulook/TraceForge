@@ -478,13 +478,14 @@ fn step0_impl_distinct_summaries() {
         GridEngine::Stateful,
         crate::conformance::selector::Selector::Ltr,
     )
-    .index(index);
+    .index(index)
+    .impl_distinct(true);
     let cc = gc.conf_config(&f);
     let t0 = std::time::Instant::now();
     let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
     let c = &o.counters;
     note!(
-        "STEP0\t{name}\t{kind}\tlabel {}\timpl_distinct_summaries {}\timpl_graphs {}\tspec_graphs {}\torders_held {}\tsignatures {}\treports {}\twall_ms {}",
+        "STEP0\t{name}\t{kind}\tlabel {}\timpl_distinct_summaries {:?}\timpl_graphs {}\tspec_graphs {}\torders_held {}\tsignatures {}\treports {}\twall_ms {}",
         gc.label(),
         c.impl_distinct_summaries,
         c.impl_graphs,
@@ -511,7 +512,8 @@ fn slice_configs() -> [(&'static str, GridConfig); 3] {
             x1_config(GridEngine::Stateful, Selector::Ltr)
                 .index(IndexKind::Compact)
                 .antichain(true)
-                .probe_memo(true),
+                .probe_memo(true)
+                .impl_distinct(true),
         ),
         (
             "row2",
@@ -520,7 +522,8 @@ fn slice_configs() -> [(&'static str, GridConfig); 3] {
                 .quiet(true)
                 .index(IndexKind::Compact)
                 .antichain(true)
-                .probe_memo(true),
+                .probe_memo(true)
+                .impl_distinct(true),
         ),
         (
             "row3",
@@ -529,7 +532,8 @@ fn slice_configs() -> [(&'static str, GridConfig); 3] {
                 .quiet(true)
                 .index(IndexKind::Compact)
                 .antichain(false)
-                .probe_memo(true),
+                .probe_memo(true)
+                .impl_distinct(true),
         ),
     ]
 }
@@ -541,7 +545,13 @@ fn stats_json(s: &crate::conformance::compact::CompactStats) -> serde_json::Valu
         "antichain_dropped_new": s.antichain_dropped_new,
         "antichain_dropped_old": s.antichain_dropped_old, "insert_tests": s.insert_tests,
         "containment_tests": s.containment_tests, "summary_bytes": s.summary_bytes,
-        "sig_bytes": s.sig_bytes, "memo_on": s.memo_on, "memo_hits": s.memo_hits,
+        "sig_bytes_est": s.sig_bytes_est, "signatures": s.signatures,
+        "signatures_seen": s.signatures_seen, "sig_tests": s.sig_tests,
+        "sig_aliases": s.sig_aliases,
+        "inverted_used": s.inverted_used, "inverted_words": s.inverted_words,
+        "trie_nodes_visited": s.trie_nodes_visited,
+        "coordinates_compared": s.coordinates_compared,
+        "memo_on": s.memo_on, "memo_hits": s.memo_hits,
         "memo_entries": s.memo_entries, "memo_clears": s.memo_clears,
         "impl_distinct_summaries": s.impl_distinct_summaries,
     })
@@ -553,9 +563,35 @@ fn stats_json(s: &crate::conformance::compact::CompactStats) -> serde_json::Valu
 #[test]
 #[ignore]
 fn engine_counters_on_the_size2_cells() {
-    for name in SIZE2_CELLS {
+    // Phase 2: `ENGINE_CELLS` (comma list of slice cells) and `ENGINE_ROWS`
+    // (comma list of `row1`..`row3`) narrow the run; the five size-2 cells
+    // and all three rows when unset.
+    let cells: Vec<String> = std::env::var("ENGINE_CELLS")
+        .map(|v| v.split(',').map(str::to_owned).collect())
+        .unwrap_or_else(|_| SIZE2_CELLS.iter().map(|s| (*s).to_owned()).collect());
+    let rows = std::env::var("ENGINE_ROWS").unwrap_or_else(|_| "row1,row2,row3".to_owned());
+    // Items 4-5: `ENGINE_BUCKET` = `inverted:<t>` or `trie` puts that slot
+    // structure on every row (the scan when unset).
+    let bucket = match std::env::var("ENGINE_BUCKET").ok().as_deref() {
+        None | Some("scan") => crate::conformance::config::BucketKind::Scan,
+        Some("trie") => crate::conformance::config::BucketKind::Trie,
+        Some(v) => crate::conformance::config::BucketKind::Inverted(
+            v.strip_prefix("inverted:")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or_else(|| panic!("conformance: ENGINE_BUCKET {v}")),
+        ),
+    };
+    for name in &cells {
+        assert!(
+            SLICE_CELLS.contains(&name.as_str()),
+            "conformance: not a slice cell: {name}"
+        );
         let f = fx(name);
-        for (row, gc) in slice_configs() {
+        for (row, gc) in slice_configs()
+            .into_iter()
+            .filter(|(r, _)| rows.split(',').any(|x| x == *r))
+        {
+            let gc = gc.bucket(bucket);
             let cc = gc.conf_config(&f);
             let j = if gc.engine == GridEngine::Stateful {
                 let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
@@ -954,14 +990,14 @@ fn m1_the_antichain_in_the_index() {
     );
     let (zero, one, two) = (vec![0u8; l], vec![1u8; l], vec![2u8; l]);
     let mut ix = CompactIndex::new(true);
-    assert_eq!(ix.insert(&syn(&base, &one)), Inserted::Stored(0));
+    assert_eq!(ix.insert(&syn(&base, &one)).1, Inserted::Stored(0));
     assert_eq!(
-        ix.insert(&syn(&base, &two)),
+        ix.insert(&syn(&base, &two)).1,
         Inserted::DroppedNew,
         "conformance: one ≤ two drops two"
     );
     assert_eq!(
-        ix.insert(&syn(&base, &one)),
+        ix.insert(&syn(&base, &one)).1,
         Inserted::Duplicate,
         "conformance: a duplicate is not a drop"
     );
@@ -985,11 +1021,14 @@ fn m1_the_antichain_in_the_index() {
         v[2] = 1;
         v
     };
-    assert!(matches!(ix.insert(&syn(&base, &a)), Inserted::Stored(_)));
-    assert!(matches!(ix.insert(&syn(&base, &b)), Inserted::Stored(_)));
-    assert!(matches!(ix.insert(&syn(&base, &c)), Inserted::Stored(_)));
+    assert!(matches!(ix.insert(&syn(&base, &a)).1, Inserted::Stored(_)));
+    assert!(matches!(ix.insert(&syn(&base, &b)).1, Inserted::Stored(_)));
+    assert!(matches!(ix.insert(&syn(&base, &c)).1, Inserted::Stored(_)));
     assert_eq!(ix.stats().bucket_max, 3);
-    assert!(matches!(ix.insert(&syn(&base, &zero)), Inserted::Stored(3)));
+    assert!(matches!(
+        ix.insert(&syn(&base, &zero)).1,
+        Inserted::Stored(3)
+    ));
     let s = ix.stats().clone();
     assert_eq!(
         (
@@ -1006,8 +1045,12 @@ fn m1_the_antichain_in_the_index() {
         s.summary_bytes, l,
         "conformance: one held entry of l u8 counts"
     );
-    assert_eq!(s.sig_bytes, base.sig_len, "conformance: one live bucket");
-    assert_eq!(ix.covers(&syn(&base, &two)), Covers::Found(3));
+    assert_eq!(
+        (s.sig_bytes_est, s.signatures, s.signatures_seen),
+        (base.sig_est, 1, 1),
+        "conformance: one live slot"
+    );
+    assert_eq!(ix.covers(&syn(&base, &two)).1, Covers::Found(3));
     assert_eq!(ix.stats().containment_tests, 1);
     // Query order: antichain off, a then b held; a query above both is
     // answered by the first in insertion order.
@@ -1015,17 +1058,17 @@ fn m1_the_antichain_in_the_index() {
     ix.insert(&syn(&base, &a));
     ix.insert(&syn(&base, &b));
     assert_eq!(
-        ix.covers(&syn(&base, &one)),
+        ix.covers(&syn(&base, &one)).1,
         Covers::Found(0),
         "conformance: the first held entry answers"
     );
-    assert_eq!(ix.covers(&syn(&base, &unit(l, 1))), Covers::Found(1));
+    assert_eq!(ix.covers(&syn(&base, &unit(l, 1))).1, Covers::Found(1));
     assert_eq!(
         ix.stats().containment_tests,
         3,
         "conformance: 1 + 2 comparisons"
     );
-    assert_eq!(ix.covers(&syn(&base, &zero)), Covers::NotFound);
+    assert_eq!(ix.covers(&syn(&base, &zero)).1, Covers::NotFound);
     assert_eq!(ix.stats().containment_tests, 5);
 }
 
@@ -1038,9 +1081,15 @@ fn m2_the_index_without_the_antichain() {
     let l = base.ord.len();
     let (one, two) = (vec![1u8; l], vec![2u8; l]);
     let mut ix = CompactIndex::new(false);
-    assert!(matches!(ix.insert(&syn(&base, &one)), Inserted::Stored(_)));
-    assert!(matches!(ix.insert(&syn(&base, &two)), Inserted::Stored(_)));
-    assert_eq!(ix.insert(&syn(&base, &two)), Inserted::Duplicate);
+    assert!(matches!(
+        ix.insert(&syn(&base, &one)).1,
+        Inserted::Stored(_)
+    ));
+    assert!(matches!(
+        ix.insert(&syn(&base, &two)).1,
+        Inserted::Stored(_)
+    ));
+    assert_eq!(ix.insert(&syn(&base, &two)).1, Inserted::Duplicate);
     let s = ix.stats().clone();
     assert_eq!(
         (
@@ -1074,27 +1123,27 @@ fn m3_fifo_eviction_clears_the_memo_in_r1_order() {
     // g_i = m_i (equal orders cover).
     let (g1, g2, g3) = (m1.clone(), m2.clone(), m3.clone());
     let mut c = CompactCache::new(Capacity::Bounded(2), true, true);
-    assert_eq!(c.probe(&g1), Probe::Miss);
+    assert_eq!(c.probe(&g1).0, Probe::Miss);
     assert!(c.admit(&m1, &g1));
-    assert_eq!(c.probe(&g1), Probe::MemoHit);
-    assert_eq!(c.probe(&g2), Probe::Miss);
+    assert_eq!(c.probe(&g1).0, Probe::MemoHit);
+    assert_eq!(c.probe(&g2).0, Probe::Miss);
     assert!(c.admit(&m2, &g2));
     assert_eq!((c.len(), c.memo_len(), c.evictions()), (2, 2, 0));
-    assert_eq!(c.probe(&g3), Probe::Miss);
+    assert_eq!(c.probe(&g3).0, Probe::Miss);
     assert!(c.admit(&m3, &g3));
     assert_eq!(
         (c.len(), c.memo_len(), c.evictions(), c.stats().memo_clears),
         (2, 1, 1, 1),
         "conformance: evict m1, clear, insert m3, memo = {{g3}}"
     );
-    assert_eq!(c.probe(&g3), Probe::MemoHit);
+    assert_eq!(c.probe(&g3).0, Probe::MemoHit);
     assert_eq!(
-        c.probe(&g1),
+        c.probe(&g1).0,
         Probe::Miss,
         "conformance: m1 evicted and g1 forgotten by the memo"
     );
     assert_eq!(
-        c.probe(&g2),
+        c.probe(&g2).0,
         Probe::Hit,
         "conformance: m2 still held: a bucket hit"
     );
@@ -1128,7 +1177,7 @@ fn m4_the_memo_is_extended_at_hits_and_admissions_only() {
     let g2 = syn(&base, &g2v); // m ≤ g2, g2 ≠ g1
     let gx = syn(&base, &unit(l, 1)); // not covered by m
     let mut c = CompactCache::new(Capacity::Unbounded, true, true);
-    assert_eq!(c.probe(&gx), Probe::Miss);
+    assert_eq!(c.probe(&gx).0, Probe::Miss);
     assert_eq!(c.memo_len(), 0, "conformance: a miss is not memoised");
     assert!(c.admit(&m, &g1));
     assert_eq!(
@@ -1136,17 +1185,17 @@ fn m4_the_memo_is_extended_at_hits_and_admissions_only() {
         1,
         "conformance: extended at the admission with the probed summary"
     );
-    assert_eq!(c.probe(&g2), Probe::Hit);
+    assert_eq!(c.probe(&g2).0, Probe::Hit);
     assert_eq!(c.memo_len(), 2, "conformance: extended at the bucket hit");
-    assert_eq!(c.probe(&g2), Probe::MemoHit);
-    assert_eq!(c.probe(&gx), Probe::Miss);
+    assert_eq!(c.probe(&g2).0, Probe::MemoHit);
+    assert_eq!(c.probe(&gx).0, Probe::Miss);
     let s = c.stats();
     assert_eq!((s.memo_hits, s.memo_entries, s.memo_on), (1, 2, true));
     let mut off = CompactCache::new(Capacity::Unbounded, true, false);
     assert!(off.admit(&m, &g1));
-    assert_eq!(off.probe(&g2), Probe::Hit);
+    assert_eq!(off.probe(&g2).0, Probe::Hit);
     assert_eq!(
-        off.probe(&g2),
+        off.probe(&g2).0,
         Probe::Hit,
         "conformance: no memo: the bucket answers again"
     );
@@ -1209,7 +1258,7 @@ fn m6_zero_admits_nothing() {
     let mut c = CompactCache::new(Capacity::Zero, true, true);
     assert!(!c.admit(&m, &m), "conformance: Zero admits nothing");
     assert_eq!((c.len(), c.memo_len()), (0, 0));
-    assert_eq!(c.probe(&m), Probe::Miss);
+    assert_eq!(c.probe(&m).0, Probe::Miss);
     let f = fx("apps/a3/fifo/spec/k2q2");
     let run = |k: IndexKind| {
         let cc = x1_config(GridEngine::CompleteFirst, Selector::Ltr)
@@ -1339,8 +1388,9 @@ fn panic_text<R>(f: impl FnOnce() -> R) -> Option<String> {
     }
 }
 
-/// A summary with `base`'s hash and order but another fixture's `Sig`: a
-/// forged 128-bit collision with equal counts (gate 4 B1).
+/// A summary with `base`'s bucket hash and counts but another fixture's
+/// `Sig` (and its byte estimate): two signatures in one bucket with equal
+/// counts, the case a hash- or shape-only identity would confuse.
 fn forged(base: &CompactSummary) -> CompactSummary {
     let other = real_summary("2pc/leader/conf/n2");
     assert!(
@@ -1351,68 +1401,118 @@ fn forged(base: &CompactSummary) -> CompactSummary {
         hash: base.hash,
         ord: base.ord.clone(),
         sig: other.sig,
-        sig_len: other.sig_len,
+        sig_est: other.sig_est,
     }
 }
 
-/// m8 (gate 4 B1, frozen §3.3 C2, §5 C3): a forged collision (equal hash,
-/// equal counts, unequal `Sig`) panics and never answers: at a memo entry
-/// made by an admission, at one made by a bucket hit, at an insertion and at
-/// a query; with the memo off it reaches the query's check.
+/// m8 (phase 2 D1; P2-frozen §1, §5, §7; replaces the slice's
+/// collision-panic test): a summary with an equal bucket hash and equal
+/// counts but an unequal `Sig` is a **signature miss**, never an answer and
+/// never a panic — at a memo probe after an admission and after a bucket hit
+/// (`(Miss, None)`), and at a bucket query (`(None, NoSig)`: no `≤` test and,
+/// P1, no slot). Stored, it gets its own slot, and each summary then answers
+/// only from its own slot; through the rendering hint (P3) each resolution of
+/// an existing slot costs one `Sig` test and no alias arises.
 #[test]
-fn m8_a_forged_collision_panics_at_the_memo_the_insert_and_the_query() {
+fn m8_a_forged_equal_hash_different_sig_is_a_signature_miss() {
     let base = real_summary(MECH_CELL);
     let bad = forged(&base);
-    let want = |site: &str, got: Option<String>| {
-        let m = got.unwrap_or_else(|| panic!("conformance: {site}: returned, no panic"));
-        assert!(
-            m.contains("128-bit signature hash collision"),
-            "conformance: {site}: another panic: {m}"
-        );
-        m
-    };
-    // A memo entry made by an admission.
+    // The memo after an admission.
     let mut c = CompactCache::new(Capacity::Unbounded, true, true);
-    assert!(c.admit(&base, &base), "conformance: admitted");
-    assert_eq!(c.probe(&base), Probe::MemoHit, "conformance: control");
-    let m = want("memo (admission)", panic_text(|| c.probe(&bad)));
-    assert!(
-        m.contains("at a memo hit"),
-        "conformance: the memo site: {m}"
+    assert_eq!(
+        c.probe(&base),
+        (Probe::Miss, None),
+        "conformance: empty cache"
     );
-    // A memo entry made by a bucket hit (the witness is not the probe).
+    assert!(c.admit(&base, &base), "conformance: admitted");
+    assert_eq!(
+        c.probe(&base),
+        (Probe::MemoHit, Some(0)),
+        "conformance: control"
+    );
+    assert_eq!(
+        c.probe(&bad),
+        (Probe::Miss, None),
+        "conformance: memo (admission), forged"
+    );
+    // The memo after a bucket hit (w ≤ q).
     let w = syn(&base, &vec![0u8; base.ord.len()]);
     let q = syn(&base, &vec![1u8; base.ord.len()]);
     let mut c = CompactCache::new(Capacity::Unbounded, true, true);
+    assert_eq!(c.probe(&w).0, Probe::Miss);
     assert!(c.admit(&w, &w), "conformance: admitted");
-    assert_eq!(c.probe(&q), Probe::Hit, "conformance: a bucket hit");
+    assert_eq!(
+        c.probe(&q),
+        (Probe::Hit, Some(0)),
+        "conformance: a bucket hit"
+    );
+    assert_eq!(
+        c.probe(&q),
+        (Probe::MemoHit, Some(0)),
+        "conformance: memoised"
+    );
     let bad_q = CompactSummary {
         ord: q.ord.clone(),
         ..bad.clone()
     };
-    let m = want("memo (bucket hit)", panic_text(|| c.probe(&bad_q)));
-    assert!(
-        m.contains("at a memo hit"),
-        "conformance: the memo site: {m}"
+    assert_eq!(
+        c.probe(&bad_q),
+        (Probe::Miss, None),
+        "conformance: memo (bucket hit), forged"
     );
-    // The memo off: the query's check.
-    let mut c = CompactCache::new(Capacity::Unbounded, true, false);
-    assert!(c.admit(&base, &base), "conformance: admitted");
-    let m = want("probe (memo off)", panic_text(|| c.probe(&bad)));
-    assert!(m.contains("at a query"), "conformance: the query site: {m}");
-    // The index directly: insertion and query.
+    // The index.
     let mut ix = CompactIndex::new(true);
-    assert_eq!(ix.insert(&base), Inserted::Stored(0));
-    let m = want("insert", panic_text(|| ix.insert(&bad)));
-    assert!(
-        m.contains("at an insertion"),
-        "conformance: the insertion site: {m}"
+    assert_eq!(ix.insert(&base), (0, Inserted::Stored(0)));
+    let t0 = ix.stats().containment_tests;
+    assert_eq!(
+        ix.covers(&bad),
+        (None, Covers::NoSig),
+        "conformance: a signature miss, no slot"
     );
-    let mut ix = CompactIndex::new(false);
-    assert_eq!(ix.insert(&base), Inserted::Stored(0));
-    assert_eq!(ix.covers(&base), Covers::Found(0), "conformance: control");
-    let m = want("covers", panic_text(|| ix.covers(&bad)));
-    assert!(m.contains("at a query"), "conformance: the query site: {m}");
+    let s = ix.stats().clone();
+    assert_eq!(s.containment_tests, t0, "conformance: no test on a miss");
+    assert_eq!(
+        (
+            s.buckets,
+            s.signatures,
+            s.signatures_seen,
+            s.sig_tests,
+            s.sig_aliases
+        ),
+        (1, 1, 1, 1, 0),
+        "conformance: one bucket, one slot; one Sig test; the query created nothing"
+    );
+    assert_eq!(
+        ix.insert(&bad),
+        (1, Inserted::Stored(1)),
+        "conformance: its own slot, not a duplicate of base's counts"
+    );
+    assert_eq!(ix.covers(&base), (Some(0), Covers::Found(0)));
+    assert_eq!(ix.covers(&bad), (Some(1), Covers::Found(1)));
+    let s = ix.stats().clone();
+    assert_eq!(
+        (
+            s.buckets,
+            s.signatures,
+            s.signatures_seen,
+            s.entries,
+            s.duplicates
+        ),
+        (1, 2, 2, 2, 0)
+    );
+    assert_eq!(
+        s.sig_bytes_est,
+        base.sig_est + bad.sig_est,
+        "conformance: the two occupied slots"
+    );
+    // P2-derived §13: insert base 0; covers bad 1 (second pass, miss);
+    // insert bad 1 (second pass, new slot); covers base 1 and covers bad 1
+    // (each through its hint).
+    assert_eq!(
+        (s.sig_tests, s.sig_aliases),
+        (4, 0),
+        "conformance: Sig == comparisons"
+    );
 }
 
 /// The single graph of: `a` sends `n` messages to `b`, which receives none
@@ -1508,4 +1608,1156 @@ fn m9_the_u16_bound_refuses_65536_visible_events() {
             "conformance: {site}: another panic: {m}"
         );
     }
+}
+
+/// The streaming oracle trace (phase 2, D4's size-3 lock reference; approved
+/// 2026-10-19): `oracle_trace_dump`'s lines for one cell
+/// (`$COMPACT_STREAM_CELL`), written as each completion arrives instead of
+/// from kept graphs, so the lock's ~330 k implementation completions are
+/// never held. The two enumerations are `stateful::run_with`'s (Spec with
+/// `max_iterations` lifted, then Impl with the cell's configuration), so the
+/// order is the in-memory dump's. A summary already written on its side is
+/// written again as `{"side", "idx", "ref"}`, `ref` the index of its first
+/// occurrence (the order stays exact; the file stays small).
+#[test]
+#[ignore]
+fn oracle_trace_stream() {
+    use crate::conformance::ctx::{CompletionSink, ConfMode, SinkVerdict};
+    use crate::conformance::stateful::{enumerate, EnumRun};
+    use std::io::Write;
+    let (Ok(dir), Ok(name)) = (
+        std::env::var("COMPACT_DUMP_DIR"),
+        std::env::var("COMPACT_STREAM_CELL"),
+    ) else {
+        return;
+    };
+    std::fs::create_dir_all(&dir).expect("conformance: the dump directory");
+    let f = fx(&name);
+    let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+    let path = std::path::Path::new(&dir).join(format!("{}.jsonl", name.replace('/', "_")));
+    let out = std::rc::Rc::new(std::cell::RefCell::new(std::io::BufWriter::new(
+        std::fs::File::create(&path).expect("conformance: the dump file"),
+    )));
+    let mut counts = Vec::new();
+    for side in ["spec", "impl"] {
+        let seen: std::rc::Rc<
+            std::cell::RefCell<(usize, std::collections::HashMap<String, usize>)>,
+        > = Default::default();
+        let sink: CompletionSink = {
+            let (out, seen, vis) = (
+                std::rc::Rc::clone(&out),
+                std::rc::Rc::clone(&seen),
+                f.visible.clone(),
+            );
+            Box::new(move |g: &ExecutionGraph, _| {
+                let w = wobs(g, &vis).expect("conformance: wobs");
+                let s = Summary::of(
+                    CompleteExecution::try_finished(g).expect("conformance: complete"),
+                    &w,
+                    &vis,
+                )
+                .expect("conformance: a summary");
+                let mut st = seen.borrow_mut();
+                let i = st.0;
+                st.0 += 1;
+                let key = dump_line(side, 0, &s, &vis);
+                let line = match st.1.get(&key) {
+                    Some(&first) => {
+                        serde_json::json!({"side": side, "idx": i, "ref": first}).to_string()
+                    }
+                    None => {
+                        st.1.insert(key, i);
+                        dump_line(side, i, &s, &vis)
+                    }
+                };
+                writeln!(out.borrow_mut(), "{line}").expect("conformance: a dump line");
+                SinkVerdict::Continue
+            })
+        };
+        let mut config = cc.config.clone();
+        if side == "spec" {
+            config.max_iterations = None;
+        }
+        let program = if side == "spec" {
+            &f.specification
+        } else {
+            &f.implementation
+        };
+        enumerate(
+            EnumRun {
+                config,
+                visible: f.visible.clone(),
+                mode: ConfMode::Enumerate,
+                sink,
+                cut: false,
+                stop_at_first_report: false,
+                gate_sink: None,
+            },
+            program,
+        );
+        let st = seen.borrow();
+        counts.push((side, st.0, st.1.len()));
+    }
+    out.borrow_mut().flush().expect("conformance: flush");
+    note!("stream {name}: {counts:?} → {}", path.display());
+}
+
+// =========================================================================
+// Phase 2 items 1–3: the D1, D4, D6 and D7 mechanism fixtures
+// (P2-derived.md §1, §2, §3, §6, §8, written before the code)
+// =========================================================================
+
+/// A test-local fixture around a program pair, `Bag` model, seed 0, the grid's
+/// thread threshold.
+fn local_fixture(
+    name: &str,
+    spec: crate::conformance::grid::Prog,
+    imp: crate::conformance::grid::Prog,
+    vis: &[&str],
+) -> Fixture {
+    let mut f = fx(MECH_CELL);
+    f.name = name.to_owned();
+    f.specification = spec;
+    f.implementation = imp;
+    f.visible = vis.iter().map(|s| (*s).to_owned()).collect();
+    f.config = crate::conformance::grid::cfg(crate::ConsType::Bag);
+    f
+}
+
+/// `P(v₁, …)` (P2-derived §1.1): visible `a` and `r`; `r` receives one `i32`
+/// and forwards it to `a`; one invisible sender per value sends it to `r`.
+/// One complete graph per value; all share the shape and the counts
+/// `[2, 0, 0]`, and differ in `Sig` exactly when the values differ.
+fn p_prog(vals: &'static [i32]) -> crate::conformance::grid::Prog {
+    crate::conformance::grid::prog(move || {
+        let a = crate::thread::Builder::new()
+            .name("a".to_owned())
+            .spawn(|| {
+                let _: i32 = crate::recv_msg_block();
+            })
+            .unwrap();
+        let aid = a.thread().id();
+        let r = crate::thread::Builder::new()
+            .name("r".to_owned())
+            .spawn(move || {
+                let x: i32 = crate::recv_msg_block();
+                crate::send_msg(aid, x);
+            })
+            .unwrap();
+        let rid = r.thread().id();
+        for (k, v) in vals.iter().enumerate() {
+            let v = *v;
+            crate::thread::Builder::new()
+                .name(format!("s{k}"))
+                .spawn(move || crate::send_msg(rid, v))
+                .unwrap();
+        }
+    })
+}
+
+/// The compact summaries of a program's complete graphs, in the stateful
+/// engine's (Current, `keep_graphs`) completion order: `(spec, impl)`.
+fn kept_summaries(f: &Fixture) -> (Vec<CompactSummary>, Vec<CompactSummary>) {
+    let cc = GridConfig::new(GridEngine::Stateful).conf_config(f);
+    let o = stateful::run_with(&cc, &f.implementation, &f.specification, true);
+    let sum = |gs: &[ExecutionGraph]| -> Vec<CompactSummary> {
+        gs.iter()
+            .map(|g| CompactSummary::at_completion(g, &f.visible, "test"))
+            .collect()
+    };
+    (sum(&o.kept_spec_graphs), sum(&o.kept_impl_graphs))
+}
+
+fn sverify_pair(
+    f: &Fixture,
+) -> (
+    crate::conformance::stateful::StatefulOutcome,
+    crate::conformance::stateful::StatefulOutcome,
+) {
+    use crate::conformance::config::IndexKind;
+    let run = |k: IndexKind| {
+        let cc = GridConfig::new(GridEngine::Stateful)
+            .index(k)
+            .antichain(true)
+            .impl_distinct(true)
+            .conf_config(f);
+        stateful::run_with(&cc, &f.implementation, &f.specification, false)
+    };
+    (run(IndexKind::Current), run(IndexKind::Compact))
+}
+
+/// m10 (P2-derived §1.2, §8; P2-frozen §4): `SVerify-S` on two signatures of
+/// one shape. `P(1,2)` against itself: one bucket, two slots, each query
+/// answered from its own slot. `P(1,2)` against `P(1,3)`: `G(3)` finds the
+/// bucket, no slot of its signature: `NoSig`, no `≤` test, a report — equal
+/// counts in the other slots do not answer it. Current agrees in the same
+/// process (reports; `sig_key_buckets` = buckets; `signatures`).
+#[test]
+fn m10_d1_two_signatures_of_one_shape_in_sverify_s() {
+    static V12: [i32; 2] = [1, 2];
+    static V13: [i32; 2] = [1, 3];
+    // D1-self.
+    let f = local_fixture("compact/d1-self", p_prog(&V12), p_prog(&V12), &["a", "r"]);
+    let (spec, imp) = kept_summaries(&f);
+    assert_eq!(
+        (spec.len(), imp.len()),
+        (2, 2),
+        "conformance: two graphs each"
+    );
+    assert!(
+        spec[0].hash == spec[1].hash && spec[0].sig != spec[1].sig && spec[0].ord == spec[1].ord,
+        "conformance: one shape, two signatures, equal counts"
+    );
+    assert_eq!(
+        spec[0].ord,
+        OrdCounts::U8(vec![2, 0, 0]),
+        "conformance: P's counts"
+    );
+    let (cur, cmp) = sverify_pair(&f);
+    let s = cmp.counters.compact.as_ref().unwrap();
+    assert_eq!(
+        (
+            cmp.reports.len(),
+            s.buckets,
+            s.signatures,
+            s.signatures_seen,
+            s.entries,
+            s.admitted,
+            s.insert_tests,
+            s.containment_tests,
+            s.coordinates_compared,
+            s.sig_tests,
+            s.sig_bytes_est
+        ),
+        (0, 1, 2, 2, 2, 2, 0, 2, 6, 3, 256),
+        "conformance: D1-self, SVerify-S compact (P2-frozen §7: hint)"
+    );
+    assert_eq!(cur.reports.len(), 0);
+    assert_eq!(
+        (cmp.counters.sig_key_buckets, cmp.counters.signatures),
+        (cur.counters.sig_key_buckets, cur.counters.signatures),
+        "conformance: the current index's two counts"
+    );
+    assert_eq!(
+        (cur.counters.sig_key_buckets, cur.counters.signatures),
+        (1, 2)
+    );
+    // D1-miss.
+    let f = local_fixture("compact/d1-miss", p_prog(&V12), p_prog(&V13), &["a", "r"]);
+    let (spec, imp) = kept_summaries(&f);
+    let (cur, cmp) = sverify_pair(&f);
+    let s = cmp.counters.compact.as_ref().unwrap();
+    let g1_slot = spec
+        .iter()
+        .position(|m| imp.iter().any(|g| g.sig == m.sig))
+        .unwrap();
+    assert_eq!(
+        (
+            cmp.reports.len(),
+            s.buckets,
+            s.signatures,
+            s.signatures_seen,
+            s.entries,
+            s.containment_tests,
+            s.coordinates_compared,
+            s.sig_tests,
+            s.sig_bytes_est
+        ),
+        (1, 1, 2, 2, 2, 1, 3, 4, 256),
+        "conformance: D1-miss, SVerify-S compact (G(1)'s slot at {g1_slot}; P1: no slot for Sig(3))"
+    );
+    let c = &cmp.counters;
+    assert_eq!(
+        (
+            c.lookups,
+            c.lookups_succeeded,
+            c.lookups_signature_miss,
+            c.lookups_failed_after_tests
+        ),
+        (2, 1, 1, 0)
+    );
+    let k = &cur.counters;
+    assert_eq!(
+        (
+            cur.reports.len(),
+            k.lookups_signature_miss,
+            k.lookups_succeeded
+        ),
+        (1, 1, 1),
+        "conformance: Current agrees"
+    );
+    assert_eq!(
+        report_seq(&cur.reports, &f.visible),
+        report_seq(&cmp.reports, &f.visible)
+    );
+    assert_eq!(
+        (c.impl_distinct_summaries, k.impl_distinct_summaries),
+        (Some(2), Some(2)),
+        "conformance: exact distinct counts, the unstored signature included"
+    );
+}
+
+fn cfirst_compact(f: &Fixture, cap: Capacity) -> crate::conformance::cfirst::CFirstOutcome {
+    use crate::conformance::config::IndexKind;
+    let cc = GridConfig::new(GridEngine::CompleteFirst)
+        .witness_cache(cap)
+        .quiet(true)
+        .index(IndexKind::Compact)
+        .antichain(true)
+        .probe_memo(true)
+        .impl_distinct(true)
+        .conf_config(f);
+    crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false)
+}
+
+fn cfirst_current(f: &Fixture, cap: Capacity) -> crate::conformance::cfirst::CFirstOutcome {
+    let cc = GridConfig::new(GridEngine::CompleteFirst)
+        .witness_cache(cap)
+        .quiet(true)
+        .conf_config(f);
+    crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false)
+}
+
+/// m11 (P2-derived §1.3, §1.4.3, §8; P2-frozen §4–§5): complete-first on two
+/// signatures of one shape. `P(1,2)` against `P(1,3)` at `w=inf`: a failing
+/// sweep for `G(3)` (a report), whose signature still gets an id and an empty
+/// slot; `sig_tests` 2 or 3 by the implementation order. `P(1,2)` against
+/// itself: two slots, four `Sig` tests. `P₃(1,2,1)` at `Bounded(1)`: the
+/// emptied slot keeps its id, so a re-admission counts — equal to the current
+/// engine's — and the counters follow the implementation order's row.
+/// The implementation order is read from the stateful engine's kept graphs
+/// (the same `Ltr` enumeration of the same program).
+#[test]
+fn m11_d1_two_signatures_of_one_shape_in_complete_first() {
+    static V12: [i32; 2] = [1, 2];
+    static V13: [i32; 2] = [1, 3];
+    static V121: [i32; 3] = [1, 2, 1];
+    // D1-miss, w=inf.
+    let f = local_fixture(
+        "compact/d1-miss-cf",
+        p_prog(&V12),
+        p_prog(&V13),
+        &["a", "r"],
+    );
+    let (spec, imp) = kept_summaries(&f);
+    let g1_first = spec.iter().any(|m| m.sig == imp[0].sig);
+    let o = cfirst_compact(&f, Capacity::Unbounded);
+    let s = o.counters.compact.as_ref().unwrap();
+    assert_eq!(
+        (
+            o.reports.len(),
+            o.counters.sweeps,
+            o.counters.admissions,
+            s.signatures,
+            s.signatures_seen,
+            s.buckets,
+            s.sig_tests,
+            s.impl_distinct_summaries
+        ),
+        (1, 2, 1, 1, 1, 1, if g1_first { 1 } else { 0 }, Some(2)),
+        "conformance: D1-miss complete-first (G(1) first: {g1_first})"
+    );
+    let cur = cfirst_current(&f, Capacity::Unbounded);
+    assert_eq!(
+        report_seq(&cur.reports, &f.visible),
+        report_seq(&o.reports, &f.visible)
+    );
+    assert_eq!(
+        (&cur.counters.sweep_sizes, cur.counters.sweeps),
+        (&o.counters.sweep_sizes, o.counters.sweeps)
+    );
+    // D1-self, w=inf.
+    let f = local_fixture(
+        "compact/d1-self-cf",
+        p_prog(&V12),
+        p_prog(&V12),
+        &["a", "r"],
+    );
+    let o = cfirst_compact(&f, Capacity::Unbounded);
+    let s = o.counters.compact.as_ref().unwrap();
+    assert_eq!(
+        (
+            o.reports.len(),
+            o.counters.admissions,
+            s.signatures,
+            s.signatures_seen,
+            s.buckets,
+            s.sig_tests,
+            s.memo_entries
+        ),
+        (0, 2, 2, 2, 1, 2, 2),
+        "conformance: D1-self complete-first"
+    );
+    // P₃(1,2,1) at Bounded(1).
+    let f = local_fixture("compact/d1-p3", p_prog(&V121), p_prog(&V121), &["a", "r"]);
+    let (spec, imp) = kept_summaries(&f);
+    assert_eq!((spec.len(), imp.len()), (3, 3));
+    let one = &spec
+        .iter()
+        .find(|m| spec.iter().filter(|n| n.sig == m.sig).count() == 2)
+        .unwrap()
+        .sig;
+    let order: Vec<u8> = imp
+        .iter()
+        .map(|g| if &g.sig == one { 1 } else { 2 })
+        .collect();
+    // (sweeps, admissions, evictions, memo_clears, readmissions, memo_hits, sig_tests)
+    let want = match order.as_slice() {
+        [1, 2, 1] => (3, 3, 2, 2, 1, 0, 4),
+        [1, 1, 2] => (2, 2, 1, 1, 0, 1, 3),
+        [2, 1, 1] => (2, 2, 1, 1, 0, 1, 3),
+        other => panic!("conformance: an impossible order {other:?}"),
+    };
+    let o = cfirst_compact(&f, Capacity::Bounded(1));
+    let (c, s) = (&o.counters, o.counters.compact.as_ref().unwrap());
+    assert_eq!(
+        (
+            c.sweeps,
+            c.admissions,
+            c.evictions,
+            s.memo_clears,
+            c.readmissions,
+            s.memo_hits,
+            s.sig_tests
+        ),
+        want,
+        "conformance: P3 at Bounded(1), order {order:?}"
+    );
+    assert_eq!(
+        (
+            s.signatures,
+            s.signatures_seen,
+            s.buckets,
+            s.entries,
+            o.reports.len()
+        ),
+        (1, 2, 1, 1, 0)
+    );
+    let cur = cfirst_current(&f, Capacity::Bounded(1));
+    assert_eq!(
+        (
+            cur.counters.evictions,
+            cur.counters.readmissions,
+            &cur.counters.sweep_sizes
+        ),
+        (c.evictions, c.readmissions, &c.sweep_sizes),
+        "conformance: the emptied slot keeps its id: readmissions equal the current engine's"
+    );
+}
+
+/// m12 (P2-derived §2.2; P2-frozen §2): D4's exit. A held order whose first
+/// coordinate exceeds the query's is rejected after one coordinate (the
+/// slice's three-way scan read all `L`); a held order larger at 0 and
+/// smaller at 1 after one (the slice: two); a held order `≤` the query reads
+/// all `L` and answers. `containment_tests` counts the tests, and
+/// `coordinates_compared` the coordinates.
+#[test]
+fn m12_d4_the_first_exceeding_coordinate_exits() {
+    let base = real_summary(MECH_CELL);
+    let l = base.ord.len();
+    let mut q = vec![1u8; l];
+    q[0] = 0;
+    let mut coords = 0;
+    assert!(!syn(&base, &vec![1u8; l])
+        .ord
+        .le_counted(&syn(&base, &q).ord, &mut coords));
+    assert_eq!(coords, 1, "conformance: exit at coordinate 0");
+    let mut h = vec![0u8; l];
+    h[0] = 1;
+    let mut coords = 0;
+    assert!(!syn(&base, &h)
+        .ord
+        .le_counted(&syn(&base, &q).ord, &mut coords));
+    assert_eq!(coords, 1);
+    let mut coords = 0;
+    assert!(syn(&base, &vec![0u8; l])
+        .ord
+        .le_counted(&syn(&base, &q).ord, &mut coords));
+    assert_eq!(coords, l, "conformance: a contained order reads all");
+    // Through the index (antichain off; admission order h1, h0).
+    let mut ix = CompactIndex::new(false);
+    ix.insert(&syn(&base, &vec![1u8; l]));
+    ix.insert(&syn(&base, &vec![0u8; l]));
+    assert_eq!(ix.covers(&syn(&base, &q)), (Some(0), Covers::Found(1)));
+    let s = ix.stats().clone();
+    assert_eq!(
+        (s.containment_tests, s.coordinates_compared),
+        (2, 1 + l),
+        "conformance: 1 coordinate for the exceeding entry, L for the answering one"
+    );
+    assert!(s.coordinates_compared <= s.containment_tests * l);
+}
+
+/// `Q` (P2-derived §3.1): one signature (`a: [Send 5]`, `b: [Recv 5]`), two
+/// orders. `direct = false`: `a` sends to invisible `x`, which forwards a 5
+/// to `b`, and invisible `y` sends a 5 to `b` (b reads y: `[0,0]`; b reads
+/// x: `[0,1]`); under `Ltr` the `[0,0]` graph completes first (measured).
+/// `direct = true`: `a` sends its 5 straight to `b` and `y`, spawned after
+/// `a`, sends a 5 too (b reads a: `[0,1]`; b reads y: `[0,0]`); under `Ltr`
+/// the `[0,1]` graph completes first (measured), so the second insertion
+/// removes it.
+fn q_prog(direct: bool) -> crate::conformance::grid::Prog {
+    crate::conformance::grid::prog(move || {
+        let b = crate::thread::Builder::new()
+            .name("b".to_owned())
+            .spawn(|| {
+                let _: i32 = crate::recv_msg_block();
+            })
+            .unwrap();
+        let bid = b.thread().id();
+        let spawn_y = move || {
+            crate::thread::Builder::new()
+                .name("y".to_owned())
+                .spawn(move || crate::send_msg(bid, 5i32))
+                .unwrap();
+        };
+        if direct {
+            crate::thread::Builder::new()
+                .name("a".to_owned())
+                .spawn(move || crate::send_msg(bid, 5i32))
+                .unwrap();
+            spawn_y();
+        } else {
+            spawn_y();
+            let xid = crate::thread::Builder::new()
+                .name("x".to_owned())
+                .spawn(move || {
+                    let _: i32 = crate::recv_msg_block();
+                    crate::send_msg(bid, 5i32);
+                })
+                .unwrap()
+                .thread()
+                .id();
+            crate::thread::Builder::new()
+                .name("a".to_owned())
+                .spawn(move || crate::send_msg(xid, 5i32))
+                .unwrap();
+        }
+    })
+}
+
+/// m13 (P2-derived §3.1; P2-frozen §3 D7): `orders_held` under `Compact` is
+/// the held orders, `admitted − antichain_dropped_old` = `entries`. On `Q`
+/// the enumeration order decides between a removal (`[0,1]` first: the
+/// second insertion removes it; the slice's `orders_held` would say 2) and a
+/// dropped new order; both spawn orders are run and at least one must take
+/// the removal, so the D7 case is exercised.
+#[test]
+fn m13_d7_orders_held_subtracts_antichain_removals() {
+    let mut removal_seen = false;
+    for direct in [true, false] {
+        let f = local_fixture("compact/d7-q", q_prog(direct), q_prog(direct), &["a", "b"]);
+        let (spec, _) = kept_summaries(&f);
+        assert_eq!(spec.len(), 2, "conformance: two graphs");
+        assert_eq!(spec[0].sig, spec[1].sig, "conformance: one signature");
+        let big_first = spec[0].ord == OrdCounts::U8(vec![0, 1]);
+        assert!(
+            big_first || spec[0].ord == OrdCounts::U8(vec![0, 0]),
+            "conformance: Q's counts {:?}",
+            spec[0].ord
+        );
+        let (_, cmp) = sverify_pair(&f);
+        let s = cmp.counters.compact.as_ref().unwrap();
+        let want = if big_first { (2, 1, 0) } else { (1, 0, 1) };
+        assert_eq!(
+            (s.admitted, s.antichain_dropped_old, s.antichain_dropped_new),
+            want,
+            "conformance: Q, direct {direct}, [0,1] first {big_first}"
+        );
+        assert_eq!(
+            (
+                cmp.counters.orders_held,
+                s.entries,
+                cmp.reports.len(),
+                s.containment_tests
+            ),
+            (1, 1, 0, 2)
+        );
+        assert_eq!(
+            cmp.counters.orders_held,
+            s.admitted - s.antichain_dropped_old
+        );
+        removal_seen |= big_first;
+    }
+    assert!(
+        removal_seen,
+        "conformance: neither spawn order put [0,1] first"
+    );
+}
+
+/// m14 (P2-derived §3.2; P2-frozen §3 D6, §5): the `impl_distinct` knob.
+/// Off (the default): no distinct set, the column blank (`None`) on both
+/// engines and both index kinds, and the label unchanged. On:
+/// `/distinct=on` closes the label and parses back; the stateful engine
+/// counts under both kinds and complete-first under `Compact` only, each
+/// equal to step 0 on the cell (A2 pb k2q2: 6).
+#[test]
+fn m14_d6_the_distinct_knob() {
+    use crate::conformance::config::IndexKind;
+    let f = fx(MECH_CELL);
+    for k in [IndexKind::Current, IndexKind::Compact] {
+        for on in [false, true] {
+            let g = GridConfig::new(GridEngine::Stateful)
+                .index(k)
+                .impl_distinct(on);
+            let label = g.label();
+            assert_eq!(label.ends_with("/distinct=on"), on, "conformance: {label}");
+            let back = crate::conformance::eval::parse_label(&label)
+                .unwrap_or_else(|| panic!("conformance: {label} does not parse"));
+            assert_eq!(back.label(), label, "conformance: the label round-trips");
+            let o = stateful::run_with(
+                &g.conf_config(&f),
+                &f.implementation,
+                &f.specification,
+                false,
+            );
+            let want = on.then_some(6);
+            assert_eq!(
+                o.counters.impl_distinct_summaries, want,
+                "conformance: stateful {k:?} {on}"
+            );
+            if let Some(s) = o.counters.compact.as_ref() {
+                assert_eq!(s.impl_distinct_summaries, want, "conformance: stats {on}");
+            }
+            let c = GridConfig::new(GridEngine::CompleteFirst)
+                .quiet(true)
+                .index(k)
+                .impl_distinct(on);
+            let o = crate::conformance::cfirst::run_with(
+                &c.conf_config(&f),
+                &f.implementation,
+                &f.specification,
+                false,
+            );
+            let got = o
+                .counters
+                .compact
+                .as_ref()
+                .and_then(|s| s.impl_distinct_summaries);
+            let want = (on && k == IndexKind::Compact).then_some(6);
+            assert_eq!(got, want, "conformance: complete-first {k:?} {on}");
+        }
+    }
+    assert!(
+        !GridConfig::new(GridEngine::Stateful)
+            .label()
+            .contains("distinct"),
+        "conformance: the default label is the slice's"
+    );
+}
+
+/// m15 (P1, P2-frozen §7): a query never creates a bucket or a slot. On an
+/// empty index two queries are both `(None, NoBucket)` (the first created
+/// nothing, so the second is not `NoSig`); with `base` held, two queries of
+/// another signature of the shape are both `(None, NoSig)` with
+/// `signatures_seen` unchanged; in the cache a probe of an absent signature
+/// is `(Miss, None)` and only the admission creates its slot.
+#[test]
+fn m15_p1_a_query_creates_no_bucket_and_no_slot() {
+    let base = real_summary(MECH_CELL);
+    let bad = forged(&base);
+    let mut ix = CompactIndex::new(true);
+    for _ in 0..2 {
+        assert_eq!(ix.covers(&base), (None, Covers::NoBucket));
+    }
+    let s = ix.stats().clone();
+    assert_eq!(
+        (s.buckets, s.signatures, s.signatures_seen, s.sig_tests),
+        (0, 0, 0, 0),
+        "conformance: nothing created by two queries"
+    );
+    assert_eq!(ix.insert(&base), (0, Inserted::Stored(0)));
+    for _ in 0..2 {
+        assert_eq!(ix.covers(&bad), (None, Covers::NoSig));
+    }
+    let s = ix.stats().clone();
+    assert_eq!(
+        (
+            s.buckets,
+            s.signatures,
+            s.signatures_seen,
+            s.sig_tests,
+            s.containment_tests
+        ),
+        (1, 1, 1, 2, 0),
+        "conformance: one Sig test per query, no slot"
+    );
+    let mut c = CompactCache::new(Capacity::Unbounded, true, true);
+    assert!(c.admit(&base, &base));
+    assert_eq!(c.probe(&bad), (Probe::Miss, None));
+    assert_eq!(
+        c.stats().signatures_seen,
+        1,
+        "conformance: the probe created nothing"
+    );
+    assert!(
+        c.admit(&bad, &bad),
+        "conformance: the admission creates the slot"
+    );
+    assert_eq!(c.probe(&bad), (Probe::MemoHit, Some(1)));
+    assert_eq!(c.stats().signatures_seen, 2);
+}
+
+/// A message type whose equality ignores a field its `Debug` prints: two
+/// `Sig`-equal values with different renderings (`Val`'s equality is the
+/// type's `PartialEq`, through `msg_equals`).
+#[derive(Clone, Debug)]
+struct Noisy {
+    v: i32,
+    noise: i32,
+}
+
+impl PartialEq for Noisy {
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v
+    }
+}
+
+/// `PN` (P2-derived §13.1): `P`'s shape with `Noisy` messages; the two
+/// senders send `Noisy { v: 1, noise: 0 }` and `Noisy { v: 1, noise: 1 }`.
+fn pn_prog() -> crate::conformance::grid::Prog {
+    crate::conformance::grid::prog(|| {
+        let a = crate::thread::Builder::new()
+            .name("a".to_owned())
+            .spawn(|| {
+                let _: Noisy = crate::recv_msg_block();
+            })
+            .unwrap();
+        let aid = a.thread().id();
+        let r = crate::thread::Builder::new()
+            .name("r".to_owned())
+            .spawn(move || {
+                let x: Noisy = crate::recv_msg_block();
+                crate::send_msg(aid, x);
+            })
+            .unwrap();
+        let rid = r.thread().id();
+        for noise in 0..2 {
+            crate::thread::Builder::new()
+                .name(format!("s{noise}"))
+                .spawn(move || crate::send_msg(rid, Noisy { v: 1, noise }))
+                .unwrap();
+        }
+    })
+}
+
+/// m16 (P3, P2-frozen §7): an alias. `PN`'s two graphs have equal `Sig` and
+/// different renderings; the second insertion's rendering has no hint, the
+/// second pass finds slot 0 by `Sig ==` (an alias, appended to its hint
+/// list), and the insertion is a duplicate; each query then costs one test
+/// through its hint. Current agrees (one signature, no report).
+#[test]
+fn m16_p3_an_alias_is_found_by_the_second_pass() {
+    let f = local_fixture("compact/p3-alias", pn_prog(), pn_prog(), &["a", "r"]);
+    let (spec, _) = kept_summaries(&f);
+    assert_eq!(spec.len(), 2, "conformance: two graphs");
+    assert!(
+        spec[0].sig == spec[1].sig && format!("{:?}", spec[0].sig) != format!("{:?}", spec[1].sig),
+        "conformance: equal signatures, different renderings"
+    );
+    let (cur, cmp) = sverify_pair(&f);
+    let s = cmp.counters.compact.as_ref().unwrap();
+    assert_eq!(
+        (
+            cmp.reports.len(),
+            s.sig_tests,
+            s.sig_aliases,
+            s.signatures,
+            s.signatures_seen,
+            s.entries,
+            s.duplicates,
+            s.buckets
+        ),
+        (0, 3, 1, 1, 1, 1, 1, 1),
+        "conformance: one alias, found once, then hinted"
+    );
+    assert_eq!(
+        (cur.reports.len(), cur.counters.signatures),
+        (0, 1),
+        "conformance: Current agrees"
+    );
+}
+
+/// m17 (P7, P2-frozen §7): `/distinct=on` prints only where the knob has
+/// effect — Stateful under both kinds, CompleteFirst under Compact — and
+/// every printed label parses back to itself.
+#[test]
+fn m17_p7_the_distinct_suffix_only_where_it_acts() {
+    use crate::conformance::config::IndexKind;
+    for e in [
+        GridEngine::Stateful,
+        GridEngine::CompleteFirst,
+        GridEngine::Enumerator,
+    ] {
+        for k in [IndexKind::Current, IndexKind::Compact] {
+            for on in [false, true] {
+                let g = GridConfig::new(e).index(k).impl_distinct(on);
+                let label = g.label();
+                let acts = on
+                    && (e == GridEngine::Stateful
+                        || (e == GridEngine::CompleteFirst && k == IndexKind::Compact));
+                assert_eq!(
+                    label.ends_with("/distinct=on"),
+                    acts,
+                    "conformance: {e:?} {k:?} {on}: {label}"
+                );
+                let back = crate::conformance::eval::parse_label(&label)
+                    .unwrap_or_else(|| panic!("conformance: {label} does not parse"));
+                assert_eq!(back.label(), label, "conformance: {label} round-trips");
+            }
+        }
+    }
+}
+
+// =========================================================================
+// Phase 2 items 4, 5, 7: the inverted index, the trie, the knobs
+// (P2-derived §11, §15; P2-frozen §6, §6.1), written before their code
+// =========================================================================
+
+use crate::conformance::config::BucketKind;
+
+fn kinds() -> [BucketKind; 5] {
+    [
+        BucketKind::Scan,
+        BucketKind::Inverted(0),
+        BucketKind::Inverted(3),
+        BucketKind::Inverted(BucketKind::INVERTED_DEFAULT_THRESHOLD),
+        BucketKind::Trie,
+    ]
+}
+
+/// T2's extension (PHASE2 §2; P2-derived §11.1): for each fixture, the
+/// spec summaries inserted into one index per slot structure (scan,
+/// `inverted:0`, `inverted:3`, `inverted:256`, trie), with the antichain on
+/// and off; every insertion's `(SigId, Inserted)` and every implementation
+/// query's `(Option<SigId>, Covers)` — the answering `seq` included — must be
+/// the scan's. Returns the number of queries compared.
+fn t2x_on(name: &str) -> usize {
+    let f = fx(name);
+    let (spec, imp) = kept_summaries(&f);
+    let mut queries = 0;
+    for anti in [true, false] {
+        let mut ix: Vec<CompactIndex> = kinds()
+            .iter()
+            .map(|k| CompactIndex::with_bucket(anti, *k))
+            .collect();
+        for m in &spec {
+            let r: Vec<_> = ix.iter_mut().map(|x| x.insert(m)).collect();
+            assert!(
+                r.iter().all(|x| *x == r[0]),
+                "conformance: {name} anti {anti}: insertions differ {r:?}"
+            );
+        }
+        let mut reached = 0;
+        for g in &imp {
+            let r: Vec<_> = ix.iter_mut().map(|x| x.covers(g)).collect();
+            assert!(
+                r.iter().all(|x| *x == r[0]),
+                "conformance: {name} anti {anti}: answers differ {r:?}"
+            );
+            if matches!(r[0].1, Covers::Found(_) | Covers::NotFound) {
+                reached += 1;
+            }
+            queries += 1;
+        }
+        // P2-frozen §6.1: at threshold 0 every query reaching a slot that
+        // holds orders goes through its index; `inverted:256` uses at most
+        // as many.
+        assert_eq!(
+            ix[1].stats().inverted_used,
+            Some(reached),
+            "conformance: {name} anti {anti}: inverted_used at threshold 0"
+        );
+        assert!(ix[3].stats().inverted_used.unwrap_or(0) <= reached);
+        assert_eq!(
+            ix[0].stats().inverted_used,
+            None,
+            "conformance: scan has no inverted counter"
+        );
+        assert!(ix[4].stats().trie_nodes_visited.is_some());
+    }
+    queries
+}
+
+#[test]
+fn t2x_the_structures_answer_as_the_scan_on_the_size2_cells() {
+    let n: usize = SIZE2_CELLS.iter().map(|c| t2x_on(c)).sum();
+    note!("t2x size-2: {n} queries");
+    assert!(n > 0);
+}
+
+#[test]
+#[ignore]
+fn t2x_the_structures_answer_as_the_scan_on_the_pilot_corpus() {
+    let n: usize = PILOT_NAMES.iter().map(|c| t2x_on(c)).sum();
+    note!("t2x pilot: {n} queries");
+}
+
+/// m18 (P2-derived §11.2): the threshold crossing at `inverted:3` — scan
+/// below three orders, the index from the third on, kept after the antichain
+/// empties the slot down to one order — and the trie on the same steps.
+#[test]
+fn m18_the_inverted_threshold_crossing_and_the_trie() {
+    let base = real_summary(MECH_CELL);
+    let l = base.ord.len();
+    assert!(l >= 3);
+    let u = |i: usize| syn(&base, &unit(l, i));
+    let zero = syn(&base, &vec![0u8; l]);
+    let st = |ix: &CompactIndex| {
+        let s = ix.stats();
+        (
+            s.containment_tests,
+            s.coordinates_compared,
+            s.inverted_used,
+            s.inverted_words,
+        )
+    };
+    let mut ix = CompactIndex::with_bucket(true, BucketKind::Inverted(3));
+    ix.insert(&u(0));
+    ix.insert(&u(1));
+    assert_eq!(
+        ix.covers(&u(1)),
+        (Some(0), Covers::Found(1)),
+        "conformance: step 2"
+    );
+    assert_eq!(
+        st(&ix),
+        (2, 1 + l, Some(0), Some(0)),
+        "conformance: below the threshold, the scan"
+    );
+    ix.insert(&u(2));
+    assert_eq!(
+        ix.covers(&u(2)),
+        (Some(0), Covers::Found(2)),
+        "conformance: step 4"
+    );
+    assert_eq!(
+        st(&ix),
+        (2, 1 + l, Some(1), Some(3)),
+        "conformance: the index, 2 + 1 words"
+    );
+    assert_eq!(ix.insert(&zero), (0, Inserted::Stored(3)));
+    assert_eq!(ix.stats().antichain_dropped_old, 3);
+    assert_eq!(
+        ix.covers(&u(0)),
+        (Some(0), Covers::Found(3)),
+        "conformance: step 6"
+    );
+    assert_eq!(
+        st(&ix),
+        (2, 1 + l, Some(2), Some(6)),
+        "conformance: the index kept at one order"
+    );
+    // The trie on the same steps.
+    let mut tr = CompactIndex::with_bucket(true, BucketKind::Trie);
+    tr.insert(&u(0));
+    tr.insert(&u(1));
+    assert_eq!(tr.covers(&u(1)), (Some(0), Covers::Found(1)));
+    assert_eq!(tr.stats().trie_nodes_visited, Some(l + 1));
+    tr.insert(&u(2));
+    assert_eq!(tr.covers(&u(2)), (Some(0), Covers::Found(2)));
+    assert_eq!(tr.stats().trie_nodes_visited, Some(2 * (l + 1)));
+    tr.insert(&zero);
+    assert_eq!(tr.covers(&u(0)), (Some(0), Covers::Found(3)));
+    let s = tr.stats();
+    assert_eq!(
+        (
+            s.trie_nodes_visited,
+            s.containment_tests,
+            s.coordinates_compared
+        ),
+        (Some(3 * (l + 1)), 0, 0),
+        "conformance: no ≤ test through the trie"
+    );
+}
+
+/// m19 (P2-derived §15.2 R1): antichain removal reaches each structure. u₀,
+/// u₁, then 0…0 removing both; the query u₁ is answered by 0…0 (seq 2) —
+/// inverted: rule {0}, 1 + 1 words; trie: L + 1 nodes (a stale branch or
+/// `min_seq` would enter u₁'s dead path or answer seq 1).
+#[test]
+fn m19_antichain_removal_reaches_the_structures() {
+    let base = real_summary(MECH_CELL);
+    let l = base.ord.len();
+    let u = |i: usize| syn(&base, &unit(l, i));
+    let zero = syn(&base, &vec![0u8; l]);
+    for k in [BucketKind::Scan, BucketKind::Inverted(0), BucketKind::Trie] {
+        let mut ix = CompactIndex::with_bucket(true, k);
+        ix.insert(&u(0));
+        ix.insert(&u(1));
+        assert_eq!(ix.insert(&zero), (0, Inserted::Stored(2)));
+        assert_eq!(ix.stats().antichain_dropped_old, 2);
+        assert_eq!(
+            ix.covers(&u(1)),
+            (Some(0), Covers::Found(2)),
+            "conformance: {k:?}"
+        );
+        let s = ix.stats();
+        let got = (
+            s.containment_tests,
+            s.inverted_used,
+            s.inverted_words,
+            s.trie_nodes_visited,
+        );
+        let want = match k {
+            BucketKind::Scan => (1, None, None, None),
+            BucketKind::Inverted(_) => (0, Some(1), Some(2), None),
+            BucketKind::Trie => (0, None, None, Some(l + 1)),
+        };
+        assert_eq!(got, want, "conformance: {k:?}");
+    }
+}
+
+/// m20 (P2-derived §15.2 R2): FIFO eviction and re-admission at
+/// `Bounded(2)` with each structure. After u₀ is evicted, the probe u₀
+/// misses (inverted 2 + 1 words; trie 3 nodes); re-admitting u₀ evicts u₁
+/// and stores u₀ at seq 3 (a new position; `readmissions` 1); the probe
+/// u₀ + u₁ is answered by seq 3 (inverted 1 + 1 words; trie L + 3 nodes).
+#[test]
+fn m20_fifo_eviction_and_readmission_reach_the_structures() {
+    let base = real_summary(MECH_CELL);
+    let l = base.ord.len();
+    let u = |i: usize| syn(&base, &unit(l, i));
+    let mut q = vec![0u8; l];
+    q[0] = 1;
+    q[1] = 1;
+    let q = syn(&base, &q);
+    for k in [BucketKind::Scan, BucketKind::Inverted(0), BucketKind::Trie] {
+        let mut c = CompactCache::with_bucket(Capacity::Bounded(2), false, true, k);
+        for i in 0..3 {
+            assert!(c.admit(&u(i), &u(i)), "conformance: {k:?} admit u{i}");
+        }
+        assert_eq!(c.evictions(), 1);
+        let s0 = c.stats();
+        assert_eq!(
+            c.probe(&u(0)),
+            (Probe::Miss, Some(0)),
+            "conformance: {k:?} u0 evicted"
+        );
+        let s1 = c.stats();
+        let d = |a: Option<usize>, b: Option<usize>| b.map(|b| b - a.unwrap_or(0));
+        let got = (
+            s1.containment_tests - s0.containment_tests,
+            d(s0.inverted_words, s1.inverted_words),
+            d(s0.trie_nodes_visited, s1.trie_nodes_visited),
+        );
+        let want = match k {
+            BucketKind::Scan => (2, None, None),
+            BucketKind::Inverted(_) => (0, Some(3), None),
+            BucketKind::Trie => (0, None, Some(3)),
+        };
+        assert_eq!(got, want, "conformance: {k:?} the miss");
+        assert!(c.admit(&u(0), &u(0)), "conformance: {k:?} re-admission");
+        assert_eq!((c.evictions(), c.readmissions()), (2, 1));
+        let s2 = c.stats();
+        assert_eq!(
+            c.probe(&q),
+            (Probe::Hit, Some(0)),
+            "conformance: {k:?} the hit"
+        );
+        let s3 = c.stats();
+        let got = (
+            s3.containment_tests - s2.containment_tests,
+            d(s2.inverted_words, s3.inverted_words),
+            d(s2.trie_nodes_visited, s3.trie_nodes_visited),
+        );
+        let want = match k {
+            BucketKind::Scan => (2, None, None),
+            BucketKind::Inverted(_) => (0, Some(2), None),
+            BucketKind::Trie => (0, None, Some(l + 3)),
+        };
+        assert_eq!(got, want, "conformance: {k:?} the hit");
+    }
+}
+
+/// m21 (P2-derived §15.3, §15.4; P2-frozen §6 item 7): the bucket field in
+/// the label — under Compact only, never for the scan, before `/distinct=on`
+/// — round-trips through `parse_label`; and `COMPACT2` is 24 + 14 rows as
+/// PHASE2 §6 says, every row rep 0, timed, default tier, knob off.
+#[test]
+fn m21_the_bucket_label_and_the_compact2_spec() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::{
+        compact2_ablation_configs, compact2_spec, compact_configs, parse_label, RunKind,
+    };
+    for e in [GridEngine::Stateful, GridEngine::CompleteFirst] {
+        for k in [IndexKind::Current, IndexKind::Compact] {
+            for b in [
+                BucketKind::Scan,
+                BucketKind::Inverted(0),
+                BucketKind::Inverted(256),
+                BucketKind::Trie,
+            ] {
+                for on in [false, true] {
+                    let g = GridConfig::new(e).index(k).bucket(b).impl_distinct(on);
+                    let label = g.label();
+                    let field = match (k, b) {
+                        (IndexKind::Compact, BucketKind::Inverted(t)) => {
+                            Some(format!("/bucket=inverted:{t}"))
+                        }
+                        (IndexKind::Compact, BucketKind::Trie) => Some("/bucket=trie".to_owned()),
+                        _ => None,
+                    };
+                    match &field {
+                        Some(f) => {
+                            let at = label
+                                .find(f.as_str())
+                                .unwrap_or_else(|| panic!("conformance: {label}"));
+                            if let Some(d) = label.find("/distinct=on") {
+                                assert!(at < d, "conformance: bucket before distinct: {label}");
+                            }
+                        }
+                        None => assert!(!label.contains("bucket="), "conformance: {label}"),
+                    }
+                    let back = parse_label(&label)
+                        .unwrap_or_else(|| panic!("conformance: {label} does not parse"));
+                    assert_eq!(back.label(), label, "conformance: round trip");
+                }
+            }
+        }
+    }
+    let spec = compact2_spec();
+    assert_eq!(spec.name, "COMPACT2");
+    assert_eq!(spec.rows.len(), 38, "conformance: 6 × 4 + 2 × 7");
+    let size: Vec<&str> = vec![
+        "apps/a1/correct/spec/n4r4",
+        "apps/a2/pb/spec/k4q4",
+        "apps/a3/fifo/spec/k4q4",
+        "apps/a4/hash/a4a/k4q4m4",
+        "2pc/leader/conf/n4",
+        "2pc/leader/conf/n5",
+    ];
+    let configs = compact_configs();
+    let ablations = compact2_ablation_configs();
+    for (i, r) in spec.rows.iter().enumerate() {
+        assert!(
+            r.rep == 0 && r.run_kind == RunKind::Timed && r.tier.name == "default",
+            "conformance: row {i}"
+        );
+        assert!(
+            !r.config.label().contains("distinct=on"),
+            "conformance: D6 off on row {i}"
+        );
+        if i < 24 {
+            assert_eq!(r.fixture, size[i / 4], "conformance: block 1 row {i}");
+            assert_eq!(r.config.label(), configs[i % 4].label());
+        } else {
+            let j = i - 24;
+            let cell = ["apps/a3/fifo/spec/k3q3", "apps/a4/hash/a4a/k3q3m3"][j / 7];
+            assert_eq!(r.fixture, cell, "conformance: block 2 row {i}");
+            assert_eq!(r.config.label(), ablations[j % 7].label());
+        }
+    }
+    let labels: Vec<String> = ablations.iter().map(|g| g.label()).collect();
+    let n = |s: &str| labels.iter().filter(|l| l.contains(s)).count();
+    assert_eq!(
+        (
+            n("bucket=inverted:0"),
+            n("bucket=trie"),
+            n("anti=false"),
+            n("pmemo=false")
+        ),
+        (2, 2, 2, 1),
+        "conformance: the seven ablations: {labels:#?}"
+    );
 }

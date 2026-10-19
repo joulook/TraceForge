@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use crate::conformance::cfirst::{self, CFirstOutcome, SweepEnd};
 use crate::conformance::config::{
-    Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode, IndexKind,
+    BucketKind, Capacity, CompletionCover, ConfConfig, Engine, GatePolicy, GatedMode, IndexKind,
 };
 use crate::conformance::gated::{self, GatedOutcome, ReportSite};
 use crate::conformance::search::SearchOpts;
@@ -1351,6 +1351,11 @@ pub(super) struct GridConfig {
     pub(super) antichain: bool,
     /// `COMPACT-INDEX` §5.1 item 4(b) (`pmemo=<bool>`; printed under `Compact`).
     pub(super) probe_memo: bool,
+    /// `COMPACT-INDEX` phase 2 D6 (`distinct=on`; printed only when on).
+    pub(super) impl_distinct: bool,
+    /// `COMPACT-INDEX` phase 2 item 7 (`bucket=inverted:<t>` or
+    /// `bucket=trie`, printed under `Compact`; nothing for the scan).
+    pub(super) bucket: BucketKind,
 }
 
 impl GridConfig {
@@ -1375,6 +1380,8 @@ impl GridConfig {
             index: IndexKind::Current,
             antichain: true,
             probe_memo: true,
+            impl_distinct: false,
+            bucket: BucketKind::Scan,
         }
     }
 
@@ -1399,6 +1406,18 @@ impl GridConfig {
     /// `COMPACT-INDEX` §5.1 item 4(b): the probe memo knob.
     pub(super) fn probe_memo(mut self, b: bool) -> Self {
         self.probe_memo = b;
+        self
+    }
+
+    /// `COMPACT-INDEX` phase 2 D6: the step-0 counter's knob.
+    pub(super) fn impl_distinct(mut self, b: bool) -> Self {
+        self.impl_distinct = b;
+        self
+    }
+
+    /// `COMPACT-INDEX` phase 2 item 7: the slot structure.
+    pub(super) fn bucket(mut self, k: BucketKind) -> Self {
+        self.bucket = k;
         self
     }
 
@@ -1482,6 +1501,8 @@ impl GridConfig {
             .index(self.index)
             .antichain(self.antichain)
             .probe_memo(self.probe_memo)
+            .impl_distinct(self.impl_distinct)
+            .bucket(self.bucket)
             .skip_spec_errfree_check(!self.precheck)
             .triage(self.engine == GridEngine::Verify);
         b.build()
@@ -1510,7 +1531,11 @@ impl GridConfig {
         // key the driver derives; a non-default knob prints the two fields.
         // `COMPACT-INDEX` frozen §8: under `Compact` the thirteen-field form
         // followed by the three knobs; under `Current` nothing changes.
-        if self.index == IndexKind::Compact {
+        // Phase 2 D6: `/distinct=on` appended only when the knob is on, so
+        // every key with it off is the slice's key; P7: and only where it has
+        // effect (the stateful engine, either index; complete-first under
+        // `Compact`).
+        let base = if self.index == IndexKind::Compact {
             format!(
                 "{eleven}/{}/quiet={}/index=compact/anti={}/pmemo={}",
                 capacity_field(self.witness_cache),
@@ -1522,6 +1547,21 @@ impl GridConfig {
             eleven
         } else {
             format!("{eleven}/{}/quiet={}", capacity_field(self.witness_cache), self.quiet)
+        };
+        // Phase 2 item 7 (P2-frozen §6): the slot structure after the
+        // compact fields, under `Compact` only; nothing for the scan, so every
+        // scan key is the slice's.
+        let base = match (self.index, self.bucket) {
+            (IndexKind::Compact, BucketKind::Inverted(t)) => format!("{base}/bucket=inverted:{t}"),
+            (IndexKind::Compact, BucketKind::Trie) => format!("{base}/bucket=trie"),
+            _ => base,
+        };
+        let distinct_effective = self.engine == GridEngine::Stateful
+            || (self.engine == GridEngine::CompleteFirst && self.index == IndexKind::Compact);
+        if self.impl_distinct && distinct_effective {
+            format!("{base}/distinct=on")
+        } else {
+            base
         }
     }
 }
@@ -2009,7 +2049,18 @@ fn compact_columns(row: &mut Row, cs: Option<&crate::conformance::compact::Compa
     push_d(row, "antichain_dropped_old", cs.antichain_dropped_old);
     push_d(row, "insert_tests", cs.insert_tests);
     push_d(row, "summary_bytes", cs.summary_bytes);
-    push_d(row, "sig_bytes", cs.sig_bytes);
+    // Phase 2 D1 (P2-frozen §1): `sig_bytes` replaced by the estimate and
+    // the slot counts; D4's coordinate count. (`signatures` is pushed by the
+    // engine arms: the stateful engine's counter carries it.)
+    push_d(row, "sig_bytes_est", cs.sig_bytes_est);
+    push_d(row, "signatures_seen", cs.signatures_seen);
+    push_d(row, "sig_tests", cs.sig_tests);
+    push_d(row, "sig_aliases", cs.sig_aliases);
+    push_d(row, "coordinates_compared", cs.coordinates_compared);
+    // Items 4, 5: blank unless the row's slot structure is that one.
+    push_opt(row, "inverted_used", cs.inverted_used);
+    push_opt(row, "inverted_words", cs.inverted_words);
+    push_opt(row, "trie_nodes_visited", cs.trie_nodes_visited);
     push_d(row, "memo_on", cs.memo_on);
     push_d(row, "memo_hits", cs.memo_hits);
     push_d(row, "memo_entries", cs.memo_entries);
@@ -2163,7 +2214,7 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "spec_wall_time_ms", c.spec_wall_time_ms);
             push_d(&mut row, "impl_wall_time_ms", c.impl_wall_time_ms);
             // `COMPACT-INDEX` §5.1 items 1 and 5.
-            push_d(&mut row, "impl_distinct_summaries", c.impl_distinct_summaries);
+            push_opt(&mut row, "impl_distinct_summaries", c.impl_distinct_summaries);
             push_d(&mut row, "index_kind", index_kind_field(c.compact.is_some()));
             compact_columns(&mut row, c.compact.as_ref());
         }
@@ -2226,7 +2277,8 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "index_kind", index_kind_field(c.compact.is_some()));
             if let Some(cs) = c.compact.as_ref() {
                 push_d(&mut row, "containment_tests", cs.containment_tests);
-                push_d(&mut row, "impl_distinct_summaries", cs.impl_distinct_summaries);
+                push_opt(&mut row, "impl_distinct_summaries", cs.impl_distinct_summaries);
+                push_d(&mut row, "signatures", cs.signatures);
             }
             compact_columns(&mut row, c.compact.as_ref());
         }

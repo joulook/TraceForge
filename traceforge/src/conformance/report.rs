@@ -929,8 +929,8 @@ pub struct StatefulCounters {
     pub invisible_ops_of_visible_threads: usize,
     /// `COMPACT-INDEX` §5.1 item 1 (step 0): distinct implementation
     /// summaries `(Sig, ord)` over the Impl run, under both index kinds
-    /// (frozen §6).
-    pub impl_distinct_summaries: usize,
+    /// (frozen §6); `Some` iff the `impl_distinct` knob is on (phase 2 D6).
+    pub impl_distinct_summaries: Option<usize>,
     /// `COMPACT-INDEX` §5.1 item 5: the bucket index's counters, `Some` iff
     /// `index = Compact`.
     pub(crate) compact: Option<crate::conformance::compact::CompactStats>,

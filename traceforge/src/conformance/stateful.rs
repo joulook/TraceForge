@@ -41,7 +41,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::conformance::compact::{CompactIndex, CompactSummary, Covers, Inserted, OrdCounts, SigHash};
+use crate::conformance::compact::{CompactIndex, CompactSummary, Covers, Inserted, OrdCounts};
 use crate::conformance::config::{ConfConfig, Engine, IndexKind};
 use crate::conformance::ctx::{
     CompletionSink, ConfCtx, ConfMode, Diagnostic, DiagnosticReason, Gate, GateSink, Report,
@@ -103,8 +103,11 @@ struct SinkState {
     /// implementation summaries, exact `(Sig, ord)`, in the engine's own
     /// structure.
     impl_seen: SigBuckets<BTreeSet<VisOrder>>,
-    /// Step 0 under `Compact`: the same count by `(SigHash, OrdCounts)`.
-    impl_seen_compact: std::collections::HashSet<(SigHash, OrdCounts)>,
+    /// Step 0 under `Compact`: the same count by the exact `(Sig,
+    /// OrdCounts)` (phase 2 P1, P2-frozen §7).
+    impl_seen_compact: SigBuckets<std::collections::HashSet<OrdCounts>>,
+    /// Phase 2 D6: the distinct-summary sets exist only when asked for.
+    impl_distinct: bool,
     counters: StatefulCounters,
     reports: Vec<(ExecutionGraph, ReplaySnapshot)>,
     kept: Vec<ExecutionGraph>,
@@ -224,7 +227,12 @@ pub(crate) fn run_with(
     // `COMPACT-INDEX` §5.1 item 4(a): the bucket index in place of
     // `SigBuckets` when asked for (frozen C1, §4).
     if cc.index == IndexKind::Compact {
-        state.borrow_mut().compact = Some(CompactIndex::new(cc.antichain));
+        state.borrow_mut().compact = Some(CompactIndex::with_bucket(cc.antichain, cc.bucket));
+    }
+    // Phase 2 D6: the step-0 counter only when the knob asks for it.
+    state.borrow_mut().impl_distinct = cc.impl_distinct;
+    if cc.impl_distinct {
+        state.borrow_mut().counters.impl_distinct_summaries = Some(0);
     }
     let spec_started = Instant::now();
     let spec_sink = {
@@ -235,7 +243,7 @@ pub(crate) fn run_with(
             let inserted = if st.compact.is_some() {
                 let s = CompactSummary::at_completion(g, &visible, "specification");
                 let ci = st.compact.as_mut().expect("conformance: the compact index is set");
-                matches!(ci.insert(&s), Inserted::Stored(_))
+                matches!(ci.insert(&s), (_, Inserted::Stored(_)))
             } else {
                 let summary = summarise(g, &visible, "specification");
                 st.index
@@ -270,10 +278,14 @@ pub(crate) fn run_with(
         st.counters.sig_key_buckets = st.index.key_buckets();
         st.counters.signatures = st.index.len();
         if let Some(ci) = st.compact.as_ref() {
-            // Under `Compact` both are the live buckets (frozen §7).
-            let buckets = ci.stats().buckets;
-            st.counters.sig_key_buckets = buckets;
-            st.counters.signatures = buckets;
+            // Phase 2 D1: the shape buckets are `SigKey` buckets and the
+            // occupied slots are the full-`Sig` slots, the current index's two
+            // counts; D7: `orders_held` is the held orders (antichain removals
+            // subtracted).
+            let stats = ci.stats().clone();
+            st.counters.sig_key_buckets = stats.buckets;
+            st.counters.signatures = stats.signatures;
+            st.counters.orders_held = stats.entries;
         }
     }
     assert!(
@@ -352,18 +364,25 @@ pub(crate) fn run_with(
                 compact,
                 impl_seen,
                 impl_seen_compact,
+                impl_distinct,
                 counters,
                 ..
             } = &mut *st;
             let covered = if let Some(s) = cs.as_ref() {
-                // `COMPACT-INDEX` frozen §4.2, §6: the bucket query, and
-                // step 0's count under the compact identity.
-                if impl_seen_compact.insert(s.key()) {
-                    counters.impl_distinct_summaries += 1;
-                }
+                // `COMPACT-INDEX` frozen §4.2, §6; phase 2 D1, D6: the
+                // query, and step 0's count under the exact compact identity
+                // when the knob is on.
                 let ci = compact.as_mut().expect("conformance: the compact index is set");
-                match ci.covers(s) {
-                    Covers::NoBucket => {
+                let (_, outcome) = ci.covers(s);
+                if *impl_distinct
+                    && impl_seen_compact
+                        .entry(s.sig.clone(), std::collections::HashSet::new)
+                        .insert(s.ord.clone())
+                {
+                    *counters.impl_distinct_summaries.get_or_insert(0) += 1;
+                }
+                match outcome {
+                    Covers::NoBucket | Covers::NoSig => {
                         counters.lookups_signature_miss += 1;
                         false
                     }
@@ -380,12 +399,14 @@ pub(crate) fn run_with(
                 }
             } else {
                 let summary = current.as_ref().expect("conformance: the current summary is set");
-                // `COMPACT-INDEX` step 0 (frozen §6): exact `(Sig, ord)`.
-                if impl_seen
-                    .entry(summary.sig.clone(), BTreeSet::new)
-                    .insert(summary.ord.clone())
+                // `COMPACT-INDEX` step 0 (frozen §6): exact `(Sig, ord)`,
+                // only when the knob is on (phase 2 D6).
+                if *impl_distinct
+                    && impl_seen
+                        .entry(summary.sig.clone(), BTreeSet::new)
+                        .insert(summary.ord.clone())
                 {
-                    counters.impl_distinct_summaries += 1;
+                    *counters.impl_distinct_summaries.get_or_insert(0) += 1;
                 }
                 match index.get(&summary.sig) {
                     None => {

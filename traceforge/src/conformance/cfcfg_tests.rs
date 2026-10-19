@@ -887,9 +887,11 @@ fn c07_schema_three() {
     // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, 202 columns;
     // the five schema-3 columns stay right after `witnesses`, and a schema-3
     // store (a copy of `cfirst-1/rows.csv`) is now refused as well.
-    assert_eq!(SCHEMA_VERSION, 4, "conformance: schema");
+    // COMPACT-INDEX phase 2 re-pin (2026-10-19): schema 5, 208 columns;
+    // fix round P3 (`sig_aliases`): 209.
+    assert_eq!(SCHEMA_VERSION, 5, "conformance: schema");
     let h = header();
-    assert_eq!(h.len(), 202, "conformance: header width");
+    assert_eq!(h.len(), 209, "conformance: header width");
     let i = h.iter().position(|c| *c == "witnesses").unwrap();
     assert_eq!(
         &h[i + 1..i + 6],

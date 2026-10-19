@@ -2216,8 +2216,10 @@ fn c12_the_pins_that_must_not_move() {
     // P5-CFCFG re-pin (2026-10-14): schema 3, five columns after `witnesses`.
     // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, seventeen
     // columns after `flat_wall_time_ms` (202).
-    assert_eq!(SCHEMA_VERSION, 4, "conformance: schema");
-    assert_eq!(header().len(), 202, "conformance: header");
+    // COMPACT-INDEX phase 2 re-pin (2026-10-19): schema 5, 208 columns;
+    // fix round P3 (`sig_aliases`): 209.
+    assert_eq!(SCHEMA_VERSION, 5, "conformance: schema");
+    assert_eq!(header().len(), 209, "conformance: header");
     assert_eq!(
         LABEL_PIN,
         GridConfig::new(GridEngine::Enumerator).label(),

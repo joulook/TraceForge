@@ -294,6 +294,32 @@ pub struct ConfConfig {
     /// `COMPACT-INDEX` §5.1 item 4(b): the complete-first probe memo
     /// (`Compact` and complete-first only).
     pub(crate) probe_memo: bool,
+    /// `COMPACT-INDEX` phase 2 D6: keep the distinct-implementation-summary
+    /// set and export `impl_distinct_summaries` (both index kinds).
+    pub(crate) impl_distinct: bool,
+    /// `COMPACT-INDEX` phase 2 item 7: the structure answering a signature
+    /// slot's queries (`Compact` only).
+    pub(crate) bucket: BucketKind,
+}
+
+/// `COMPACT-INDEX` phase 2 items 4, 5, 7 (P2-frozen §6): the structure that
+/// answers a signature slot's queries under `IndexKind::Compact`, in both
+/// engines. `Scan` is the slice's linear scan; `Inverted(t)` the inverted
+/// index, built once the slot first holds `max(t, 1)` orders (the scan
+/// before); `Trie` the multiset trie. All three answer with the same order
+/// (the live order `≤` the query with the smallest admission number); the
+/// duplicate check and the antichain stay the scan's in every mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum BucketKind {
+    #[default]
+    Scan,
+    Inverted(usize),
+    Trie,
+}
+
+impl BucketKind {
+    /// PHASE2 §1 item 4: the inverted index's default threshold (entries).
+    pub const INVERTED_DEFAULT_THRESHOLD: usize = 256;
 }
 
 /// `COMPACT-INDEX` §5 (frozen C1): the index behind the stateful engine's
@@ -382,6 +408,8 @@ pub struct ConfBuilder {
     index: IndexKind,
     antichain: bool,
     probe_memo: bool,
+    impl_distinct: bool,
+    bucket: BucketKind,
 }
 
 impl Default for ConfBuilder {
@@ -424,6 +452,11 @@ impl ConfBuilder {
             index: IndexKind::Current,
             antichain: true,
             probe_memo: true,
+            // `COMPACT-INDEX` phase 2 D6: off unless the step-0 counter is
+            // asked for, so a run's peak is the algorithm's.
+            impl_distinct: false,
+            // Phase 2 item 7: the slice's scan.
+            bucket: BucketKind::Scan,
             // `P4-ENUMERATOR` criterion 4: memo off until D7 is decided.
             memo: false,
             engine: Engine::Enumerator,
@@ -494,6 +527,23 @@ impl ConfBuilder {
     /// [`Engine::CompleteFirst`] only.
     pub fn probe_memo(mut self, on: bool) -> Self {
         self.probe_memo = on;
+        self
+    }
+
+    /// `COMPACT-INDEX` phase 2 D6: keep the set of distinct implementation
+    /// summaries and export `impl_distinct_summaries` (the step-0 counter).
+    /// Default `false`. Read by [`Engine::Stateful`] under both index kinds
+    /// and by [`Engine::CompleteFirst`] under `IndexKind::Compact`.
+    pub fn impl_distinct(mut self, on: bool) -> Self {
+        self.impl_distinct = on;
+        self
+    }
+
+    /// `COMPACT-INDEX` phase 2 item 7: the slot structure ([`BucketKind`]).
+    /// Default `Scan`. Read under `IndexKind::Compact` by
+    /// [`Engine::Stateful`] and [`Engine::CompleteFirst`].
+    pub fn bucket(mut self, k: BucketKind) -> Self {
+        self.bucket = k;
         self
     }
 
@@ -657,6 +707,8 @@ impl ConfBuilder {
             index: self.index,
             antichain: self.antichain,
             probe_memo: self.probe_memo,
+            impl_distinct: self.impl_distinct,
+            bucket: self.bucket,
         })
     }
 }

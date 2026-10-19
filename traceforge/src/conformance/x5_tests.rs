@@ -1222,8 +1222,10 @@ fn run_rec(name: &str, config: GridConfig) -> Rec {
 fn c02_verdict_rows_carry_the_run_with_counters() {
     // P5-CFCFG re-pin (2026-10-14): schema 3, 185 columns.
     // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, 202 columns.
-    assert_eq!(SCHEMA_VERSION, 4, "conformance: the schema version");
-    assert_eq!(header().len(), 202, "conformance: the header's width");
+    // COMPACT-INDEX phase 2 re-pin (2026-10-19): schema 5, 208 columns;
+    // fix round P3 (`sig_aliases`): 209.
+    assert_eq!(SCHEMA_VERSION, 5, "conformance: the schema version");
+    assert_eq!(header().len(), 209, "conformance: the header's width");
     for c in CFIRST_COUNTER_COLUMNS
         .iter()
         .chain(GATED_COUNTER_COLUMNS.iter())
