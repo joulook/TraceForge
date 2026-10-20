@@ -2761,3 +2761,161 @@ fn m21_the_bucket_label_and_the_compact2_spec() {
         "conformance: the seven ablations: {labels:#?}"
     );
 }
+
+// =========================================================================
+// Final audit of 55ef467, A1: several covering orders for one query
+// (P2-derived §18, derived before this test)
+// =========================================================================
+
+/// §18.1's 73 orders, in admission order, as length-L count vectors on
+/// `MECH_CELL`'s signature: c₀ (seq 0); 69 fillers (x₃ ≥ 1, coordinate sum
+/// 10, x₃ ascending then (x₀, x₁, x₂) lexicographic, skipping (5, 4, 0, 1));
+/// c₁ (70); c₂ (71); m = c₀ − e₁ (72).
+fn a1_orders(l: usize) -> Vec<Vec<u8>> {
+    let v = |xs: [u8; 4]| {
+        let mut o = vec![0u8; l];
+        o[..4].copy_from_slice(&xs);
+        o
+    };
+    let mut out = vec![v([5, 5, 0, 0])];
+    'fill: for x3 in 1..=10u8 {
+        for x0 in 0..=10u8 {
+            for x1 in 0..=10u8 {
+                let Some(x2) = 10u8.checked_sub(x3 + x0 + x1) else {
+                    continue;
+                };
+                if [x0, x1, x2, x3] == [5, 4, 0, 1] {
+                    continue;
+                }
+                out.push(v([x0, x1, x2, x3]));
+                if out.len() == 70 {
+                    break 'fill;
+                }
+            }
+        }
+    }
+    out.push(v([4, 1, 5, 0]));
+    out.push(v([0, 5, 5, 0]));
+    out.push(v([5, 4, 0, 0]));
+    out
+}
+
+/// m22 (A1; P2-derived §18): one query q = (5, 5, 5, 0) with several
+/// pairwise-incomparable covers (c₀ seq 0, c₁ seq 70, c₂ seq 71, m seq 72),
+/// a slot of 73 positions (two bitset words), and a removal of the earliest
+/// cover — by the antichain (m < c₀) with the antichain on, by FIFO eviction
+/// at `Bounded(72)` with it off. Scan, `inverted:0`, `inverted:40` (crossed
+/// between Q0 and Q1) and trie must all return the **earliest live** cover:
+/// Q0 (30 orders) `Found(0)`; Q1 (72 orders) `Found(0)` though the
+/// value-ascending first cover is c₂ (71); Q2 (after the removal)
+/// `Found(70)` though c₂ (71) is still met first and c₀'s stale position 0 is
+/// in word 0. With the antichain on, `inverted:0`'s words are 4, 9, 10.
+#[test]
+fn m22_a1_the_earliest_of_several_covers_after_removals() {
+    let base = real_summary(MECH_CELL);
+    let l = base.ord.len();
+    assert!(l >= 4, "conformance: the cell's order is too short ({l})");
+    let orders = a1_orders(l);
+    assert_eq!(orders.len(), 73);
+    let s = |o: &Vec<u8>| syn(&base, o);
+    let mut qv = vec![0u8; l];
+    qv[..3].copy_from_slice(&[5, 5, 5]);
+    let q = s(&qv);
+    // The covers, independent of any structure: exactly seq 0, 70, 71, 72.
+    let covers: Vec<usize> = (0..73)
+        .filter(|&i| orders[i].iter().zip(&qv).all(|(a, b)| a <= b))
+        .collect();
+    assert_eq!(covers, vec![0, 70, 71, 72], "conformance: §18.1 fact 3");
+    let kinds = [
+        BucketKind::Scan,
+        BucketKind::Inverted(0),
+        BucketKind::Inverted(40),
+        BucketKind::Trie,
+    ];
+    // Antichain on: the index, the removal by dominance.
+    for k in kinds {
+        let mut ix = CompactIndex::with_bucket(true, k);
+        let words = |ix: &CompactIndex| ix.stats().inverted_words.unwrap_or(0);
+        for o in &orders[..30] {
+            assert!(matches!(ix.insert(&s(o)).1, Inserted::Stored(_)));
+        }
+        let w0 = words(&ix);
+        assert_eq!(
+            ix.covers(&q),
+            (Some(0), Covers::Found(0)),
+            "conformance: {k:?} Q0"
+        );
+        let w1 = words(&ix);
+        for o in &orders[30..72] {
+            assert!(
+                matches!(ix.insert(&s(o)).1, Inserted::Stored(_)),
+                "conformance: {k:?}"
+            );
+        }
+        assert_eq!(
+            ix.covers(&q),
+            (Some(0), Covers::Found(0)),
+            "conformance: {k:?} Q1"
+        );
+        let w2 = words(&ix);
+        assert_eq!(ix.insert(&s(&orders[72])), (0, Inserted::Stored(72)));
+        assert_eq!(
+            ix.stats().antichain_dropped_old,
+            1,
+            "conformance: {k:?}: m removes c₀ alone"
+        );
+        assert_eq!(
+            ix.covers(&q),
+            (Some(0), Covers::Found(70)),
+            "conformance: {k:?} Q2"
+        );
+        let w3 = words(&ix);
+        let got = (w1 - w0, w2 - w1, w3 - w2);
+        match k {
+            BucketKind::Inverted(0) => assert_eq!(got, (4, 9, 10), "conformance: §18.3 words"),
+            BucketKind::Inverted(40) => assert_eq!(got, (0, 9, 10), "conformance: §18.3 words"),
+            _ => assert_eq!(got, (0, 0, 0)),
+        }
+    }
+    // Antichain off: the cache at Bounded(72), memo off, FIFO eviction.
+    for k in kinds {
+        let mut c = CompactCache::with_bucket(Capacity::Bounded(72), false, false, k);
+        for o in &orders[..30] {
+            assert!(c.admit(&s(o), &s(o)));
+        }
+        assert_eq!(
+            c.index().clone().covers(&q),
+            (Some(0), Covers::Found(0)),
+            "conformance: {k:?} off Q0"
+        );
+        for o in &orders[30..72] {
+            assert!(c.admit(&s(o), &s(o)));
+        }
+        assert_eq!(c.evictions(), 0);
+        assert_eq!(
+            c.index().clone().covers(&q),
+            (Some(0), Covers::Found(0)),
+            "conformance: {k:?} off Q1"
+        );
+        assert!(c.admit(&s(&orders[72]), &s(&orders[72])));
+        assert_eq!(
+            c.evictions(),
+            1,
+            "conformance: {k:?}: m's admission evicts c₀"
+        );
+        assert_eq!(
+            c.index().clone().covers(&q),
+            (Some(0), Covers::Found(70)),
+            "conformance: {k:?} off Q2"
+        );
+        assert_eq!(
+            c.probe(&q),
+            (Probe::Hit, Some(0)),
+            "conformance: {k:?} off probe"
+        );
+        assert!(
+            !c.index().antichain(),
+            "conformance: Bounded forces the antichain off"
+        );
+    }
+}
