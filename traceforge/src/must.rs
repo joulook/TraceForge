@@ -201,6 +201,45 @@ pub(crate) fn reset_selector_picks_for_test() {
     SELECTOR_PICKS.with(|c| c.set(0));
 }
 
+// `MIN-ENGINES` E2-4, test builds only: how many times this thread took the
+// context box out at a gate (`conf_gate_at`, `conf_revisit_gate`) and how many
+// times it cloned a backward revisit's outgoing carry — the tester's evidence
+// that a plain-scheduled run does neither at a growing gate.
+#[cfg(test)]
+thread_local! {
+    static GATE_TAKES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CARRY_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn gate_takes_bump() {
+    GATE_TAKES.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn carry_clones_bump() {
+    CARRY_CLONES.with(|c| c.set(c.get() + 1));
+}
+
+/// `MIN-ENGINES` E2-4, test builds only: the thread's gate box takes.
+#[cfg(test)]
+pub(crate) fn gate_takes_for_test() -> usize {
+    GATE_TAKES.with(|c| c.get())
+}
+
+/// `MIN-ENGINES` E2-4, test builds only: the thread's carry clones.
+#[cfg(test)]
+pub(crate) fn carry_clones_for_test() -> usize {
+    CARRY_CLONES.with(|c| c.get())
+}
+
+/// `MIN-ENGINES` E2-4, test builds only: reset both counts.
+#[cfg(test)]
+pub(crate) fn reset_gate_counts_for_test() {
+    GATE_TAKES.with(|c| c.set(0));
+    CARRY_CLONES.with(|c| c.set(0));
+}
+
 impl Must {
     pub(crate) fn new(conf: Config, replay_mode: bool) -> Self {
         let seed = conf.seed;
@@ -1849,10 +1888,20 @@ impl Must {
     /// `conf_gate` with the installed position, for the gated checker's gate
     /// sink (`P4-GATED` G1): the fresh gates pass the event they installed.
     fn conf_gate_at(&mut self, gate: crate::conformance::ctx::Gate, at: Option<Event>) {
-        use crate::conformance::ctx::{GateAt, GateOutcome};
+        use crate::conformance::ctx::{Gate, GateAt, GateOutcome};
+        // `MIN-ENGINES` E2-1: a growing gate returns at entry in the three
+        // plain-scheduled modes (`ConfMode::plain_scheduling`) — no box take,
+        // no counter, no branch test; the completion gate is untouched.
+        if gate != Gate::Completion
+            && self.conf.as_ref().is_some_and(|c| c.mode().plain_scheduling())
+        {
+            return;
+        }
         let Some(mut ctx) = self.conf.take() else {
             return;
         };
+        #[cfg(test)]
+        gate_takes_bump();
         let site = at.map(|at| GateAt {
             at,
             revisit: None,
@@ -3056,7 +3105,13 @@ impl Must {
     /// edge, and step (4) fails. Recorded as obligation **O-skip** in
     /// `backlog/algorithm-issues.md` so it has a name to be found by.
     fn conf_revisit_gate(&mut self, rev: &RevisitEnum) -> bool {
-        if self.conf.is_none() {
+        // `MIN-ENGINES` E2-1: the revisit-apply gate returns at entry in the
+        // three plain-scheduled modes — before the label match (and the §9
+        // backstop in it), the box take and the carry clone.
+        let Some(ctx) = self.conf.as_ref() else {
+            return false;
+        };
+        if ctx.mode().plain_scheduling() {
             return false;
         }
         let pos = rev.pos();
@@ -3068,6 +3123,8 @@ impl Must {
                 let Some(mut ctx) = self.conf.take() else {
                     return false;
                 };
+                #[cfg(test)]
+                gate_takes_bump();
                 // `P4-GATED` G1: the gate sink needs the popped position, the
                 // revisit kind, the new source and, for a backward pop, the
                 // outgoing state's carried pair (the state `backward_revisit`
@@ -3087,7 +3144,11 @@ impl Must {
                         at: pos,
                         revisit: Some(crate::conformance::ctx::RevisitKind::Backward),
                         source,
-                        outgoing_carry: self.states.last().map(|st| st.conf_carry.borrow().clone()),
+                        outgoing_carry: self.states.last().map(|st| {
+                            #[cfg(test)]
+                            carry_clones_bump();
+                            st.conf_carry.borrow().clone()
+                        }),
                     },
                 };
                 let outcome = ctx.gate_at(

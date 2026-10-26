@@ -5156,3 +5156,165 @@ fn e1_the_selector_column_is_the_keys_field() {
     }
     assert!(bad.is_empty(), "conformance: F2: {bad:#?}");
 }
+
+// =========================================================================
+// MIN-ENGINES E2 (tester, gate 3; criteria/MIN-ENGINES-E2.md; derived §E2):
+// the growing gates return at entry in the plain-scheduled modes
+// =========================================================================
+
+/// One Must exploring `p` with a gate-disabled context in `mode` (a completion
+/// sink counting calls in the enumerating modes), on the test thread: the
+/// context's counters, its F49/F42 tallies, plain Must's split, the sink's
+/// calls, and the test-only take and clone counts over the run.
+fn e2_entry_counts(
+    f: &Fixture,
+    p: &crate::conformance::grid::Prog,
+    mode: crate::conformance::ctx::ConfMode,
+) -> (crate::conformance::report::ConfCounters, usize, usize, usize, usize, usize, usize) {
+    use crate::conformance::ctx::{ConfCtx, SinkVerdict};
+    use crate::must::{carry_clones_for_test, gate_takes_for_test, reset_gate_counts_for_test};
+    let mut config = crate::conformance::eval::x1_config(
+        GridEngine::Stateful,
+        crate::conformance::selector::Selector::Ltr,
+    )
+    .conf_config(f)
+    .config;
+    config.max_iterations = None;
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let mut ctx = ConfCtx::gate_disabled(config.clone(), f.visible.clone(), mode);
+    if mode.enumerates() {
+        let c = std::rc::Rc::clone(&calls);
+        ctx.set_sink(Box::new(move |_, _| {
+            c.set(c.get() + 1);
+            SinkVerdict::Continue
+        }));
+    }
+    let must = std::rc::Rc::new(std::cell::RefCell::new(crate::must::Must::new(config, false)));
+    must.borrow_mut().enable_conformance(ctx);
+    reset_gate_counts_for_test();
+    {
+        let _guard = crate::conformance::testing::CurrentMustGuard;
+        let q = p.clone();
+        crate::explore(&must, &std::sync::Arc::new(move || q()));
+    }
+    let (takes, clones) = (gate_takes_for_test(), carry_clones_for_test());
+    let m = must.borrow();
+    let s = m.stats();
+    let ctx = m.conf_ctx().expect("conformance: the context went missing");
+    (
+        ctx.counters().clone(),
+        ctx.skipped_gates(),
+        ctx.inert_gates(),
+        s.execs + s.block,
+        calls.get(),
+        takes,
+        clones,
+    )
+}
+
+/// MIN-ENGINES E2 (derived §E2 items 4–5 (a), (c), (d)): in `Enumerate`,
+/// `CFirstOuter` and `CFirstSweep` no growing gate enters the context —
+/// `gate_invocations` = `executions` = plain Must's `execs + block` = the
+/// completion sink's calls; `gate_skipped_disabled` = the completions too (the
+/// completion gate itself ends at the gate-disabled return, `ctx.rs` 1556 — the
+/// tester's correction of derived §E2 item 4, which had it 0); the other skip
+/// counters, `skipped_gates` and `inert_gates` 0; the gate takes equal to the
+/// completions and no carry clone — on A3 fifo k2q2's implementation
+/// (replays, backward revisits) and `e1:race/bag`; under `Collect` and
+/// `Precheck` on the same programs the growing gates still enter
+/// (`gate_invocations` > `executions`, `gate_skipped_disabled` > 0, takes >
+/// completions; on A3 fifo k2q2 the carry is cloned at its backward revisits),
+/// and a `GatedOuter` run (`gated::run_with`, its outer run on the test thread)
+/// clones the carry — the counts are live. The completion gate still takes once
+/// per execution in every mode (the verdict's reading: takes = executions).
+#[test]
+fn e2_no_growing_gate_enters_the_context_in_the_plain_modes() {
+    use crate::conformance::ctx::ConfMode;
+    let mut bad = Vec::new();
+    for name in ["apps/a3/fifo/spec/k2q2", "e1:race/bag"] {
+        let f = e1_fixture(name);
+        for mode in [ConfMode::Enumerate, ConfMode::CFirstOuter, ConfMode::CFirstSweep] {
+            let (c, skipped, inert, total, calls, takes, clones) =
+                e2_entry_counts(&f, &f.implementation, mode);
+            let zero = c.gate_skipped_inert
+                + c.gate_skipped_replay
+                + c.gate_skipped_pruned
+                + c.gate_skipped_aborted
+                + skipped
+                + inert;
+            if c.gate_invocations != c.executions
+                || c.executions != total
+                || calls != total
+                || c.gate_skipped_disabled != total
+                || zero != 0
+                || takes != total
+                || clones != 0
+            {
+                bad.push(format!(
+                    "{name} {mode:?}: invocations {} executions {} total {total} calls {calls} \
+                     skips {zero} takes {takes} clones {clones}",
+                    c.gate_invocations, c.executions
+                ));
+            }
+        }
+        for mode in [ConfMode::Collect, ConfMode::Precheck] {
+            let (c, _, _, total, _, takes, clones) = e2_entry_counts(&f, &f.implementation, mode);
+            let entered = c.gate_invocations > c.executions && c.gate_skipped_disabled > 0;
+            note!("e2 {name} {mode:?}: takes {takes} completions {total} clones {clones}");
+            let cloned = clones > 0 || name != "apps/a3/fifo/spec/k2q2";
+            if !entered || takes <= total || !cloned {
+                bad.push(format!(
+                    "{name} {mode:?}: invocations {} executions {} disabled {} takes {takes} \
+                     clones {clones}",
+                    c.gate_invocations, c.executions, c.gate_skipped_disabled
+                ));
+            }
+        }
+    }
+    {
+        use crate::must::{carry_clones_for_test, reset_gate_counts_for_test};
+        let f = e1_fixture("apps/a3/fifo/spec/k2q2");
+        let cc = crate::conformance::eval::x1_config(
+            GridEngine::Gated,
+            crate::conformance::selector::Selector::Ltr,
+        )
+        .conf_config(&f);
+        reset_gate_counts_for_test();
+        let (imp, spec) = (&f.implementation, &f.specification);
+        let _ = crate::conformance::gated::run_with(&cc, imp, spec, false);
+        if carry_clones_for_test() == 0 {
+            bad.push("GatedOuter: no carry clone (the counter is not live)".to_owned());
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E2: {bad:#?}");
+}
+
+/// MIN-ENGINES E2 (derived §E2 item 5 (b)): the source order. In
+/// `conf_gate_at` the plain-mode return names `gate != Completion` and precedes
+/// `self.conf.take()`; in `conf_revisit_gate` it precedes the label match, the
+/// `take()` and the `outgoing_carry` clone; both read E1's `plain_scheduling`.
+#[test]
+fn e2_the_returns_precede_the_take_and_the_clone() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let must = std::fs::read_to_string(root.join("must.rs")).expect("conformance: must.rs");
+    let body = |head: &str| -> &str {
+        let at = must.find(head).unwrap_or_else(|| panic!("conformance: {head}"));
+        let rest = &must[at..];
+        &rest[..rest.find("\n    }\n").expect("conformance: the function's end")]
+    };
+    let g = body("fn conf_gate_at(");
+    let (ret, take) = (g.find("plain_scheduling()"), g.find("self.conf.take()"));
+    assert!(
+        matches!((ret, take), (Some(r), Some(t)) if r < t) && g.contains("Completion"),
+        "conformance: conf_gate_at: {g}"
+    );
+    let r = body("fn conf_revisit_gate(");
+    let ret = r.find("plain_scheduling()");
+    for later in ["match self.current.graph.label(pos)", "self.conf.take()", "conf_carry"] {
+        let l = r.find(later);
+        assert!(
+            matches!((ret, l), (Some(a), Some(b)) if a < b),
+            "conformance: conf_revisit_gate: `{later}` before the return: {r}"
+        );
+    }
+}
