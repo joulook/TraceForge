@@ -1214,19 +1214,23 @@ impl CompactCache {
 // `SVERIFY-P` I2: the set index (`SVERIFY-P.md` §1 items 4–5; the criteria
 // `plan/traceForge/criteria/SVERIFY-P-I2.md`). Added below `CompactCache`;
 // nothing above this line changed (Q11 option (a): `CompactIndex` untouched).
+// `SVERIFY-P` I2b (`criteria/SVERIFY-P-I2B.md`, the owner's rulings of
+// 2026-10-26 §6 and §5): each order held once, in one `IndexMap` per slot
+// that answers the duplicate check and the exact-hit probe; `exact_hits`.
 // ---------------------------------------------------------------------------
 
 /// One signature's slot in the set index: the representative signature (the
-/// first occurrence's, I2-2 — later equal occurrences do not replace it), its
-/// orders in admission order, and the set of held orders that answers the
-/// duplicate question with no `cmp`.
+/// first occurrence's, I2-2 — later equal occurrences do not replace it) and
+/// its orders, each held **once** (I2b-1): the order is the key, its
+/// admission number the value, in one `IndexMap` that keeps admission order
+/// for the scan and answers the duplicate check and the exact-hit probe by
+/// hash, with no `cmp`.
 #[derive(Clone, Debug)]
 struct SetSlot {
     sig_id: SigId,
     sig: Sig,
     sig_est: usize,
-    orders: Vec<Entry>,
-    held: HashSet<OrdCounts>,
+    orders: indexmap::IndexMap<OrdCounts, u64>,
 }
 
 /// One shape's bucket in the set index: its slots in creation order and the
@@ -1315,26 +1319,77 @@ pub struct SetStats {
     pub containment_tests: usize,
     /// Coordinates read by the queries' `≤` tests (D4).
     pub coordinates_compared: usize,
-    /// Σ payload bytes of the held orders (one copy; the set holds a second).
+    /// Queries answered by the exact-hit probe (I2b-3): the slot held the
+    /// query's order itself, so no `≤` test ran and no `≤` coordinate was
+    /// read (the probe hashes the query's vector and compares it for
+    /// equality; no counter sees that).
+    pub exact_hits: usize,
+    /// Σ payload bytes of the held orders, held once (I2b-1).
     pub summary_bytes: usize,
     /// Σ `32 × Σ_t |w_t| + 16 × T` over the occupied slots.
     pub sig_bytes_est: usize,
 }
 
+impl SetStats {
+    /// The counters in the reference's record (I2b-6), for the stateful
+    /// engine's `counters.compact` so that the store's columns are filled
+    /// under `IndexKind::Set`: the thirteen shared fields carried over
+    /// (`bucket_max` is `slot_max`), `insert_tests` 0 (no `cmp` at insertion),
+    /// the antichain, inverted, trie and memo fields off or `None`,
+    /// `impl_distinct_summaries` `None` (the engine sets it as under
+    /// `Compact`). `exact_hits` has no counterpart there and is read from the
+    /// engine's `set_index`.
+    pub(crate) fn as_compact_stats(&self) -> CompactStats {
+        CompactStats {
+            antichain_effective: false,
+            entries: self.entries,
+            buckets: self.buckets,
+            bucket_max: self.slot_max,
+            signatures: self.signatures,
+            signatures_seen: self.signatures_seen,
+            sig_tests: self.sig_tests,
+            sig_aliases: self.sig_aliases,
+            admitted: self.admitted,
+            duplicates: self.duplicates,
+            antichain_dropped_new: 0,
+            antichain_dropped_old: 0,
+            insert_tests: 0,
+            containment_tests: self.containment_tests,
+            coordinates_compared: self.coordinates_compared,
+            inverted_used: None,
+            inverted_words: None,
+            trie_nodes_visited: None,
+            summary_bytes: self.summary_bytes,
+            sig_bytes_est: self.sig_bytes_est,
+            memo_on: false,
+            memo_hits: 0,
+            memo_entries: 0,
+            memo_clears: 0,
+            impl_distinct_summaries: None,
+        }
+    }
+}
+
 /// The set index (`SVERIFY-P` I2): the compact summaries of one side as a
 /// hash set per signature — the shape bucket by `hash`, the slot by `Sig ==`
 /// through the P3 hint exactly as [`CompactIndex`] resolves it, the orders of
-/// a slot in a `HashSet<OrdCounts>` that answers an exact duplicate with no
-/// `cmp` — and the admission-ordered scan of [`CompactIndex`]'s query, through
-/// `&self`. No antichain, no removal, no capacity: the held set is the set of
-/// distinct summaries inserted. On one insertion sequence it equals
-/// `CompactIndex::with_bucket(false, BucketKind::Scan)` in every outcome, id,
-/// seq and counter but `insert_tests` (criteria I2-3); across insertion
-/// orders only the held identities, the occupancy counters, `sig_aliases`
-/// and each query's `Covers` discriminant are invariant (I2-4). The orders'
-/// bytes are held twice (the admission list and the set), about twice
-/// `summary_bytes` plus the table. `Send`, not `Sync` (`Sig` holds
-/// `Box<dyn Message>`; the `Cell`s and `RefCell`s add nothing to that).
+/// a slot held once in an `IndexMap<OrdCounts, u64>` (I2b-1) that answers an
+/// exact duplicate and the exact-hit probe by hash with no `cmp` — and the
+/// admission-ordered scan of [`CompactIndex`]'s query, through `&self`. No
+/// antichain, no removal, no capacity: the held set is the set of distinct
+/// summaries inserted. On one insertion sequence it equals
+/// `CompactIndex::with_bucket(false, BucketKind::Scan)` in every insertion
+/// outcome, id and seq, in every query's verdict class, and in every counter
+/// but `insert_tests`, `containment_tests` and `coordinates_compared`: the
+/// exact-hit probe (I2b-3) answers `Found` with the held order's own `seq`
+/// before the scan, so where an earlier-admitted order is also `≤` the query
+/// the witness differs (`seq_r ≤ seq_s`) and the two scan counters are
+/// smaller by the probe's work. Across insertion orders only the held
+/// identities, the occupancy counters, `sig_aliases`, `exact_hits` and each
+/// query's `Covers` discriminant are invariant (I2-4). Memory: one
+/// `IndexMap` bucket of 48 B per order plus its counts and the index table
+/// (criteria I2b-8). `Send`, not `Sync` (`Sig` holds `Box<dyn Message>`; the
+/// `Cell`s and `RefCell`s add nothing to that).
 #[derive(Clone, Debug)]
 pub(crate) struct SetIndex {
     buckets: HashMap<SigHash, SetBucket>,
@@ -1348,6 +1403,7 @@ pub(crate) struct SetIndex {
     sig_aliases: std::cell::Cell<usize>,
     containment_tests: std::cell::Cell<usize>,
     coordinates_compared: std::cell::Cell<usize>,
+    exact_hits: std::cell::Cell<usize>,
 }
 
 impl Default for SetIndex {
@@ -1367,6 +1423,7 @@ impl SetIndex {
             sig_aliases: std::cell::Cell::new(0),
             containment_tests: std::cell::Cell::new(0),
             coordinates_compared: std::cell::Cell::new(0),
+            exact_hits: std::cell::Cell::new(0),
         }
     }
 
@@ -1377,6 +1434,7 @@ impl SetIndex {
         s.sig_aliases = self.sig_aliases.get();
         s.containment_tests = self.containment_tests.get();
         s.coordinates_compared = self.coordinates_compared.get();
+        s.exact_hits = self.exact_hits.get();
         s
     }
 
@@ -1405,8 +1463,7 @@ impl SetIndex {
             sig_id,
             sig: s.sig.clone(),
             sig_est: s.sig_est,
-            orders: Vec::new(),
-            held: HashSet::new(),
+            orders: indexmap::IndexMap::new(),
         });
         let i = bucket.slots.len() - 1;
         if let Some(r) = r {
@@ -1416,9 +1473,10 @@ impl SetIndex {
         i
     }
 
-    /// Hash-set insertion (I2-2): an exact duplicate is refused by the slot's
-    /// set with no `cmp`; otherwise the order is stored with the next checked
-    /// admission number. `DroppedNew` is never returned (no antichain).
+    /// Hash-set insertion (I2-2, I2b-2): an exact duplicate is refused by the
+    /// slot's map with no `cmp`; otherwise the order is stored once, as the
+    /// map's key, with the next checked admission number as its value.
+    /// `DroppedNew` is never returned (no antichain).
     pub(crate) fn insert(&mut self, s: &CompactSummary) -> (SigId, Inserted) {
         let si = self.slot_for_insert(s);
         let stats = &mut self.stats;
@@ -1429,7 +1487,7 @@ impl SetIndex {
         let first_in_bucket = bucket.slots.len() == 1;
         let slot = &mut bucket.slots[si];
         let sig_id = slot.sig_id;
-        if slot.held.contains(&s.ord) {
+        if slot.orders.contains_key(&s.ord) {
             stats.duplicates += 1;
             return (sig_id, Inserted::Duplicate);
         }
@@ -1438,11 +1496,7 @@ impl SetIndex {
             .checked_add(1)
             .expect("conformance: more than u64::MAX insertions (seq overflow)");
         let was_empty = slot.orders.is_empty();
-        slot.orders.push(Entry {
-            seq,
-            ord: s.ord.clone(),
-        });
-        slot.held.insert(s.ord.clone());
+        slot.orders.insert(s.ord.clone(), seq);
         stats.admitted += 1;
         stats.entries += 1;
         stats.summary_bytes += s.ord.payload_bytes();
@@ -1460,12 +1514,15 @@ impl SetIndex {
         (sig_id, Inserted::Stored(seq))
     }
 
-    /// The read-only query (I2-3): the signature's id, `None` when it has no
-    /// slot (the query creates none, P1), with the outcome — the first held
-    /// order `≤` the query in admission order answers (D4's exit), exactly
-    /// `CompactIndex::covers` under `BucketKind::Scan`. A slot with no orders
-    /// does not exist here (nothing is removed), so `(Some(_), NoSig)` is
-    /// unreachable.
+    /// The read-only query (I2-3, I2b-3): the signature's id, `None` when it
+    /// has no slot (the query creates none, P1), with the outcome. The
+    /// exact-hit probe first: if the slot holds the query's order itself, it
+    /// answers `Found` with that order's `seq` — no `≤` test, no `≤`
+    /// coordinate read (the hash and the equality compare are not counted),
+    /// `exact_hits` + 1. Otherwise the first held order `≤` the query
+    /// in admission order answers (D4's exit), exactly `CompactIndex::covers`
+    /// under `BucketKind::Scan`. A slot with no orders does not exist here
+    /// (nothing is removed), so `(Some(_), NoSig)` is unreachable.
     pub(crate) fn covers(&self, s: &CompactSummary) -> (Option<SigId>, Covers) {
         let Some(bucket) = self.buckets.get(&s.hash) else {
             return (None, Covers::NoBucket);
@@ -1479,31 +1536,36 @@ impl SetIndex {
             !slot.orders.is_empty(),
             "conformance: a set-index slot holds at least one order"
         );
+        if let Some(&seq) = slot.orders.get(&s.ord) {
+            self.exact_hits.set(self.exact_hits.get() + 1);
+            return (Some(slot.sig_id), Covers::Found(seq));
+        }
         let mut coords = self.coordinates_compared.get();
-        for held in &slot.orders {
+        for (held, &seq) in &slot.orders {
             self.containment_tests.set(self.containment_tests.get() + 1);
-            if held.ord.le_counted(&s.ord, &mut coords) {
+            if held.le_counted(&s.ord, &mut coords) {
                 self.coordinates_compared.set(coords);
-                return (Some(slot.sig_id), Covers::Found(held.seq));
+                return (Some(slot.sig_id), Covers::Found(seq));
             }
         }
         self.coordinates_compared.set(coords);
         (Some(slot.sig_id), Covers::NotFound)
     }
 
-    /// Every held order with its signature's id and the slot's representative
-    /// signature (I2-6): buckets in ascending `SigHash`, slots in creation
-    /// order, orders in admission order — deterministic for one insertion
-    /// history; the order and the representative's rendering depend on the
-    /// history (I2-4).
-    pub(crate) fn entries(&self) -> impl Iterator<Item = (SigId, &Sig, &Entry)> + '_ {
+    /// Every held order with its signature's id, the slot's representative
+    /// signature and its admission number (I2-6, I2b-5): buckets in ascending
+    /// `SigHash`, slots in creation order, orders in admission order —
+    /// deterministic for one insertion history; the order and the
+    /// representative's rendering depend on the history (I2-4).
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (SigId, &Sig, u64, &OrdCounts)> + '_ {
         let mut hashes: Vec<&SigHash> = self.buckets.keys().collect();
         hashes.sort_unstable();
         hashes.into_iter().flat_map(move |h| {
-            self.buckets[h]
-                .slots
-                .iter()
-                .flat_map(|slot| slot.orders.iter().map(move |e| (slot.sig_id, &slot.sig, e)))
+            self.buckets[h].slots.iter().flat_map(|slot| {
+                slot.orders
+                    .iter()
+                    .map(move |(ord, &seq)| (slot.sig_id, &slot.sig, seq, ord))
+            })
         })
     }
 }

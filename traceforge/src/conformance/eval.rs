@@ -545,9 +545,9 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     };
     // `P5-CFCFG` F4: eleven fields (the campaign's form: the unbounded cache,
     // sweeps not quiet) or thirteen (`w=…`, `quiet=…`); `COMPACT-INDEX`
-    // frozen §8: sixteen (`index=compact`, `anti=…`, `pmemo=…`); any other
-    // count fails.
-    if p.len() != 11 && p.len() != 13 && p.len() != 16 {
+    // frozen §8: sixteen (`index=compact`, `anti=…`, `pmemo=…`); `SVERIFY-P`
+    // I2b-7: fourteen (`index=set`); any other count fails.
+    if p.len() != 11 && p.len() != 13 && p.len() != 14 && p.len() != 16 {
         return None;
     }
     fn flag(s: &str, name: &str) -> Option<bool> {
@@ -567,6 +567,14 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
             flag(p[14], "anti")?,
             flag(p[15], "pmemo")?,
         )
+    } else if p.len() == 14 {
+        // `SVERIFY-P` I2b-7: `index=set`; the knobs it does not print are not
+        // read under `Set` and take `GridConfig::new`'s values, as under
+        // `Current` below.
+        if p[13] != "index=set" {
+            return None;
+        }
+        (IndexKind::Set, true, true)
     } else {
         (IndexKind::Current, true, true)
     };
@@ -590,6 +598,11 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         early_error_cut: flag(p[9], "cut")?,
         completion_cover: parse_cover(p[10].strip_prefix("cover=")?)?,
     };
+    // `SVERIFY-P` I2b-7: `index=set` is the stateful engine's key only (the
+    // complete-first engine is refused with it; the others do not read it).
+    if parsed.index == IndexKind::Set && parsed.engine != GridEngine::Stateful {
+        return None;
+    }
     // `P5-CFCFG` F4 (gate 4 n1): only `label()`'s own spelling parses — the
     // thirteen-field form at the defaults, `w=08`, `w=+8` and the like are
     // refused, so a stored key is always the key the driver derives.

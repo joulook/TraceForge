@@ -2023,6 +2023,7 @@ fn c12_the_entry_point_fields() {
         executions,
         max_paper_events,
         compact_index,
+        set_index,
     } = rw(&cc, &naive(2, 0), &naive(2, 1), false);
     // COMPACT-INDEX: `None` under the default `IndexKind::Current`.
     let compact_index: Option<crate::conformance::compact::CompactIndex> = compact_index;
@@ -2030,6 +2031,9 @@ fn c12_the_entry_point_fields() {
         compact_index.is_none(),
         "conformance: no compact index under Current"
     );
+    // SVERIFY-P I2b-7: `None` under the default `IndexKind::Current`.
+    let set_index: Option<crate::conformance::compact::SetIndex> = set_index;
+    assert!(set_index.is_none(), "conformance: no set index under Current");
     let reports: Vec<(ExecutionGraph, ReplaySnapshot)> = reports;
     let counters: StatefulCounters = counters;
     let index: SigBuckets<BTreeSet<VisOrder>> = index;
@@ -2476,4 +2480,43 @@ fn c03_the_survival_helper_rejects_a_block_after_the_receive() {
         msg.contains("late graph 0: w's block") && msg.contains("is not before c's receive"),
         "conformance: the helper refused for another reason: {msg}"
     );
+}
+
+/// `SVERIFY-P` I2b-7 (the tester): the specification-error return under
+/// `IndexKind::Set`. c03's pair, whose specification side fails an assertion
+/// in `w`, ends at the early return; there `counters.compact` is filled from
+/// the set index (one of the knob's end sites), `set_index` is set and
+/// `compact_index` empty. Against `Compact` with the antichain off: the same
+/// specification errors, ends, graph and held-order counts, and the same
+/// record but `insert_tests` (0 under `Set`).
+#[test]
+fn i2b_the_spec_error_return_under_set() {
+    use crate::conformance::config::IndexKind;
+    let v = vis(&["a", "b", "c"]);
+    let run = |k: IndexKind| {
+        let cc = built(sb(cfg(ConsType::Bag), &v).index(k).antichain(false));
+        rw(
+            &cc,
+            &inv_block_before_revisit(false),
+            &inv_block_before_revisit(true),
+            false,
+        )
+    };
+    let (s, c) = (run(IndexKind::Set), run(IndexKind::Compact));
+    assert!(!s.spec_errors.is_empty(), "conformance: the specification fails");
+    assert_eq!(format!("{:?}", s.spec_errors), format!("{:?}", c.spec_errors));
+    assert_eq!(
+        format!("{:?}", (&s.impl_end, &s.spec_end)),
+        format!("{:?}", (&c.impl_end, &c.spec_end))
+    );
+    assert!(s.set_index.is_some() && s.compact_index.is_none() && c.compact_index.is_some());
+    let view = |o: &StatefulOutcome| {
+        let k = &o.counters;
+        (k.spec_graphs, k.impl_graphs, k.orders_held, k.signatures, k.sig_key_buckets)
+    };
+    assert_eq!(view(&s), view(&c));
+    let sc = s.counters.compact.clone().expect("conformance: filled under Set");
+    let mut want = c.counters.compact.clone().expect("conformance: filled under Compact");
+    want.insert_tests = 0;
+    assert_eq!(sc, want, "conformance: the record at the early return");
 }

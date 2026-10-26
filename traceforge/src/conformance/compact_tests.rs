@@ -3035,7 +3035,8 @@ fn i1_sverify_s_uncovered_multiset() {
 use crate::conformance::compact::{SetIndex, SetStats};
 
 /// The reference's counters as `SetStats` (`slot_max` is `bucket_max`;
-/// `insert_tests` has no counterpart, I2-7).
+/// `insert_tests` has no counterpart, I2-7; `exact_hits` 0, the reference
+/// has no probe, I2b-6).
 fn ref_stats(ix: &CompactIndex) -> SetStats {
     let c = ix.stats();
     SetStats {
@@ -3050,6 +3051,7 @@ fn ref_stats(ix: &CompactIndex) -> SetStats {
         duplicates: c.duplicates,
         containment_tests: c.containment_tests,
         coordinates_compared: c.coordinates_compared,
+        exact_hits: 0,
         summary_bytes: c.summary_bytes,
         sig_bytes_est: c.sig_bytes_est,
     }
@@ -3072,18 +3074,150 @@ fn ref_held(ix: &CompactIndex) -> Vec<(u32, u64, OrdCounts)> {
 fn set_held(ix: &SetIndex) -> Vec<(u32, u64, OrdCounts)> {
     let mut v: Vec<_> = ix
         .entries()
-        .map(|(id, _, e)| (id, e.seq, e.ord.clone()))
+        .map(|(id, _, seq, ord)| (id, seq, ord.clone()))
         .collect();
     v.sort_by_key(|x| (x.0, x.1));
     v
 }
 
-/// I2-3 on one explicit sequence: per insertion the same `(SigId, Inserted)`,
-/// insertion-only counters 0 (I2-8), per query (through `&self`) the same
-/// `(Option<SigId>, Covers)` including the seq, at the end the same held
-/// multiset of (sig_id, seq, counts) with equal representatives, and the same
-/// counters. Returns the mismatches.
-fn i2_compare(spec: &[CompactSummary], imp: &[CompactSummary]) -> Vec<String> {
+/// The exact-hit oracle (I2b-3; derived §I2b item 3): the reference's own
+/// held list as `sig_id → (counts → seq)`, read from `CompactIndex`'s slots,
+/// so that a hit is decided without the set's map.
+type Oracle = std::collections::HashMap<u32, std::collections::HashMap<OrdCounts, u64>>;
+
+fn exact_oracle(rf: &CompactIndex) -> Oracle {
+    let mut m: Oracle = std::collections::HashMap::new();
+    for (id, seq, ord) in ref_held(rf) {
+        m.entry(id).or_default().insert(ord, seq);
+    }
+    m
+}
+
+/// One comparison's totals: the queries, the exact hits, the hits whose
+/// reference witness is an earlier order (`seq_r < seq_s`), and the
+/// reference's containment tests and coordinates on the hit queries.
+#[derive(Clone, Copy, Debug, Default)]
+struct I2bTally {
+    queries: usize,
+    hits: usize,
+    witness_differs: usize,
+    hit_ref_tests: usize,
+    hit_ref_coords: usize,
+}
+
+/// One query through both indexes (I2b-3), from per-query snapshots of both
+/// records: the `Option<SigId>` and the class equal, `sig_tests` and
+/// `sig_aliases` moving equally. On an exact hit (the oracle) the set answers
+/// the held order's own seq with `seq_r ≤ seq_s`, its two scan counters do
+/// not move, `exact_hits` gains one, and the reference tests at least once;
+/// otherwise the answers (seq included) and the deltas are equal and
+/// `exact_hits` does not move. At most twenty mismatches are kept.
+fn i2b_query(
+    set: &SetIndex,
+    rf: &mut CompactIndex,
+    oracle: &Oracle,
+    q: &CompactSummary,
+    t: &mut I2bTally,
+    bad: &mut Vec<String>,
+) {
+    let (s0, r0) = (set.stats(), rf.stats().clone());
+    let (a, b) = (set.covers(q), rf.covers(q));
+    let (s1, r1) = (set.stats(), rf.stats().clone());
+    let n = t.queries;
+    t.queries += 1;
+    let mut push = |m: String| {
+        if bad.len() < 20 {
+            bad.push(m);
+        }
+    };
+    let ds = (
+        s1.containment_tests - s0.containment_tests,
+        s1.coordinates_compared - s0.coordinates_compared,
+        s1.exact_hits - s0.exact_hits,
+    );
+    let dr = (
+        r1.containment_tests - r0.containment_tests,
+        r1.coordinates_compared - r0.coordinates_compared,
+    );
+    if (s1.sig_tests - s0.sig_tests, s1.sig_aliases - s0.sig_aliases)
+        != (r1.sig_tests - r0.sig_tests, r1.sig_aliases - r0.sig_aliases)
+    {
+        push(format!("query {n}: sig_tests or sig_aliases moved differently"));
+    }
+    if a.0 != b.0 || std::mem::discriminant(&a.1) != std::mem::discriminant(&b.1) {
+        push(format!("query {n}: set {a:?} reference {b:?}"));
+        return;
+    }
+    let exact = b.0.and_then(|id| oracle.get(&id)).and_then(|m| m.get(&q.ord)).copied();
+    match exact {
+        Some(seq_s) => {
+            t.hits += 1;
+            t.hit_ref_tests += dr.0;
+            t.hit_ref_coords += dr.1;
+            let seq_r = match b.1 {
+                Covers::Found(r) => r,
+                _ => u64::MAX,
+            };
+            if seq_r < seq_s {
+                t.witness_differs += 1;
+            }
+            if a.1 != Covers::Found(seq_s) || ds != (0, 0, 1) || dr.0 == 0 || seq_r > seq_s {
+                push(format!(
+                    "query {n}, exact hit {seq_s}: set {a:?} {ds:?} reference {b:?} {dr:?}"
+                ));
+            }
+        }
+        None => {
+            if a != b || ds != (dr.0, dr.1, 0) {
+                push(format!("query {n}: set {a:?} {ds:?} reference {b:?} {dr:?}"));
+            }
+        }
+    }
+}
+
+/// The end of one comparison (I2b-3, I2b-6): `exact_hits` is the oracle's
+/// count; the two identities hold (the set's scan counters plus the
+/// reference's work on the hit queries are the reference's), that work being
+/// at least one test per hit; every other `SetStats` field is the
+/// reference's; the held multisets are equal; `as_compact_stats` is the
+/// reference's record with `insert_tests` 0 and the set's two scan counters.
+fn i2b_end(set: &SetIndex, rf: &CompactIndex, t: &I2bTally, bad: &mut Vec<String>) {
+    let (s, r) = (set.stats(), ref_stats(rf));
+    if s.exact_hits != t.hits {
+        bad.push(format!("exact_hits {} against the oracle's {}", s.exact_hits, t.hits));
+    }
+    if s.containment_tests + t.hit_ref_tests != r.containment_tests
+        || s.coordinates_compared + t.hit_ref_coords != r.coordinates_compared
+        || t.hit_ref_tests < t.hits
+    {
+        bad.push(format!("the identities: set {s:?} reference {r:?} {t:?}"));
+    }
+    let rest = SetStats {
+        containment_tests: r.containment_tests,
+        coordinates_compared: r.coordinates_compared,
+        exact_hits: 0,
+        ..s
+    };
+    if rest != r {
+        bad.push(format!("the other fields: set {s:?} reference {r:?}"));
+    }
+    let mut want = rf.stats().clone();
+    want.insert_tests = 0;
+    want.containment_tests = s.containment_tests;
+    want.coordinates_compared = s.coordinates_compared;
+    if s.as_compact_stats() != want {
+        bad.push(format!("as_compact_stats {:?} against {want:?}", s.as_compact_stats()));
+    }
+    if set_held(set) != ref_held(rf) {
+        bad.push("held multisets differ".to_owned());
+    }
+}
+
+/// I2b-3 on one explicit sequence: per insertion the same `(SigId,
+/// Inserted)`; the scan counters and `exact_hits` 0 after the insertions
+/// (I2-8); every query through `&self` by [`i2b_query`]; the representatives
+/// equal; [`i2b_end`]. Returns the mismatches and the totals.
+fn i2_compare(spec: &[CompactSummary], imp: &[CompactSummary]) -> (Vec<String>, I2bTally) {
     let mut bad = Vec::new();
     let (mut set, mut rf) = (SetIndex::new(), CompactIndex::with_bucket(false, BucketKind::Scan));
     for (i, s) in spec.iter().enumerate() {
@@ -3093,18 +3227,14 @@ fn i2_compare(spec: &[CompactSummary], imp: &[CompactSummary]) -> Vec<String> {
         }
     }
     let st = set.stats();
-    if (st.containment_tests, st.coordinates_compared) != (0, 0) {
+    if (st.containment_tests, st.coordinates_compared, st.exact_hits) != (0, 0, 0) {
         bad.push(format!("I2-8: an insertion-only sequence counted {st:?}"));
     }
+    let oracle = exact_oracle(&rf);
+    let mut t = I2bTally::default();
     let shared: &SetIndex = &set;
-    for (i, g) in imp.iter().chain(spec.iter()).enumerate() {
-        let (a, b) = (shared.covers(g), rf.covers(g));
-        if a != b {
-            bad.push(format!("query {i}: set {a:?} reference {b:?}"));
-        }
-    }
-    if set_held(&set) != ref_held(&rf) {
-        bad.push("held multisets differ".to_owned());
+    for g in imp.iter().chain(spec.iter()) {
+        i2b_query(shared, &mut rf, &oracle, g, &mut t, &mut bad);
     }
     let reps: std::collections::BTreeMap<u32, &Sig> = rf
         .buckets()
@@ -3115,15 +3245,13 @@ fn i2_compare(spec: &[CompactSummary], imp: &[CompactSummary]) -> Vec<String> {
                 .map(|s| (s.sig_id, &s.sig))
         })
         .collect();
-    for (id, sig, _) in set.entries() {
+    for (id, sig, _, _) in set.entries() {
         if reps.get(&id).is_none_or(|r| *r != sig) {
             bad.push(format!("the representative of sig_id {id} differs"));
         }
     }
-    if set.stats() != ref_stats(&rf) {
-        bad.push(format!("stats: set {:?} reference {:?}", set.stats(), ref_stats(&rf)));
-    }
-    bad
+    i2b_end(&set, &rf, &t, &mut bad);
+    (bad, t)
 }
 
 /// s1 (I2-3): `SetIndex` is `Send` (I3 moves per-task sets into the merge).
@@ -3133,17 +3261,19 @@ fn s1_the_set_index_is_send() {
     assert_send::<SetIndex>();
 }
 
-/// s2 (I2-3, I2-8): equality with the reference on the five size-2 cells
-/// (specification inserted in completion order; implementation and
-/// specification summaries queried).
+/// s2 (I2-3, I2-8; I2b-3): the set against the reference on the five size-2
+/// cells (specification inserted in completion order; implementation and
+/// specification summaries queried, the latter all exact hits).
 #[test]
 fn s2_the_set_index_equals_the_reference_on_the_size2_cells() {
     let mut bad = Vec::new();
     for name in SIZE2_CELLS {
         let (spec, imp) = kept_summaries(&fx(name));
-        bad.extend(i2_compare(&spec, &imp).into_iter().map(|m| format!("{name}: {m}")));
+        let (b, t) = i2_compare(&spec, &imp);
+        note!("s2 {name}: {t:?}");
+        bad.extend(b.into_iter().map(|m| format!("{name}: {m}")));
     }
-    assert!(bad.is_empty(), "conformance: I2-3: {bad:#?}");
+    assert!(bad.is_empty(), "conformance: I2b-3: {bad:#?}");
 }
 
 /// s2 on the pilot corpus (I2-10's in-process part), one process.
@@ -3151,12 +3281,19 @@ fn s2_the_set_index_equals_the_reference_on_the_size2_cells() {
 #[ignore]
 fn s2_the_set_index_equals_the_reference_on_the_pilot_corpus() {
     let mut bad = Vec::new();
+    let mut all = I2bTally::default();
     for name in PILOT_NAMES {
         let (spec, imp) = kept_summaries(&fx(name));
-        bad.extend(i2_compare(&spec, &imp).into_iter().map(|m| format!("{name}: {m}")));
+        let (b, t) = i2_compare(&spec, &imp);
+        all.queries += t.queries;
+        all.hits += t.hits;
+        all.witness_differs += t.witness_differs;
+        all.hit_ref_tests += t.hit_ref_tests;
+        all.hit_ref_coords += t.hit_ref_coords;
+        bad.extend(b.into_iter().map(|m| format!("{name}: {m}")));
     }
-    note!("s2 pilot: {} fixtures", PILOT_NAMES.len());
-    assert!(bad.is_empty(), "conformance: I2-3 on the pilot: {bad:#?}");
+    note!("s2 pilot: {} fixtures {all:?}", PILOT_NAMES.len());
+    assert!(bad.is_empty(), "conformance: I2b-3 on the pilot: {bad:#?}");
 }
 
 /// A seeded permutation (Fisher–Yates with a 64-bit LCG).
@@ -3179,7 +3316,8 @@ fn shuffled<T: Clone>(v: &[T], mut seed: u64) -> Vec<T> {
 /// query's `Covers` discriminant. Between the order and its reverse, the
 /// `Noisy` pair's `Stored`/`Duplicate` assignment and the stored
 /// representative's rendering swap. The order-dependent quantities are
-/// printed.
+/// printed. I2b-4: `exact_hits` is in the invariant record (equal across the
+/// three orders) and is not 0.
 #[test]
 fn s3_order_dependence_with_a_noisy_alias_pair() {
     let (a3_spec, a3_imp) = kept_summaries(&fx("apps/a3/fifo/spec/k2q2"));
@@ -3246,9 +3384,12 @@ fn s3_order_dependence_with_a_noisy_alias_pair() {
         if s.sig_aliases != 1 {
             bad.push(format!("{what}: sig_aliases {}", s.sig_aliases));
         }
+        if s.exact_hits == 0 {
+            bad.push(format!("{what}: no exact hit"));
+        }
         // The held identities, by `Sig ==` and counts, against the sequence order.
         let held: Vec<(Sig, OrdCounts)> =
-            ix.entries().map(|(_, g, e)| (g.clone(), e.ord.clone())).collect();
+            ix.entries().map(|(_, g, _, o)| (g.clone(), o.clone())).collect();
         for q in &seq {
             if !held.iter().any(|(g, o)| *g == q.sig && *o == q.ord) {
                 bad.push(format!("{what}: an inserted identity is not held"));
@@ -3259,8 +3400,8 @@ fn s3_order_dependence_with_a_noisy_alias_pair() {
         let pos1 = ins.iter().position(|x| render(x) == render(&pn_spec[1])).unwrap();
         let rep = ix
             .entries()
-            .find(|(_, g, _)| **g == pn_spec[0].sig)
-            .map(|(_, g, _)| format!("{g:?}"))
+            .find(|(_, g, _, _)| **g == pn_spec[0].sig)
+            .map(|(_, g, _, _)| format!("{g:?}"))
             .unwrap();
         pn_roles.push((
             what.to_string(),
@@ -3268,9 +3409,11 @@ fn s3_order_dependence_with_a_noisy_alias_pair() {
             outcomes[pos1],
             rep == render(&pn_spec[0]),
         ));
-        let seqs: Vec<(u32, u64)> = ix.entries().map(|(id, _, e)| (id, e.seq)).collect();
+        let seqs: Vec<(u32, u64)> = ix.entries().map(|(id, _, seq, _)| (id, seq)).collect();
         note!(
-            "s3 {what}: sig_tests {} containment {} coords {} found-seqs {:?} entries[..4] {:?}",
+            "s3 {what}: exact_hits {} sig_tests {} containment {} coords {} found-seqs {:?} \
+             entries[..4] {:?}",
+            s.exact_hits,
             s.sig_tests,
             s.containment_tests,
             s.coordinates_compared,
@@ -3301,7 +3444,7 @@ fn s3_order_dependence_with_a_noisy_alias_pair() {
 fn s4_equality_is_never_by_rendering() {
     let pn = local_fixture("compact/i2-noisy", pn_prog(), pn_prog(), &["a", "r"]);
     let (spec, imp) = kept_summaries(&pn);
-    let bad = i2_compare(&spec, &imp);
+    let (bad, _) = i2_compare(&spec, &imp);
     assert!(bad.is_empty(), "conformance: I2-5 against the reference: {bad:#?}");
     let mut ix = SetIndex::new();
     assert_eq!(ix.insert(&spec[0]), (0, Inserted::Stored(0)));
@@ -3311,6 +3454,8 @@ fn s4_equality_is_never_by_rendering() {
     }
     let s = ix.stats();
     assert_eq!((s.entries, s.duplicates, s.sig_aliases, s.signatures), (1, 1, 1, 1));
+    // I2b-3: both queries are exact hits, answered by the probe alone.
+    assert_eq!((s.exact_hits, s.containment_tests, s.coordinates_compared), (2, 0, 0));
 }
 
 /// s5 (I2-6): `entries()` yields buckets in ascending `SigHash`, slots in
@@ -3336,8 +3481,11 @@ fn s5_the_iteration_order_is_deterministic() {
     };
     let (a, hash_of) = build();
     let (b, _) = build();
-    let ia: Vec<(u32, u64)> = a.entries().map(|(id, _, e)| (id, e.seq)).collect();
-    let ib: Vec<(u32, u64)> = b.entries().map(|(id, _, e)| (id, e.seq)).collect();
+    // I2b-5: the item type, `(SigId, &Sig, u64, &OrdCounts)`.
+    let first: Option<(u32, &Sig, u64, &OrdCounts)> = a.entries().next();
+    assert!(first.is_some());
+    let ia: Vec<(u32, u64)> = a.entries().map(|(id, _, seq, _)| (id, seq)).collect();
+    let ib: Vec<(u32, u64)> = b.entries().map(|(id, _, seq, _)| (id, seq)).collect();
     assert_eq!(ia, ib, "conformance: deterministic for one history");
     assert_eq!(ia.len(), a.len());
     for w in ia.windows(2) {
@@ -3353,8 +3501,13 @@ fn s5_the_iteration_order_is_deterministic() {
     assert!(hash_of.values().collect::<std::collections::BTreeSet<_>>().len() >= 3);
 }
 
-/// s6 (I2-1, I2-5, I2-8, I2-9): source checks on the appended set index:
-/// `insert` reaches no `cmp`/`le`; no explicit `Debug` formatting other than
+/// s6 (I2-1, I2-5, I2-8, I2-9; I2b-1–3): source checks on the set index's
+/// code (comment lines dropped): one `IndexMap<OrdCounts, u64>` per slot and
+/// no second copy (no `HashSet<OrdCounts>`, no `Vec<Entry>`, no `held:`);
+/// nothing ever removed from a map (the scan and `entries()` rely on its
+/// insertion order); `insert` decides by `contains_key`, stores one clone and
+/// reaches no `cmp`/`le`; `covers` probes before the scan and advances
+/// `exact_hits` at one site; no explicit `Debug` formatting other than
 /// through `render_hash`; both ids checked; every panic message prefixed.
 #[test]
 fn s6_the_set_index_source() {
@@ -3362,12 +3515,30 @@ fn s6_the_set_index_source() {
     let text = std::fs::read_to_string(path).expect("conformance: compact.rs");
     let start = text.find("// `SVERIFY-P` I2: the set index").expect("conformance: the I2 block");
     let block = &text[start..];
-    let ins_from = block.find("pub(crate) fn insert(").unwrap();
-    let ins_to = block.find("/// The read-only query (I2-3)").unwrap();
-    let insert = &block[ins_from..ins_to];
+    let code: Vec<&str> = block.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+    let code = code.join("\n");
+    assert!(
+        code.contains("    orders: indexmap::IndexMap<OrdCounts, u64>,"),
+        "conformance: I2b-1: one map per slot"
+    );
+    for gone in ["HashSet<OrdCounts>", "Vec<Entry>", "held:", "remove("] {
+        assert!(!code.contains(gone), "conformance: I2b-1: the set index's code has {gone}");
+    }
+    let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("conformance: no {s}"));
+    let insert = &code[at("pub(crate) fn insert(")..at("pub(crate) fn covers(")];
     for bad in [".cmp(", "le_counted", ".le("] {
         assert!(!insert.contains(bad), "conformance: I2-8: `insert` contains {bad}");
     }
+    assert!(
+        insert.contains("slot.orders.contains_key(&s.ord)")
+            && insert.contains("slot.orders.insert(s.ord.clone(), seq)"),
+        "conformance: I2b-2: the duplicate check and the one stored copy"
+    );
+    let covers = &code[at("pub(crate) fn covers(")..at("pub(crate) fn entries(")];
+    let probe = covers.find("slot.orders.get(&s.ord)").expect("conformance: I2b-3: the probe");
+    let scan = covers.find("le_counted").expect("conformance: I2b-3: the scan");
+    assert!(probe < scan, "conformance: I2b-3: the probe precedes the scan");
+    assert_eq!(code.matches("self.exact_hits.set(").count(), 1, "conformance: I2b-3: one site");
     // No printing macro is listed: `compact.rs` is not test-only, so s5's
     // `c1_no_user_facing_emission_outside_the_rendering_module` scans it,
     // and spelling one out here would trip that scan on this file.
@@ -3383,12 +3554,13 @@ fn s6_the_set_index_source() {
     }
 }
 
-/// s7 (I2-10, in-process): one cell (`I2_CELL`) through `oracle_trace_stream`'s
-/// two enumerations; the completion sinks build each `CompactSummary` and feed
-/// both types — the specification inserted, then the implementation queried —
-/// comparing every outcome; at the end the counters. Prints `S7` with the
-/// entries and duplicates. The k-th `Stored` insertion must carry seq k, so the
-/// seqs are 0 .. entries - 1 in completion order (I2-10).
+/// s7 (I2-10, I2b-3, in-process): one cell (`I2_CELL`) through
+/// `oracle_trace_stream`'s two enumerations; the completion sinks build each
+/// `CompactSummary` and feed both types. The specification is inserted
+/// (identical outcomes; the k-th `Stored` insertion carries seq k, so the
+/// seqs are 0 .. entries - 1 in completion order), then the implementation
+/// queried, each query by [`i2b_query`] against the oracle built once the
+/// specification is in; at the end [`i2b_end`]. Prints `S7`.
 #[test]
 #[ignore]
 fn s7_the_set_index_on_one_cell_in_process() {
@@ -3399,21 +3571,39 @@ fn s7_the_set_index_on_one_cell_in_process() {
     };
     let f = any_fixture(&name);
     let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
-    type Pair = (SetIndex, CompactIndex, Vec<String>, usize, u64);
-    let st: std::rc::Rc<std::cell::RefCell<Pair>> = std::rc::Rc::new(std::cell::RefCell::new((
-        SetIndex::new(),
-        CompactIndex::with_bucket(false, BucketKind::Scan),
-        Vec::new(),
-        0,
-        0,
-    )));
+    struct Run {
+        set: SetIndex,
+        rf: CompactIndex,
+        bad: Vec<String>,
+        n: usize,
+        stored: u64,
+        oracle: Option<Oracle>,
+        t: I2bTally,
+    }
+    let st = std::rc::Rc::new(std::cell::RefCell::new(Run {
+        set: SetIndex::new(),
+        rf: CompactIndex::with_bucket(false, BucketKind::Scan),
+        bad: Vec::new(),
+        n: 0,
+        stored: 0,
+        oracle: None,
+        t: I2bTally::default(),
+    }));
     for side in ["spec", "impl"] {
         let sink: CompletionSink = {
             let (st, vis) = (std::rc::Rc::clone(&st), f.visible.clone());
             Box::new(move |g: &ExecutionGraph, _| {
                 let s = CompactSummary::at_completion(g, &vis, side);
                 let mut p = st.borrow_mut();
-                let (set, rf, bad, n, stored) = &mut *p;
+                let Run {
+                    set,
+                    rf,
+                    bad,
+                    n,
+                    stored,
+                    oracle,
+                    t,
+                } = &mut *p;
                 *n += 1;
                 if side == "spec" {
                     let (a, b) = (set.insert(&s), rf.insert(&s));
@@ -3427,10 +3617,8 @@ fn s7_the_set_index_on_one_cell_in_process() {
                         *stored += 1;
                     }
                 } else {
-                    let (a, b) = (set.covers(&s), rf.covers(&s));
-                    if a != b && bad.len() < 20 {
-                        bad.push(format!("query {n}: {a:?} vs {b:?}"));
-                    }
+                    let o = oracle.get_or_insert_with(|| exact_oracle(rf));
+                    i2b_query(set, rf, o, &s, t, bad);
                 }
                 SinkVerdict::Continue
             })
@@ -3454,25 +3642,30 @@ fn s7_the_set_index_on_one_cell_in_process() {
         );
     }
     let p = st.borrow();
-    let (set, rf, bad, n, stored) = &*p;
-    let (s, r) = (set.stats(), ref_stats(rf));
+    let mut bad = p.bad.clone();
+    i2b_end(&p.set, &p.rf, &p.t, &mut bad);
+    let (s, r) = (p.set.stats(), ref_stats(&p.rf));
     note!(
-        "S7\t{name}\tentries {}\tduplicates {}\tcompletions {n}\tsig_tests {}\tsig_aliases {}\t\
-         containment {}\tcoords {}\tref_insert_tests {}\tstats_equal {}\tmismatches {}",
+        "S7\t{name}\tentries {}\tduplicates {}\tcompletions {}\tqueries {}\texact_hits {}\t\
+         witness_differs {}\tsig_tests {}\tsig_aliases {}\tcontainment {} ref {}\t\
+         coords {} ref {}\tref_insert_tests {}\tmismatches {}",
         s.entries,
         s.duplicates,
+        p.n,
+        p.t.queries,
+        s.exact_hits,
+        p.t.witness_differs,
         s.sig_tests,
         s.sig_aliases,
         s.containment_tests,
+        r.containment_tests,
         s.coordinates_compared,
-        rf.stats().insert_tests,
-        s == r,
+        r.coordinates_compared,
+        p.rf.stats().insert_tests,
         bad.len()
     );
-    assert!(bad.is_empty(), "conformance: I2-10 {name}: {bad:#?}");
-    assert_eq!(s, r, "conformance: I2-10 {name}: counters");
-    assert_eq!(*stored, s.entries as u64, "conformance: I2-10 {name}: seq 0 .. entries");
-    assert!(set_held(set) == ref_held(rf), "conformance: I2-10 {name}: held multisets");
+    assert!(bad.is_empty(), "conformance: I2-10/I2b-3 {name}: {bad:#?}");
+    assert_eq!(p.stored, s.entries as u64, "conformance: I2-10 {name}: seq 0 .. entries");
 }
 
 /// s8 (I2-11, information): the specification summaries of one cell
@@ -3528,5 +3721,535 @@ fn s8_insertion_walls() {
         summaries.len(),
         rf.stats().insert_tests,
         set.len()
+    );
+}
+
+// =========================================================================
+// SVERIFY-P I2b (tester, gate 3; criteria/SVERIFY-P-I2B.md rev 1.3, derived
+// §I2b items 1–11): the fast path's witness, the layout, the knob, the
+// refusals, the key, the measurement
+// =========================================================================
+
+/// s9 (I2b-3, I2b-10, the behavioural difference from I2): one slot holding
+/// `A` (all zeros) and then `B` (coordinate 0 raised), so `A ≤ B`. The query
+/// `B` is an exact hit: the set answers `B`'s seq (1) by the probe, the
+/// reference `A`'s (0) by its first `≤`; the class is equal; the set's scan
+/// counters do not move, the reference tests once. The query `A`: both
+/// answer 0, the set by the probe. `C ≥ A`, held nowhere: both scan, one
+/// test each, both answer 0. Indexes holding `B` alone: `D` (coordinate 1
+/// raised) is incomparable — `NotFound` after one test each — and `E`
+/// (coordinate 0 at 2) answers `B`'s seq by the scan. On the I2 code the
+/// query `B` answers 0 and tests once.
+#[test]
+fn s9_an_exact_hit_reports_its_own_seq() {
+    let base = real_summary("apps/a3/fifo/spec/k2q2");
+    let l = base.ord.len();
+    assert!(l >= 2, "conformance: s9 needs two coordinates");
+    let at = |v: &[(usize, u8)]| {
+        let mut x = vec![0u8; l];
+        for &(i, c) in v {
+            x[i] = c;
+        }
+        syn(&base, &x)
+    };
+    let (a, b, c) = (at(&[]), at(&[(0, 1)]), at(&[(0, 1), (1, 1)]));
+    let (mut set, mut rf) = (SetIndex::new(), CompactIndex::with_bucket(false, BucketKind::Scan));
+    for s in [&a, &b] {
+        assert_eq!(set.insert(s), rf.insert(s));
+    }
+    let snap = |set: &SetIndex, rf: &CompactIndex| {
+        let (s, r) = (set.stats(), rf.stats().clone());
+        (s.containment_tests, s.exact_hits, r.containment_tests)
+    };
+    let mut prev = snap(&set, &rf);
+    let mut step = |set: &SetIndex, rf: &mut CompactIndex, q: &CompactSummary| {
+        let ans = (set.covers(q), rf.covers(q));
+        let now = snap(set, rf);
+        let d = (now.0 - prev.0, now.1 - prev.1, now.2 - prev.2);
+        prev = now;
+        (ans, d)
+    };
+    let found = |q: u64| (Some(0), Covers::Found(q));
+    assert_eq!(step(&set, &mut rf, &b), ((found(1), found(0)), (0, 1, 1)), "conformance: B");
+    assert_eq!(step(&set, &mut rf, &a), ((found(0), found(0)), (0, 1, 1)), "conformance: A");
+    assert_eq!(step(&set, &mut rf, &c), ((found(0), found(0)), (1, 0, 1)), "conformance: C");
+    assert_eq!(
+        set.stats().containment_tests + 2,
+        rf.stats().containment_tests,
+        "conformance: I2b-3: the identity, the reference's two tests on the hits"
+    );
+    let (mut set2, mut rf2) = (SetIndex::new(), CompactIndex::with_bucket(false, BucketKind::Scan));
+    assert_eq!(set2.insert(&b), rf2.insert(&b));
+    let (d, e) = (at(&[(1, 1)]), at(&[(0, 2)]));
+    let nf = (Some(0), Covers::NotFound);
+    assert_eq!((set2.covers(&d), rf2.covers(&d)), (nf, nf), "conformance: D");
+    assert_eq!((set2.covers(&e), rf2.covers(&e)), (found(0), found(0)), "conformance: E");
+    let s2 = set2.stats();
+    assert_eq!((s2.containment_tests, s2.exact_hits), (2, 0));
+    assert_eq!(rf2.stats().containment_tests, 2);
+}
+
+/// s10 (I2b-8 (a)): the inline sizes the byte model rests on, on this
+/// target: `OrdCounts` 32 B, and the `IndexMap` bucket's fields (hash, key,
+/// value) 48 B.
+#[test]
+fn s10_the_inline_sizes_of_the_byte_model() {
+    assert_eq!(std::mem::size_of::<OrdCounts>(), 32, "conformance: I2b-8: OrdCounts");
+    assert_eq!(
+        std::mem::size_of::<(usize, OrdCounts, u64)>(),
+        48,
+        "conformance: I2b-8: the bucket's fields"
+    );
+}
+
+/// One stateful run through the grid driver (`run_grid` → `call` →
+/// `stateful::run_with`, the knob's path), with its row.
+fn knob_run(
+    f: &Fixture,
+    g: &GridConfig,
+) -> (stateful::StatefulOutcome, crate::conformance::grid::Row) {
+    use crate::conformance::grid::{row_of, run_grid, GridEnd, GridRaw};
+    match run_grid(f, g, None) {
+        GridEnd::Ok(r) => {
+            let row = row_of(&r);
+            match r.raw {
+                GridRaw::Stateful(o) => (o, row),
+                other => panic!("conformance: {}: not a stateful outcome: {other:?}", f.name),
+            }
+        }
+        other => panic!("conformance: {}: {other:?}", f.name),
+    }
+}
+
+/// The implementation summaries of the reported graphs, in report order: the
+/// uncovered sequence.
+fn uncovered(f: &Fixture, o: &stateful::StatefulOutcome) -> Vec<(Sig, OrdCounts)> {
+    o.reports
+        .iter()
+        .map(|(g, _)| {
+            let s = CompactSummary::at_completion(g, &f.visible, "implementation");
+            (s.sig, s.ord)
+        })
+        .collect()
+}
+
+/// I2b-7's engine-level equality on one fixture: Set, Compact with the
+/// antichain off, Compact at its defaults and Current. Equal across the
+/// four: the class counters, the reports and the uncovered sequence, the
+/// graph counts, `executions`, the ends. `orders_held`: Set = Compact
+/// (antichain off) = Current ≥ Compact (defaults). Set's `counters.compact`
+/// is Compact-antichain-off's but `insert_tests` (0) and the two scan
+/// counters (smaller by at least `exact_hits`); `counters.containment_tests`
+/// is the set's; `set_index` only under Set, `compact_index` never under it;
+/// the `index_kind` column; each label round-trips. Returns the mismatches
+/// and a one-line summary.
+fn i2b_knob(f: &Fixture, distinct: bool) -> (Vec<String>, String) {
+    use crate::conformance::config::IndexKind;
+    let base = GridConfig::new(GridEngine::Stateful).impl_distinct(distinct);
+    let configs = [
+        ("set", base.clone().index(IndexKind::Set), "set"),
+        ("compact-anti-off", base.clone().index(IndexKind::Compact).antichain(false), "compact"),
+        ("compact-default", base.clone().index(IndexKind::Compact), "compact"),
+        ("current", base.clone(), "current"),
+    ];
+    let mut bad = Vec::new();
+    let mut runs = Vec::new();
+    for (w, g, kind) in &configs {
+        let (o, row) = knob_run(f, g);
+        let col = row.iter().find(|(c, _)| *c == "index_kind").map(|(_, v)| v.as_str());
+        if col != Some(*kind) {
+            bad.push(format!("{w}: index_kind {col:?}"));
+        }
+        if crate::conformance::eval::parse_label(&g.label()).as_ref() != Some(g) {
+            bad.push(format!("{w}: the label {} does not round-trip", g.label()));
+        }
+        runs.push((*w, o));
+    }
+    let view = |o: &stateful::StatefulOutcome| {
+        let c = &o.counters;
+        format!(
+            "{:?}",
+            (
+                (c.spec_graphs, c.impl_graphs, c.lookups, c.lookups_signature_miss),
+                (c.lookups_containment_tested, c.lookups_succeeded, c.lookups_failed_after_tests),
+                (c.reports, c.signatures, c.sig_key_buckets, c.impl_distinct_summaries),
+                (c.invisible_ops_of_visible_threads, o.executions, o.reports.len()),
+                (o.spec_errors.len(), &o.impl_end, &o.spec_end),
+            )
+        )
+    };
+    let (v0, u0) = (view(&runs[0].1), uncovered(f, &runs[0].1));
+    for (w, o) in &runs[1..] {
+        if view(o) != v0 {
+            bad.push(format!("{w}: {} against set {v0}", view(o)));
+        }
+        if uncovered(f, o) != u0 {
+            bad.push(format!("{w}: the uncovered sequence differs"));
+        }
+    }
+    let held: Vec<usize> = runs.iter().map(|(_, o)| o.counters.orders_held).collect();
+    if !(held[0] == held[1] && held[0] == held[3] && held[0] >= held[2]) {
+        bad.push(format!("orders_held {held:?}"));
+    }
+    let (so, ro) = (&runs[0].1, &runs[1].1);
+    let eh = so
+        .set_index
+        .as_ref()
+        .expect("conformance: set_index under Set")
+        .stats()
+        .exact_hits;
+    match (so.counters.compact.clone(), ro.counters.compact.clone()) {
+        (Some(sc), Some(rc)) => {
+            let mut want = rc.clone();
+            want.insert_tests = 0;
+            want.containment_tests = sc.containment_tests;
+            want.coordinates_compared = sc.coordinates_compared;
+            if sc != want {
+                bad.push(format!("counters.compact: set {sc:?} against {rc:?}"));
+            }
+            if sc.containment_tests + eh > rc.containment_tests
+                || sc.coordinates_compared > rc.coordinates_compared
+                || eh > so.counters.lookups_succeeded
+                || so.counters.containment_tests != sc.containment_tests
+            {
+                bad.push(format!("scan counters: set {sc:?} exact_hits {eh} against {rc:?}"));
+            }
+        }
+        other => bad.push(format!("counters.compact {other:?}")),
+    }
+    if so.compact_index.is_some() || runs[1..].iter().any(|(_, o)| o.set_index.is_some()) {
+        bad.push("set_index only under Set, compact_index never under it".to_owned());
+    }
+    let line = format!(
+        "{}: exact_hits {eh} orders_held {held:?} containment set {} compact {}",
+        f.name, so.counters.containment_tests, ro.counters.containment_tests
+    );
+    (bad, line)
+}
+
+/// s11 (I2b-7): the knob's engine-level equality on the five size-2 cells,
+/// and on A4 k2q2m2 with `impl_distinct` on.
+#[test]
+fn s11_the_set_knob_at_the_engine() {
+    let mut bad = Vec::new();
+    let cells = SIZE2_CELLS.iter().map(|n| (*n, false));
+    for (name, distinct) in cells.chain([("apps/a4/hash/a4a/k2q2m2", true)]) {
+        let (b, line) = i2b_knob(&fx(name), distinct);
+        note!("s11 {line} distinct {distinct}");
+        bad.extend(b.into_iter().map(|m| format!("{name}: {m}")));
+    }
+    assert!(bad.is_empty(), "conformance: I2b-7: {bad:#?}");
+}
+
+/// s11 on the pilot corpus, one process.
+#[test]
+#[ignore]
+fn s11_the_set_knob_at_the_engine_on_the_pilot_corpus() {
+    let mut bad = Vec::new();
+    for name in PILOT_NAMES {
+        let (b, _) = i2b_knob(&fx(name), false);
+        bad.extend(b.into_iter().map(|m| format!("{name}: {m}")));
+    }
+    note!("s11 pilot: {} fixtures, {} mismatches", PILOT_NAMES.len(), bad.len());
+    assert!(bad.is_empty(), "conformance: I2b-7 on the pilot: {bad:#?}");
+}
+
+/// s12 (I2b-7, "not read" at the engine): under `Set`, `antichain`,
+/// `probe_memo` and `bucket` change nothing — one label, and the same
+/// counters (the wall times aside), set counters, reports and executions.
+#[test]
+fn s12_the_set_knob_reads_no_compact_knob() {
+    use crate::conformance::config::IndexKind;
+    let f = fx("apps/a3/fifo/spec/k2q2");
+    let set = GridConfig::new(GridEngine::Stateful).index(IndexKind::Set);
+    let variants = [
+        set.clone(),
+        set.clone().antichain(false),
+        set.clone().probe_memo(false),
+        set.clone().bucket(BucketKind::Trie),
+        set.clone()
+            .antichain(false)
+            .probe_memo(false)
+            .bucket(BucketKind::Inverted(2)),
+    ];
+    let view = |o: &stateful::StatefulOutcome| {
+        let mut c = o.counters.clone();
+        c.spec_wall_time_ms = 0;
+        c.impl_wall_time_ms = 0;
+        (
+            format!("{c:?}"),
+            o.set_index.as_ref().map(|s| s.stats()),
+            uncovered(&f, o),
+            o.executions,
+        )
+    };
+    let want = view(&knob_run(&f, &variants[0]).0);
+    for g in &variants[1..] {
+        assert_eq!(g.label(), variants[0].label(), "conformance: one key");
+        assert!(view(&knob_run(&f, g).0) == want, "conformance: I2b-7: {g:?} changes the run");
+    }
+}
+
+/// s13 (I2b-7, "not read" in the source): the set's construction in
+/// `stateful.rs` is one statement, `SetIndex::new()`, which takes no
+/// argument; the file reads `cc.antichain` and `cc.bucket` once each, at the
+/// `Compact` construction, and `cc.probe_memo` nowhere.
+#[test]
+fn s13_the_set_construction_reads_no_knob() {
+    let read = |p: &str| {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p);
+        std::fs::read_to_string(path).expect("conformance: a source")
+    };
+    let st = read("src/conformance/stateful.rs");
+    let at = st.find("    if cc.index == IndexKind::Set {\n").expect("conformance: the Set arm");
+    let end = at + st[at..].find("\n    }\n").expect("conformance: its end");
+    let body = &st[at..end];
+    assert_eq!(body.lines().count(), 2, "conformance: one statement: {body}");
+    assert!(
+        body.contains("state.borrow_mut().set = Some(SetIndex::new());"),
+        "conformance: the Set construction: {body}"
+    );
+    for knob in ["antichain", "probe_memo", "bucket"] {
+        assert!(!body.contains(knob), "conformance: the Set construction reads {knob}");
+    }
+    assert_eq!((st.matches("cc.antichain").count(), st.matches("cc.bucket").count()), (1, 1));
+    assert!(st.contains("compact = Some(CompactIndex::with_bucket(cc.antichain, cc.bucket));"));
+    assert!(!st.contains("cc.probe_memo"), "conformance: probe_memo is complete-first's");
+    let cp = read("src/conformance/compact.rs");
+    let block = &cp[cp.find("// `SVERIFY-P` I2: the set index").expect("conformance: I2")..];
+    assert!(block.contains("    pub(crate) fn new() -> Self {\n"), "conformance: no argument");
+}
+
+/// s14 (I2b-7, the two refusal sites): the public `verify` with the
+/// complete-first engine and `Set` returns the `KnobConflict` and runs
+/// neither program; the grid's `conf_config` panics with its message, and
+/// `run_grid` ends `Panicked` with it, before any engine starts. The gated
+/// and enumerator engines read no index: under `Set` they run as under
+/// `Compact`.
+#[test]
+fn s14_complete_first_with_set_is_refused_at_both_sites() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::grid::{run_grid, GridEnd, GridRaw};
+    use crate::conformance::{ConfBuilder, ConfError, Engine};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let f = fx("apps/a3/fifo/spec/k2q2");
+    let calls = std::sync::Arc::new(AtomicUsize::new(0));
+    let (ci, cs) = (std::sync::Arc::clone(&calls), std::sync::Arc::clone(&calls));
+    let (imp, spec) = (f.implementation.clone(), f.specification.clone());
+    let cc = ConfBuilder::new()
+        .config(f.config.clone())
+        .visible_threads(f.visible.clone())
+        .engine(Engine::CompleteFirst)
+        .index(IndexKind::Set)
+        .build()
+        .expect("conformance: the builder takes the pair; `run` refuses it");
+    let r = crate::conformance::verify(
+        cc,
+        move || {
+            ci.fetch_add(1, SeqCst);
+            imp()
+        },
+        move || {
+            cs.fetch_add(1, SeqCst);
+            spec()
+        },
+    );
+    assert!(
+        matches!(
+            r,
+            Err(ConfError::KnobConflict {
+                knob: "index(Set)",
+                conflicts_with: "engine(CompleteFirst)"
+            })
+        ),
+        "conformance: the public site: {r:?}"
+    );
+    assert_eq!(calls.load(SeqCst), 0, "conformance: neither program ran");
+    let msg = "conformance: index(Set) with engine(CompleteFirst) is not a configuration \
+               (SVERIFY-P I2b)";
+    let g = GridConfig::new(GridEngine::CompleteFirst).index(IndexKind::Set);
+    let p = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.conf_config(&f))) {
+        Ok(_) => panic!("conformance: the grid site did not refuse"),
+        Err(p) => p,
+    };
+    let got = p
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| p.downcast_ref::<String>().cloned());
+    assert_eq!(got.as_deref(), Some(msg), "conformance: the grid site's message");
+    let end = run_grid(&f, &g, None);
+    let shown = format!("{end:?}");
+    assert!(
+        matches!(end, GridEnd::Panicked { .. }) && shown.contains(msg),
+        "conformance: run_grid: {shown}"
+    );
+    for e in [GridEngine::Gated, GridEngine::Enumerator] {
+        let run = |k: IndexKind| match run_grid(&f, &GridConfig::new(e).index(k), None) {
+            GridEnd::Ok(r) => match r.raw {
+                GridRaw::Gated(o) => format!(
+                    "{:?}",
+                    (o.reports.len(), o.executions, o.max_paper_events, o.aborted, o.impl_end)
+                ),
+                GridRaw::Enumerator(o) => format!(
+                    "{:?}",
+                    (o.reports.len(), o.diagnostics.len(), o.end, o.skipped_gates, o.spec_error)
+                ),
+                other => panic!("conformance: {other:?}"),
+            },
+            other => panic!("conformance: {other:?}"),
+        };
+        assert_eq!(run(IndexKind::Set), run(IndexKind::Compact), "conformance: {e:?}");
+    }
+}
+
+/// s15 (I2b-7, the parser): the Set key is the fourteen-field
+/// `…/index=set`; it parses back to `GridConfig::new(Stateful).index(Set)`
+/// field by field, the unprinted knobs at `GridConfig::new`'s values (a Set
+/// configuration with other knob values has the same key and parses to the
+/// defaults), and with `distinct=on`; it is refused on every engine but the
+/// stateful one, with a bucket suffix, and in the sixteen-field form.
+#[test]
+fn s15_the_set_key() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::parse_label;
+    let set = GridConfig::new(GridEngine::Stateful).index(IndexKind::Set);
+    let key = set.label();
+    assert_eq!(key.split('/').count(), 14, "conformance: {key}");
+    assert!(key.ends_with("/index=set"), "conformance: {key}");
+    assert_eq!(parse_label(&key), Some(set.clone()));
+    let other = set.clone().antichain(false).probe_memo(false).bucket(BucketKind::Trie);
+    assert_eq!(other.label(), key, "conformance: the unread knobs are not printed");
+    assert_eq!(parse_label(&other.label()), Some(set.clone()));
+    let d = set.clone().impl_distinct(true);
+    assert_eq!(parse_label(&d.label()), Some(d.clone()));
+    for e in [
+        GridEngine::CompleteFirst,
+        GridEngine::Gated,
+        GridEngine::Enumerator,
+        GridEngine::Verify,
+        GridEngine::Explore,
+    ] {
+        let k = GridConfig::new(e).index(IndexKind::Set).label();
+        assert!(k.ends_with("/index=set"), "conformance: {k}");
+        assert_eq!(parse_label(&k), None, "conformance: {e:?} with index=set");
+    }
+    for bad in [
+        format!("{key}/bucket=trie"),
+        format!("{key}/bucket=inverted:2"),
+        key.replace("/index=set", "/index=set/anti=false/pmemo=false"),
+        key.replace("/index=set", "/index=set/anti=true/pmemo=true"),
+        key.replace("/index=set", "/index=compact"),
+    ] {
+        assert_eq!(parse_label(&bad), None, "conformance: {bad}");
+    }
+}
+
+extern "C" {
+    /// glibc: return the free memory of every arena to the kernel.
+    fn malloc_trim(pad: usize) -> i32;
+}
+
+/// `VmSize` and `VmRSS` of this process (`/proc/self/status`) and the exact
+/// `Rss` (`/proc/self/smaps_rollup`, a walk of the page tables), KiB. `VmRSS`
+/// is read from the kernel's per-CPU counters, which fold in batches of
+/// pages, so a small delta of it is approximate; the walk is not.
+fn vm_kib() -> (i64, i64, i64) {
+    let read = |p: &str| std::fs::read_to_string(p).expect("conformance: /proc/self");
+    let field = |s: &str, k: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<i64>().ok())
+            .unwrap_or_else(|| panic!("conformance: no {k}"))
+    };
+    let (s, r) = (read("/proc/self/status"), read("/proc/self/smaps_rollup"));
+    (field(&s, "VmSize:"), field(&s, "VmRSS:"), field(&r, "Rss:"))
+}
+
+/// The specification summaries of one cell, collected in-process (as s8).
+fn spec_summaries_in_process(name: &str) -> Vec<CompactSummary> {
+    use crate::conformance::ctx::{CompletionSink, ConfMode, SinkVerdict};
+    use crate::conformance::stateful::{enumerate, EnumRun};
+    let f = any_fixture(name);
+    let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+    let got: std::rc::Rc<std::cell::RefCell<Vec<CompactSummary>>> = Default::default();
+    let sink: CompletionSink = {
+        let (got, vis) = (std::rc::Rc::clone(&got), f.visible.clone());
+        Box::new(move |g: &ExecutionGraph, _| {
+            got.borrow_mut().push(CompactSummary::at_completion(g, &vis, "spec"));
+            SinkVerdict::Continue
+        })
+    };
+    let mut config = cc.config.clone();
+    config.max_iterations = None;
+    enumerate(
+        EnumRun {
+            config,
+            visible: f.visible.clone(),
+            mode: ConfMode::Enumerate,
+            sink,
+            cut: false,
+            stop_at_first_report: false,
+            gate_sink: None,
+        },
+        &f.specification,
+    );
+    let v = got.borrow().clone();
+    v
+}
+
+/// s16 (I2b-8 (b), information, single runs): `I2B_MEM_CELL`'s
+/// specification summaries collected first, then inserted into one index
+/// (`I2B_MEM_KIND`: `set`, or `ref` for `CompactIndex::with_bucket(false,
+/// Scan)`), with `malloc_trim(0)` before each reading; prints `S16` with the
+/// `VmSize` and `VmRSS` deltas and both per held order.
+#[test]
+#[ignore]
+fn s16_bytes_per_entry() {
+    let (Ok(name), Ok(kind)) = (std::env::var("I2B_MEM_CELL"), std::env::var("I2B_MEM_KIND")) else {
+        return;
+    };
+    let summaries = spec_summaries_in_process(&name);
+    // SAFETY: glibc's `malloc_trim` only releases free memory of the
+    // allocator's own arenas; no live allocation is touched.
+    let trim = || {
+        unsafe { malloc_trim(0) };
+    };
+    trim();
+    let (v0, r0, x0) = vm_kib();
+    let (entries, signatures, (v1, r1, x1)) = match kind.as_str() {
+        "set" => {
+            let mut ix = SetIndex::new();
+            for s in &summaries {
+                ix.insert(s);
+            }
+            trim();
+            let m = vm_kib();
+            let st = std::hint::black_box(&ix).stats();
+            (st.entries, st.signatures, m)
+        }
+        "ref" => {
+            let mut ix = CompactIndex::with_bucket(false, BucketKind::Scan);
+            for s in &summaries {
+                ix.insert(s);
+            }
+            trim();
+            let m = vm_kib();
+            let st = std::hint::black_box(&ix).stats().clone();
+            (st.entries, st.signatures, m)
+        }
+        other => panic!("conformance: I2B_MEM_KIND {other}"),
+    };
+    let per = |d: i64| d as f64 * 1024.0 / entries as f64;
+    note!(
+        "S16\t{name}\t{kind}\tsummaries {}\tentries {entries}\tsignatures {signatures}\t\
+         vmsize_delta_kib {}\tvmrss_delta_kib {}\trss_exact_delta_kib {}\t\
+         B_per_entry_vmsize {:.1}\tB_per_entry_vmrss {:.1}\tB_per_entry_rss_exact {:.1}",
+        summaries.len(),
+        v1 - v0,
+        r1 - r0,
+        x1 - x0,
+        per(v1 - v0),
+        per(r1 - r0),
+        per(x1 - x0)
     );
 }

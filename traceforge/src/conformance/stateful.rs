@@ -41,7 +41,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::conformance::compact::{CompactIndex, CompactSummary, Covers, Inserted, OrdCounts};
+use crate::conformance::compact::{
+    CompactIndex, CompactSummary, Covers, Inserted, OrdCounts, SetIndex,
+};
 use crate::conformance::config::{ConfConfig, Engine, IndexKind};
 use crate::conformance::ctx::{
     CompletionSink, ConfCtx, ConfMode, Diagnostic, DiagnosticReason, Gate, GateSink, Report,
@@ -73,6 +75,8 @@ pub(crate) struct StatefulOutcome {
     /// `COMPACT-INDEX` §5.1 item 4(a): the bucket index, `Some` iff
     /// `index = Compact`.
     pub(crate) compact_index: Option<CompactIndex>,
+    /// `SVERIFY-P` I2b-7: the set index, `Some` iff `index = Set`.
+    pub(crate) set_index: Option<SetIndex>,
     /// Every Impl graph, in completion order — empty unless `keep_graphs`.
     pub(crate) kept_impl_graphs: Vec<ExecutionGraph>,
     /// Every Spec graph, in completion order — empty unless `keep_graphs`.
@@ -99,6 +103,9 @@ struct SinkState {
     /// `COMPACT-INDEX` §5.1 item 4(a): `Some` iff `index = Compact`; then
     /// `index` above stays empty.
     compact: Option<CompactIndex>,
+    /// `SVERIFY-P` I2b-7: `Some` iff `index = Set`; then `index` and
+    /// `compact` above stay empty.
+    set: Option<SetIndex>,
     /// `COMPACT-INDEX` step 0 under `Current` (frozen §6): the distinct
     /// implementation summaries, exact `(Sig, ord)`, in the engine's own
     /// structure.
@@ -231,6 +238,11 @@ pub(crate) fn run_with(
     if cc.index == IndexKind::Compact {
         state.borrow_mut().compact = Some(CompactIndex::with_bucket(cc.antichain, cc.bucket));
     }
+    // `SVERIFY-P` I2b-7: the set index in place of either; it reads none of
+    // `antichain`, `probe_memo`, `bucket`.
+    if cc.index == IndexKind::Set {
+        state.borrow_mut().set = Some(SetIndex::new());
+    }
     // Phase 2 D6: the step-0 counter only when the knob asks for it.
     state.borrow_mut().impl_distinct = cc.impl_distinct;
     if cc.impl_distinct {
@@ -242,7 +254,12 @@ pub(crate) fn run_with(
         let visible = visible.clone();
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
             let mut st = state.borrow_mut();
-            let inserted = if st.compact.is_some() {
+            let inserted = if st.set.is_some() {
+                // `SVERIFY-P` I2b-7: the set index's insertion.
+                let s = CompactSummary::at_completion(g, &visible, "specification");
+                let si = st.set.as_mut().expect("conformance: the set index is set");
+                matches!(si.insert(&s), (_, Inserted::Stored(_)))
+            } else if st.compact.is_some() {
                 let s = CompactSummary::at_completion(g, &visible, "specification");
                 let ci = st.compact.as_mut().expect("conformance: the compact index is set");
                 matches!(ci.insert(&s), (_, Inserted::Stored(_)))
@@ -289,6 +306,13 @@ pub(crate) fn run_with(
             st.counters.signatures = stats.signatures;
             st.counters.orders_held = stats.entries;
         }
+        if let Some(si) = st.set.as_ref() {
+            // `SVERIFY-P` I2b-7: the same three counts from the set index.
+            let stats = si.stats();
+            st.counters.sig_key_buckets = stats.buckets;
+            st.counters.signatures = stats.signatures;
+            st.counters.orders_held = stats.entries;
+        }
     }
     assert!(
         spec_run.end == SearchEnd::StateSpaceExhausted,
@@ -316,11 +340,16 @@ pub(crate) fn run_with(
         if let Some(ci) = st.compact.as_ref() {
             st.counters.compact = Some(ci.stats().clone());
         }
+        if let Some(si) = st.set.as_ref() {
+            // `SVERIFY-P` I2b-7: the set's counters in the reference's record.
+            st.counters.compact = Some(si.stats().as_compact_stats());
+        }
         return StatefulOutcome {
             reports: Vec::new(),
             counters: st.counters,
             index: st.index,
             compact_index: st.compact,
+            set_index: st.set,
             kept_impl_graphs: Vec::new(),
             kept_spec_graphs,
             impl_end: SearchEnd::Unknown,
@@ -342,7 +371,12 @@ pub(crate) fn run_with(
         Box::new(move |g: &ExecutionGraph, must_state: &MustState| {
             // `COMPACT-INDEX` §5.1 item 4(a): under `Compact` the compact
             // summary is the only one built; under `Current` today's.
-            let compact_on = state.borrow().compact.is_some();
+            // `SVERIFY-P` I2b-7: under `Set` too — the set index answers the
+            // compact summary's query.
+            let compact_on = {
+                let st = state.borrow();
+                st.compact.is_some() || st.set.is_some()
+            };
             let cs = compact_on.then(|| CompactSummary::at_completion(g, &visible, "implementation"));
             let current = (!compact_on).then(|| summarise(g, &visible, "implementation"));
             let mut st = state.borrow_mut();
@@ -363,6 +397,7 @@ pub(crate) fn run_with(
             let SinkState {
                 index,
                 compact,
+                set,
                 impl_seen,
                 impl_seen_compact,
                 impl_distinct,
@@ -373,8 +408,13 @@ pub(crate) fn run_with(
                 // `COMPACT-INDEX` frozen §4.2, §6; phase 2 D1, D6: the
                 // query, and step 0's count under the exact compact identity
                 // when the knob is on.
-                let ci = compact.as_mut().expect("conformance: the compact index is set");
-                let (_, outcome) = ci.covers(s);
+                let (_, outcome) = if let Some(si) = set.as_ref() {
+                    // `SVERIFY-P` I2b-7: the set index's read-only query.
+                    si.covers(s)
+                } else {
+                    let ci = compact.as_mut().expect("conformance: the compact index is set");
+                    ci.covers(s)
+                };
                 if *impl_distinct
                     && impl_seen_compact
                         .entry(s.sig.clone(), std::collections::HashSet::new)
@@ -472,12 +512,22 @@ pub(crate) fn run_with(
         st.counters.containment_tests = stats.containment_tests;
         st.counters.compact = Some(stats);
     }
+    if let Some(si) = st.set.as_ref() {
+        // `SVERIFY-P` I2b-7: the set's counters in the reference's record, as
+        // the compact arm fills it (`insert_tests` 0; `exact_hits` stays on
+        // `set_index`).
+        let mut stats = si.stats().as_compact_stats();
+        stats.impl_distinct_summaries = st.counters.impl_distinct_summaries;
+        st.counters.containment_tests = stats.containment_tests;
+        st.counters.compact = Some(stats);
+    }
 
     StatefulOutcome {
         reports: st.reports,
         counters: st.counters,
         index: st.index,
         compact_index: st.compact,
+        set_index: st.set,
         kept_impl_graphs: st.kept,
         kept_spec_graphs,
         impl_end: impl_run.end,

@@ -326,11 +326,18 @@ impl BucketKind {
 /// `I` and the complete-first engine's `W`. `Current` is Parts 4–5's code
 /// (`SigBuckets<BTreeSet<VisOrder>>`, `WitnessCache`); `Compact` is the
 /// bucket index of counts (`compact.rs`). The gated engine reads neither.
+/// `SVERIFY-P` I2b: `Set` is the stateful engine's set index (`compact.rs`,
+/// `SetIndex`: each order held once, no antichain, the exact-hit probe);
+/// the complete-first engine does not read it and is refused with it
+/// (`ConfError::KnobConflict` at `run`; the grid's `conf_config` panics);
+/// the enumerator and gated engines ignore it as they ignore `Compact`.
+/// Under `Set`, `antichain`, `probe_memo` and `bucket` are not read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum IndexKind {
     #[default]
     Current,
     Compact,
+    Set,
 }
 
 /// `P5-CFCFG` F1: the capacity of the complete-first witness cache `W`
@@ -508,7 +515,9 @@ impl ConfBuilder {
     /// `COMPACT-INDEX` §5 (frozen C1): the index behind `I` and `W`
     /// ([`IndexKind`]). Default `Current`. Read by [`Engine::Stateful`] and
     /// [`Engine::CompleteFirst`]; `Compact` with `completion_cover(Flat)` is
-    /// refused by the complete-first engine (`ConfError::KnobConflict`).
+    /// refused by the complete-first engine (`ConfError::KnobConflict`);
+    /// `Set` with [`Engine::CompleteFirst`] is refused at `run`
+    /// (`SVERIFY-P` I2b).
     pub fn index(mut self, k: IndexKind) -> Self {
         self.index = k;
         self

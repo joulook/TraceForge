@@ -1483,6 +1483,15 @@ impl GridConfig {
                 panic!("conformance: `Explore` has no conformance configuration (P5-XBASE F1)")
             }
         };
+        // `SVERIFY-P` I2b-7: the set index is the stateful engine's; the
+        // complete-first engine would run `Current` under `Set` (it reads
+        // `Compact` only), and this path does not pass `conformance::run`'s
+        // refusal, so the pair is refused here, before any engine starts.
+        assert!(
+            !(engine == Engine::CompleteFirst && self.index == IndexKind::Set),
+            "conformance: index(Set) with engine(CompleteFirst) is not a configuration \
+             (SVERIFY-P I2b)"
+        );
         let b = ConfBuilder::new()
             .config(fixture.config.clone())
             .visible_threads(fixture.visible.clone())
@@ -1543,6 +1552,15 @@ impl GridConfig {
                 self.antichain,
                 self.probe_memo
             )
+        } else if self.index == IndexKind::Set {
+            // `SVERIFY-P` I2b-7: fourteen fields; `antichain`, `probe_memo`
+            // and `bucket` are neither read nor printed under `Set`, as
+            // under `Current`.
+            format!(
+                "{eleven}/{}/quiet={}/index=set",
+                capacity_field(self.witness_cache),
+                self.quiet
+            )
         } else if self.witness_cache == Capacity::Unbounded && !self.quiet {
             eleven
         } else {
@@ -1566,12 +1584,13 @@ impl GridConfig {
     }
 }
 
-/// `COMPACT-INDEX` frozen §7: the `index_kind` column.
-fn index_kind_field(compact: bool) -> &'static str {
-    if compact {
-        "compact"
-    } else {
-        "current"
+/// `COMPACT-INDEX` frozen §7: the `index_kind` column, from the
+/// configuration's kind (`SVERIFY-P` I2b-7: `set` as well).
+fn index_kind_field(index: IndexKind) -> &'static str {
+    match index {
+        IndexKind::Current => "current",
+        IndexKind::Compact => "compact",
+        IndexKind::Set => "set",
     }
 }
 
@@ -2215,7 +2234,8 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "impl_wall_time_ms", c.impl_wall_time_ms);
             // `COMPACT-INDEX` §5.1 items 1 and 5.
             push_opt(&mut row, "impl_distinct_summaries", c.impl_distinct_summaries);
-            push_d(&mut row, "index_kind", index_kind_field(c.compact.is_some()));
+            // `SVERIFY-P` I2b-7: the kind from the configuration (stateful row).
+            push_d(&mut row, "index_kind", index_kind_field(r.config.index));
             compact_columns(&mut row, c.compact.as_ref());
         }
         GridRaw::CompleteFirst(o) => {
@@ -2274,7 +2294,8 @@ pub(super) fn row_of(r: &GridResult) -> Row {
                 "impl_phase_wall_ms",
                 c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),
             );
-            push_d(&mut row, "index_kind", index_kind_field(c.compact.is_some()));
+            // `SVERIFY-P` I2b-7: the kind from the configuration (complete-first row).
+            push_d(&mut row, "index_kind", index_kind_field(r.config.index));
             if let Some(cs) = c.compact.as_ref() {
                 push_d(&mut row, "containment_tests", cs.containment_tests);
                 push_opt(&mut row, "impl_distinct_summaries", cs.impl_distinct_summaries);

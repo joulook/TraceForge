@@ -2280,10 +2280,12 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // `b93188a9…`); the hunks regenerated from the whole phase-2 diff.
     // Items 4, 5, 7 (2026-10-19, tester re-pin): to `e1a0ca73…` (grid.rs md5
     // `3c6f6c61…`); the hunks regenerated again.
+    // SVERIFY-P I2b (2026-10-26, tester re-pin, gate 3): to `e81c8b53…` (grid.rs
+    // md5 `85a28650…`); `I2B_HUNKS` undo it to `e1a0ca73…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "e1a0ca73b0aaf6256f044a74a8ed533c",
+        "e81c8b53c8bbbb3872ef3e590c5d9811",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2362,7 +2364,27 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         ("            // `COMPACT-INDEX` §5.1 items 1 and 5.\n            push_opt(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n", "            // `COMPACT-INDEX` §5.1 items 1 and 5.\n            push_d(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n"),
         ("                push_d(&mut row, \"containment_tests\", cs.containment_tests);\n                push_opt(&mut row, \"impl_distinct_summaries\", cs.impl_distinct_summaries);\n                push_d(&mut row, \"signatures\", cs.signatures);\n            }\n", "                push_d(&mut row, \"containment_tests\", cs.containment_tests);\n                push_d(&mut row, \"impl_distinct_summaries\", cs.impl_distinct_summaries);\n            }\n"),
     ];
+    // SVERIFY-P I2b (2026-10-26, tester re-pin): the lead's five `grid.rs`
+    // hunks (`diff -U1` against grid.rs `3c6f6c61…`: the `conf_config`
+    // refusal, the label's `index=set` arm, `index_kind_field` by kind and
+    // its two call sites), all inside the prefix, each with one line of
+    // context; undoing them gives back the phase-2 prefix, byte for byte.
+    const I2B_HUNKS: [(&str, &str); 5] = [
+        ("        };\n        // `SVERIFY-P` I2b-7: the set index is the stateful engine's; the\n        // complete-first engine would run `Current` under `Set` (it reads\n        // `Compact` only), and this path does not pass `conformance::run`'s\n        // refusal, so the pair is refused here, before any engine starts.\n        assert!(\n            !(engine == Engine::CompleteFirst && self.index == IndexKind::Set),\n            \"conformance: index(Set) with engine(CompleteFirst) is not a configuration \\\n             (SVERIFY-P I2b)\"\n        );\n        let b = ConfBuilder::new()\n", "        };\n        let b = ConfBuilder::new()\n"),
+        ("            )\n        } else if self.index == IndexKind::Set {\n            // `SVERIFY-P` I2b-7: fourteen fields; `antichain`, `probe_memo`\n            // and `bucket` are neither read nor printed under `Set`, as\n            // under `Current`.\n            format!(\n                \"{eleven}/{}/quiet={}/index=set\",\n                capacity_field(self.witness_cache),\n                self.quiet\n            )\n        } else if self.witness_cache == Capacity::Unbounded && !self.quiet {\n", "            )\n        } else if self.witness_cache == Capacity::Unbounded && !self.quiet {\n"),
+        ("\n/// `COMPACT-INDEX` frozen §7: the `index_kind` column, from the\n/// configuration's kind (`SVERIFY-P` I2b-7: `set` as well).\nfn index_kind_field(index: IndexKind) -> &'static str {\n    match index {\n        IndexKind::Current => \"current\",\n        IndexKind::Compact => \"compact\",\n        IndexKind::Set => \"set\",\n    }\n", "\n/// `COMPACT-INDEX` frozen §7: the `index_kind` column.\nfn index_kind_field(compact: bool) -> &'static str {\n    if compact {\n        \"compact\"\n    } else {\n        \"current\"\n    }\n"),
+        ("            push_opt(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            // `SVERIFY-P` I2b-7: the kind from the configuration (stateful row).\n            push_d(&mut row, \"index_kind\", index_kind_field(r.config.index));\n            compact_columns(&mut row, c.compact.as_ref());\n", "            push_opt(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            compact_columns(&mut row, c.compact.as_ref());\n"),
+        ("            );\n            // `SVERIFY-P` I2b-7: the kind from the configuration (complete-first row).\n            push_d(&mut row, \"index_kind\", index_kind_field(r.config.index));\n            if let Some(cs) = c.compact.as_ref() {\n", "            );\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            if let Some(cs) = c.compact.as_ref() {\n"),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in I2B_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "e1a0ca73b0aaf6256f044a74a8ed533c",
+        "conformance: the prefix without I2b's hunks = the phase-2 prefix"
+    );
     for (new, old) in COMPACT_P2_HUNKS {
         t = undo(t, new, old);
     }
