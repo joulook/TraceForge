@@ -394,18 +394,27 @@ fn build_derived() -> Derived {
 }
 
 /// derived.md §2: rows per spec and the distinct-key count.
+/// `MIN-ENGINES` E1 (2026-10-26, tester re-pin at gate 3): a `Plain` key
+/// (`GridConfig::plain_key`: the stateful engine; complete-first without the
+/// precheck) is built under `Ltr` alone (`selectors_for`), so a point's 36
+/// rows (4 engines × 3 selectors × 3 reps) are 24 (enumerator 9, stateful 3,
+/// complete-first 3, gated 9): X1 278 points × 24 = 6 672, X1V 83 × 12 = 996
+/// (complete-first 3 + gated 9), X2 178 × 24 = 4 272, X2P its rep 0 = 178 × 8
+/// = 1 424; X0 (the lead's F1b fix, `selectors_for` on each engine) 3 + 1 + 1 +
+/// 3 = 8; X2S, X1P and X3A unchanged. Distinct: 6 672 + 996 + 4 272 + 1 424 +
+/// 176 + 1 980 + 8 − X1∩X3A 990 − X0∩X1V 4 = 14 534.
 const DERIVED_ROWS: [(&str, usize); 8] = [
-    ("X0", 12),
-    ("X1", 10_008),
-    ("X1V", 1_494),
-    ("X2", 6_408),
-    ("X2P", 2_136),
+    ("X0", 8),
+    ("X1", 6_672),
+    ("X1V", 996),
+    ("X2", 4_272),
+    ("X2P", 1_424),
     // 178 X2 fixtures minus the two round-02 m2 exclusions (176).
     ("X2S", 176),
     ("X1P", 0),
     ("X3A", 1_980),
 ];
-const DERIVED_DISTINCT: usize = 21_218;
+const DERIVED_DISTINCT: usize = 14_534;
 
 /// `P5-X5`'s two specs (criteria `P5-X5` F1, F2, criterion 1), every list
 /// unfrozen (the X5 list empty); re-derived 2026-10-09 for the gate-3 fixes
@@ -423,8 +432,14 @@ const DERIVED_DISTINCT: usize = 21_218;
 /// complete-first `Ltr` rep 0, also an X1V key); X5G none. Distinct: 21 218 +
 /// (588 − 198) + 372 = **21 980** (22 196 at gate 3). (At the landing, `a2be4f81…`: X5 372, X5G
 /// 552, distinct 22 142.)
-const X5_ROWS: [(&str, usize); 2] = [("X5", 588), ("X5G", 372)];
-const DERIVED_DISTINCT_WITH_X5: usize = 21_980;
+/// `MIN-ENGINES` E1 (tester re-pin at gate 3): the `A_flat` keys keep their
+/// selector (complete-first with the precheck), so `A_flat` stays 294; the
+/// `stop = true` partners are `Plain` keys, one per (point, rep): 108 → 36,
+/// so X5 = 294 + 36 + 18 + 72 + 96 = 516 rows, each key once; X5G 372. Shared:
+/// X1∩X5 72, X1V∩X5 18, X2∩X5 36, X0∩X5 1 (inside X1V∩X5). Distinct: 14 534 +
+/// (516 − 126) + 372 = 15 296.
+const X5_ROWS: [(&str, usize); 2] = [("X5", 516), ("X5G", 372)];
+const DERIVED_DISTINCT_WITH_X5: usize = 15_296;
 
 /// `CAL` (`P5-SYNTH` criterion 1's calibration pilot as a spec, 2026-10-09;
 /// since `eval.rs` `ef932078…` built with `x1_config(engine, Ltr)`): every
@@ -443,17 +458,20 @@ const DERIVED_DISTINCT_WITH_X5: usize = 21_980;
 const CAL_ROWS: usize = 728;
 /// The distinct count with CAL (`x1_config` rows, 2026-10-09 `ef932078…`):
 /// 21 980 + 728 − (4·110 + 2·68 + 1) = 22 131 (22 240 with the
-/// `GridConfig::new` rows of `5157dbec…`).
-const DERIVED_DISTINCT_WITH_CAL: usize = 22_131;
+/// `GridConfig::new` rows of `5157dbec…`). `MIN-ENGINES` E1 (gate 3): CAL's
+/// shared keys are unchanged (its rows are `Ltr` rep 0; the `Plain` keys of
+/// X0, X1 and X1V at rep 0 are CAL's), so 15 296 + 728 − 577 = 15 447.
+const DERIVED_DISTINCT_WITH_CAL: usize = 15_447;
 
 /// `CALX` (D20(1), `ANSWERS-calibration.md` §3; `eval.rs` `22a20583…`): the
 /// seven feasibility probes at the extension tier — `naive-self/k7enc{1,2}` ×
 /// {CompleteFirst, Gated}, `ex:naive/k7/enc{1,2}` × CompleteFirst,
 /// `share/m16c16` × Enumerator; X1's configuration, `Ltr`, rep 0, timed. The
 /// tier name is in the key and no other spec has an extension-tier row while
-/// the extension list is empty, so the 7 keys are new: 22 131 + 7 = 22 138.
+/// the extension list is empty, so the 7 keys are new: 22 131 + 7 = 22 138
+/// (`MIN-ENGINES` E1, gate 3: 15 447 + 7 = 15 454).
 const CALX_ROWS: usize = 7;
-const DERIVED_DISTINCT_WITH_CALX: usize = 22_138;
+const DERIVED_DISTINCT_WITH_CALX: usize = 15_454;
 const CALX_PROBES: [(&str, GridEngine); 7] = [
     ("synth/naive-self/k7enc1", GridEngine::CompleteFirst),
     ("synth/naive-self/k7enc1", GridEngine::Gated),
@@ -777,9 +795,12 @@ fn c01_builtin_specs_hold_the_campaign_and_v_is_apart() {
         *m.entry(r.fixture.as_str()).or_default() += 1;
         m
     });
+    // `MIN-ENGINES` E1 (the tester's re-pin at gate 3, after the lead's F1 fix):
+    // `selectors_for` — the enumerator and the gated engine under three
+    // selectors, the stateful and complete-first engines once (`Plain`): 8.
     assert!(
-        per_fixture.values().all(|n| *n == 12),
-        "conformance: 4 engines × 3 selectors"
+        per_fixture.values().all(|n| *n == 8),
+        "conformance: 3 + 1 + 1 + 3 configurations per fixture"
     );
     assert_eq!(per_fixture.len(), contract_fixtures().len());
     note!(
@@ -958,6 +979,9 @@ fn c01_row_configurations_per_spec() {
         "conformance: X1P's list is unfrozen"
     );
     // Every X1 fixture under all four engines and three selectors; X2 likewise.
+    // `MIN-ENGINES` E1 (the tester's re-pin at gate 3, after the lead's F1
+    // fix): the three selectors on the enumerator and the gated engine, `Ltr`
+    // alone on the stateful and complete-first engines (`Plain` keys) — 8.
     for name in ["X1", "X2"] {
         let mut per: BTreeMap<&str, BTreeSet<(String, String)>> = BTreeMap::new();
         for r in &spec(name).rows {
@@ -965,10 +989,13 @@ fn c01_row_configurations_per_spec() {
                 format!("{:?}", r.config.engine),
                 format!("{:?}", r.config.selector),
             ));
+            if r.config.plain_key() {
+                assert_eq!(r.config.selector, Selector::Ltr, "conformance: {name}");
+            }
         }
         assert!(
-            per.values().all(|s| s.len() == 12),
-            "conformance: {name}: 4 × 3 per fixture"
+            per.values().all(|s| s.len() == 8),
+            "conformance: {name}: 3 + 1 + 1 + 3 per fixture"
         );
     }
 }
@@ -1240,12 +1267,14 @@ fn c01_overlaps() {
     }
     note!("c01 overlaps: {pairs:?}");
     let want: BTreeMap<String, usize> = [
-        ("X0∩X1V".to_owned(), 6),
+        // `MIN-ENGINES` E1 (gate 3 re-pin): X0's complete-first rows are one
+        // `Plain` key (6 → 4); X5's `stop` partners one per (point, rep) (108 → 36).
+        ("X0∩X1V".to_owned(), 4),
         ("X1∩X3A".to_owned(), 990),
         ("X0∩X5".to_owned(), 1),
         ("X1∩X5".to_owned(), 72),
         ("X1V∩X5".to_owned(), 18),
-        ("X2∩X5".to_owned(), 108),
+        ("X2∩X5".to_owned(), 36),
         ("X0∩CAL".to_owned(), 3),
         ("CAL∩X1".to_owned(), 4 * cal_x1_points()),
         ("CAL∩X3A".to_owned(), cal_x1_points()),
@@ -1479,7 +1508,9 @@ fn c02_experiments_of_names_every_holder() {
     assert_eq!(
         x0x1v,
         [
-            ("X0+X1V".to_owned(), 4),
+            // `MIN-ENGINES` E1 (gate 3 re-pin): X0's gated `FewestEvents` and
+            // `Reverse` keys; its complete-first key is `Plain` (CAL's).
+            ("X0+X1V".to_owned(), 2),
             ("X0+CAL+X1V".to_owned(), 1),
             ("X0+CAL+X1V+X5".to_owned(), 1),
         ]
@@ -1499,7 +1530,8 @@ fn c02_experiments_of_names_every_holder() {
             ("X1V+X5".to_owned(), 12),
             ("CAL+X1V+X5".to_owned(), 5),
             ("X0+CAL+X1V+X5".to_owned(), 1),
-            ("X2+X5".to_owned(), 108),
+            // `MIN-ENGINES` E1 (gate 3 re-pin): one `Plain` partner per (point, rep).
+            ("X2+X5".to_owned(), 36),
         ]
         .into(),
         "conformance: the holders of X5's keys"
@@ -2282,10 +2314,12 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // `3c6f6c61…`); the hunks regenerated again.
     // SVERIFY-P I2b (2026-10-26, tester re-pin, gate 3): to `e81c8b53…` (grid.rs
     // md5 `85a28650…`); `I2B_HUNKS` undo it to `e1a0ca73…`.
+    // MIN-ENGINES E1 (2026-10-26, tester re-pin, gate 3): to `24d93d46…` (grid.rs
+    // md5 `b4daad38…`, F2's column included); `E1_HUNKS` undo it to `e81c8b53…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "e81c8b53c8bbbb3872ef3e590c5d9811",
+        "24d93d4695912fbded599c96b1d2668b",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2376,7 +2410,122 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         ("            push_opt(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            // `SVERIFY-P` I2b-7: the kind from the configuration (stateful row).\n            push_d(&mut row, \"index_kind\", index_kind_field(r.config.index));\n            compact_columns(&mut row, c.compact.as_ref());\n", "            push_opt(&mut row, \"impl_distinct_summaries\", c.impl_distinct_summaries);\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            compact_columns(&mut row, c.compact.as_ref());\n"),
         ("            );\n            // `SVERIFY-P` I2b-7: the kind from the configuration (complete-first row).\n            push_d(&mut row, \"index_kind\", index_kind_field(r.config.index));\n            if let Some(cs) = c.compact.as_ref() {\n", "            );\n            push_d(&mut row, \"index_kind\", index_kind_field(c.compact.is_some()));\n            if let Some(cs) = c.compact.as_ref() {\n"),
     ];
+    // MIN-ENGINES E1 (2026-10-26, tester re-pin): the lead's four `grid.rs`
+    // hunks (`diff -U1` against grid.rs `85a28650…`: the `selector` doc and the
+    // `legacy_selector` field, its default, `selector_field`/`plain_key` and the
+    // label's second field, and F2's `selector` column), all inside the prefix,
+    // each with one line of context; undoing them gives back the I2b prefix,
+    // byte for byte.
+    const E1_HUNKS: [(&str, &str); 4] = [
+        (
+            concat!(
+                "    pub(super) engine: GridEngine,\n",
+                "    /// The selector the enumerator, precheck, triage, oracle and gated runs\n",
+                "    /// read; `MIN-ENGINES` E1: not read by the stateful and stateless engines,\n",
+                "    /// which schedule by plain Must — their key prints `Plain` in this field\n",
+                "    /// (`selector_field`), whatever this holds.\n",
+                "    pub(super) selector: Selector,\n",
+                "    /// `MIN-ENGINES` E1-2: `Some(s)` only on a configuration parsed from a\n",
+                "    /// stored key whose second field names a selector on a plain-scheduled\n",
+                "    /// engine — a legacy key, kept as a stored identity (its label reprints\n",
+                "    /// `s`) and refused by every execution path; `None` on every\n",
+                "    /// configuration the driver builds.\n",
+                "    pub(super) legacy_selector: Option<Selector>,\n",
+                "    /// `stop_at_first_report` on every engine (plan §6's \"stopped at first\n"
+            ),
+            concat!(
+                "    pub(super) engine: GridEngine,\n",
+                "    pub(super) selector: Selector,\n",
+                "    /// `stop_at_first_report` on every engine (plan §6's \"stopped at first\n"
+            ),
+        ),
+        (
+            concat!(
+                "            selector: Selector::Ltr,\n",
+                "            legacy_selector: None,\n",
+                "            stop_at_first_report: false,\n"
+            ),
+            concat!(
+                "            selector: Selector::Ltr,\n",
+                "            stop_at_first_report: false,\n"
+            ),
+        ),
+        (
+            concat!(
+                "    /// One line naming every knob, for a table row.\n",
+                "    /// `MIN-ENGINES` E1-2: the key's second field — `Plain` when no run of\n",
+                "    /// this configuration reads the selector: the stateful engine always, the\n",
+                "    /// stateless engine when its precheck is off (its outer run and sweeps\n",
+                "    /// schedule by plain Must whatever `selector` holds; a `precheck = true`\n",
+                "    /// row's `Precheck` run still reads it, so that row keeps the selector's\n",
+                "    /// name — one key for one scheduling, and no key hides a knob a run\n",
+                "    /// read); the selector's name for the engines that read it; a legacy\n",
+                "    /// key's own spelling when this configuration was parsed from one (a\n",
+                "    /// stored identity, never run).\n",
+                "    fn selector_field(&self) -> String {\n",
+                "        match (self.legacy_selector, self.engine) {\n",
+                "            (Some(s), _) => format!(\"{s:?}\"),\n",
+                "            (None, GridEngine::Stateful) => \"Plain\".to_owned(),\n",
+                "            (None, GridEngine::CompleteFirst) if !self.precheck => \"Plain\".to_o",
+                "wned(),\n",
+                "            (None, _) => format!(\"{:?}\", self.selector),\n",
+                "        }\n",
+                "    }\n",
+                "\n",
+                "    /// `MIN-ENGINES` E1-2: whether this configuration's key prints `Plain`\n",
+                "    /// (`selector_field`), i.e. no run of it reads the selector.\n",
+                "    pub(super) fn plain_key(&self) -> bool {\n",
+                "        self.legacy_selector.is_none()\n",
+                "            && match self.engine {\n",
+                "                GridEngine::Stateful => true,\n",
+                "                GridEngine::CompleteFirst => !self.precheck,\n",
+                "                _ => false,\n",
+                "            }\n",
+                "    }\n",
+                "\n",
+                "    pub(super) fn label(&self) -> String {\n",
+                "        let eleven = format!(\n",
+                "            \"{:?}/{}/stop={}/{:?}/{:?}/memo={}/{:?}/precheck={}/instr={}/cut={}/",
+                "cover={:?}\",\n",
+                "            self.engine,\n",
+                "            self.selector_field(),\n",
+                "            self.stop_at_first_report,\n"
+            ),
+            concat!(
+                "    /// One line naming every knob, for a table row.\n",
+                "    pub(super) fn label(&self) -> String {\n",
+                "        let eleven = format!(\n",
+                "            \"{:?}/{:?}/stop={}/{:?}/{:?}/memo={}/{:?}/precheck={}/instr={}/cut={",
+                "}/cover={:?}\",\n",
+                "            self.engine,\n",
+                "            self.selector,\n",
+                "            self.stop_at_first_report,\n"
+            ),
+        ),
+        (
+            concat!(
+                "    push(row, \"engine\", config.engine);\n",
+                "    // `MIN-ENGINES` E1-2 (gate 3 F2): the key's field — `Plain` where no run\n",
+                "    // read the selector, so the column names no knob the run did not use.\n",
+                "    push_d(row, \"selector\", config.selector_field());\n",
+                "    push_d(row, \"stop\", config.stop_at_first_report);\n"
+            ),
+            concat!(
+                "    push(row, \"engine\", config.engine);\n",
+                "    push(row, \"selector\", config.selector);\n",
+                "    push_d(row, \"stop\", config.stop_at_first_report);\n"
+            ),
+        ),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in E1_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "e81c8b53c8bbbb3872ef3e590c5d9811",
+        "conformance: the prefix without E1's hunks = the I2b prefix"
+    );
     for (new, old) in I2B_HUNKS {
         t = undo(t, new, old);
     }
@@ -2449,25 +2598,35 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
 
 /// C3/criterion 3: each corner's `EVAL_ONLY` glob selects exactly its four
 /// `Ltr` rep-0 X1 keys, one per engine.
+/// `MIN-ENGINES` E1 (2026-10-26, tester re-pin at gate 3): the stateful and
+/// complete-first keys print `Plain` (`GridConfig::plain_key`), so
+/// `<fx>|*/Ltr/*|0|*` selects the enumerator's and the gated engine's rep-0
+/// keys and `<fx>|*/Plain/*|0|*` the other two; together one key per engine.
 #[test]
 fn c03_corner_globs_select_their_ltr_rep0_keys() {
     for (fx, _) in APPS_CORNERS {
-        let glob = format!("{fx}|*/Ltr/*|0|*");
-        let hit: Vec<&String> = ks("X1").iter().filter(|k| glob_match(&glob, k)).collect();
-        assert_eq!(hit.len(), 4, "conformance: {glob}: {hit:?}");
-        let engines: BTreeSet<&str> = hit
-            .iter()
-            .map(|k| k.split('|').nth(1).unwrap().split('/').next().unwrap())
-            .collect();
-        assert_eq!(engines.len(), 4);
-        for k in hit {
-            let parts: Vec<&str> = k.split('|').collect();
-            assert_eq!(parts[0], fx);
-            assert_eq!(parts[2], "0");
-            assert!(parts[1].split('/').nth(1) == Some("Ltr"));
+        let mut all: Vec<&String> = Vec::new();
+        let fields = [("Ltr", ["Enumerator", "Gated"]), ("Plain", ["CompleteFirst", "Stateful"])];
+        for (field, want) in fields {
+            let glob = format!("{fx}|*/{field}/*|0|*");
+            let hit: Vec<&String> = ks("X1").iter().filter(|k| glob_match(&glob, k)).collect();
+            assert_eq!(hit.len(), 2, "conformance: {glob}: {hit:?}");
+            let engines: BTreeSet<&str> = hit
+                .iter()
+                .map(|k| k.split('|').nth(1).unwrap().split('/').next().unwrap())
+                .collect();
+            assert_eq!(engines, want.into_iter().collect(), "conformance: {glob}");
+            for k in &hit {
+                let parts: Vec<&str> = k.split('|').collect();
+                assert_eq!(parts[0], fx);
+                assert_eq!(parts[2], "0");
+                assert!(parts[1].split('/').nth(1) == Some(field));
+            }
+            // Nothing of another spec is selected through X1.
+            assert!(!ks("X2").iter().any(|k| glob_match(&glob, k)));
+            all.extend(hit);
         }
-        // Nothing of another spec is selected through X1.
-        assert!(!ks("X2").iter().any(|k| glob_match(&glob, k)));
+        assert_eq!(all.len(), 4, "conformance: {fx}: one key per engine");
     }
 }
 
@@ -2509,8 +2668,9 @@ fn c04_twin_keys_are_x1_keys() {
             ),
         }
     }
-    // Every one of the derived 122 table entries is an X2 point (T1 fixed).
-    assert_eq!(with, 122 * 36);
+    // Every one of the derived 122 table entries is an X2 point (T1 fixed);
+    // `MIN-ENGINES` E1 (gate 3 re-pin): 24 rows per point (`selectors_for`).
+    assert_eq!(with, 122 * 24);
     let twinless: BTreeSet<&String> = spec("X2")
         .rows
         .iter()
@@ -2527,7 +2687,7 @@ fn c04_twin_keys_are_x1_keys() {
             .iter()
             .filter(|r| r.twin_key.is_empty())
             .count(),
-        56 * 36
+        56 * 24
     );
     // The twin lines hold every twin point.
     for t in d.twins.values() {
@@ -2984,7 +3144,9 @@ fn c05_section6_sides_are_part_6s() {
 }
 
 /// Criterion 5: the corpus under all three selectors — 70 fixtures × 36 =
-/// 2 520 rows across X1 and X2.
+/// 2 520 rows across X1 and X2. `MIN-ENGINES` E1 (gate 3 re-pin): × 24 = 1 680
+/// (the `Plain` keys under `Ltr` alone); the three selectors remain on the
+/// enumerator and gated rows.
 #[test]
 fn c05_corpus_rows_under_all_three_selectors() {
     let mut n = 0;
@@ -2999,7 +3161,7 @@ fn c05_corpus_rows_under_all_three_selectors() {
             sels.insert(format!("{:?}", r.config.selector));
         }
     }
-    assert_eq!(n, 2_520);
+    assert_eq!(n, 1_680);
     assert_eq!(sels.len(), 3);
 }
 
@@ -3060,7 +3222,9 @@ fn c06_reach_predicate_and_counts_per_spec() {
             }
         }
     }
-    assert_eq!(sweeping_out, 72);
+    // `MIN-ENGINES` E1 (the tester's re-pin at gate 3): 4 points × (complete-first
+    // 3 + gated 9) = 48 (72 with three complete-first selectors).
+    assert_eq!(sweeping_out, 48);
     for s in specs() {
         let inside = s
             .rows
@@ -4166,9 +4330,11 @@ fn r01_every_twin_key_is_a_key_of_some_spec() {
     for s in specs() {
         let with = s.rows.iter().filter(|r| !r.twin_key.is_empty()).count();
         match s.name.as_str() {
-            "X2" => assert_eq!(with, 122 * 36, "conformance: X2's twinned rows"),
-            "X2P" => assert_eq!(with, 122 * 12, "conformance: X2P's twinned rows"),
-            "X5" => assert_eq!(with, 108, "conformance: X5's X2-held rows"),
+            // `MIN-ENGINES` E1 (gate 3 re-pin): 24 rows per X2 point, 8 per X2P
+            // point; X5's `stop` partners one per (point, rep).
+            "X2" => assert_eq!(with, 122 * 24, "conformance: X2's twinned rows"),
+            "X2P" => assert_eq!(with, 122 * 8, "conformance: X2P's twinned rows"),
+            "X5" => assert_eq!(with, 36, "conformance: X5's X2-held rows"),
             other => assert_eq!(with, 0, "conformance: {other} carries no twin key"),
         }
         for r in s.rows.iter().filter(|r| !r.twin_key.is_empty()) {
@@ -4215,7 +4381,7 @@ fn r01_every_twin_key_is_a_key_of_some_spec() {
             None => assert!(r.twin_key.is_empty(), "conformance: X5 {k}"),
         }
     }
-    assert_eq!(shared, 108, "conformance: X2∩X5");
+    assert_eq!(shared, 36, "conformance: X2∩X5");
     let mut holders: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     for name in ["X5", "X5G"] {
         let own = ks(name);
@@ -4261,10 +4427,13 @@ fn r01_every_twin_key_is_a_key_of_some_spec() {
         }
         let want_flat = if name == "X5" { 294 } else { 186 };
         assert_eq!(flat, want_flat, "conformance: {name}'s A_flat rows");
+        // `MIN-ENGINES` E1 (gate 3 re-pin): X5's 108 `stop` rows share 36
+        // `Plain` partners (one per point and rep), so 294 + 222; X5G one each.
+        let partners = if name == "X5" { 222 } else { 186 };
         assert_eq!(
             spec(name).rows.len(),
-            2 * flat,
-            "conformance: {name}: one partner each"
+            flat + partners,
+            "conformance: {name}: its partners, each key once"
         );
     }
     note!("r01: X5/X5G partner holders: {holders:?}");
@@ -4790,8 +4959,9 @@ fn r02_two_step_extension_rule_through_the_driver() {
         None,
         None,
     );
-    let cheap = "synth/width/w2|Stateful/Ltr/*|0|*";
-    let corner = "apps/a1/correct/spec/n3r2|Stateful/Ltr/*|0|*";
+    // `MIN-ENGINES` E1 (gate 3 re-pin): the stateful key prints `Plain`.
+    let cheap = "synth/width/w2|Stateful/Plain/*|0|*";
+    let corner = "apps/a1/correct/spec/n3r2|Stateful/Plain/*|0|*";
     let cases: [(&str, &str, Option<&str>, &str); 6] = [
         (
             "{}",
@@ -5008,7 +5178,8 @@ fn frozen_case(
 ///   the X1P list too;
 /// - C: step 2 changed after both were recorded → refused ("the extension list
 ///   changed after both steps were recorded"), the record unchanged;
-/// - D: an unfrozen X0 run (no file, all 12 rows) writes no record;
+/// - D: an unfrozen X0 run (no file, all 8 rows since `MIN-ENGINES` E1's F1b)
+///   writes no record;
 /// - E: a run that stops at its first row's `store.append` (the store
 ///   directory's `rows-test.csv` made read-only before the run, so the first
 ///   row runs in its child and its append fails — `refused: io`) has already
@@ -5026,8 +5197,9 @@ fn r02_frozen_record_through_the_driver() {
     let one = frozen_json(&[a1], None, None);
     let two = frozen_json(&[a1, s2], Some(x1p), None);
     let changed = frozen_json(&[a1, &["synth/share/m24c24"]], Some(x1p), None);
-    let corner = "apps/a1/correct/spec/n3r2|Stateful/Ltr/*|0|*";
-    let cheap = "synth/width/w2|Stateful/Ltr/*|0|*";
+    // `MIN-ENGINES` E1 (gate 3 re-pin): the stateful key prints `Plain`.
+    let corner = "apps/a1/correct/spec/n3r2|Stateful/Plain/*|0|*";
+    let cheap = "synth/width/w2|Stateful/Plain/*|0|*";
     let used = out.join("frozen.used.json");
     let record = |path: &Path| -> serde_json::Value {
         serde_json::from_str(&fs::read_to_string(path).expect("conformance: the record")).unwrap()
@@ -5100,7 +5272,8 @@ fn r02_frozen_record_through_the_driver() {
     let out2 = base.join("out-unfrozen");
     let d = frozen_case(&base.join("d"), None, "X0", None, &out2);
     note!("r03 record D: {d}");
-    assert_eq!(d, "ran 12");
+    // `MIN-ENGINES` E1 (the tester's re-pin at gate 3, after the lead's F1b).
+    assert_eq!(d, "ran 8");
     assert!(
         !out2.join("frozen.used.json").exists(),
         "conformance: no record for an unfrozen run"

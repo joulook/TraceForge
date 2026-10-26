@@ -3027,6 +3027,264 @@ fn i1_sverify_s_uncovered_multiset() {
     note!("UNCN\t{}", o.reports.len());
 }
 
+/// MIN-ENGINES E1 rev 1.3 (the record's nested-spawn fixtures): the existing
+/// corpus programs, reached through test-only `pub(super)` —
+/// `stateful_tests::nested4` (the corpus pair `nested4/self`: `p1` spawns `x`,
+/// `p2` spawns `y`; visible `p1`, `p2`) and `selector_tests`' adversarial pairs
+/// on `Bag` (`nested_race`: `p1` spawns `x`, `p2` spawns `y`, which may spawn
+/// `z` behind a toss; `deep_chain`: `a` → `b` → `c`; visible `r`) — named
+/// `e1:…`, on `Bag` as their corpora run them.
+/// The record's fixture by name: the four `e1:` nested pairs, else the
+/// catalogue's.
+fn e1_fixture(name: &str) -> Fixture {
+    match name {
+        "e1:nested4/self" => {
+            let p = crate::conformance::stateful_tests::nested4;
+            local_fixture(name, p(), p(), &["p1", "p2"])
+        }
+        "e1:race/bag" | "e1:race-bad/bag" => {
+            let race = crate::conformance::selector_tests::nested_race;
+            local_fixture(name, race(false), race(name == "e1:race-bad/bag"), &["r"])
+        }
+        "e1:chain/bag" => {
+            let deep = crate::conformance::selector_tests::deep_chain;
+            let chain = || crate::conformance::grid::prog(deep);
+            local_fixture(name, chain(), chain(), &["r"])
+        }
+        _ => any_fixture(name),
+    }
+}
+
+/// MIN-ENGINES E1, the before/after record (the tester; derived §E1). One
+/// fixture per process: `E1_FIXTURE`; `E1_SELECTOR` `Ltr` (default),
+/// `Reverse` or `FewestEvents`; `E1_PARTS` (default `stateful,stateless,enum`).
+/// - `stateful`: SVerify-S at X1 (`x1_config`), each report's summary printed
+///   as `UNC\t<Sig Debug>\t<counts>` (the I1 record's format), then `E1S`;
+/// - `stateless`: complete-first at X1, the same per report as `UNCS`, then
+///   `E1C`;
+/// - `enum`: both programs enumerated (`stateful::enumerate`, the stateful
+///   engine's mode), one `E1E` line per side: completions, distinct, a digest
+///   of the multiset (sorted lines `mult\tsig\tcounts`) and of the completion
+///   order (the sequence of `sig\tcounts`), the longest origination vector,
+///   and whether a visible value's rendering names a `ThreadId`.
+/// Digests are std's `DefaultHasher` (fixed keys): comparable across runs of
+/// one toolchain, not across toolchains.
+#[test]
+#[ignore]
+fn e1_record() {
+    use crate::conformance::ctx::{CompletionSink, ConfMode, SinkVerdict};
+    use crate::conformance::selector::Selector;
+    use crate::conformance::stateful::{enumerate, EnumRun};
+    use std::hash::{Hash, Hasher};
+    let Ok(name) = std::env::var("E1_FIXTURE") else {
+        return;
+    };
+    let sel = match std::env::var("E1_SELECTOR").as_deref() {
+        Ok("Reverse") => Selector::Reverse,
+        Ok("FewestEvents") => Selector::FewestEvents,
+        _ => Selector::Ltr,
+    };
+    let parts = std::env::var("E1_PARTS").unwrap_or_else(|_| "stateful,stateless,enum".to_owned());
+    let f = e1_fixture(&name);
+    let line_of = |g: &ExecutionGraph| -> String {
+        let w = wobs(g, &f.visible).expect("conformance: wobs");
+        let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, &f.visible)
+            .expect("conformance: a summary");
+        let counts = match OrdCounts::of(g, &w, &f.visible) {
+            OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        };
+        format!("{:?}\t{}", s.sig, counts.join(","))
+    };
+    let digest = |lines: &[String]| -> String {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for l in lines {
+            l.hash(&mut h);
+        }
+        format!("{:016x}", h.finish())
+    };
+    if parts.contains("stateful") {
+        let cc = crate::conformance::eval::x1_config(GridEngine::Stateful, sel).conf_config(&f);
+        let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
+        for (g, _) in &o.reports {
+            note!("UNC\t{}", line_of(g));
+        }
+        let c = &o.counters;
+        note!(
+            "E1S\t{name}\t{sel:?}\treports {}\tspec_graphs {}\timpl_graphs {}\torders_held {}\t\
+             lookups {}/{}/{}\tspec_errors {}",
+            o.reports.len(),
+            c.spec_graphs,
+            c.impl_graphs,
+            c.orders_held,
+            c.lookups_succeeded,
+            c.lookups_failed_after_tests,
+            c.lookups_signature_miss,
+            o.spec_errors.len()
+        );
+    }
+    if parts.contains("stateless") {
+        let cc =
+            crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel).conf_config(&f);
+        let o =
+            crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false);
+        for (g, _) in &o.reports {
+            note!("UNCS\t{}", line_of(g));
+        }
+        let c = &o.counters;
+        let sizes: Vec<String> = c.sweep_sizes.iter().map(|n| n.to_string()).collect();
+        note!(
+            "E1C\t{name}\t{sel:?}\treports {}\texecutions {}\tspec_errors {}\tsweeps {}\t\
+             sweep_sizes {} sum {} digest {}\tcache_hits {}\tadmissions {}\tevictions {}\t\
+             witnesses {}",
+            o.reports.len(),
+            o.executions,
+            o.spec_errors.len(),
+            c.sweeps,
+            sizes.len(),
+            c.sweep_sizes.iter().sum::<usize>(),
+            digest(&sizes),
+            c.cache_hits,
+            c.admissions,
+            c.evictions,
+            c.witnesses
+        );
+    }
+    // Rev 1.1 E1-4 (the record's missing fields), three further parts:
+    // `stateful_set` — SVerify-S at X1 on `Set`: verdict, `UNCSET` lines,
+    //   graphs per side (the order digests are the `enum` part's: the same
+    //   mode and configuration explore identically);
+    // `stateless_keep` — the stateless engine at X1 with `keep_graphs`: the
+    //   outer completion order's digest, the sweep count, and per sweep its
+    //   size and order digest (`SW` lines) — run on the light fixtures only;
+    // `plain` — plain Must per side (the fixture's `Config` with
+    //   `keep_going_after_error`): `execs` and `block`.
+    if parts.contains("stateful_set") {
+        let cc = crate::conformance::eval::x1_config(GridEngine::Stateful, sel)
+            .index(crate::conformance::config::IndexKind::Set)
+            .conf_config(&f);
+        let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
+        for (g, _) in &o.reports {
+            note!("UNCSET\t{}", line_of(g));
+        }
+        let c = &o.counters;
+        note!(
+            "E1T\t{name}\t{sel:?}\tverdict {}\treports {}\tspec_graphs {}\timpl_graphs {}",
+            if o.reports.is_empty() { "conforms" } else { "reported" },
+            o.reports.len(),
+            c.spec_graphs,
+            c.impl_graphs
+        );
+    }
+    if parts.contains("stateless_keep") {
+        let cc =
+            crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel).conf_config(&f);
+        let o =
+            crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, true);
+        let outer: Vec<String> = o.kept_impl_graphs.iter().map(|g| line_of(g)).collect();
+        let mut sweeps: Vec<String> = Vec::new();
+        for (i, sw) in o.kept_spec_graphs.iter().enumerate() {
+            let lines: Vec<String> = sw.iter().map(|g| line_of(g)).collect();
+            let size = o.counters.sweep_sizes.get(i).copied().unwrap_or(usize::MAX);
+            let d = digest(&lines);
+            note!("SW\t{i}\tkept {}\tsize {size}\torder {d}", lines.len());
+            sweeps.push(format!("{}\t{size}\t{d}", lines.len()));
+        }
+        note!(
+            "E1K\t{name}\t{sel:?}\tverdict {}\treports {}\texecutions {}\touter {}\t\
+             outer_order {}\tsweeps {}\tkept_sweeps {}\tsweep_digest {}",
+            if o.reports.is_empty() { "conforms" } else { "reported" },
+            o.reports.len(),
+            o.executions,
+            outer.len(),
+            digest(&outer),
+            o.counters.sweeps,
+            o.kept_spec_graphs.len(),
+            digest(&sweeps)
+        );
+        note!(
+            "E1KC\t{name}\t{sel:?}\tcache_hits {}\tadmissions {}\tevictions {}\twitnesses {}",
+            o.counters.cache_hits,
+            o.counters.admissions,
+            o.counters.evictions,
+            o.counters.witnesses
+        );
+    }
+    if parts.contains("plain") {
+        let sides = [("specification", &f.specification), ("implementation", &f.implementation)];
+        for (side, program) in sides {
+            let mut cfg = f.config.clone();
+            cfg.keep_going_after_error = true;
+            let p = program.clone();
+            let s = crate::verify(cfg, move || p());
+            note!("E1P\t{name}\t{side}\texecs {}\tblock {}", s.execs, s.block);
+        }
+    }
+    if parts.contains("enum") {
+        let cc = crate::conformance::eval::x1_config(GridEngine::Stateful, sel).conf_config(&f);
+        let sides = [("specification", &f.specification), ("implementation", &f.implementation)];
+        for (side, program) in sides {
+            type Acc = (Vec<String>, usize, bool);
+            let acc: std::rc::Rc<std::cell::RefCell<Acc>> = Default::default();
+            let sink: CompletionSink = {
+                let (acc, vis) = (std::rc::Rc::clone(&acc), f.visible.clone());
+                Box::new(move |g: &ExecutionGraph, _| {
+                    let w = wobs(g, &vis).expect("conformance: wobs");
+                    let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, &vis)
+                        .expect("conformance: a summary");
+                    let counts = match OrdCounts::of(g, &w, &vis) {
+                        OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+                        OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+                    };
+                    let mut a = acc.borrow_mut();
+                    a.0.push(format!("{:?}\t{}", s.sig, counts.join(",")));
+                    let depth = g
+                        .thread_ids()
+                        .into_iter()
+                        .map(|t| g.get_thread_tclab(t).origination_vec().len())
+                        .max()
+                        .unwrap_or(0);
+                    a.1 = a.1.max(depth);
+                    if !a.2 {
+                        a.2 = vis.iter().any(|n| {
+                            w.of(n).iter().any(|(_, o)| format!("{o:?}").contains("ThreadId"))
+                        });
+                    }
+                    SinkVerdict::Continue
+                })
+            };
+            let mut config = cc.config.clone();
+            config.max_iterations = None;
+            enumerate(
+                EnumRun {
+                    config,
+                    visible: f.visible.clone(),
+                    mode: ConfMode::Enumerate,
+                    sink,
+                    cut: false,
+                    stop_at_first_report: false,
+                    gate_sink: None,
+                },
+                program,
+            );
+            let (order, depth, tid) = std::mem::take(&mut *acc.borrow_mut());
+            let mut counts: std::collections::BTreeMap<&String, usize> = Default::default();
+            for l in &order {
+                *counts.entry(l).or_default() += 1;
+            }
+            let ms: Vec<String> = counts.iter().map(|(l, m)| format!("{m}\t{l}")).collect();
+            note!(
+                "E1E\t{name}\t{sel:?}\t{side}\tcompletions {}\tdistinct {}\tms {}\torder {}\t\
+                 depth {depth}\tthreadid {tid}",
+                order.len(),
+                ms.len(),
+                digest(&ms),
+                digest(&order)
+            );
+        }
+    }
+}
+
 // =========================================================================
 // SVERIFY-P I2 (tester, gate 3; criteria/SVERIFY-P-I2.md rev 1.3): the set
 // index against `CompactIndex::with_bucket(false, Scan)`
@@ -4252,4 +4510,649 @@ fn s16_bytes_per_entry() {
         per(r1 - r0),
         per(x1 - x0)
     );
+}
+
+// =========================================================================
+// MIN-ENGINES E1 (tester, gate 3; criteria/MIN-ENGINES-E1.md rev 1.4,
+// derived §E1 items 9–16): the plain-scheduled modes, the second scheduler,
+// names only, the key
+// =========================================================================
+
+/// One complete graph's summary line (`Sig` Debug, tab, the order counts),
+/// as the before/after record prints it (`e1_record`'s `line_of`).
+fn e1_line(g: &ExecutionGraph, visible: &[String]) -> String {
+    let w = wobs(g, visible).expect("conformance: wobs");
+    let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, visible)
+        .expect("conformance: a summary");
+    let counts = match OrdCounts::of(g, &w, visible) {
+        OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+    };
+    format!("{:?}\t{}", s.sig, counts.join(","))
+}
+
+/// One program's summary lines in the stateful engine's `Enumerate` run's
+/// completion order (`stateful::enumerate`) under `config`, unbounded.
+fn e1_enumerate(
+    config: &crate::Config,
+    visible: &[String],
+    p: &crate::conformance::grid::Prog,
+) -> Vec<String> {
+    use crate::conformance::ctx::{CompletionSink, ConfMode, SinkVerdict};
+    use crate::conformance::stateful::{enumerate, EnumRun};
+    let acc: std::rc::Rc<std::cell::RefCell<Vec<String>>> = Default::default();
+    let sink: CompletionSink = {
+        let (acc, vis) = (std::rc::Rc::clone(&acc), visible.to_vec());
+        Box::new(move |g: &ExecutionGraph, _| {
+            acc.borrow_mut().push(e1_line(g, &vis));
+            SinkVerdict::Continue
+        })
+    };
+    let mut config = config.clone();
+    config.max_iterations = None;
+    enumerate(
+        EnumRun {
+            config,
+            visible: visible.to_vec(),
+            mode: ConfMode::Enumerate,
+            sink,
+            cut: false,
+            stop_at_first_report: false,
+            gate_sink: None,
+        },
+        p,
+    );
+    let out = std::mem::take(&mut *acc.borrow_mut());
+    out
+}
+
+/// MIN-ENGINES E1-1 (derived §E1 item 12): the counting test, on the lead's
+/// test-only counter (`must::selector_picks_for_test`, bumped on the selector
+/// branch at both scheduling sites). On A3 fifo k2q2 and the nested pair
+/// `e1:race/bag`, under each selector: no pick over a stateful run (both
+/// sides, `Enumerate`) or a complete-first outer run (`CFirstOuter`), each of
+/// which explores; and picks over an enumerator run, the oracle's `Collect`
+/// run, a gated run and complete-first with its precheck (`Precheck`) on the
+/// same fixture — the counter is live and those modes keep the selector.
+/// **The counter is thread-local and a sweep runs on its own scoped thread**
+/// (`cfirst::sweep_with`), so it sees no `CFirstSweep` (or `GatedSweep`) pick:
+/// the sweeps' not-reading is pinned by behaviour instead —
+/// `cfirst_tests::c12_the_selector_no_longer_reaches_the_outer_run_or_the_sweeps`
+/// (every swept graph's stamps equal under the three selectors) and the
+/// after-run's per-sweep order digests.
+#[test]
+fn e1_the_selector_branch_is_never_taken_by_the_plain_modes() {
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::search::SearchOpts;
+    use crate::conformance::selector::{InnerOrder, Selector};
+    use crate::must::{reset_selector_picks_for_test as reset, selector_picks_for_test as picks};
+    let mut bad = Vec::new();
+    for name in ["apps/a3/fifo/spec/k2q2", "e1:race/bag"] {
+        let f = e1_fixture(name);
+        for sel in [Selector::Ltr, Selector::Reverse, Selector::FewestEvents] {
+            reset();
+            let cc = x1_config(GridEngine::Stateful, sel).conf_config(&f);
+            let st = stateful::run_with(&cc, &f.implementation, &f.specification, false);
+            let (n, c) = (picks(), &st.counters);
+            if n != 0 || c.spec_graphs == 0 || c.impl_graphs == 0 {
+                bad.push(format!(
+                    "{name} {sel:?} stateful: {n} picks, graphs {} / {}",
+                    c.spec_graphs, c.impl_graphs
+                ));
+            }
+            reset();
+            let cc = x1_config(GridEngine::CompleteFirst, sel).conf_config(&f);
+            let cf = crate::conformance::cfirst::run_with(
+                &cc,
+                &f.implementation,
+                &f.specification,
+                false,
+            );
+            let n = picks();
+            if n != 0 || cf.executions == 0 || cf.counters.sweeps == 0 {
+                bad.push(format!(
+                    "{name} {sel:?} complete-first: {n} picks, {} executions, {} sweeps",
+                    cf.executions, cf.counters.sweeps
+                ));
+            }
+        }
+        let mut live = Vec::new();
+        reset();
+        let mut ec = f.config.clone();
+        ec.selector = Selector::Ltr;
+        let _ = crate::conformance::verify_conformance_with_opts(
+            ec,
+            f.implementation.clone(),
+            f.specification.clone(),
+            f.visible.clone(),
+            usize::MAX,
+            false,
+            SearchOpts {
+                inner_order: InnerOrder::Recorded,
+                memo: true,
+                instrument: false,
+            },
+        );
+        live.push(("enumerator", picks()));
+        reset();
+        let mut config = x1_config(GridEngine::Stateful, Selector::Ltr).conf_config(&f).config;
+        config.max_iterations = None;
+        let gs = crate::conformance::selector_tests::graphs_of(
+            config,
+            &f.visible,
+            f.implementation.clone(),
+        );
+        live.push(("collect", if gs.is_empty() { 0 } else { picks() }));
+        reset();
+        let cc = x1_config(GridEngine::Gated, Selector::Ltr).conf_config(&f);
+        let _ =
+            crate::conformance::gated::run_with(&cc, &f.implementation, &f.specification, false);
+        live.push(("gated", picks()));
+        reset();
+        let cc = x1_config(GridEngine::CompleteFirst, Selector::Ltr).precheck(true).conf_config(&f);
+        let _ = crate::conformance::cfirst::run(
+            cc,
+            f.implementation.clone(),
+            f.specification.clone(),
+        );
+        live.push(("precheck", picks()));
+        note!("e1 counting {name}: {live:?}");
+        for (what, n) in live {
+            if n == 0 {
+                bad.push(format!("{name} {what}: no pick (the counter is not live)"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E1-1: {bad:#?}");
+}
+
+/// MIN-ENGINES E1-1 (derived §E1 item 12, the source half): `uses_selector` is
+/// the predicate over `ConfMode::plain_scheduling`, which names `Enumerate`,
+/// `CFirstOuter` and `CFirstSweep` and no other mode; the scheduling step's
+/// plain branch is the `SchedulePolicy` match with the LTR arm
+/// `runnable.iter().find(..)` — no candidate vector, no origination vector —
+/// and `unblock_ready`'s plain return is `blocked.first()`.
+#[test]
+fn e1_the_plain_path_builds_no_candidate_vector() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let must = std::fs::read_to_string(root.join("must.rs")).expect("conformance: must.rs");
+    let ctx = std::fs::read_to_string(root.join("conformance/ctx.rs"))
+        .expect("conformance: ctx.rs");
+    assert!(
+        must.contains(
+            "self.probe.is_some() || self.conf.as_ref().is_some_and(|c| \
+             !c.mode().plain_scheduling())"
+        ),
+        "conformance: the predicate"
+    );
+    let at = ctx
+        .find("pub(crate) fn plain_scheduling(self) -> bool {")
+        .expect("conformance: plain_scheduling");
+    let body = &ctx[at..at + ctx[at..].find("\n    }\n").expect("conformance: its end")];
+    assert_eq!(body.matches("ConfMode::").count(), 3, "conformance: {body}");
+    for m in ["ConfMode::Enumerate", "ConfMode::CFirstOuter", "ConfMode::CFirstSweep"] {
+        assert!(body.contains(m), "conformance: {m} in {body}");
+    }
+    let start = must
+        .find("let next = if self.uses_selector() {")
+        .expect("conformance: the scheduling step");
+    let rest = &must[start..];
+    let els = rest
+        .find("        } else {\n            match self.config.schedule_policy {")
+        .expect("conformance: the plain branch");
+    let end = rest.find("        if next.is_some() {").expect("conformance: its end");
+    let plain = &rest[els..end];
+    for no in ["collect", "Vec", "origination_vec", "selector"] {
+        assert!(!plain.contains(no), "conformance: `{no}` on the plain path: {plain}");
+    }
+    assert!(
+        plain.contains(
+            "SchedulePolicy::LTR => runnable\n                    .iter()\n                    \
+             .find(|(t, i)| self.is_thread_runnable(t, i))"
+        ),
+        "conformance: the LTR arm: {plain}"
+    );
+    assert!(rest[..els].contains("self.config.selector.pick("));
+    assert!(
+        must.contains(
+            "            return self.config.selector.pick(&self.current.graph, &candidates);\n\
+             \x20       }\n        blocked.first().map(|(t, _)| t.to_owned())"
+        ),
+        "conformance: unblock_ready's plain return"
+    );
+}
+
+/// MIN-ENGINES E1-4 (ii) (derived §E1 item 11): a second scheduler. The
+/// oracle's `Collect` run (`selector_tests::graphs_of`; that mode keeps the
+/// selector) under `Reverse`, against the stateful engine's `Enumerate` run
+/// (plain Must) of the same program, both sides, on the four nested pairs and
+/// the five size-2 cells: equal multisets of summary lines on every side, and
+/// a differing completion order on A3 fifo k2q2's implementation (where
+/// `Reverse` moved the order before E1), so the check is not vacuous. One
+/// `E1X` line per side records whether the order differs; a nested pair whose
+/// order does not differ is the digest's limit, not a failure.
+#[test]
+fn e1_collect_under_reverse_against_plain() {
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::selector::Selector;
+    let mut bad = Vec::new();
+    let mut differ = Vec::new();
+    for name in [
+        "e1:nested4/self",
+        "e1:race/bag",
+        "e1:race-bad/bag",
+        "e1:chain/bag",
+        "apps/a1/correct/spec/n2r2",
+        "apps/a2/pb/spec/k2q2",
+        "apps/a3/fifo/spec/k2q2",
+        "apps/a4/hash/a4a/k2q2m2",
+        "2pc/leader/conf/n2",
+    ] {
+        let f = e1_fixture(name);
+        let mut config = x1_config(GridEngine::Stateful, Selector::Reverse).conf_config(&f).config;
+        config.max_iterations = None;
+        let sides = [("specification", &f.specification), ("implementation", &f.implementation)];
+        for (side, p) in sides {
+            let gs = crate::conformance::selector_tests::graphs_of(
+                config.clone(),
+                &f.visible,
+                p.clone(),
+            );
+            let collect: Vec<String> = gs.iter().map(|g| e1_line(g, &f.visible)).collect();
+            let plain = e1_enumerate(&config, &f.visible, p);
+            let (mut a, mut b) = (collect.clone(), plain.clone());
+            a.sort();
+            b.sort();
+            if a != b || a.is_empty() {
+                bad.push(format!(
+                    "{name} {side}: multisets differ ({} / {})",
+                    a.len(),
+                    b.len()
+                ));
+            }
+            let order = if collect == plain { "same" } else { "differs" };
+            note!("E1X\t{name}\t{side}\tcompletions {}\torder {order}", plain.len());
+            if collect != plain {
+                differ.push(format!("{name} {side}"));
+            }
+        }
+    }
+    note!("e1 second scheduler: orders differ on {differ:?}");
+    assert!(bad.is_empty(), "conformance: E1-4 (ii): {bad:#?}");
+    assert!(
+        differ.contains(&"apps/a3/fifo/spec/k2q2 implementation".to_owned()),
+        "conformance: E1-4 (ii) vacuous: {differ:?}"
+    );
+}
+
+/// Whether two lists of compact summaries are equal as multisets: `Sig ==`
+/// (`msg_equals`), then `OrdCounts ==` (compared only under equal signatures).
+fn e1_same_multiset(
+    a: &[crate::conformance::compact::CompactSummary],
+    b: &[crate::conformance::compact::CompactSummary],
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut left: Vec<&crate::conformance::compact::CompactSummary> = b.iter().collect();
+    for x in a {
+        match left.iter().position(|y| y.sig == x.sig && y.ord == x.ord) {
+            Some(i) => {
+                left.swap_remove(i);
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
+/// MIN-ENGINES E1-3 (derived §E1 item 13): names only, on the compact summary.
+/// `P₁`: `main` spawns an invisible receiver `q`, an invisible `w`, then the
+/// visible `v`; `P₀`: `q`, then `v`; `v` sends 1 and 2 to `q` (`Bag`). The two
+/// programs' multisets of `CompactSummary` (the stateful engine's kept graphs)
+/// are equal and the engine reports nothing, while `v`'s `ThreadId` differs
+/// between them (`resolve_visible`; the pairing is by name). The limit (E1-3's
+/// caveat), pinned: when `v` sends its own `ThreadId`, the multisets differ
+/// and the engine reports — a value carrying a thread id is the program's
+/// content.
+#[test]
+fn e1_names_only_on_the_compact_summary() {
+    use crate::conformance::compact::CompactSummary;
+    fn prog(extra: bool, own_id: bool) -> crate::conformance::grid::Prog {
+        crate::conformance::grid::prog(move || {
+            let q = crate::thread::Builder::new()
+                .name("q".to_owned())
+                .spawn(move || {
+                    for _ in 0..2 {
+                        if own_id {
+                            let _: crate::thread::ThreadId = crate::recv_msg_block();
+                        } else {
+                            let _: i32 = crate::recv_msg_block();
+                        }
+                    }
+                })
+                .unwrap();
+            let qid = q.thread().id();
+            if extra {
+                crate::thread::Builder::new()
+                    .name("w".to_owned())
+                    .spawn(|| {})
+                    .unwrap();
+            }
+            crate::thread::Builder::new()
+                .name("v".to_owned())
+                .spawn(move || {
+                    if own_id {
+                        let me = crate::thread::current().id();
+                        crate::send_msg(qid, me);
+                        crate::send_msg(qid, me);
+                    } else {
+                        crate::send_msg(qid, 1i32);
+                        crate::send_msg(qid, 2i32);
+                    }
+                })
+                .unwrap();
+        })
+    }
+    type Side = (Vec<CompactSummary>, Vec<String>);
+    let run = |own_id: bool| -> (Side, Side, usize) {
+        let f = local_fixture("e1:names", prog(true, own_id), prog(false, own_id), &["v"]);
+        let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+        let o = stateful::run_with(&cc, &f.implementation, &f.specification, true);
+        let side = |gs: &[ExecutionGraph]| -> Side {
+            let s = gs
+                .iter()
+                .map(|g| CompactSummary::at_completion(g, &f.visible, "test"))
+                .collect();
+            let mut ids: Vec<String> = gs
+                .iter()
+                .map(|g| {
+                    let t = crate::conformance::obs::resolve_visible(g, "v");
+                    format!("{:?}", t.expect("conformance: v resolves").expect("conformance: v"))
+                })
+                .collect();
+            ids.sort();
+            ids.dedup();
+            (s, ids)
+        };
+        (side(&o.kept_spec_graphs), side(&o.kept_impl_graphs), o.reports.len())
+    };
+    let ((s, sid), (i, iid), reports) = run(false);
+    note!("e1 names: spec {} graphs, v {sid:?}; impl {} graphs, v {iid:?}", s.len(), i.len());
+    assert!(!s.is_empty() && !i.is_empty(), "conformance: E1-3: no graphs");
+    assert!(e1_same_multiset(&s, &i), "conformance: E1-3: the multisets differ");
+    assert_eq!(reports, 0, "conformance: E1-3: the engine reports");
+    assert!(
+        sid.len() == 1 && iid.len() == 1 && sid != iid,
+        "conformance: E1-3 vacuous: v is {sid:?} in P₁ and {iid:?} in P₀"
+    );
+    let ((s, _), (i, _), reports) = run(true);
+    assert!(
+        !e1_same_multiset(&s, &i) && reports > 0,
+        "conformance: E1-3's limit: a ThreadId-valued message compared equal ({reports} reports)"
+    );
+}
+
+/// MIN-ENGINES E1-2 (derived §E1 item 14 (a)–(c); rev 1.4's rule): the key.
+/// (a) `Plain` exactly on `plain_key()` configurations (the stateful engine;
+/// complete-first without the precheck), under each selector: the three give
+/// one key, which parses to `Ltr` with no legacy selector and reprints itself;
+/// complete-first with the precheck names its selector (three keys, each
+/// round-tripping exactly); `Plain` on the enumerator, the gated engine or a
+/// precheck row is no key. (b)–(c) Every key of the four stores
+/// (`campaign-1`, `apptab-1`, `cfirst-1`, `compact-2`) parses and reprints byte
+/// for byte; a stored stateful or precheck-free complete-first key naming a
+/// selector is a legacy identity (`legacy_selector: Some(s)`); each of the
+/// three spellings is stored on both engines; one stored key of each is
+/// refused by `run_row_in_process` with its spelling and the fix in the
+/// payload and no program run (a counting fixture, which runs under the
+/// `Plain` key).
+#[test]
+fn e1_the_key_plain_and_legacy() {
+    use crate::conformance::eval::{parse_key, parse_label, read_rows, run_row_in_process};
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::grid::GridEnd;
+    use crate::conformance::selector::Selector;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let sels = [Selector::Ltr, Selector::Reverse, Selector::FewestEvents];
+    let mut bad = Vec::new();
+    for engine in [GridEngine::Stateful, GridEngine::CompleteFirst] {
+        for (pre, stop) in [(false, false), (false, true), (true, false), (true, true)] {
+            let of = |s: Selector| GridConfig::new(engine).selector(s).precheck(pre).stop(stop);
+            let plain = engine == GridEngine::Stateful || !pre;
+            let labels: BTreeSet<String> = sels.iter().map(|s| of(*s).label()).collect();
+            let want_n = if plain { 1 } else { 3 };
+            if labels.len() != want_n {
+                bad.push(format!("(a) {engine:?} pre={pre}: {labels:?}"));
+            }
+            for s in sels {
+                let (c, l) = (of(s), of(s).label());
+                let want = if plain { "Plain".to_owned() } else { format!("{s:?}") };
+                if l.split('/').nth(1) != Some(want.as_str()) || c.plain_key() != plain {
+                    bad.push(format!("(a) {l}: field, plain_key {}", c.plain_key()));
+                }
+                let sel = if plain { Selector::Ltr } else { s };
+                match parse_label(&l) {
+                    Some(p)
+                        if p.label() == l && p.legacy_selector.is_none() && p.selector == sel => {}
+                    other => bad.push(format!("(a) {l}: {other:?}")),
+                }
+            }
+        }
+    }
+    for l in [
+        GridConfig::new(GridEngine::Enumerator).label(),
+        GridConfig::new(GridEngine::Gated).label(),
+        GridConfig::new(GridEngine::CompleteFirst).precheck(true).label(),
+    ] {
+        let p = l.replacen("/Ltr/", "/Plain/", 1);
+        if parse_label(&p).is_some() {
+            bad.push(format!("(a) `Plain` parsed on {p}"));
+        }
+    }
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plan/traceForge/log/eval");
+    let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for store in ["campaign-1", "apptab-1", "cfirst-1", "compact-2"] {
+        let rows = read_rows(&dir.join(store).join("rows.csv"))
+            .unwrap_or_else(|e| panic!("conformance: {store}: {}", e.text()));
+        if rows.is_empty() {
+            bad.push(format!("(c) {store}: no rows"));
+        }
+        for r in &rows {
+            let k = &r["key"];
+            let field = k.split('|').nth(1).unwrap_or("");
+            let Some((_, c, ..)) = parse_key(k) else {
+                bad.push(format!("(c) {store}: {k} does not parse"));
+                continue;
+            };
+            if c.label() != field {
+                bad.push(format!("(c) {store}: {k} reprints {}", c.label()));
+                continue;
+            }
+            let name = field.split('/').nth(1).unwrap_or("").to_owned();
+            let plain_engine = c.engine == GridEngine::Stateful
+                || (c.engine == GridEngine::CompleteFirst && !c.precheck);
+            let class = match c.legacy_selector {
+                Some(s) if plain_engine && format!("{s:?}") == name => {
+                    seen.entry((format!("{:?}", c.engine), name)).or_insert_with(|| k.clone());
+                    "legacy"
+                }
+                None if !plain_engine => "selector",
+                _ => {
+                    bad.push(format!("(b) {store}: {k}: legacy {:?}", c.legacy_selector));
+                    "?"
+                }
+            };
+            *counts.entry(format!("{store} {class}")).or_default() += 1;
+        }
+    }
+    note!("e1 keys: {counts:?}");
+    for e in ["Stateful", "CompleteFirst"] {
+        for s in sels {
+            if !seen.contains_key(&(e.to_owned(), format!("{s:?}"))) {
+                bad.push(format!("(b) no stored {e} key under {s:?}"));
+            }
+        }
+    }
+    static E1_CALLS: AtomicUsize = AtomicUsize::new(0);
+    let counting = || {
+        crate::conformance::grid::prog(|| {
+            E1_CALLS.fetch_add(1, SeqCst);
+            let _ = crate::thread::Builder::new()
+                .name("r".to_owned())
+                .spawn(|| {})
+                .unwrap();
+        })
+    };
+    let fx = local_fixture("e1:counting", counting(), counting(), &["r"]);
+    for ((e, s), k) in &seen {
+        let (_, c, ..) = parse_key(k).expect("conformance: a stored key");
+        let before = E1_CALLS.load(SeqCst);
+        match run_row_in_process(&fx, &c, false) {
+            GridEnd::Panicked { payload, .. }
+                if payload.starts_with("refused: ")
+                    && payload.contains(&format!("`{s}`"))
+                    && payload.contains("`Plain` key") => {}
+            other => bad.push(format!("(b) {e} {s}: {k}: {other:?}")),
+        }
+        if E1_CALLS.load(SeqCst) != before {
+            bad.push(format!("(b) {e} {s}: a program ran"));
+        }
+    }
+    let before = E1_CALLS.load(SeqCst);
+    let end = run_row_in_process(&fx, &x1_config(GridEngine::Stateful, Selector::Ltr), false);
+    if E1_CALLS.load(SeqCst) == before || matches!(end, GridEnd::Panicked { .. }) {
+        bad.push(format!("(b) the counting fixture did not run under `Plain`: {end:?}"));
+    }
+    assert!(bad.is_empty(), "conformance: E1-2: {bad:#?}");
+}
+
+/// MIN-ENGINES E1-2 (derived §E1 item 14 (b)), through the child: `EVAL_ROW`
+/// naming a legacy key (the stateful engine under `Reverse`; complete-first
+/// under `FewestEvents`) is refused by `eval_row` with its `conformance: `
+/// diagnostic before any engine — the child fails and prints no sentinel
+/// record; the same row under its `Plain` key prints one.
+#[test]
+fn e1_eval_row_refuses_a_legacy_key() {
+    use crate::conformance::eval::{parse_label, row_json, RowSpec, RunKind, Tier};
+    let row = |c: GridConfig| RowSpec {
+        fixture: "ex:naive/k2/enc1".to_owned(),
+        config: c,
+        rep: 0,
+        tier: Tier::default_tier(),
+        run_kind: RunKind::Timed,
+        family: "ex:naive".to_owned(),
+        knobs: "k=2,enc=1".to_owned(),
+        k: [Some(2), Some(1), None, None],
+        variant: "violating".to_owned(),
+        twin_key: String::new(),
+        series: None,
+    };
+    let child = |json: String| -> (bool, String) {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "conformance::eval::eval_row"])
+            .args(["--nocapture", "--test-threads=1"])
+            .env("EVAL_ROW", json)
+            .env_remove("EVAL_RUN_DIR")
+            .env_remove("EVAL_EXPORT")
+            .output()
+            .expect("conformance: the child");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned()
+            + &String::from_utf8_lossy(&out.stderr);
+        (out.status.success(), text)
+    };
+    let mut bad = Vec::new();
+    let cases = [(GridEngine::Stateful, "Reverse"), (GridEngine::CompleteFirst, "FewestEvents")];
+    for (engine, s) in cases {
+        let plain = GridConfig::new(engine).label();
+        let legacy = plain.replacen("/Plain/", &format!("/{s}/"), 1);
+        let c = parse_label(&legacy).expect("conformance: a legacy label parses");
+        if c.legacy_selector.is_none() || c.label() != legacy {
+            bad.push(format!("{legacy}: not a legacy identity"));
+            continue;
+        }
+        let (ok, text) = child(row_json(&row(c)));
+        if ok
+            || !text.contains("conformance: EVAL_ROW names a legacy key")
+            || !text.contains(&format!("`{s}`"))
+            || text.contains("EVALROW\t")
+        {
+            bad.push(format!("{legacy}: ok {ok}: {text}"));
+        }
+        let (ok, text) = child(row_json(&row(GridConfig::new(engine))));
+        if !ok || !text.contains("EVALROW\t") {
+            bad.push(format!("{plain}: ok {ok}: {text}"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E1-2: {bad:#?}");
+}
+
+/// MIN-ENGINES E1-2 with rev 1.4's spec rule (the lead's F1 fix: one row per
+/// point where the key is `Plain`, `selectors_for`): no built-in spec, and no
+/// contract spec, lists a key twice. Derived from the spec builders before
+/// running: as landed at 14:42 `x0_spec` kept its own three-selector loop, so
+/// X0 listed its stateful and complete-first keys three times each (12 rows,
+/// 8 keys) and this test failed on X0 alone (the tester's F1b, 15:01); the
+/// lead's fix (17:58) builds X0 by `selectors_for` as well: 8 rows, 8 keys.
+#[test]
+fn e1_no_spec_lists_a_key_twice() {
+    use crate::conformance::eval::{builtin_specs, contract_specs, profile_name};
+    let mut bad = Vec::new();
+    for s in builtin_specs().into_iter().chain(contract_specs()) {
+        let keys: std::collections::BTreeSet<String> =
+            s.rows.iter().map(|r| r.key(profile_name())).collect();
+        if keys.len() != s.rows.len() {
+            bad.push(format!("{}: {} rows, {} keys", s.name, s.rows.len(), keys.len()));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: duplicate keys: {bad:?}");
+}
+
+/// MIN-ENGINES E1-2, the lead's F2 fix (the tester's finding at gate 3): a
+/// row's `selector` column is the key's second field (`selector_field`) —
+/// `Plain` on a `Plain`-key row under every selector, a legacy key's own
+/// spelling, and the selector's name where a run reads it (complete-first with
+/// the precheck, the gated engine, the enumerator) — on `row_of_end`'s settings
+/// columns.
+#[test]
+fn e1_the_selector_column_is_the_keys_field() {
+    use crate::conformance::eval::{parse_label, x1_config};
+    use crate::conformance::grid::{row_of_end, GridEnd};
+    use crate::conformance::selector::Selector;
+    let col = |c: &GridConfig| -> String {
+        let end = GridEnd::Panicked {
+            fixture: "e1:column".to_owned(),
+            config: c.clone(),
+            payload: String::new(),
+        };
+        let row = row_of_end(&end);
+        row.into_iter().find(|(k, _)| *k == "selector").map(|(_, v)| v).unwrap_or_default()
+    };
+    let mut bad = Vec::new();
+    for s in [Selector::Ltr, Selector::Reverse, Selector::FewestEvents] {
+        let name = format!("{s:?}");
+        let cases = [
+            (x1_config(GridEngine::Stateful, s), "Plain"),
+            (x1_config(GridEngine::CompleteFirst, s), "Plain"),
+            (x1_config(GridEngine::CompleteFirst, s).precheck(true), name.as_str()),
+            (x1_config(GridEngine::Gated, s), name.as_str()),
+            (x1_config(GridEngine::Enumerator, s), name.as_str()),
+        ];
+        for (c, want) in cases {
+            let (got, l) = (col(&c), c.label());
+            if got != want || l.split('/').nth(1) != Some(got.as_str()) {
+                bad.push(format!("{l}: column {got:?}, want {want}"));
+            }
+        }
+        let plain = GridConfig::new(GridEngine::Stateful).label();
+        let legacy = plain.replacen("/Plain/", &format!("/{name}/"), 1);
+        let c = parse_label(&legacy).expect("conformance: a legacy label parses");
+        if col(&c) != name {
+            bad.push(format!("{legacy}: column {:?}", col(&c)));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: F2: {bad:#?}");
 }

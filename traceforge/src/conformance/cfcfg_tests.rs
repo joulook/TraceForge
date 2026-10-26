@@ -44,7 +44,13 @@ macro_rules! note {
 type Rec = BTreeMap<String, String>;
 
 const PLAN: &str = "../../plan/traceForge/";
-const X1_CF: &str = "CompleteFirst/Ltr/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep";
+// `MIN-ENGINES` E1 (2026-10-26, tester re-pin at gate 3): X1's complete-first
+// key (the precheck off) prints `Plain` in the selector field; the gated key
+// keeps `Ltr`.
+const X1_CF: &str = concat!(
+    "CompleteFirst/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/",
+    "instr=false/cut=false/cover=Sweep"
+);
 const X1_GATED: &str = "Gated/Ltr/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep";
 /// The five configurations, F6's order, as label fields.
 const CFGS: [&str; 5] = ["w=0", "w=inf", "w=1", "w=8", "w=64"];
@@ -1091,6 +1097,29 @@ fn c08_the_schedule_parser() {
     assert!(bad.is_empty(), "conformance: criterion 8: {bad:#?}");
 }
 
+/// `MIN-ENGINES` E1-2 (the tester, gate 3; derived §E1 item 14 (b)): a CFCFG
+/// schedule row whose key spells a selector in place of `Plain` (each of the
+/// three legacy spellings) is rejected at the row's validation by name, the
+/// key quoted; the same file with the canonical key is accepted (150 rows).
+#[test]
+fn e1_a_legacy_key_in_the_cfcfg_schedule_is_rejected() {
+    let base = cf_schedule(cf_rows(3, "release"), 3);
+    assert_eq!(cf_parse(&base), "accepted 150", "conformance: the 150 rows");
+    let k0 = base["rows"][0]["key"].as_str().unwrap().to_owned();
+    assert!(k0.contains("|CompleteFirst/Plain/"), "conformance: {k0}");
+    let mut bad = Vec::new();
+    for s in ["Ltr", "Reverse", "FewestEvents"] {
+        let legacy = k0.replace("|CompleteFirst/Plain/", &format!("|CompleteFirst/{s}/"));
+        let mut v = base.clone();
+        v["rows"][0]["key"] = serde_json::json!(legacy);
+        let got = cf_parse(&v);
+        if !(got.contains("a legacy key") && got.contains(&legacy) && got.contains("`Plain`")) {
+            bad.push(format!("{s}: {got}"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E1-2: {bad:#?}");
+}
+
 // -------------------------------------------------------------------------
 // Child processes: the driver
 // -------------------------------------------------------------------------
@@ -1239,7 +1268,8 @@ fn c08_a_malformed_schedule_through_from_env() {
         ("EVAL_SPEC", "X0".into()),
         ("EVAL_OUT", outx.display().to_string()),
         ("EVAL_SCHEDULE", f.display().to_string()),
-        ("EVAL_ONLY", "ex:naive/k2/enc1|Stateful/Ltr/*|0|*".into()),
+        // `MIN-ENGINES` E1 (gate 3 re-pin): the stateful key prints `Plain`.
+        ("EVAL_ONLY", "ex:naive/k2/enc1|Stateful/Plain/*|0|*".into()),
         ("EVAL_ALLOW_MIXED", "1".into()),
     ]);
     note!("c08 from_env X0: {got}");

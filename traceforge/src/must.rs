@@ -176,6 +176,31 @@ thread_local! {
     pub(crate) static EXECUTIONS_BEGUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// `MIN-ENGINES` E1-1, test builds only: how many times this thread took the
+// selector branch at either scheduling site — the tester's counting test that
+// a plain-scheduled run never does (`selector_picks_for_test`).
+#[cfg(test)]
+thread_local! {
+    static SELECTOR_PICKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn selector_picks_bump() {
+    SELECTOR_PICKS.with(|c| c.set(c.get() + 1));
+}
+
+/// `MIN-ENGINES` E1-1, test builds only: the thread's selector-branch count.
+#[cfg(test)]
+pub(crate) fn selector_picks_for_test() -> usize {
+    SELECTOR_PICKS.with(|c| c.get())
+}
+
+/// `MIN-ENGINES` E1-1, test builds only: reset the thread's count.
+#[cfg(test)]
+pub(crate) fn reset_selector_picks_for_test() {
+    SELECTOR_PICKS.with(|c| c.set(0));
+}
+
 impl Must {
     pub(crate) fn new(conf: Config, replay_mode: bool) -> Self {
         let seed = conf.seed;
@@ -1631,6 +1656,8 @@ impl Must {
         // S1), a pure function of the graph over the `is_thread_runnable`
         // survivors; everything else is today's policy path, untouched.
         let next = if self.uses_selector() {
+            #[cfg(test)]
+            selector_picks_bump();
             let candidates: Vec<TaskId> = runnable
                 .iter()
                 .filter(|(t, i)| self.is_thread_runnable(t, i))
@@ -1722,17 +1749,23 @@ impl Must {
         // The second selector site (`P4-SELECTOR` S1): among the waiters whose
         // `Block` was just removed, the selector decides which installs first.
         if self.uses_selector() {
+            #[cfg(test)]
+            selector_picks_bump();
             let candidates: Vec<TaskId> = blocked.iter().map(|(t, _)| t.to_owned()).collect();
             return self.config.selector.pick(&self.current.graph, &candidates);
         }
         blocked.first().map(|(t, _)| t.to_owned())
     }
 
-    /// `P4-SELECTOR` S1's predicate: the selector is consulted by a conformance
-    /// run (outer, `Collect`, precheck, triage, sweep) or a probe, and by
-    /// nothing else — plain `verify` and replay keep today's scheduling.
+    /// `P4-SELECTOR` S1's predicate, narrowed by `MIN-ENGINES` E1: the selector
+    /// is consulted by a probe and by a conformance run whose mode is not one
+    /// of the plain-scheduled three (`ConfMode::plain_scheduling`: the
+    /// stateful engine's two runs, the stateless engine's outer run and its
+    /// sweeps), which take the config's `SchedulePolicy` path below — LTR by
+    /// the scope predicate — building no candidate vector and cloning nothing.
+    /// Plain `verify` and replay keep today's scheduling as before.
     fn uses_selector(&self) -> bool {
-        self.conf.is_some() || self.probe.is_some()
+        self.probe.is_some() || self.conf.as_ref().is_some_and(|c| !c.mode().plain_scheduling())
     }
 
     fn is_waiting_on_written(&self, t: ThreadId) -> bool {

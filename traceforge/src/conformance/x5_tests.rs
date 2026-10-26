@@ -394,7 +394,10 @@ fn check_host_rows(name: &str, gated: bool) -> (Vec<&'static RowSpec>, Vec<&'sta
         }
     }
     assert!(bad.is_empty(), "conformance: {name} rows: {bad:#?}");
-    let want_held = if gated { 0 } else { 108 };
+    // `MIN-ENGINES` E1 (2026-10-26, tester re-pin at gate 3): X2's
+    // complete-first keys print `Plain`, so X5's 108 `stop` rows share 36
+    // partners (one per point and rep), each listed once.
+    let want_held = if gated { 0 } else { 36 };
     assert_eq!(
         x2_held, want_held,
         "conformance: {name}'s X2-held sweep rows (with X2's twin key)"
@@ -463,11 +466,15 @@ fn c01_x5_and_x5g_rows_with_the_list_empty() {
             sweep_keys, partners,
             "conformance: {name}'s sweep rows are its partners"
         );
-        assert_eq!(sweep.len(), n_flat, "conformance: {name} sweep rows");
+        // `MIN-ENGINES` E1 (gate 3 re-pin): the 108 `stop` rows' partners are
+        // 36 `Plain` keys, so X5's sweep rows are 36 + 186 = 222 (keys 516);
+        // X5G's partners stay one per `A_flat` row (372).
+        let n_sweep = if gated { 186 } else { 222 };
+        assert_eq!(sweep.len(), n_sweep, "conformance: {name} sweep rows");
         assert_eq!(
             keys.len(),
-            2 * n_flat,
-            "conformance: {name} keys (588 / 372)"
+            n_flat + n_sweep,
+            "conformance: {name} keys (516 / 372)"
         );
         let reps: BTreeSet<u32> = spec(name).rows.iter().map(|r| r.rep).collect();
         assert_eq!(reps, [0, 1, 2].into(), "conformance: {name} reps");
@@ -545,7 +552,9 @@ fn c01_x5_lists_every_sweep_partner_and_shares_the_key() {
         ("X0".to_owned(), (1, 0)),
         ("X1".to_owned(), (72, 0)),
         ("X1V".to_owned(), (18, 0)),
-        ("X2".to_owned(), (108, 0)),
+        // `MIN-ENGINES` E1 (gate 3 re-pin): the `stop` partners are `Plain`
+        // keys, one per point and rep (108 → 36).
+        ("X2".to_owned(), (36, 0)),
     ]
     .into();
     assert_eq!(over, want, "conformance: the overlaps with X5 and X5G");
@@ -1042,8 +1051,12 @@ fn c01_the_frozen_x5_list_through_children() {
         assert_eq!(v["X5"]["points"][n]["rows"], 9, "conformance: (b) {n} rows");
     }
     assert_eq!(v["X5"]["flat"], 363, "conformance: (b) A_flat");
-    assert_eq!(v["X5"]["sweep"], 363, "conformance: (b) sweep rows");
-    for (h, n) in [("X5", 726), ("X5G", 510)] {
+    // `MIN-ENGINES` E1 (2026-10-26, tester re-pin at gate 3): the partners of
+    // the sample's three-selector rows and of the `stop` rows are `Plain` keys,
+    // one per point and rep: 36 (`stop`) + 186 (`FLAT_SUBSET`) + 21 (the
+    // sample's seven further points × 3 reps) = 243 sweep rows, 606 keys.
+    assert_eq!(v["X5"]["sweep"], 243, "conformance: (b) sweep rows");
+    for (h, n) in [("X5", 606), ("X5G", 510)] {
         assert_eq!(v[h]["keys"], n, "conformance: (b) {h} keys");
         assert_eq!(v[h]["rows"], n, "conformance: (b) {h} rows (each key once)");
         assert_eq!(v[h]["dangling"], 0, "conformance: (b) {h} dangling");
@@ -1073,8 +1086,10 @@ fn c01_the_frozen_x5_list_through_children() {
         v["X5"]["flat"], 906,
         "conformance: (c) A_flat with the full list"
     );
-    assert_eq!(v["X5"]["sweep"], 906, "conformance: (c) sweep rows");
-    assert_eq!(v["X5"]["keys"], 1812, "conformance: (c) keys");
+    // `MIN-ENGINES` E1 (gate 3 re-pin): 36 + 186 + (70 − 6) × 3 = 414 `Plain`
+    // partners; 906 + 414 = 1 320 keys.
+    assert_eq!(v["X5"]["sweep"], 414, "conformance: (c) sweep rows");
+    assert_eq!(v["X5"]["keys"], 1320, "conformance: (c) keys");
     assert_eq!(v["X5"]["dangling"], 0, "conformance: (c) dangling");
     assert_eq!(v["X5"]["unheld"], 0, "conformance: (c) unheld");
     assert_eq!(
@@ -1412,6 +1427,11 @@ fn partner_key(flat_key: &str) -> String {
     let mut label = p[1].replace("cover=Flat", "cover=Sweep");
     if label.starts_with("CompleteFirst/") {
         label = label.replace("precheck=true", "precheck=false");
+        // `MIN-ENGINES` E1 (the tester's re-pin at gate 3): without the
+        // precheck the complete-first key prints `Plain` in its second field.
+        let mut f: Vec<String> = label.split('/').map(str::to_owned).collect();
+        f[1] = "Plain".to_owned();
+        label = f.join("/");
     }
     p[1] = label;
     p.join("|")

@@ -654,7 +654,9 @@ fn probe_witness(p: &CorpusPair) -> Vec<String> {
 
 /// Every captured graph of `p` by an ungated Must exploration (the oracle's
 /// `Collect` mode: `conf` set, no worker, no reports), in completion order.
-fn graphs_of(config: Config, visible: &[String], p: Prog) -> Vec<ExecutionGraph> {
+/// `pub(super)` for `MIN-ENGINES` E1's second scheduler (test-only; the
+/// tester, gate 3: `compact_tests::e1_collect_under_reverse_against_plain`).
+pub(super) fn graphs_of(config: Config, visible: &[String], p: Prog) -> Vec<ExecutionGraph> {
     let must = Rc::new(RefCell::new(Must::new(config.clone(), false)));
     {
         let mut ctx = ConfCtx::gate_disabled(config, visible.to_vec(), ConfMode::Collect);
@@ -2678,7 +2680,7 @@ const OLD_TRACE: &str = r###"{"sorted_error_graph":{"label_order":[{"Begin":{"la
 /// `r` receives three times; `x` (spawned by `p1`), `p1`, `y` (spawned by
 /// `p2`) and, under a toss, `z` (spawned by `y`) send to it. `bad` changes
 /// `y`'s value, for a violating variant.
-fn nested_race(bad: bool) -> Prog {
+pub(super) fn nested_race(bad: bool) -> Prog {
     prog(move || {
         let (tx, rx) = chan();
         let _r = named("r", move || {
@@ -2720,7 +2722,7 @@ fn nested_nb() {
 }
 
 /// A spawn chain `a → b → c`, each sending to `r`, which receives twice.
-fn deep_chain() {
+pub(super) fn deep_chain() {
     let (tx, rx) = chan();
     let _r = named("r", move || {
         let _a: i32 = rx.recv_msg_block();

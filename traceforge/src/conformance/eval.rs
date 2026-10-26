@@ -578,6 +578,29 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     } else {
         (IndexKind::Current, true, true)
     };
+    let engine = parse_engine(p[0])?;
+    let precheck = flag(p[7], "precheck")?;
+    // `MIN-ENGINES` E1-2: `Plain` is the key of a configuration no run of which
+    // reads the selector (the stateful engine; the stateless engine with its
+    // precheck off); a selector name there is a legacy key — parsed as a
+    // stored identity with its own spelling kept (`legacy_selector`), refused
+    // by every execution path; `Plain` anywhere else is no key (a stateless
+    // row with the precheck on reads the selector in that run and keeps its
+    // name).
+    let plain_engine = match engine {
+        GridEngine::Stateful => true,
+        GridEngine::CompleteFirst => !precheck,
+        _ => false,
+    };
+    let (selector, legacy_selector) = match (p[1], plain_engine) {
+        ("Plain", true) => (Selector::Ltr, None),
+        ("Plain", false) => return None,
+        (s, true) => {
+            let sel = parse_selector(s)?;
+            (sel, Some(sel))
+        }
+        (s, false) => (parse_selector(s)?, None),
+    };
     let parsed = GridConfig {
         witness_cache,
         quiet,
@@ -586,14 +609,15 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         probe_memo,
         impl_distinct,
         bucket,
-        engine: parse_engine(p[0])?,
-        selector: parse_selector(p[1])?,
+        engine,
+        selector,
+        legacy_selector,
         stop_at_first_report: flag(p[2], "stop")?,
         gated_mode: parse_gated_mode(p[3])?,
         gate_policy: parse_policy(p[4])?,
         memo: flag(p[5], "memo")?,
         budget: parse_budget(p[6])?,
-        precheck: flag(p[7], "precheck")?,
+        precheck,
         instrumented: flag(p[8], "instr")?,
         early_error_cut: flag(p[9], "cut")?,
         completion_cover: parse_cover(p[10].strip_prefix("cover=")?)?,
@@ -701,7 +725,8 @@ pub(super) fn x0_spec() -> Spec {
         GridEngine::CompleteFirst,
         GridEngine::Gated,
     ] {
-        for selector in [Selector::Ltr, Selector::FewestEvents, Selector::Reverse] {
+        // `MIN-ENGINES` E1-2 (gate 3 F1b): one selector where the key is `Plain`.
+        for &selector in selectors_for(&GridConfig::new(engine)) {
             rows.push(RowSpec {
                 fixture: "ex:naive/k2/enc1".to_owned(),
                 config: GridConfig::new(engine).selector(selector),
@@ -944,6 +969,20 @@ pub(super) fn run_row_in_process(
     config: &GridConfig,
     keep_graphs: bool,
 ) -> GridEnd {
+    // `MIN-ENGINES` E1-2: a legacy key names a scheduling the stateful and
+    // stateless engines no longer run; it is a stored identity, never a run.
+    if let Some(s) = config.legacy_selector {
+        return GridEnd::Panicked {
+            fixture: fixture.name.clone(),
+            config: config.clone(),
+            payload: format!(
+                "refused: the key's selector field `{s:?}` is a legacy spelling for engine {:?}; \
+                 the stateful and stateless engines schedule by plain Must (MIN-ENGINES E1) and \
+                 their key prints `Plain` — rerun the row under its `Plain` key",
+                config.engine
+            ),
+        };
+    }
     if config.completion_cover == CompletionCover::Flat {
         let bad_engine = !matches!(config.engine, GridEngine::CompleteFirst | GridEngine::Gated);
         if bad_engine || !config.precheck {
@@ -1703,6 +1742,15 @@ fn eval_row() {
     };
     let spec =
         row_from_json(&json.to_string_lossy()).expect("conformance: EVAL_ROW does not parse");
+    // `MIN-ENGINES` E1-2: before any engine, the clearer child diagnostic.
+    if let Some(s) = spec.config.legacy_selector {
+        panic!(
+            "conformance: EVAL_ROW names a legacy key (selector `{s:?}` on {:?}); the stateful \
+             and stateless engines schedule by plain Must (MIN-ENGINES E1) — rerun under the \
+             `Plain` key",
+            spec.config.engine
+        );
+    }
     let commit = std::env::var("EVAL_COMMIT").unwrap_or_default();
     let row = child_row(&spec, &commit).unwrap_or_else(|e| panic!("conformance: {}", e.text()));
     let line = format!("{SENTINEL}{}\n", csv_line(&record_of(&row)));
@@ -2832,6 +2880,19 @@ const SWEEPING_ENGINES: [GridEngine; 2] = [GridEngine::CompleteFirst, GridEngine
 const CAMPAIGN_SELECTORS: [Selector; 3] =
     [Selector::Ltr, Selector::FewestEvents, Selector::Reverse];
 
+/// `MIN-ENGINES` E1-2 (gate 3 F1): the selectors a spec enumerates for one
+/// configuration — the three where the key names the selector (a run of the
+/// configuration reads it), `Ltr` alone where the key prints `Plain`
+/// (`GridConfig::plain_key`: the stateful engine; the stateless engine with
+/// the precheck off), so that no spec holds one key three times.
+fn selectors_for(config: &GridConfig) -> &'static [Selector] {
+    if config.plain_key() {
+        &CAMPAIGN_SELECTORS[..1]
+    } else {
+        &CAMPAIGN_SELECTORS
+    }
+}
+
 /// The conforming §6 fixtures (C5), from `P4-DIFF.tables.md`'s exhaustive
 /// verdicts; the tester pins this table (criterion 5). Every other §6 fixture
 /// is violating (twinless X2).
@@ -2987,7 +3048,7 @@ fn timed_rows(
     for p in points {
         let tier = tier_for(&p.fixture);
         for &e in engines {
-            for s in CAMPAIGN_SELECTORS {
+            for &s in selectors_for(&config(e, Selector::Ltr)) {
                 for rep in 0..3 {
                     let mut r = p.row_spec(&config(e, s), &tier, RunKind::Timed, rep);
                     r.twin_key.clear(); // twins are X2's (C4); nothing else pairs
@@ -3019,7 +3080,7 @@ pub(super) fn x2_spec() -> Spec {
     for p in &points {
         let tier = tier_for(&p.fixture);
         for e in CAMPAIGN_ENGINES {
-            for s in CAMPAIGN_SELECTORS {
+            for &s in selectors_for(&x2_config(e, Selector::Ltr)) {
                 for rep in 0..3 {
                     let mut r = p.row_spec(&x2_config(e, s), &tier, RunKind::Timed, rep);
                     r.twin_key = x1_twin_key(p, e, s, rep);
@@ -3320,7 +3381,7 @@ pub(super) fn contract_specs() -> Vec<Spec> {
     let mut rows = Vec::new();
     for name in contract_fixtures() {
         for e in CAMPAIGN_ENGINES {
-            for s in CAMPAIGN_SELECTORS {
+            for &s in selectors_for(&x1_config(e, Selector::Ltr)) {
                 rows.push(RowSpec {
                     fixture: name.clone(),
                     config: x1_config(e, s),
@@ -4580,6 +4641,12 @@ impl Schedule {
     ) -> Result<(ApptabPair, usize, String), String> {
         let (fixture, config, rep, tier, run_kind, profile) =
             parse_key(&row.key).ok_or_else(|| "the key does not parse".to_owned())?;
+        // `MIN-ENGINES` E1-2: a legacy key names a scheduling no longer run.
+        if config.legacy_selector.is_some() {
+            return Err("a legacy key: its selector field names a selector on a plain-scheduled \
+                        engine; regenerate the schedule under `Plain` (MIN-ENGINES E1)"
+                .to_owned());
+        }
         let (pair, s) = apptab_pair_of(&fixture)
             .ok_or_else(|| format!("`{fixture}` is not a diagonal fixture of a known pair"))?;
         if s != row.size {
@@ -5471,6 +5538,12 @@ impl CfcfgSchedule {
     ) -> Result<(ApptabPair, usize, Capacity, String), String> {
         let (fixture, config, rep, tier, run_kind, profile) =
             parse_key(&row.key).ok_or_else(|| "the key does not parse".to_owned())?;
+        // `MIN-ENGINES` E1-2: a legacy key names a scheduling no longer run.
+        if config.legacy_selector.is_some() {
+            return Err("a legacy key: its selector field names a selector on a plain-scheduled \
+                        engine; regenerate the schedule under `Plain` (MIN-ENGINES E1)"
+                .to_owned());
+        }
         let (pair, s) = apptab_pair_of(&fixture)
             .ok_or_else(|| format!("`{fixture}` is not a diagonal fixture of a known pair"))?;
         if s != row.size {

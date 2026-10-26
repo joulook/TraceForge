@@ -1021,8 +1021,10 @@ fn c06_the_schedule_parser() {
         .find(|i| base["rows"][*i]["mode"] == "exhaustive" && base["rows"][*i]["pair"] == "eager")
         .unwrap();
     let k = base["rows"][i]["key"].as_str().unwrap();
+    // `MIN-ENGINES` E1 (2026-10-26, tester re-pin at gate 3): the stateful key
+    // prints `Plain`, the enumerator's names its selector (`Ltr`).
     let ek = k
-        .replace("Stateful/", "Enumerator/")
+        .replace("Stateful/Plain/", "Enumerator/Ltr/")
         .replace("memo=false/Default", "memo=true/Unlimited");
     v["rows"][i]["key"] = serde_json::json!(ek);
     v["rows"][i]["engine"] = serde_json::json!("Enumerator");
@@ -1235,6 +1237,35 @@ fn c06_the_schedule_parser() {
         "conformance: criterion 6 refusals: {bad:#?}"
     );
     note!("c06: {} malformed shapes refused by name", cases.len());
+}
+
+/// `MIN-ENGINES` E1-2 (the tester, gate 3; derived §E1 item 14 (b)): an
+/// APPTAB schedule row whose stateful or complete-first key spells a selector
+/// in place of `Plain` (each of the three legacy spellings) is rejected at the
+/// row's validation by name, the key quoted; the canonical file is accepted.
+#[test]
+fn e1_a_legacy_key_in_the_apptab_schedule_is_rejected() {
+    let ok = sched_text(2, &[], &[], "/nonexistent");
+    Schedule::parse(&ok).unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let base: serde_json::Value = serde_json::from_str(&ok).unwrap();
+    let mut bad = Vec::new();
+    for engine in ["Stateful", "CompleteFirst"] {
+        let plain = format!("|{engine}/Plain/");
+        let i = (0..base["rows"].as_array().unwrap().len())
+            .find(|i| base["rows"][*i]["key"].as_str().unwrap().contains(&plain))
+            .unwrap_or_else(|| panic!("conformance: no {engine} row"));
+        let k = base["rows"][i]["key"].as_str().unwrap().to_owned();
+        for s in ["Ltr", "Reverse", "FewestEvents"] {
+            let legacy = k.replace(&plain, &format!("|{engine}/{s}/"));
+            let mut v = base.clone();
+            v["rows"][i]["key"] = serde_json::json!(legacy);
+            let e = parse_err(&v.to_string());
+            if !(e.contains("a legacy key") && e.contains(&legacy) && e.contains("`Plain`")) {
+                bad.push(format!("{engine} {s}: {e}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E1-2: {bad:#?}");
 }
 
 /// The child of the schedule and driver tests (`APPTAB_CASE` selects):
@@ -2434,7 +2465,8 @@ fn c06_a_malformed_schedule_through_from_env() {
             ("EVAL_SPEC", "X0".into()),
             ("EVAL_OUT", out_x.display().to_string()),
             ("EVAL_SCHEDULE", f.display().to_string()),
-            ("EVAL_ONLY", "ex:naive/k2/enc1|Stateful/Ltr/*|0|*".into()),
+            // `MIN-ENGINES` E1 (gate 3 re-pin): the stateful key prints `Plain`.
+            ("EVAL_ONLY", "ex:naive/k2/enc1|Stateful/Plain/*|0|*".into()),
             ("EVAL_ALLOW_MIXED", "1".into()),
         ],
         &[],

@@ -686,7 +686,7 @@ fn pe_sends_ordered_by_join() -> Prog {
 
 /// `P4-SELECTOR`'s nested shape: `p1` spawns `x`, `p2` spawns `y`; all send
 /// to a sink.
-fn nested4() -> Prog {
+pub(super) fn nested4() -> Prog {
     prog(|| {
         let (tx, _rx) = chan();
         let t1 = tx.clone();

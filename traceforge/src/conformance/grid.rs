@@ -1314,7 +1314,17 @@ impl Budget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct GridConfig {
     pub(super) engine: GridEngine,
+    /// The selector the enumerator, precheck, triage, oracle and gated runs
+    /// read; `MIN-ENGINES` E1: not read by the stateful and stateless engines,
+    /// which schedule by plain Must — their key prints `Plain` in this field
+    /// (`selector_field`), whatever this holds.
     pub(super) selector: Selector,
+    /// `MIN-ENGINES` E1-2: `Some(s)` only on a configuration parsed from a
+    /// stored key whose second field names a selector on a plain-scheduled
+    /// engine — a legacy key, kept as a stored identity (its label reprints
+    /// `s`) and refused by every execution path; `None` on every
+    /// configuration the driver builds.
+    pub(super) legacy_selector: Option<Selector>,
     /// `stop_at_first_report` on every engine (plan §6's "stopped at first
     /// report"; on the enumerator, the stop flag of
     /// `verify_conformance_with_opts`).
@@ -1366,6 +1376,7 @@ impl GridConfig {
         Self {
             engine,
             selector: Selector::Ltr,
+            legacy_selector: None,
             stop_at_first_report: false,
             gated_mode: GatedMode::Exhaustive,
             gate_policy: GatePolicy::Always,
@@ -1519,11 +1530,40 @@ impl GridConfig {
     }
 
     /// One line naming every knob, for a table row.
+    /// `MIN-ENGINES` E1-2: the key's second field — `Plain` when no run of
+    /// this configuration reads the selector: the stateful engine always, the
+    /// stateless engine when its precheck is off (its outer run and sweeps
+    /// schedule by plain Must whatever `selector` holds; a `precheck = true`
+    /// row's `Precheck` run still reads it, so that row keeps the selector's
+    /// name — one key for one scheduling, and no key hides a knob a run
+    /// read); the selector's name for the engines that read it; a legacy
+    /// key's own spelling when this configuration was parsed from one (a
+    /// stored identity, never run).
+    fn selector_field(&self) -> String {
+        match (self.legacy_selector, self.engine) {
+            (Some(s), _) => format!("{s:?}"),
+            (None, GridEngine::Stateful) => "Plain".to_owned(),
+            (None, GridEngine::CompleteFirst) if !self.precheck => "Plain".to_owned(),
+            (None, _) => format!("{:?}", self.selector),
+        }
+    }
+
+    /// `MIN-ENGINES` E1-2: whether this configuration's key prints `Plain`
+    /// (`selector_field`), i.e. no run of it reads the selector.
+    pub(super) fn plain_key(&self) -> bool {
+        self.legacy_selector.is_none()
+            && match self.engine {
+                GridEngine::Stateful => true,
+                GridEngine::CompleteFirst => !self.precheck,
+                _ => false,
+            }
+    }
+
     pub(super) fn label(&self) -> String {
         let eleven = format!(
-            "{:?}/{:?}/stop={}/{:?}/{:?}/memo={}/{:?}/precheck={}/instr={}/cut={}/cover={:?}",
+            "{:?}/{}/stop={}/{:?}/{:?}/memo={}/{:?}/precheck={}/instr={}/cut={}/cover={:?}",
             self.engine,
-            self.selector,
+            self.selector_field(),
             self.stop_at_first_report,
             self.gated_mode,
             self.gate_policy,
@@ -2021,7 +2061,9 @@ fn push_opt<T: std::fmt::Display>(row: &mut Row, k: &'static str, v: Option<T>) 
 fn settings_columns(fixture: &str, config: &GridConfig, row: &mut Row) {
     push_d(row, "fixture", fixture);
     push(row, "engine", config.engine);
-    push(row, "selector", config.selector);
+    // `MIN-ENGINES` E1-2 (gate 3 F2): the key's field — `Plain` where no run
+    // read the selector, so the column names no knob the run did not use.
+    push_d(row, "selector", config.selector_field());
     push_d(row, "stop", config.stop_at_first_report);
     push(row, "gated_mode", config.gated_mode);
     push(row, "policy", config.gate_policy);

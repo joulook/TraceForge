@@ -358,6 +358,19 @@ fn settings_key(get: impl Fn(&str) -> String) -> String {
     SETTINGS.map(&get).join("|")
 }
 
+/// `MIN-ENGINES` E1 (the tester's re-pin at gate 3, after the lead's F2): a
+/// store row's `selector` column prints its key's field, `Plain` on a
+/// `Plain`-key row; Part 6's tables, written before E1, name the selector the
+/// row ran under. A `Plain` row's Part 6 reference is its `Ltr` row (E1's
+/// before/after record: plain Must's order is the `Ltr` order on every
+/// recorded fixture), so the lookup reads `Plain` as `Ltr`.
+fn part6_settings_key(r: &BTreeMap<String, String>) -> String {
+    settings_key(|c| match (c, get(r, c)) {
+        ("selector", "Plain") => "Ltr".to_owned(),
+        (_, v) => v.to_owned(),
+    })
+}
+
 /// Split one Markdown table row of `grid::Tables` on unescaped `|`.
 fn md_cells(line: &str) -> Vec<String> {
     let inner = line
@@ -439,7 +452,10 @@ fn compare_to_part6(
             None => absent.push(c.clone()),
             Some(g) => {
                 compared += 1;
-                if g != w {
+                // `MIN-ENGINES` E1 (gate 3 re-pin): `Plain` is Part 6's `Ltr`
+                // (`part6_settings_key`).
+                let plain_ltr = c == "selector" && g == "Plain" && w == "Ltr";
+                if g != w && !plain_ltr {
                     bad.push(format!("{c}: Part 6 {w:?}, runner {g:?}"));
                 }
             }
@@ -559,12 +575,30 @@ fn h1_every_grid_label_parses_back() {
         }
     }
     for c in &configs {
+        // `MIN-ENGINES` E1-2 (2026-10-26, tester re-pin at gate 3): a `Plain`
+        // key (the stateful engine; complete-first without the precheck) names
+        // the one scheduling every selector gives and parses to `Ltr`; every
+        // other key parses back to its configuration. Each reprints itself.
+        let want = if c.plain_key() {
+            GridConfig {
+                selector: Selector::Ltr,
+                ..c.clone()
+            }
+        } else {
+            c.clone()
+        };
         assert_eq!(
             parse_label(&c.label()).as_ref(),
-            Some(c),
+            Some(&want),
             "conformance: {}",
             c.label()
         );
+        assert_eq!(
+            parse_label(&c.label()).map(|p| p.label()),
+            Some(c.label()),
+            "conformance: the key reprints itself"
+        );
+        let c = &want;
         let k = row_spec(
             "ex:naive/k2/enc1",
             c.clone(),
@@ -1139,14 +1173,6 @@ fn m1_series_of_yields_the_h5_scope() {
             RunKind::Timed,
             3,
         ),
-        Series::of(
-            "fam",
-            "enc=1",
-            &c.clone().selector(Selector::Reverse),
-            &t,
-            RunKind::Timed,
-            3,
-        ),
         Series::of("fam", "enc=1", &c.clone().memo(true), &t, RunKind::Timed, 3),
         Series::of("fam", "enc=1", &c, &Tier::default_tier(), RunKind::Timed, 3),
         Series::of("fam", "enc=1", &c, &t, RunKind::Profiling, 3),
@@ -1154,6 +1180,18 @@ fn m1_series_of_yields_the_h5_scope() {
     for o in others {
         assert_ne!(o.scope, base.scope, "conformance: {}", o.scope);
     }
+    // `MIN-ENGINES` E1-2 (2026-10-26, tester re-pin at gate 3): the selector is
+    // in the scope where the key carries it — the gated engine here; on the
+    // stateful engine it is read by no run, the key prints `Plain`, and the
+    // scope is the same under every selector.
+    let cr = c.clone().selector(Selector::Reverse);
+    let rev = Series::of("fam", "enc=1", &cr, &t, RunKind::Timed, 3);
+    assert_eq!(rev.scope, base.scope, "conformance: the stateful engine's selector");
+    let g = GridConfig::new(GridEngine::Gated);
+    let gs = Series::of("fam", "enc=1", &g, &t, RunKind::Timed, 3);
+    let gr = g.clone().selector(Selector::Reverse);
+    let gr = Series::of("fam", "enc=1", &gr, &t, RunKind::Timed, 3);
+    assert_ne!(gr.scope, gs.scope, "conformance: the gated engine's selector");
 }
 
 /// **Round 01 M2**: an `EVAL_ONLY` glob that selects no key of the spec is
@@ -1340,10 +1378,6 @@ fn r2m2_of_row_differs_on_every_scope_component() {
             Box::new(|r| r.config = GridConfig::new(GridEngine::Gated)),
         ),
         (
-            "selector",
-            Box::new(|r| r.config = r.config.clone().selector(Selector::Reverse)),
-        ),
-        (
             "knob in the label",
             Box::new(|r| r.config = r.config.clone().memo(true)),
         ),
@@ -1357,6 +1391,19 @@ fn r2m2_of_row_differs_on_every_scope_component() {
         assert_ne!(s.scope, scope, "conformance: {what}: {}", s.scope);
         assert_eq!(s.size, 3, "conformance: {what}");
     }
+    // `MIN-ENGINES` E1-2 (2026-10-26, tester re-pin at gate 3): the selector is
+    // a scope component where the key carries it (a gated row); on the
+    // stateful base row the key prints `Plain` and the scope does not move.
+    let mut g = base.clone();
+    g.config = GridConfig::new(GridEngine::Gated);
+    let mut gr = g.clone();
+    gr.config = gr.config.clone().selector(Selector::Reverse);
+    let (gs, grs) = (Series::of_row(&g, 0).scope, Series::of_row(&gr, 0).scope);
+    assert_ne!(grs, gs, "conformance: selector (gated): {grs}");
+    let mut sr = base.clone();
+    sr.config = sr.config.clone().selector(Selector::Reverse);
+    let srs = Series::of_row(&sr, 0).scope;
+    assert_eq!(srs, scope, "conformance: selector (stateful, `Plain`)");
 }
 
 /// **Round 02 m2, a size axis other than `k1`** (derived before running): with
@@ -1886,6 +1933,11 @@ fn x0_reps_spec() -> Spec {
 // Process tests (`#[ignore]`d): every one spawns children through the driver
 // =========================================================================
 
+/// `MIN-ENGINES` E1 (the tester's re-pin at gate 3, after the lead's F1b):
+/// `X0` is 8 rows (`selectors_for`: the enumerator and the gated engine under
+/// three selectors, the stateful and complete-first engines once, `Plain`),
+/// and the Part 6 lookup reads `Plain` as `Ltr` (`part6_settings_key`).
+///
 /// **Criterion 1, the driver and the child** (H1–H3): `X0`'s 12 rows, each
 /// from its own process (`pid` distinct), `end_class = ok`; every Part 6
 /// column (criterion 1's exclusions) equal to Part 6's table row
@@ -1896,15 +1948,15 @@ fn x0_reps_spec() -> Spec {
 /// Measured runtime: 0.31 s test profile, 0.25 s release (gate 3).
 #[test]
 #[ignore]
-fn c01_x0_twelve_rows_each_from_its_own_process() {
+fn c01_x0_eight_rows_each_from_its_own_process() {
     let dir = fresh("c01");
     let d = real_driver(x0_spec(), vec![x0_spec()], &dir);
     let s = run_ok(&d);
-    assert_eq!((s.ran, s.skipped_present, s.censored), (12, 0, 0));
+    assert_eq!((s.ran, s.skipped_present, s.censored), (8, 0, 0));
     let rows = store_of(&d);
-    assert_eq!(rows.len(), 12);
+    assert_eq!(rows.len(), 8);
     let pids: BTreeSet<&str> = rows.iter().map(|r| get(r, "pid")).collect();
-    assert_eq!(pids.len(), 12, "conformance: one process per row");
+    assert_eq!(pids.len(), 8, "conformance: one process per row");
     assert!(!pids.contains(std::process::id().to_string().as_str()));
     let part6 = part6_grid_rows();
     let mut absent_all = BTreeSet::new();
@@ -1914,7 +1966,7 @@ fn c01_x0_twelve_rows_each_from_its_own_process() {
         assert_eq!(get(r, "censored"), "false");
         assert_eq!(get(r, "run_kind"), "timed");
         assert_eq!(get(r, "comm_model"), "NoOrder");
-        let key = settings_key(|c| get(r, c).to_owned());
+        let key = part6_settings_key(r);
         let want = part6
             .get(&key)
             .unwrap_or_else(|| panic!("conformance: no Part 6 row for {key}"));
@@ -2323,6 +2375,8 @@ fn c03_the_memory_columns() {
 /// second invocation (and `X0` itself) adds no row; `X0b` overlapping `X0`
 /// computes once and its shared rows read `X0,X0b` after either run order; a
 /// store with a truncated last line resumes, rerunning exactly that key.
+/// `MIN-ENGINES` E1 (the tester's re-pin at gate 3, after the lead's F1b): `X0`
+/// is 8 rows, so `X0r` is 24 rows in 8 sets; `X0b` shares 2 keys with `X0`.
 ///
 /// Measured runtime: 0.37 s test profile (gate 3).
 #[test]
@@ -2331,9 +2385,9 @@ fn c04_repetitions_deduplication_and_resumption() {
     let dir = fresh("c04-reps");
     let specs = vec![x0_spec(), x0b_spec(), x0_reps_spec()];
     let d = real_driver(x0_reps_spec(), specs.clone(), &dir);
-    assert_eq!(run_ok(&d).ran, 36);
+    assert_eq!(run_ok(&d).ran, 24);
     let rows = store_of(&d);
-    assert_eq!(rows.len(), 36);
+    assert_eq!(rows.len(), 24);
     let mut sets: BTreeMap<String, Vec<&BTreeMap<String, String>>> = BTreeMap::new();
     for r in &rows {
         let (f, c, ..) = parse_key(get(r, "key")).unwrap();
@@ -2341,7 +2395,7 @@ fn c04_repetitions_deduplication_and_resumption() {
             .or_default()
             .push(r);
     }
-    assert_eq!(sets.len(), 12);
+    assert_eq!(sets.len(), 8);
     let volatile = |c: &str| {
         excluded_c1(c)
             || c.starts_with("rss_")
@@ -2368,11 +2422,11 @@ fn c04_repetitions_deduplication_and_resumption() {
     }
     // Second invocations add nothing.
     let s = run_ok(&d);
-    assert_eq!((s.ran, s.skipped_present), (0, 36));
+    assert_eq!((s.ran, s.skipped_present), (0, 24));
     let s = run_ok(&real_driver(x0_spec(), specs.clone(), &dir));
-    assert_eq!((s.ran, s.skipped_present), (0, 12));
+    assert_eq!((s.ran, s.skipped_present), (0, 8));
     let runs = fs::read_dir(dir.join("runs")).unwrap().count();
-    assert_eq!(runs, 36, "conformance: one run directory per row run");
+    assert_eq!(runs, 24, "conformance: one run directory per row run");
     // X0b after X0: only its own key runs.
     let s = run_ok(&real_driver(x0b_spec(), specs.clone(), &dir));
     assert_eq!((s.ran, s.skipped_present), (1, 2));
@@ -2384,7 +2438,7 @@ fn c04_repetitions_deduplication_and_resumption() {
     );
     assert_eq!(
         run_ok(&real_driver(x0_spec(), specs.clone(), &dir2)).ran,
-        10
+        6
     );
     let names = [x0_spec(), x0b_spec()];
     for store_dir in [&dir, &dir2] {
@@ -2417,7 +2471,7 @@ fn c04_repetitions_deduplication_and_resumption() {
     assert_eq!((s.ran, s.skipped_present), (1, 2));
     assert_eq!(data_lines(&path), before);
     let rows = store_of(&d);
-    assert_eq!(rows.len(), 37);
+    assert_eq!(rows.len(), 25);
     assert_eq!(rows.iter().filter(|r| get(r, "key") == last_key).count(), 1);
 }
 
@@ -2842,12 +2896,15 @@ fn c05_part6_default_subset_as_contract_rows() {
         .into_iter()
         .filter(|r| keys.contains(get(r, "key")))
         .collect();
-    assert_eq!(rows.len(), s.rows.len());
+    // `MIN-ENGINES` E1 (the tester's re-pin at gate 3): the stateful and
+    // complete-first configurations print one `Plain` key under the three
+    // selectors, so the store holds each key once.
+    assert_eq!(rows.len(), keys.len());
     let (mut cells, mut bad, mut no_part6, mut absent) =
         (0, Vec::new(), Vec::new(), BTreeSet::new());
     for r in &rows {
         assert_eq!(get(r, "end_class"), "ok", "conformance: {}", get(r, "key"));
-        let key = settings_key(|c| get(r, c).to_owned());
+        let key = part6_settings_key(r);
         match part6.get(&key) {
             None => no_part6.push(key),
             Some(w) => {

@@ -2473,37 +2473,73 @@ fn stamp_of(g: &ExecutionGraph, n: &str, i: u32) -> usize {
 /// graph and on the swept graph;
 /// the rev 2.2 `ex:naive` facts that do hold (same family, `sweep_sizes =
 /// [1..6]` per selector) are kept.
+///
+/// **Re-pinned for `MIN-ENGINES` E1** (2026-10-26, the tester at gate 3; the
+/// positional list's §2, `log/dev/MIN-ENGINES.e1-positional.md`): the outer
+/// run (`CFirstOuter`) and the sweeps (`CFirstSweep`) schedule by plain Must,
+/// so the knob no longer reaches them — the not-read pin. On `c3_prog` the
+/// `unblock_ready` pick is plain Must's first waiter, `r1`, under `Ltr`,
+/// `Reverse` and `FewestEvents` alike (before E1 `Reverse` installed `r2`
+/// first: this test's earlier pin), in the kept Impl graph and in the swept
+/// graph; and every kept graph's stamps (outer and per sweep), on `c3_prog`
+/// and on `ex:naive` (α), are those of the `Ltr` run. The kept facts stand
+/// (`sweep_sizes` `[1]` and `[1..6]` under every selector). The selector's
+/// reach is now the oracle's `Collect` mode's
+/// (`compact_tests::e1_collect_under_reverse_against_plain`).
 #[test]
-fn c12_the_selector_reaches_the_outer_run_and_the_sweeps() {
+fn c12_the_selector_no_longer_reaches_the_outer_run_or_the_sweeps() {
+    type Fp = Vec<(Option<String>, Vec<usize>)>;
+    // Every thread's name and its events' stamps: the installation order.
+    let fp = |g: &ExecutionGraph| -> Fp {
+        g.thread_ids()
+            .into_iter()
+            .map(|t| {
+                let n = g.get_thread_tclab(t).name().as_deref().map(str::to_owned);
+                let s = (0..g.thread_size(t) as u32).map(|i| g.label(Event::new(t, i)).stamp());
+                (n, s.collect())
+            })
+            .collect()
+    };
+    let run_fp = |o: &CFirstOutcome| -> (Vec<Fp>, Vec<Vec<Fp>>) {
+        let outer = o.kept_impl_graphs.iter().map(&fp).collect();
+        let sweeps = o.kept_spec_graphs.iter().map(|s| s.iter().map(&fp).collect()).collect();
+        (outer, sweeps)
+    };
     let v = vis(&["r1", "r2", "s"]);
-    for (what, s, r1_first) in [
-        ("ltr", Selector::Ltr, true),
-        ("reverse", Selector::Reverse, false),
+    let nv = naive_visible(3);
+    let mut runs = Vec::new();
+    for (what, s) in [
+        ("ltr", Selector::Ltr),
+        ("reverse", Selector::Reverse),
+        ("fewest", Selector::FewestEvents),
     ] {
         let c = with_selector(cfg(ConsType::Bag), s);
         let cc = built(cb(c, &v).selector(s).skip_spec_errfree_check(true));
         let o = rw(&cc, &c3_prog(), &c3_prog(), true);
         assert_eq!(o.counters.sweep_sizes, vec![1], "conformance: {what}");
         let order = |g: &ExecutionGraph| stamp_of(g, "r1", 1) < stamp_of(g, "r2", 1);
-        let impl_graph = &o.kept_impl_graphs[0];
-        assert_eq!(
-            order(impl_graph),
-            r1_first,
-            "conformance: {what}: the outer run ignored the selector"
+        assert!(
+            order(&o.kept_impl_graphs[0]),
+            "conformance: {what}: the outer run read the selector"
         );
-        assert_eq!(
+        assert!(
             order(&o.kept_spec_graphs[0][0]),
-            r1_first,
-            "conformance: {what}: the sweep ignored the selector"
+            "conformance: {what}: the sweep read the selector"
         );
-        let nv = naive_visible(3);
         let c = with_selector(cfg(ConsType::Bag), s);
         let cc = built(cb(c, &nv).selector(s).skip_spec_errfree_check(true));
-        let o = rw(&cc, &naive(3, 0), &naive(3, 0), true);
+        let n = rw(&cc, &naive(3, 0), &naive(3, 0), true);
         assert_eq!(
-            o.counters.sweep_sizes,
+            n.counters.sweep_sizes,
             vec![1, 2, 3, 4, 5, 6],
             "conformance: {what}: ex:naive (α) per selector"
+        );
+        runs.push((what, run_fp(&o), run_fp(&n)));
+    }
+    for (what, a, b) in &runs[1..] {
+        assert!(
+            a == &runs[0].1 && b == &runs[0].2,
+            "conformance: {what}'s kept graphs differ from ltr's"
         );
     }
 }

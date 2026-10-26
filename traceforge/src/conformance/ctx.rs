@@ -115,6 +115,19 @@ impl ConfMode {
                 | ConfMode::GatedSweep
         )
     }
+
+    /// `MIN-ENGINES` E1-1: the modes that schedule by plain Must (the config's
+    /// `SchedulePolicy`, never the selector) — the stateful engine's two runs
+    /// and the stateless engine's outer run and sweeps. Named explicitly:
+    /// `Outer`, `Precheck`, `Triage`, `Collect`, `GatedOuter` and `GatedSweep`
+    /// keep the selector (`MIN-ENGINES.md` §5: the gated engine unchanged), as
+    /// does a probe (`Must::uses_selector`).
+    pub(crate) fn plain_scheduling(self) -> bool {
+        matches!(
+            self,
+            ConfMode::Enumerate | ConfMode::CFirstOuter | ConfMode::CFirstSweep
+        )
+    }
 }
 
 /// What a completion sink tells the `Enumerate` run to do next (`P4-STATEFUL`
