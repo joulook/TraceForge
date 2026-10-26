@@ -3026,3 +3026,507 @@ fn i1_sverify_s_uncovered_multiset() {
     }
     note!("UNCN\t{}", o.reports.len());
 }
+
+// =========================================================================
+// SVERIFY-P I2 (tester, gate 3; criteria/SVERIFY-P-I2.md rev 1.3): the set
+// index against `CompactIndex::with_bucket(false, Scan)`
+// =========================================================================
+
+use crate::conformance::compact::{SetIndex, SetStats};
+
+/// The reference's counters as `SetStats` (`slot_max` is `bucket_max`;
+/// `insert_tests` has no counterpart, I2-7).
+fn ref_stats(ix: &CompactIndex) -> SetStats {
+    let c = ix.stats();
+    SetStats {
+        entries: c.entries,
+        buckets: c.buckets,
+        slot_max: c.bucket_max,
+        signatures: c.signatures,
+        signatures_seen: c.signatures_seen,
+        sig_tests: c.sig_tests,
+        sig_aliases: c.sig_aliases,
+        admitted: c.admitted,
+        duplicates: c.duplicates,
+        containment_tests: c.containment_tests,
+        coordinates_compared: c.coordinates_compared,
+        summary_bytes: c.summary_bytes,
+        sig_bytes_est: c.sig_bytes_est,
+    }
+}
+
+/// The reference's held orders as (sig_id, seq, counts), sorted.
+fn ref_held(ix: &CompactIndex) -> Vec<(u32, u64, OrdCounts)> {
+    let mut v: Vec<_> = ix
+        .buckets()
+        .flat_map(|(_, b)| {
+            b.slots
+                .iter()
+                .flat_map(|sl| sl.orders.iter().map(move |e| (sl.sig_id, e.seq, e.ord.clone())))
+        })
+        .collect();
+    v.sort_by_key(|x| (x.0, x.1));
+    v
+}
+
+fn set_held(ix: &SetIndex) -> Vec<(u32, u64, OrdCounts)> {
+    let mut v: Vec<_> = ix
+        .entries()
+        .map(|(id, _, e)| (id, e.seq, e.ord.clone()))
+        .collect();
+    v.sort_by_key(|x| (x.0, x.1));
+    v
+}
+
+/// I2-3 on one explicit sequence: per insertion the same `(SigId, Inserted)`,
+/// insertion-only counters 0 (I2-8), per query (through `&self`) the same
+/// `(Option<SigId>, Covers)` including the seq, at the end the same held
+/// multiset of (sig_id, seq, counts) with equal representatives, and the same
+/// counters. Returns the mismatches.
+fn i2_compare(spec: &[CompactSummary], imp: &[CompactSummary]) -> Vec<String> {
+    let mut bad = Vec::new();
+    let (mut set, mut rf) = (SetIndex::new(), CompactIndex::with_bucket(false, BucketKind::Scan));
+    for (i, s) in spec.iter().enumerate() {
+        let (a, b) = (set.insert(s), rf.insert(s));
+        if a != b {
+            bad.push(format!("insertion {i}: set {a:?} reference {b:?}"));
+        }
+    }
+    let st = set.stats();
+    if (st.containment_tests, st.coordinates_compared) != (0, 0) {
+        bad.push(format!("I2-8: an insertion-only sequence counted {st:?}"));
+    }
+    let shared: &SetIndex = &set;
+    for (i, g) in imp.iter().chain(spec.iter()).enumerate() {
+        let (a, b) = (shared.covers(g), rf.covers(g));
+        if a != b {
+            bad.push(format!("query {i}: set {a:?} reference {b:?}"));
+        }
+    }
+    if set_held(&set) != ref_held(&rf) {
+        bad.push("held multisets differ".to_owned());
+    }
+    let reps: std::collections::BTreeMap<u32, &Sig> = rf
+        .buckets()
+        .flat_map(|(_, b)| {
+            b.slots
+                .iter()
+                .filter(|s| !s.orders.is_empty())
+                .map(|s| (s.sig_id, &s.sig))
+        })
+        .collect();
+    for (id, sig, _) in set.entries() {
+        if reps.get(&id).is_none_or(|r| *r != sig) {
+            bad.push(format!("the representative of sig_id {id} differs"));
+        }
+    }
+    if set.stats() != ref_stats(&rf) {
+        bad.push(format!("stats: set {:?} reference {:?}", set.stats(), ref_stats(&rf)));
+    }
+    bad
+}
+
+/// s1 (I2-3): `SetIndex` is `Send` (I3 moves per-task sets into the merge).
+#[test]
+fn s1_the_set_index_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<SetIndex>();
+}
+
+/// s2 (I2-3, I2-8): equality with the reference on the five size-2 cells
+/// (specification inserted in completion order; implementation and
+/// specification summaries queried).
+#[test]
+fn s2_the_set_index_equals_the_reference_on_the_size2_cells() {
+    let mut bad = Vec::new();
+    for name in SIZE2_CELLS {
+        let (spec, imp) = kept_summaries(&fx(name));
+        bad.extend(i2_compare(&spec, &imp).into_iter().map(|m| format!("{name}: {m}")));
+    }
+    assert!(bad.is_empty(), "conformance: I2-3: {bad:#?}");
+}
+
+/// s2 on the pilot corpus (I2-10's in-process part), one process.
+#[test]
+#[ignore]
+fn s2_the_set_index_equals_the_reference_on_the_pilot_corpus() {
+    let mut bad = Vec::new();
+    for name in PILOT_NAMES {
+        let (spec, imp) = kept_summaries(&fx(name));
+        bad.extend(i2_compare(&spec, &imp).into_iter().map(|m| format!("{name}: {m}")));
+    }
+    note!("s2 pilot: {} fixtures", PILOT_NAMES.len());
+    assert!(bad.is_empty(), "conformance: I2-3 on the pilot: {bad:#?}");
+}
+
+/// A seeded permutation (Fisher–Yates with a 64-bit LCG).
+fn shuffled<T: Clone>(v: &[T], mut seed: u64) -> Vec<T> {
+    let mut out = v.to_vec();
+    for i in (1..out.len()).rev() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        out.swap(i, (seed >> 33) as usize % (i + 1));
+    }
+    out
+}
+
+/// s3 (I2-4, rev 1.3): order dependence with a `Noisy` alias pair. The
+/// insertions are A3 fifo k2q2's specification summaries plus `PN`'s two
+/// (equal `Sig` and counts, different renderings), in one order, its reverse
+/// and a seeded shuffle; each inserted in full, then the same queries (A3's
+/// implementation summaries, `PN`'s, a forged `NoSig` and a `NoBucket`).
+/// Equal across orders: the held identities (by `Sig ==` and counts), the
+/// occupancy counters, `sig_aliases` (1), the outcome-class counts and each
+/// query's `Covers` discriminant. Between the order and its reverse, the
+/// `Noisy` pair's `Stored`/`Duplicate` assignment and the stored
+/// representative's rendering swap. The order-dependent quantities are
+/// printed.
+#[test]
+fn s3_order_dependence_with_a_noisy_alias_pair() {
+    let (a3_spec, a3_imp) = kept_summaries(&fx("apps/a3/fifo/spec/k2q2"));
+    let pn = local_fixture("compact/i2-noisy", pn_prog(), pn_prog(), &["a", "r"]);
+    let (pn_spec, pn_imp) = kept_summaries(&pn);
+    assert_eq!(pn_spec.len(), 2);
+    let render = |s: &CompactSummary| format!("{:?}", s.sig);
+    assert!(pn_spec[0].sig == pn_spec[1].sig && render(&pn_spec[0]) != render(&pn_spec[1]));
+    let mut seq: Vec<CompactSummary> = vec![pn_spec[0].clone()];
+    seq.extend(a3_spec.iter().cloned());
+    seq.push(pn_spec[1].clone());
+    let mut queries: Vec<CompactSummary> = a3_imp.clone();
+    queries.extend(pn_imp.iter().cloned());
+    queries.push(forged(&a3_spec[0]));
+    queries.push(real_summary("2pc/leader/conf/n2"));
+    let orders = [
+        ("sequence", seq.clone()),
+        ("reverse", seq.iter().rev().cloned().collect()),
+        ("shuffle", shuffled(&seq, 17)),
+    ];
+    let run = |ins: &[CompactSummary]| {
+        let mut ix = SetIndex::new();
+        let outcomes: Vec<Inserted> = ins.iter().map(|s| ix.insert(s).1).collect();
+        let answers: Vec<Covers> = queries.iter().map(|q| ix.covers(q).1).collect();
+        (ix, outcomes, answers)
+    };
+    let disc = |c: &Covers| match c {
+        Covers::Found(_) => "Found",
+        Covers::NotFound => "NotFound",
+        Covers::NoSig => "NoSig",
+        Covers::NoBucket => "NoBucket",
+    };
+    let mut first: Option<(SetStats, Vec<&str>, (usize, usize))> = None;
+    let mut bad = Vec::new();
+    let mut pn_roles = Vec::new();
+    for (what, ins) in &orders {
+        let (ix, outcomes, answers) = run(ins);
+        let s = ix.stats();
+        let classes = (
+            outcomes.iter().filter(|o| matches!(o, Inserted::Stored(_))).count(),
+            outcomes.iter().filter(|o| matches!(o, Inserted::Duplicate)).count(),
+        );
+        let d: Vec<&str> = answers.iter().map(disc).collect();
+        let inv = SetStats {
+            sig_tests: 0,
+            containment_tests: 0,
+            coordinates_compared: 0,
+            ..s
+        };
+        // Held identities: every held (Sig, counts) of this order is held in
+        // the first order's index, by `Sig ==` and counts (checked below via
+        // the invariant counters and the per-identity check).
+        if let Some((s0, d0, c0)) = &first {
+            if inv != *s0 || &d != d0 || classes != *c0 {
+                bad.push(format!(
+                    "{what}: invariant {inv:?} {classes:?} vs {s0:?} {c0:?}; \
+                     discriminants equal {}",
+                    &d == d0
+                ));
+            }
+        } else {
+            first = Some((inv, d.clone(), classes));
+        }
+        if s.sig_aliases != 1 {
+            bad.push(format!("{what}: sig_aliases {}", s.sig_aliases));
+        }
+        // The held identities, by `Sig ==` and counts, against the sequence order.
+        let held: Vec<(Sig, OrdCounts)> =
+            ix.entries().map(|(_, g, e)| (g.clone(), e.ord.clone())).collect();
+        for q in &seq {
+            if !held.iter().any(|(g, o)| *g == q.sig && *o == q.ord) {
+                bad.push(format!("{what}: an inserted identity is not held"));
+            }
+        }
+        // The Noisy pair: which occurrence stored, and the representative.
+        let pos0 = ins.iter().position(|x| render(x) == render(&pn_spec[0])).unwrap();
+        let pos1 = ins.iter().position(|x| render(x) == render(&pn_spec[1])).unwrap();
+        let rep = ix
+            .entries()
+            .find(|(_, g, _)| **g == pn_spec[0].sig)
+            .map(|(_, g, _)| format!("{g:?}"))
+            .unwrap();
+        pn_roles.push((
+            what.to_string(),
+            outcomes[pos0],
+            outcomes[pos1],
+            rep == render(&pn_spec[0]),
+        ));
+        let seqs: Vec<(u32, u64)> = ix.entries().map(|(id, _, e)| (id, e.seq)).collect();
+        note!(
+            "s3 {what}: sig_tests {} containment {} coords {} found-seqs {:?} entries[..4] {:?}",
+            s.sig_tests,
+            s.containment_tests,
+            s.coordinates_compared,
+            answers
+                .iter()
+                .filter_map(|c| if let Covers::Found(q) = c { Some(*q) } else { None })
+                .take(6)
+                .collect::<Vec<_>>(),
+            &seqs[..seqs.len().min(4)]
+        );
+    }
+    // Sequence: pn0 first stores, pn1 duplicates, representative pn0's
+    // rendering; reverse: the roles and the rendering swap.
+    let (s, r) = (&pn_roles[0], &pn_roles[1]);
+    if !(matches!(s.1, Inserted::Stored(_)) && s.2 == Inserted::Duplicate && s.3) {
+        bad.push(format!("sequence roles {s:?}"));
+    }
+    if !(r.1 == Inserted::Duplicate && matches!(r.2, Inserted::Stored(_)) && !r.3) {
+        bad.push(format!("reverse roles {r:?}"));
+    }
+    assert!(bad.is_empty(), "conformance: I2-4: {bad:#?}");
+}
+
+/// s4 (I2-5): the `Noisy` pair (equal by `PartialEq`, different `Debug`) is one
+/// entry and one `Duplicate` through the alias path (`sig_aliases` 1), the
+/// query finds it, and every counter equals the reference's.
+#[test]
+fn s4_equality_is_never_by_rendering() {
+    let pn = local_fixture("compact/i2-noisy", pn_prog(), pn_prog(), &["a", "r"]);
+    let (spec, imp) = kept_summaries(&pn);
+    let bad = i2_compare(&spec, &imp);
+    assert!(bad.is_empty(), "conformance: I2-5 against the reference: {bad:#?}");
+    let mut ix = SetIndex::new();
+    assert_eq!(ix.insert(&spec[0]), (0, Inserted::Stored(0)));
+    assert_eq!(ix.insert(&spec[1]), (0, Inserted::Duplicate));
+    for q in &spec {
+        assert_eq!(ix.covers(q), (Some(0), Covers::Found(0)));
+    }
+    let s = ix.stats();
+    assert_eq!((s.entries, s.duplicates, s.sig_aliases, s.signatures), (1, 1, 1, 1));
+}
+
+/// s5 (I2-6): `entries()` yields buckets in ascending `SigHash`, slots in
+/// creation order (ids ascending within a bucket), orders in admission order
+/// (seqs ascending within a slot); two identical insertion histories give
+/// identical iterations.
+#[test]
+fn s5_the_iteration_order_is_deterministic() {
+    let mut ins = Vec::new();
+    for name in ["apps/a1/correct/spec/n2r2", "apps/a4/hash/a4a/k2q2m2", "2pc/leader/conf/n2"] {
+        ins.extend(kept_summaries(&fx(name)).0);
+    }
+    let pn = local_fixture("compact/i2-noisy", pn_prog(), pn_prog(), &["a", "r"]);
+    ins.extend(kept_summaries(&pn).0);
+    let build = || {
+        let mut ix = SetIndex::new();
+        let mut hash_of = std::collections::HashMap::new();
+        for s in &ins {
+            let (id, _) = ix.insert(s);
+            hash_of.entry(id).or_insert(s.hash);
+        }
+        (ix, hash_of)
+    };
+    let (a, hash_of) = build();
+    let (b, _) = build();
+    let ia: Vec<(u32, u64)> = a.entries().map(|(id, _, e)| (id, e.seq)).collect();
+    let ib: Vec<(u32, u64)> = b.entries().map(|(id, _, e)| (id, e.seq)).collect();
+    assert_eq!(ia, ib, "conformance: deterministic for one history");
+    assert_eq!(ia.len(), a.len());
+    for w in ia.windows(2) {
+        let (h0, h1) = (hash_of[&w[0].0], hash_of[&w[1].0]);
+        assert!(h0 <= h1, "conformance: buckets in ascending SigHash");
+        if h0 == h1 {
+            assert!(w[0].0 <= w[1].0, "conformance: slots in creation order");
+            if w[0].0 == w[1].0 {
+                assert!(w[0].1 < w[1].1, "conformance: orders in admission order");
+            }
+        }
+    }
+    assert!(hash_of.values().collect::<std::collections::BTreeSet<_>>().len() >= 3);
+}
+
+/// s6 (I2-1, I2-5, I2-8, I2-9): source checks on the appended set index:
+/// `insert` reaches no `cmp`/`le`; no explicit `Debug` formatting other than
+/// through `render_hash`; both ids checked; every panic message prefixed.
+#[test]
+fn s6_the_set_index_source() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance/compact.rs");
+    let text = std::fs::read_to_string(path).expect("conformance: compact.rs");
+    let start = text.find("// `SVERIFY-P` I2: the set index").expect("conformance: the I2 block");
+    let block = &text[start..];
+    let ins_from = block.find("pub(crate) fn insert(").unwrap();
+    let ins_to = block.find("/// The read-only query (I2-3)").unwrap();
+    let insert = &block[ins_from..ins_to];
+    for bad in [".cmp(", "le_counted", ".le("] {
+        assert!(!insert.contains(bad), "conformance: I2-8: `insert` contains {bad}");
+    }
+    // No printing macro is listed: `compact.rs` is not test-only, so s5's
+    // `c1_no_user_facing_emission_outside_the_rendering_module` scans it,
+    // and spelling one out here would trip that scan on this file.
+    for bad in ["{:?}", "{sig:?}", "format!(", "write!("] {
+        assert!(!block.contains(bad), "conformance: I2-5/s5: the I2 block contains {bad}");
+    }
+    assert_eq!(block.matches(".checked_add(1)").count(), 2, "conformance: seq and SigId checked");
+    for line in block.lines().filter(|l| l.contains(".expect(\"") || l.contains("panic!(\"")) {
+        assert!(
+            line.contains("\"conformance: "),
+            "conformance: a message without the prefix: {line}"
+        );
+    }
+}
+
+/// s7 (I2-10, in-process): one cell (`I2_CELL`) through `oracle_trace_stream`'s
+/// two enumerations; the completion sinks build each `CompactSummary` and feed
+/// both types — the specification inserted, then the implementation queried —
+/// comparing every outcome; at the end the counters. Prints `S7` with the
+/// entries and duplicates. The k-th `Stored` insertion must carry seq k, so the
+/// seqs are 0 .. entries - 1 in completion order (I2-10).
+#[test]
+#[ignore]
+fn s7_the_set_index_on_one_cell_in_process() {
+    use crate::conformance::ctx::{CompletionSink, ConfMode, SinkVerdict};
+    use crate::conformance::stateful::{enumerate, EnumRun};
+    let Ok(name) = std::env::var("I2_CELL") else {
+        return;
+    };
+    let f = any_fixture(&name);
+    let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+    type Pair = (SetIndex, CompactIndex, Vec<String>, usize, u64);
+    let st: std::rc::Rc<std::cell::RefCell<Pair>> = std::rc::Rc::new(std::cell::RefCell::new((
+        SetIndex::new(),
+        CompactIndex::with_bucket(false, BucketKind::Scan),
+        Vec::new(),
+        0,
+        0,
+    )));
+    for side in ["spec", "impl"] {
+        let sink: CompletionSink = {
+            let (st, vis) = (std::rc::Rc::clone(&st), f.visible.clone());
+            Box::new(move |g: &ExecutionGraph, _| {
+                let s = CompactSummary::at_completion(g, &vis, side);
+                let mut p = st.borrow_mut();
+                let (set, rf, bad, n, stored) = &mut *p;
+                *n += 1;
+                if side == "spec" {
+                    let (a, b) = (set.insert(&s), rf.insert(&s));
+                    if a != b && bad.len() < 20 {
+                        bad.push(format!("insertion {n}: {a:?} vs {b:?}"));
+                    }
+                    if let Inserted::Stored(q) = a.1 {
+                        if q != *stored && bad.len() < 20 {
+                            bad.push(format!("insertion {n}: seq {q}, expected {stored}"));
+                        }
+                        *stored += 1;
+                    }
+                } else {
+                    let (a, b) = (set.covers(&s), rf.covers(&s));
+                    if a != b && bad.len() < 20 {
+                        bad.push(format!("query {n}: {a:?} vs {b:?}"));
+                    }
+                }
+                SinkVerdict::Continue
+            })
+        };
+        let mut config = cc.config.clone();
+        if side == "spec" {
+            config.max_iterations = None;
+        }
+        let program = if side == "spec" { &f.specification } else { &f.implementation };
+        enumerate(
+            EnumRun {
+                config,
+                visible: f.visible.clone(),
+                mode: ConfMode::Enumerate,
+                sink,
+                cut: false,
+                stop_at_first_report: false,
+                gate_sink: None,
+            },
+            program,
+        );
+    }
+    let p = st.borrow();
+    let (set, rf, bad, n, stored) = &*p;
+    let (s, r) = (set.stats(), ref_stats(rf));
+    note!(
+        "S7\t{name}\tentries {}\tduplicates {}\tcompletions {n}\tsig_tests {}\tsig_aliases {}\t\
+         containment {}\tcoords {}\tref_insert_tests {}\tstats_equal {}\tmismatches {}",
+        s.entries,
+        s.duplicates,
+        s.sig_tests,
+        s.sig_aliases,
+        s.containment_tests,
+        s.coordinates_compared,
+        rf.stats().insert_tests,
+        s == r,
+        bad.len()
+    );
+    assert!(bad.is_empty(), "conformance: I2-10 {name}: {bad:#?}");
+    assert_eq!(s, r, "conformance: I2-10 {name}: counters");
+    assert_eq!(*stored, s.entries as u64, "conformance: I2-10 {name}: seq 0 .. entries");
+    assert!(set_held(set) == ref_held(rf), "conformance: I2-10 {name}: held multisets");
+}
+
+/// s8 (I2-11, information): the specification summaries of one cell
+/// (`I2_TIME_CELL`) collected first, then inserted into each type; the walls.
+#[test]
+#[ignore]
+fn s8_insertion_walls() {
+    use crate::conformance::ctx::{CompletionSink, ConfMode, SinkVerdict};
+    use crate::conformance::stateful::{enumerate, EnumRun};
+    let Ok(name) = std::env::var("I2_TIME_CELL") else {
+        return;
+    };
+    let f = any_fixture(&name);
+    let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+    let got: std::rc::Rc<std::cell::RefCell<Vec<CompactSummary>>> = Default::default();
+    let sink: CompletionSink = {
+        let (got, vis) = (std::rc::Rc::clone(&got), f.visible.clone());
+        Box::new(move |g: &ExecutionGraph, _| {
+            got.borrow_mut().push(CompactSummary::at_completion(g, &vis, "spec"));
+            SinkVerdict::Continue
+        })
+    };
+    let mut config = cc.config.clone();
+    config.max_iterations = None;
+    enumerate(
+        EnumRun {
+            config,
+            visible: f.visible.clone(),
+            mode: ConfMode::Enumerate,
+            sink,
+            cut: false,
+            stop_at_first_report: false,
+            gate_sink: None,
+        },
+        &f.specification,
+    );
+    let summaries = got.borrow();
+    let t0 = std::time::Instant::now();
+    let mut set = SetIndex::new();
+    for s in summaries.iter() {
+        set.insert(s);
+    }
+    let set_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let t1 = std::time::Instant::now();
+    let mut rf = CompactIndex::with_bucket(false, BucketKind::Scan);
+    for s in summaries.iter() {
+        rf.insert(s);
+    }
+    let ref_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    note!(
+        "S8\t{name}\tsummaries {}\tset_ms {set_ms:.1}\tref_ms {ref_ms:.1}\t\
+         ref_insert_tests {}\tentries {}",
+        summaries.len(),
+        rf.stats().insert_tests,
+        set.len()
+    );
+}

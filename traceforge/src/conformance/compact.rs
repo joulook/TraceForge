@@ -1209,3 +1209,301 @@ impl CompactCache {
         true
     }
 }
+
+// ---------------------------------------------------------------------------
+// `SVERIFY-P` I2: the set index (`SVERIFY-P.md` §1 items 4–5; the criteria
+// `plan/traceForge/criteria/SVERIFY-P-I2.md`). Added below `CompactCache`;
+// nothing above this line changed (Q11 option (a): `CompactIndex` untouched).
+// ---------------------------------------------------------------------------
+
+/// One signature's slot in the set index: the representative signature (the
+/// first occurrence's, I2-2 — later equal occurrences do not replace it), its
+/// orders in admission order, and the set of held orders that answers the
+/// duplicate question with no `cmp`.
+#[derive(Clone, Debug)]
+struct SetSlot {
+    sig_id: SigId,
+    sig: Sig,
+    sig_est: usize,
+    orders: Vec<Entry>,
+    held: HashSet<OrdCounts>,
+}
+
+/// One shape's bucket in the set index: its slots in creation order and the
+/// P3 hint (rendering hash → slot indices, creations then aliases). The hint
+/// is a `RefCell` so that the read-only query records an alias, as the
+/// reference's `covers(&mut self)` does (I2-3).
+#[derive(Clone, Debug, Default)]
+struct SetBucket {
+    slots: Vec<SetSlot>,
+    hint: std::cell::RefCell<HashMap<u64, Vec<usize>>>,
+}
+
+impl SetBucket {
+    /// The slot of `sig` by `Sig ==`: the hinted slots of its rendering hash
+    /// `r` first, in list order, then the others in slot order; a slot found
+    /// by the second pass is an alias, appended to `r`'s list and counted.
+    /// `CompactIndex::find_in`'s rule, through `&self` (`tests` and
+    /// `aliases` are the index's `Cell`s). Creates nothing.
+    fn find(
+        &self,
+        sig: &Sig,
+        r: Option<u64>,
+        tests: &std::cell::Cell<usize>,
+        aliases: &std::cell::Cell<usize>,
+    ) -> Option<usize> {
+        let hint = self.hint.borrow();
+        let hinted: &[usize] = match r {
+            Some(r) => hint.get(&r).map_or(&[][..], Vec::as_slice),
+            None => &[],
+        };
+        for &i in hinted {
+            tests.set(tests.get() + 1);
+            if self.slots[i].sig == *sig {
+                return Some(i);
+            }
+        }
+        let mut found = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            if hinted.contains(&i) {
+                continue;
+            }
+            tests.set(tests.get() + 1);
+            if slot.sig == *sig {
+                found = Some(i);
+                break;
+            }
+        }
+        let i = found?;
+        drop(hint);
+        if let Some(r) = r {
+            self.hint.borrow_mut().entry(r).or_default().push(i);
+            aliases.set(aliases.get() + 1);
+        }
+        Some(i)
+    }
+}
+
+/// The set index's counters: `CompactStats`' fields of the same names, with
+/// the same definitions (`slot_max` is `bucket_max`). Absent by construction:
+/// `insert_tests` (identically 0 — an insertion starts no `cmp`, I2-8), the
+/// antichain, memo, inverted and trie fields, and `impl_distinct_summaries`
+/// (the engine's). No store column (I4's).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SetStats {
+    /// Held orders at the end.
+    pub entries: usize,
+    /// Buckets (shapes) with at least one held order.
+    pub buckets: usize,
+    /// The largest number of orders one signature's slot holds.
+    pub slot_max: usize,
+    /// Slots (signatures) with at least one held order.
+    pub signatures: usize,
+    /// Every slot created: signatures inserted at least once.
+    pub signatures_seen: usize,
+    /// `Sig ==` comparisons started in slot resolution (insertions and
+    /// queries; the hinted slots and the rest).
+    pub sig_tests: usize,
+    /// Slots found only by the scan after the hinted ones: equal signatures
+    /// with different renderings, each then recorded in the hint.
+    pub sig_aliases: usize,
+    /// Insertions that stored an order.
+    pub admitted: usize,
+    /// Insertions refused as exact duplicates.
+    pub duplicates: usize,
+    /// `≤` tests started by queries.
+    pub containment_tests: usize,
+    /// Coordinates read by the queries' `≤` tests (D4).
+    pub coordinates_compared: usize,
+    /// Σ payload bytes of the held orders (one copy; the set holds a second).
+    pub summary_bytes: usize,
+    /// Σ `32 × Σ_t |w_t| + 16 × T` over the occupied slots.
+    pub sig_bytes_est: usize,
+}
+
+/// The set index (`SVERIFY-P` I2): the compact summaries of one side as a
+/// hash set per signature — the shape bucket by `hash`, the slot by `Sig ==`
+/// through the P3 hint exactly as [`CompactIndex`] resolves it, the orders of
+/// a slot in a `HashSet<OrdCounts>` that answers an exact duplicate with no
+/// `cmp` — and the admission-ordered scan of [`CompactIndex`]'s query, through
+/// `&self`. No antichain, no removal, no capacity: the held set is the set of
+/// distinct summaries inserted. On one insertion sequence it equals
+/// `CompactIndex::with_bucket(false, BucketKind::Scan)` in every outcome, id,
+/// seq and counter but `insert_tests` (criteria I2-3); across insertion
+/// orders only the held identities, the occupancy counters, `sig_aliases`
+/// and each query's `Covers` discriminant are invariant (I2-4). The orders'
+/// bytes are held twice (the admission list and the set), about twice
+/// `summary_bytes` plus the table. `Send`, not `Sync` (`Sig` holds
+/// `Box<dyn Message>`; the `Cell`s and `RefCell`s add nothing to that).
+#[derive(Clone, Debug)]
+pub(crate) struct SetIndex {
+    buckets: HashMap<SigHash, SetBucket>,
+    next_seq: u64,
+    next_sig_id: SigId,
+    /// The insertion-side counters.
+    stats: SetStats,
+    /// The counters a query advances, through `&self` (I2-3); `stats()`
+    /// folds them into its snapshot.
+    sig_tests: std::cell::Cell<usize>,
+    sig_aliases: std::cell::Cell<usize>,
+    containment_tests: std::cell::Cell<usize>,
+    coordinates_compared: std::cell::Cell<usize>,
+}
+
+impl Default for SetIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SetIndex {
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            next_seq: 0,
+            next_sig_id: 0,
+            stats: SetStats::default(),
+            sig_tests: std::cell::Cell::new(0),
+            sig_aliases: std::cell::Cell::new(0),
+            containment_tests: std::cell::Cell::new(0),
+            coordinates_compared: std::cell::Cell::new(0),
+        }
+    }
+
+    /// The counters, the query-side `Cell`s folded in.
+    pub(crate) fn stats(&self) -> SetStats {
+        let mut s = self.stats;
+        s.sig_tests = self.sig_tests.get();
+        s.sig_aliases = self.sig_aliases.get();
+        s.containment_tests = self.containment_tests.get();
+        s.coordinates_compared = self.coordinates_compared.get();
+        s
+    }
+
+    /// Held orders.
+    pub(crate) fn len(&self) -> usize {
+        self.stats.entries
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.stats.entries == 0
+    }
+
+    /// An insertion's resolution: the signature's slot, created (bucket and
+    /// slot, with a fresh checked id) when absent — `slot_for_insert`'s rule.
+    fn slot_for_insert(&mut self, s: &CompactSummary) -> usize {
+        let r = render_hash(&s.sig);
+        let bucket = self.buckets.entry(s.hash).or_default();
+        if let Some(i) = bucket.find(&s.sig, r, &self.sig_tests, &self.sig_aliases) {
+            return i;
+        }
+        let sig_id = self.next_sig_id;
+        self.next_sig_id = sig_id
+            .checked_add(1)
+            .expect("conformance: more than u32::MAX signatures (SigId overflow)");
+        bucket.slots.push(SetSlot {
+            sig_id,
+            sig: s.sig.clone(),
+            sig_est: s.sig_est,
+            orders: Vec::new(),
+            held: HashSet::new(),
+        });
+        let i = bucket.slots.len() - 1;
+        if let Some(r) = r {
+            bucket.hint.borrow_mut().entry(r).or_default().push(i);
+        }
+        self.stats.signatures_seen += 1;
+        i
+    }
+
+    /// Hash-set insertion (I2-2): an exact duplicate is refused by the slot's
+    /// set with no `cmp`; otherwise the order is stored with the next checked
+    /// admission number. `DroppedNew` is never returned (no antichain).
+    pub(crate) fn insert(&mut self, s: &CompactSummary) -> (SigId, Inserted) {
+        let si = self.slot_for_insert(s);
+        let stats = &mut self.stats;
+        let bucket = self
+            .buckets
+            .get_mut(&s.hash)
+            .expect("conformance: a resolved bucket exists");
+        let first_in_bucket = bucket.slots.len() == 1;
+        let slot = &mut bucket.slots[si];
+        let sig_id = slot.sig_id;
+        if slot.held.contains(&s.ord) {
+            stats.duplicates += 1;
+            return (sig_id, Inserted::Duplicate);
+        }
+        let seq = self.next_seq;
+        self.next_seq = seq
+            .checked_add(1)
+            .expect("conformance: more than u64::MAX insertions (seq overflow)");
+        let was_empty = slot.orders.is_empty();
+        slot.orders.push(Entry {
+            seq,
+            ord: s.ord.clone(),
+        });
+        slot.held.insert(s.ord.clone());
+        stats.admitted += 1;
+        stats.entries += 1;
+        stats.summary_bytes += s.ord.payload_bytes();
+        stats.slot_max = stats.slot_max.max(slot.orders.len());
+        if was_empty {
+            // A slot is created by the insertion that then stores (its set
+            // is empty), so this is the slot's creation: the occupancy
+            // counters as `CompactIndex::occupancy`'s.
+            stats.signatures += 1;
+            stats.sig_bytes_est += slot.sig_est;
+            if first_in_bucket {
+                stats.buckets += 1;
+            }
+        }
+        (sig_id, Inserted::Stored(seq))
+    }
+
+    /// The read-only query (I2-3): the signature's id, `None` when it has no
+    /// slot (the query creates none, P1), with the outcome — the first held
+    /// order `≤` the query in admission order answers (D4's exit), exactly
+    /// `CompactIndex::covers` under `BucketKind::Scan`. A slot with no orders
+    /// does not exist here (nothing is removed), so `(Some(_), NoSig)` is
+    /// unreachable.
+    pub(crate) fn covers(&self, s: &CompactSummary) -> (Option<SigId>, Covers) {
+        let Some(bucket) = self.buckets.get(&s.hash) else {
+            return (None, Covers::NoBucket);
+        };
+        let r = render_hash(&s.sig);
+        let Some(si) = bucket.find(&s.sig, r, &self.sig_tests, &self.sig_aliases) else {
+            return (None, Covers::NoSig);
+        };
+        let slot = &bucket.slots[si];
+        debug_assert!(
+            !slot.orders.is_empty(),
+            "conformance: a set-index slot holds at least one order"
+        );
+        let mut coords = self.coordinates_compared.get();
+        for held in &slot.orders {
+            self.containment_tests.set(self.containment_tests.get() + 1);
+            if held.ord.le_counted(&s.ord, &mut coords) {
+                self.coordinates_compared.set(coords);
+                return (Some(slot.sig_id), Covers::Found(held.seq));
+            }
+        }
+        self.coordinates_compared.set(coords);
+        (Some(slot.sig_id), Covers::NotFound)
+    }
+
+    /// Every held order with its signature's id and the slot's representative
+    /// signature (I2-6): buckets in ascending `SigHash`, slots in creation
+    /// order, orders in admission order — deterministic for one insertion
+    /// history; the order and the representative's rendering depend on the
+    /// history (I2-4).
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (SigId, &Sig, &Entry)> + '_ {
+        let mut hashes: Vec<&SigHash> = self.buckets.keys().collect();
+        hashes.sort_unstable();
+        hashes.into_iter().flat_map(move |h| {
+            self.buckets[h]
+                .slots
+                .iter()
+                .flat_map(|slot| slot.orders.iter().map(move |e| (slot.sig_id, &slot.sig, e)))
+        })
+    }
+}
