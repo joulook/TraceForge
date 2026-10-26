@@ -485,7 +485,10 @@ pub(crate) fn invisible_ops_of_visible_threads(
 /// general.
 ///
 /// Cost: one pass over the graph's communication events per declared visible
-/// name, with an `in_porf` query each. It runs only when `conf.is_some()`.
+/// name, with an `in_porf` query each. It runs only when `conf.is_some()`, at
+/// `Gate::Completion` and once in `Cover`'s specification-abort arm
+/// (`SVERIFY-P` I1; before I1 at every gate — 21.66 % of the stateful lock
+/// row's instructions, `P5-OWNER-ITEMS.md` O12).
 pub(crate) fn check_spawn_order(
     graph: &ExecutionGraph,
     visible: &[String],
@@ -1336,7 +1339,12 @@ impl ConfCtx {
             // unpruned completion (read at entry, before any `Cover`), maximum
             // over the run. A receive that blocks is a `Block{Value}`, no
             // event, and is not counted.
-            if !self.pruned {
+            //
+            // `SVERIFY-P` I1: not computed in a [`ConfMode::Enumerate`] run (the
+            // stateful engine, both sides), whose counter is off by the owner's
+            // ruling; the field stays 0 there and `StatefulCounters` reports
+            // `None`. Every other mode counts as before.
+            if !self.pruned && self.mode != ConfMode::Enumerate {
                 let n = invisible_ops_of_visible_threads(g1, &self.visible);
                 self.counters.invisible_ops_of_visible_threads =
                     self.counters.invisible_ops_of_visible_threads.max(n);
@@ -1346,6 +1354,26 @@ impl ConfCtx {
         if self.spec_error.is_some() {
             self.counters.gate_skipped_aborted += 1;
             return GateOutcome::Continue;
+        }
+        // `SVERIFY-P` I1: §8's guard, at `Gate::Completion` only. Within one
+        // execution events are only added, so a declared visible thread spawned
+        // after its program communicated is still so at completion, and every
+        // execution whose run returns reaches this gate (`complete_execution`
+        // fires it before `check_blocked`, pruned executions included). Above
+        // the `pruned` return: after the pruning gate an execution adds no
+        // communication or spawn event, only the terminal `Block(ConfPrune)`
+        // label of every thread (`Must::conf_prune`), and it still completes;
+        // before I1 the guard ran at the pruning gate. Below the
+        // `spec_error` return, so criterion 9 keeps its meaning; the abort arm
+        // of `Cover` runs the guard once on the aborting gate's graph, so a late
+        // spawn that preceded the abort still panics (the tester's placement
+        // review, `log/dev/SVERIFY-P.derived.md` §I1 item 5). Before I1 the
+        // guard ran at every gate (F52 had placed it above F49's skip); the
+        // function is unchanged.
+        if gate == Gate::Completion {
+            if let Err(e) = check_spawn_order(g1, &self.visible) {
+                panic!("conformance: {e}");
+            }
         }
         if self.pruned {
             self.counters.gate_skipped_pruned += 1;
@@ -1373,17 +1401,14 @@ impl ConfCtx {
         // must be adding a fresh event while the other is behind the replay
         // frontier.
         //
-        // **§8's guard runs BEFORE the skip** (F52). A gate suppressed by
-        // F49's replay-frontier skip must still check §8's precondition: a
-        // declared visible thread spawned after its program has communicated is
-        // the *user's* error in whichever program commits it, not a conformance
-        // verdict, and it does not stop being one because the gate could not
-        // observe the graph. An earlier version sat below the skip, so a skipped
-        // gate skipped this too — and the comment claimed a single change where
-        // there were two.
-        if let Err(e) = check_spawn_order(g1, &self.visible) {
-            panic!("conformance: {e}");
-        }
+        // **§8's guard no longer runs here** (`SVERIFY-P` I1): it runs at
+        // `Gate::Completion`, above, and once in `Cover`'s abort arm. F52 had
+        // placed it above this skip so that a gate F49 suppressed still checked
+        // §8's precondition — a declared visible thread spawned after its
+        // program has communicated is the *user's* error in whichever program
+        // commits it, not a conformance verdict. The completion gate is never
+        // skipped (the skip below is discriminated on the gate), so the
+        // precondition is still checked on every execution, once.
 
         // Skipping is the conservative repair: the observation genuinely does
         // not exist yet, so there is nothing for the gate to compare.
@@ -1508,11 +1533,12 @@ impl ConfCtx {
             }
         }
 
-        // **A gate-disabled context has nothing to ask.** §8's guard above
-        // still ran — a §8 violation is the user's error in whichever program
-        // commits it, and the precheck is the only engine that sees the
-        // specification's own graphs from outside the search — but there is no
-        // probe worker, no seed and no `Cover` call.
+        // **A gate-disabled context has nothing to ask.** §8's guard still
+        // runs for it, at completion (`SVERIFY-P` I1; at every gate before) —
+        // a §8 violation is the user's error in whichever program commits it,
+        // and the precheck is the only engine that sees the specification's own
+        // graphs from outside the search — but there is no probe worker, no
+        // seed and no `Cover` call.
         if self.worker.is_none() {
             self.counters.gate_skipped_disabled += 1;
             return GateOutcome::Continue;
@@ -1643,6 +1669,13 @@ impl ConfCtx {
             // no prune (`Continue`, since a `Prune` at a fresh gate would
             // `block_exec`). `run` returns `Err` on it.
             Err(ObsError::SpecNotAssertionSafe { thread, pos }) => {
+                // `SVERIFY-P` I1: §8's guard on this gate's graph, before the
+                // abort makes the execution's later gates inert; a late spawn
+                // that preceded the abort panics here, as it did at this gate
+                // before I1 (the guard ran above the sink then).
+                if let Err(e) = check_spawn_order(g1, &self.visible) {
+                    panic!("conformance: {e}");
+                }
                 self.record_end(SearchEnd::SpecNotAssertionSafe);
                 self.spec_error = Some((thread, pos));
                 self.stop_requested = true;

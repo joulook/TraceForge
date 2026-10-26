@@ -2919,3 +2919,110 @@ fn m22_a1_the_earliest_of_several_covers_after_removals() {
         );
     }
 }
+
+// =========================================================================
+// SVERIFY-P I1-9 (criteria rev 1.3): every execution reaches the completion
+// gate — measured on the stateful engine (both sides) and complete-first
+// against a plain `verify` of the same program
+// =========================================================================
+
+/// A fixture by name: the catalogue, or a `P4-MIXED` registry entry.
+fn any_fixture(name: &str) -> Fixture {
+    crate::conformance::grid::mixed_fixtures()
+        .into_iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| fx(name))
+}
+
+/// Plain Must on one program with the fixture's configuration and the one
+/// field conformance forces (`keep_going_after_error`, as the `Explore` arm):
+/// `execs + block`.
+fn plain_total(f: &Fixture, p: &crate::conformance::grid::Prog) -> usize {
+    let mut cfg = f.config.clone();
+    cfg.keep_going_after_error = true;
+    let p = p.clone();
+    let s = crate::verify(cfg, move || p());
+    s.execs + s.block
+}
+
+/// I1-9: on A3 fifo k2q2, A4 hash k2q2m2 (every completion blocked),
+/// `mixed/branch` and a violating pilot fixture (a3 never-grant k2q2), the
+/// stateful engine's completion counts (`spec_graphs`; `impl_graphs` and its
+/// ctx-side `executions`) and complete-first's outer `executions` equal plain
+/// Must's `execs + block` on the same program. Neither engine prunes here
+/// (`Enumerate` never does; complete-first's cut is off), so the exploration is
+/// plain Must's and every ending reaches `Gate::Completion`. The gated engine
+/// prunes and does not expose Must's `Stats`; it is covered by the shared-path
+/// inference (rev 1.3).
+#[test]
+fn i1_9_every_execution_reaches_the_completion_gate() {
+    let mut bad = Vec::new();
+    for name in [
+        "apps/a3/fifo/spec/k2q2",
+        "apps/a4/hash/a4a/k2q2m2",
+        "mixed/branch",
+        "apps/a3/never-grant/spec/k2q2",
+    ] {
+        let f = any_fixture(name);
+        let spec_total = plain_total(&f, &f.specification);
+        let impl_total = plain_total(&f, &f.implementation);
+        let st = stateful::run_with(
+            &GridConfig::new(GridEngine::Stateful).conf_config(&f),
+            &f.implementation,
+            &f.specification,
+            false,
+        );
+        let got = (st.counters.spec_graphs, st.counters.impl_graphs, st.executions);
+        if got != (spec_total, impl_total, impl_total) {
+            bad.push(format!(
+                "{name} stateful: {got:?} vs plain ({spec_total}, {impl_total})"
+            ));
+        }
+        let cf = crate::conformance::cfirst::run_with(
+            &GridConfig::new(GridEngine::CompleteFirst).conf_config(&f),
+            &f.implementation,
+            &f.specification,
+            false,
+        );
+        if (cf.executions, cf.counters.impl_graphs) != (impl_total, impl_total) {
+            bad.push(format!(
+                "{name} complete-first: ({}, {}) vs plain {impl_total}",
+                cf.executions, cf.counters.impl_graphs
+            ));
+        }
+        note!("i1-9 {name}: spec {spec_total} impl {impl_total}");
+    }
+    assert!(bad.is_empty(), "conformance: I1-9: {bad:#?}");
+}
+
+/// SVERIFY-P I1-7, the "after" side of SVerify-S's uncovered multiset (the
+/// "before" side: `oracle_trace_stream` replayed by the coverage rule, the
+/// tester's scratch `svp/before/`). `I1_FIXTURE` names one fixture; SVerify-S
+/// at X1 (`Ltr`, every report) runs it; each reported graph's summary is
+/// printed as `UNC\t<Sig Debug>\t<OrdCounts, comma-separated>` (the before
+/// side's line format), followed by `UNCN\t<reports>`.
+#[test]
+#[ignore]
+fn i1_sverify_s_uncovered_multiset() {
+    let Ok(name) = std::env::var("I1_FIXTURE") else {
+        return;
+    };
+    let f = any_fixture(&name);
+    let cc = crate::conformance::eval::x1_config(
+        GridEngine::Stateful,
+        crate::conformance::selector::Selector::Ltr,
+    )
+    .conf_config(&f);
+    let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
+    for (g, _) in &o.reports {
+        let w = wobs(g, &f.visible).expect("conformance: wobs");
+        let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, &f.visible)
+            .expect("conformance: a summary");
+        let counts = match OrdCounts::of(g, &w, &f.visible) {
+            OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+        };
+        note!("UNC\t{:?}\t{}", s.sig, counts.join(","));
+    }
+    note!("UNCN\t{}", o.reports.len());
+}

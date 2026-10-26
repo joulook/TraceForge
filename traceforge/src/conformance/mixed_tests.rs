@@ -152,6 +152,19 @@ fn invisible_ops(v: &Result<ConfVerdict, ConfError>) -> usize {
     outcome(v).counters().invisible_ops_of_visible_threads
 }
 
+/// The expected `ConfCounters` M8 value of engine `e` whose measured value
+/// would be `n`. `SVERIFY-P` I1 (tester re-pin, 2026-10-27): the stateful
+/// engine's `ConfVerdict` leaves the field at `ConfCounters::default()`'s 0 —
+/// not counted, its `StatefulCounters` record is `None` — so its expectation
+/// on this public path is 0; every other engine counts as before.
+fn want_ops(e: Eng, n: usize) -> usize {
+    if e == Eng::Stateful {
+        0
+    } else {
+        n
+    }
+}
+
 /// The panic payload's text, if `f` panicked.
 fn panic_of<R>(f: impl FnOnce() -> R) -> Option<String> {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -369,17 +382,34 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
 }
 
 /// The run's `invisible_ops_of_visible_threads`, from the engine's own record.
-fn grid_counter(r: &GridResult) -> usize {
+/// `SVERIFY-P` I1 (tester re-pin, 2026-10-27): the stateful engine runs both
+/// sides in `ConfMode::Enumerate`, where the counter is off, and its record is
+/// `None` ("not counted"); every other engine's value is `Some`.
+fn grid_counter(r: &GridResult) -> Option<usize> {
     match &r.raw {
-        GridRaw::Enumerator(o) => o.counters.invisible_ops_of_visible_threads,
+        GridRaw::Enumerator(o) => Some(o.counters.invisible_ops_of_visible_threads),
         GridRaw::Stateful(o) => o.counters.invisible_ops_of_visible_threads,
-        GridRaw::CompleteFirst(o) => o.counters.invisible_ops_of_visible_threads,
-        GridRaw::Gated(o) => o.counters.invisible_ops_of_visible_threads,
-        GridRaw::Verdict(v) => invisible_ops(v),
+        GridRaw::CompleteFirst(o) => Some(o.counters.invisible_ops_of_visible_threads),
+        GridRaw::Gated(o) => Some(o.counters.invisible_ops_of_visible_threads),
+        GridRaw::Verdict(v) => Some(invisible_ops(v)),
         GridRaw::Explore(_) => {
             unreachable!("conformance: Explore (plain Must) carries no conformance counters")
         }
     }
+}
+
+/// The expected M8 record of a run whose measured value would be `n`:
+/// `None` on the stateful engine (`SVERIFY-P` I1), `Some(n)` elsewhere.
+fn want_counter(r: &GridResult, n: usize) -> Option<usize> {
+    match &r.raw {
+        GridRaw::Stateful(_) => None,
+        _ => Some(n),
+    }
+}
+
+/// The M8 cell of a `P4_DIFF_TABLES` row: blank when not counted.
+fn counter_cell(c: Option<usize>) -> String {
+    c.map(|n| n.to_string()).unwrap_or_default()
 }
 
 /// The oracle families of a fixture (the stateful run, both families kept).
@@ -709,10 +739,11 @@ fn c01b_the_annotated_server_pair_conforms_everywhere() {
             if o.end() != SearchEnd::StateSpaceExhausted || !o.reports().is_empty() {
                 bad.push(format!("{what}: end {:?}", o.end()));
             }
-            if invisible_ops(&r) != 2 {
+            if invisible_ops(&r) != want_ops(e, 2) {
                 bad.push(format!(
-                    "{what}: counter {} (expected 2)",
-                    invisible_ops(&r)
+                    "{what}: counter {} (expected {})",
+                    invisible_ops(&r),
+                    want_ops(e, 2)
                 ));
             }
             if e == Eng::Enum && o.counters().gate_skipped_inert != 4 {
@@ -858,10 +889,11 @@ fn c02_status_through_an_invisible_block() {
                     "{what}: rendering does not name `s` blocked:\n{shown}"
                 ));
             }
-            if invisible_ops(&r) != 1 {
+            if invisible_ops(&r) != want_ops(e, 1) {
                 bad.push(format!(
-                    "{what}: counter {} (expected 1)",
-                    invisible_ops(&r)
+                    "{what}: counter {} (expected {})",
+                    invisible_ops(&r),
+                    want_ops(e, 1)
                 ));
             }
         }
@@ -940,8 +972,12 @@ fn c03_vpos_under_mixed_visibility() {
         );
         if class(&r) != "conforms" {
             bad.push(format!("{e:?}: {}", class(&r)));
-        } else if invisible_ops(&r) != 1 {
-            bad.push(format!("{e:?}: counter {} (expected 1)", invisible_ops(&r)));
+        } else if invisible_ops(&r) != want_ops(e, 1) {
+            bad.push(format!(
+                "{e:?}: counter {} (expected {})",
+                invisible_ops(&r),
+                want_ops(e, 1)
+            ));
         }
     }
     assert!(
@@ -1108,8 +1144,12 @@ fn c05_branch_dependent_visibility() {
         let r = verify(cc(e, cfg(ConsType::Bag), &v, Selector::Ltr, false), &p, &p);
         if class(&r) != "conforms" {
             bad.push(format!("{e:?}: {}", class(&r)));
-        } else if invisible_ops(&r) != 1 {
-            bad.push(format!("{e:?}: counter {} (expected 1)", invisible_ops(&r)));
+        } else if invisible_ops(&r) != want_ops(e, 1) {
+            bad.push(format!(
+                "{e:?}: counter {} (expected {})",
+                invisible_ops(&r),
+                want_ops(e, 1)
+            ));
         }
     }
     assert!(
@@ -1310,8 +1350,12 @@ fn c06_revisit_survivors_keep_their_annotations() {
         let r = verify(cc(e, cfg(ConsType::Bag), &v, Selector::Ltr, false), &p, &p);
         if class(&r) != "conforms" {
             bad.push(format!("{e:?}: {}", class(&r)));
-        } else if invisible_ops(&r) != 1 {
-            bad.push(format!("{e:?}: counter {} (expected 1)", invisible_ops(&r)));
+        } else if invisible_ops(&r) != want_ops(e, 1) {
+            bad.push(format!(
+                "{e:?}: counter {} (expected {})",
+                invisible_ops(&r),
+                want_ops(e, 1)
+            ));
         }
     }
     assert!(
@@ -1374,11 +1418,11 @@ fn c07_the_annotated_reply3_variant_is_reported_and_certified() {
                     bad.push(format!("{what}: the report is not at S's reply"));
                 }
             }
-            if grid_counter(&r) != want.2 {
+            if grid_counter(&r) != want_counter(&r, want.2) {
                 bad.push(format!(
-                    "{what}: counter {} (expected {})",
+                    "{what}: counter {:?} (expected {:?})",
                     grid_counter(&r),
-                    want.2
+                    want_counter(&r, want.2)
                 ));
             }
             certify_all(&fam, &r, &what);
@@ -1471,11 +1515,11 @@ fn c07p_the_early_error_cut_is_thread_keyed() {
         if !raw_notes(&r).is_empty() {
             bad.push(format!("{name}: notes {:?}", raw_notes(&r)));
         }
-        if grid_counter(&r) != want.2 {
+        if grid_counter(&r) != want_counter(&r, want.2) {
             bad.push(format!(
-                "{name}: counter {} (expected {})",
+                "{name}: counter {:?} (expected {:?})",
                 grid_counter(&r),
-                want.2
+                want_counter(&r, want.2)
             ));
         }
         if let GridRaw::CompleteFirst(o) = &r.raw {
@@ -1970,10 +2014,10 @@ fn c10_mixed_benchmarks_and_the_counter() {
             if reported != violation {
                 bad.push(format!("{what}: reported = {reported}"));
             }
-            let want = if completes(&c, &f.name) { n } else { 0 };
+            let want = want_counter(&r, if completes(&c, &f.name) { n } else { 0 });
             if grid_counter(&r) != want {
                 bad.push(format!(
-                    "{what}: counter {} (expected {want})",
+                    "{what}: counter {:?} (expected {want:?})",
                     grid_counter(&r)
                 ));
             }
@@ -1981,7 +2025,7 @@ fn c10_mixed_benchmarks_and_the_counter() {
             let mut row = row_of(&r);
             row.push((
                 "invisible_ops_of_visible_threads",
-                grid_counter(&r).to_string(),
+                counter_cell(grid_counter(&r)),
             ));
             rows.push(row);
         }
@@ -2422,8 +2466,8 @@ fn c08_the_counter_is_zero_on_the_unannotated_corpus() {
         for c in &configs {
             let r = grun(f, c);
             runs += 1;
-            if grid_counter(&r) != 0 {
-                bad.push(format!("{} {}: {}", f.name, c.label(), grid_counter(&r)));
+            if grid_counter(&r) != want_counter(&r, 0) {
+                bad.push(format!("{} {}: {:?}", f.name, c.label(), grid_counter(&r)));
             }
         }
     }
@@ -2438,4 +2482,273 @@ fn c08_the_counter_is_zero_on_the_unannotated_corpus() {
         "conformance: criterion 8, non-zero counters:\n  {}",
         bad.join("\n  ")
     );
+}
+
+// =========================================================================
+// SVERIFY-P I1 (tester, gate 3; criteria rev 1.3/1.4 I1-1, I1-3, I1-8):
+// §8's guard at completion only plus the abort arm; M8 off in `Enumerate`
+// =========================================================================
+
+const SPAWNED_LATE: &str = "§8 requires each declared visible thread to be spawned before";
+
+/// `gate_tests` c9's program: `main` sends to `a`, then spawns visible `late`.
+fn late_plain() -> Prog {
+    prog(|| {
+        let a = named("a", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        crate::send_msg(a.thread().id(), 1u64);
+        named("late", || {});
+    })
+}
+
+/// Case (iv), every engine: a plain late spawn ends in the §8 panic.
+#[test]
+fn i1_iv_a_plain_late_spawn_panics_on_every_engine() {
+    let p = late_plain();
+    let v = vis(&["main", "late"]);
+    let mut bad = Vec::new();
+    for e in ENGINES {
+        let got = panic_of(|| verify(cc(e, cfg(ConsType::Bag), &v, Selector::Ltr, false), &p, &p));
+        if !got.as_deref().is_some_and(|m| m.contains(SPAWNED_LATE)) {
+            bad.push(format!("{e:?}: {got:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: I1 case (iv): {bad:#?}");
+}
+
+/// Case (iii)'s implementation: `main` sends to invisible `x`, spawns visible
+/// `late` (porf-after that send: §8), then `a` sends `v` to `c`. The
+/// specification spawns `late` first and sends 1, so `v = 2` is a visible
+/// mismatch after the late spawn, which the enumerator (Cover's `NoCover`) and
+/// the gated engine in first-failure mode (the G1 sink's `Report`) report and
+/// prune before completion.
+fn late_then_send(v: i32) -> Prog {
+    prog(move || {
+        let x = named("x", || {
+            let _: i32 = crate::recv_msg_block();
+        });
+        crate::send_msg(x.thread().id(), 0i32);
+        named("late", || {});
+        let c = named("c", || {
+            let _: i32 = crate::recv_msg_block();
+        });
+        let cid = c.thread().id();
+        named("a", move || crate::send_msg(cid, v));
+    })
+}
+
+/// The specification of cases (i)-(iii): `late` spawned before any
+/// communication (no §8 violation), then `c` receives from `a`; with `abort`,
+/// `a` fails an assertion after its send (criterion 9's
+/// `send_then_assert(true)` shape).
+fn early_spawn_spec(abort: bool) -> Prog {
+    prog(move || {
+        named("late", || {});
+        let c = named("c", || {
+            let _: i32 = crate::recv_msg_block();
+        });
+        let cid = c.thread().id();
+        named("a", move || {
+            crate::send_msg(cid, 1i32);
+            if abort {
+                crate::assert(false);
+            }
+        });
+    })
+}
+
+/// Case (iii): a late spawn, then a reporting and pruning gate before
+/// completion, still ends in the §8 panic — on the enumerator (Cover's
+/// `NoCover`), the gated engine (first failure, the G1 sink's `Report`), and
+/// complete-first with the early-error cut (a visible assertion failure,
+/// `report_visible_error`). The pruned execution reaches the completion guard,
+/// which sits above the `pruned` return.
+#[test]
+fn i1_iii_a_late_spawn_then_a_pruning_report_still_panics() {
+    let v = vis(&["a", "c", "late"]);
+    let (imp, spec) = (late_then_send(2), early_spawn_spec(false));
+    let mut bad = Vec::new();
+    for e in [
+        Eng::Enum,
+        Eng::Gated(GatedMode::FirstFailure, GatePolicy::Always),
+    ] {
+        let got = panic_of(|| {
+            verify(cc(e, cfg(ConsType::Bag), &v, Selector::Ltr, false), &imp, &spec)
+        });
+        if !got.as_deref().is_some_and(|m| m.contains(SPAWNED_LATE)) {
+            bad.push(format!("{e:?}: {got:?}"));
+        }
+    }
+    // Complete-first with the early-error cut: `a` fails a visible assertion
+    // after the late spawn.
+    let imp = prog(|| {
+        let x = named("x", || {
+            let _: i32 = crate::recv_msg_block();
+        });
+        crate::send_msg(x.thread().id(), 0i32);
+        named("late", || {});
+        named("a", || crate::assert(false));
+    });
+    let spec = prog(|| {
+        named("late", || {});
+        named("a", || {});
+    });
+    let c = ConfBuilder::new()
+        .config(cfg(ConsType::Bag))
+        .visible_threads(vis(&["a", "late"]))
+        .selector(Selector::Ltr)
+        .engine(Engine::CompleteFirst)
+        .early_error_cut(true)
+        .build()
+        .expect("conformance: complete-first with the cut is in scope");
+    let got = panic_of(|| verify(c.clone(), &imp, &spec));
+    if !got.as_deref().is_some_and(|m| m.contains(SPAWNED_LATE)) {
+        bad.push(format!("CFirst+cut: {got:?}"));
+    }
+    assert!(bad.is_empty(), "conformance: I1 case (iii): {bad:#?}");
+}
+
+/// Cases (i) and (ii), the ordinary enumerator only (the one engine whose
+/// context has a Cover worker; criteria rev 1.3 I1-8). The specification
+/// aborts (`a` asserts after its send: `SpecNotAssertionSafe`) at the gate G
+/// whose Cover first runs it past `a`'s send. (i) `late` is spawned before G
+/// (after `main`'s send to `x`): the abort arm's guard panics, today's outcome
+/// class. (ii) `late` is spawned by `c` after it received `a`'s message, after
+/// G: no guard runs after the abort, and the run ends with the specification
+/// error, today's outcome class.
+#[test]
+fn i1_i_ii_the_abort_arm_keeps_both_outcome_classes() {
+    let v = vis(&["a", "c", "late"]);
+    let spec = early_spawn_spec(true);
+    let conf = || cc(Eng::Enum, cfg(ConsType::Bag), &v, Selector::Ltr, true);
+    // (i)
+    let imp_i = late_then_send(1);
+    let got = panic_of(|| verify(conf(), &imp_i, &spec));
+    assert!(
+        got.as_deref().is_some_and(|m| m.contains(SPAWNED_LATE)),
+        "conformance: I1 case (i): {got:?}"
+    );
+    // (ii)
+    let imp_ii = prog(|| {
+        let c = named("c", || {
+            let _: i32 = crate::recv_msg_block();
+            named("late", || {});
+        });
+        let cid = c.thread().id();
+        named("a", move || crate::send_msg(cid, 1i32));
+    });
+    let mut out = None;
+    let got = panic_of(|| {
+        out = Some(verify(conf(), &imp_ii, &spec));
+    });
+    assert!(got.is_none(), "conformance: I1 case (ii) panicked: {got:?}");
+    let r = out.expect("conformance: case (ii) ran");
+    assert!(
+        matches!(r, Err(ConfError::SpecNotAssertionSafe { .. })),
+        "conformance: I1 case (ii): {}",
+        class(&r)
+    );
+}
+
+/// I1-1's removal at the growing gates, observed: under `GatedOuter` the G1
+/// gate sink fires at the fresh gates, after the old guard's place. On
+/// `late_plain` it now sees at least one fresh gate whose graph already holds
+/// the late `TCreate` porf-after a communication (`check_spawn_order` would
+/// fail there); before I1 the guard panicked at that gate before the sink.
+/// The run still ends in the §8 panic, at completion.
+#[test]
+fn i1_the_growing_gates_no_longer_guard() {
+    let v = vis(&["main", "late"]);
+    let seen_late: Rc<RefCell<usize>> = Default::default();
+    let gate_sink: GateSink = {
+        let (seen, v) = (Rc::clone(&seen_late), v.clone());
+        Box::new(move |gate: Gate, _at: &GateAt, g: &ExecutionGraph, _st: &MustState| {
+            if gate != Gate::Completion
+                && crate::conformance::ctx::check_spawn_order(g, &v).is_err()
+            {
+                *seen.borrow_mut() += 1;
+            }
+            GateVerdict::Continue
+        })
+    };
+    let sink: CompletionSink = Box::new(|_: &ExecutionGraph, _: &MustState| SinkVerdict::Continue);
+    let p = late_plain();
+    let got = panic_of(|| {
+        enumerate(
+            EnumRun {
+                config: cfg(ConsType::Bag),
+                visible: v.clone(),
+                mode: ConfMode::GatedOuter,
+                sink,
+                cut: false,
+                stop_at_first_report: false,
+                gate_sink: Some(gate_sink),
+            },
+            &p,
+        )
+    });
+    assert!(
+        got.as_deref().is_some_and(|m| m.contains(SPAWNED_LATE)),
+        "conformance: the run still ends in the §8 panic: {got:?}"
+    );
+    assert!(
+        *seen_late.borrow() > 0,
+        "conformance: no fresh gate saw the late spawn; the guard still runs there"
+    );
+}
+
+/// I1-3: the M8 counter is computed at `Gate::Completion` in every mode but
+/// `ConfMode::Enumerate` exactly. One gate-disabled context per mode fires the
+/// completion gate on `mixed/branch`'s implementation graphs (invisible
+/// operations of visible threads: M8 = 1); the counter must be the function's
+/// maximum in every mode but `Enumerate`, and 0 there. `ConfMode::Outer` has
+/// no gate-disabled context (`ConfCtx::gate_disabled` refuses it: the outer
+/// run is the engine with a gate); its counter is pinned through the
+/// enumerator itself, `c01b` and `c10` (the enumerator's 2 and 2r, unchanged).
+#[test]
+fn i1_m8_is_off_in_enumerate_and_only_there() {
+    let f = mixed_fixtures()
+        .into_iter()
+        .find(|f| f.name == "mixed/branch")
+        .expect("conformance: mixed/branch is a registry entry");
+    let r = grun(&f, &GridConfig::new(GridEngine::Stateful));
+    let GridRaw::Stateful(o) = &r.raw else {
+        unreachable!("conformance: stateful")
+    };
+    let graphs = &o.kept_impl_graphs;
+    let want = graphs
+        .iter()
+        .map(|g| crate::conformance::ctx::invisible_ops_of_visible_threads(g, &f.visible))
+        .max()
+        .unwrap_or(0);
+    assert!(want > 0, "conformance: the fixture has invisible operations (non-vacuous)");
+    let mut bad = Vec::new();
+    for mode in [
+        ConfMode::Precheck,
+        ConfMode::Triage,
+        ConfMode::Collect,
+        ConfMode::Enumerate,
+        ConfMode::CFirstOuter,
+        ConfMode::CFirstSweep,
+        ConfMode::GatedOuter,
+        ConfMode::GatedSweep,
+    ] {
+        let mut ctx = crate::conformance::ctx::ConfCtx::gate_disabled(
+            f.config.clone(),
+            f.visible.clone(),
+            mode,
+        );
+        for g in graphs {
+            ctx.begin_execution();
+            let _ = ctx.gate_at(Gate::Completion, None, g, &MustState::default());
+            ctx.end_execution();
+        }
+        let got = ctx.counters().invisible_ops_of_visible_threads;
+        let exp = if mode == ConfMode::Enumerate { 0 } else { want };
+        if got != exp {
+            bad.push(format!("{mode:?}: {got} (expected {exp})"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: I1-3: {bad:#?}");
 }

@@ -924,9 +924,11 @@ pub struct StatefulCounters {
     pub reports: usize,
     pub spec_wall_time_ms: u128,
     pub impl_wall_time_ms: u128,
-    /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`];
-    /// computed in this engine's implementation completion sink.
-    pub invisible_ops_of_visible_threads: usize,
+    /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`].
+    /// `None` since `SVERIFY-P` I1: the counter is off in every
+    /// [`ConfMode::Enumerate`](crate::conformance::ctx::ConfMode) run, and this
+    /// engine runs both sides in that mode — not counted, never a measured zero.
+    pub invisible_ops_of_visible_threads: Option<usize>,
     /// `COMPACT-INDEX` §5.1 item 1 (step 0): distinct implementation
     /// summaries `(Sig, ord)` over the Impl run, under both index kinds
     /// (frozen §6); `Some` iff the `impl_distinct` knob is on (phase 2 D6).
@@ -974,9 +976,11 @@ pub struct StatefulCounters {
 /// of each [`CoverCounters`]: `run` does not instrument (the flag is
 /// crate-internal, for the differential harness and the tests). The other
 /// counters are always filled on the enumerator; the stateful engine fills only
-/// `executions`, `max_paper_events_per_execution`, `wall_time_ms` and
-/// `invisible_ops_of_visible_threads` (`P4-STATEFUL` T6; `P4-MIXED` M8), the
-/// sweeping engines those and `paper_events_at_first_report` (gated).
+/// `executions`, `max_paper_events_per_execution` and `wall_time_ms`
+/// (`P4-STATEFUL` T6) and leaves `invisible_ops_of_visible_threads` at this
+/// default 0 — the counter is off in `ConfMode::Enumerate` (`SVERIFY-P` I1;
+/// its own [`StatefulCounters`] record carries `None`) — the sweeping engines
+/// those four (`P4-MIXED` M8) and `paper_events_at_first_report` (gated).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfCounters {
     pub gate_invocations: usize,
@@ -1007,10 +1011,12 @@ pub struct ConfCounters {
     pub wall_time_ms: u128,
     /// `P4-MIXED` M8: the number of sends and receives of declared threads that
     /// are invisible (an `Invisible` annotation), per unpruned complete graph,
-    /// maximum over the run — 0 on every unannotated program. Filled by all four
-    /// engines (the enumerator at its completion gate; the other three in their
-    /// implementation completion sinks). A receive that blocks is no event and
-    /// is not counted.
+    /// maximum over the run — 0 on every unannotated program. Filled by the
+    /// enumerator at its completion gate and by complete-first and gated in
+    /// their implementation completion sinks. Off in every `Enumerate` run
+    /// (`SVERIFY-P` I1): the stateful engine leaves it at 0 here and reports
+    /// `None` in `StatefulCounters`. A receive that blocks is no event and is
+    /// not counted.
     pub invisible_ops_of_visible_threads: usize,
 }
 

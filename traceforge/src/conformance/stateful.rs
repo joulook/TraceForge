@@ -177,7 +177,9 @@ pub(crate) fn run(
         executions: out.executions,
         max_paper_events_per_execution: out.max_paper_events,
         wall_time_ms: started.elapsed().as_millis(),
-        invisible_ops_of_visible_threads: out.counters.invisible_ops_of_visible_threads,
+        // `SVERIFY-P` I1: the M8 counter is off in this engine's `Enumerate`
+        // runs; the field keeps the default 0 like every other field this
+        // engine does not measure here, and `StatefulCounters` says `None`.
         ..ConfCounters::default()
     };
 
@@ -347,10 +349,9 @@ pub(crate) fn run_with(
             st.executions += 1;
             let paper: usize = g.thread_ids().into_iter().map(|t| paper_events(g, t)).sum();
             st.max_paper_events = st.max_paper_events.max(paper);
-            // `P4-MIXED` M8, in the implementation completion sink.
-            let inv = crate::conformance::ctx::invisible_ops_of_visible_threads(g, &visible);
-            st.counters.invisible_ops_of_visible_threads =
-                st.counters.invisible_ops_of_visible_threads.max(inv);
+            // `P4-MIXED` M8 was computed here; `SVERIFY-P` I1 turns the
+            // counter off in every `Enumerate` run (`StatefulCounters::
+            // invisible_ops_of_visible_threads` is `None`).
             st.counters.impl_graphs += 1;
             st.counters.lookups += 1;
             if keep_graphs {
