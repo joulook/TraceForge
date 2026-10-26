@@ -2026,11 +2026,33 @@ fn s4_check(d: usize, fail: &mut Vec<String>) {
         } else {
             "max_paper_events"
         };
-        if num(&row, col) != 4 * d {
+        // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the stateful and
+        // complete-first rows leave `L` blank (`ConfConfig::paper_events` off on
+        // every grid route); the enumerator and gated rows carry `4d`; the two
+        // engines' `4d` is checked below with the knob on, in process.
+        let plain = matches!(c.engine, GridEngine::Stateful | GridEngine::CompleteFirst);
+        if plain {
+            if !cell(&row, col).is_empty() {
+                fail.push(format!("{l}: {col} {:?} (blank expected)", cell(&row, col)));
+            }
+        } else if num(&row, col) != 4 * d {
             fail.push(format!("{l}: {col} {} (4d = {})", num(&row, col), 4 * d));
         }
         if c.engine != GridEngine::Enumerator && num(&row, "impl_graphs") != 1 {
             fail.push(format!("{l}: impl_graphs"));
+        }
+        if plain {
+            let mut cc = c.conf_config(&f);
+            cc.paper_events = true;
+            let (imp, spec) = (&f.implementation, &f.specification);
+            let got = if c.engine == GridEngine::Stateful {
+                crate::conformance::stateful::run_with(&cc, imp, spec, false).max_paper_events
+            } else {
+                crate::conformance::cfirst::run_with(&cc, imp, spec, false).max_paper_events
+            };
+            if got != Some(4 * d) {
+                fail.push(format!("{l}: L with the knob on {got:?} (4d = {})", 4 * d));
+            }
         }
     }
     let o = oracle(&f);

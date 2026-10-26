@@ -3602,13 +3602,19 @@ fn verdict_counter_fill(end: &GridEnd, mut inner: Row) -> Row {
         }
     }
     let o = v.outcome();
-    if o.cfirst_counters().is_some() || o.gated_counters().is_some() {
+    if o.gated_counters().is_some() {
         // the paper's `L` (`row_of` renders it with `Display` on the `run_with` routes)
         push(
             &mut inner,
             "max_paper_events",
             o.counters().max_paper_events_per_execution.to_string(),
         );
+    } else if o.cfirst_counters().is_some() {
+        // `MIN-ENGINES` E3: the complete-first engine counts `L` only with
+        // `ConfConfig::paper_events` on, which no grid route sets, so the
+        // column is blank here as `row_of` leaves it on the `run_with` route
+        // (`push_opt` of `None`); the public counter would read 0.
+        push(&mut inner, "max_paper_events", String::new());
     }
     if let Some(c) = o.cfirst_counters() {
         push(&mut inner, "impl_graphs", c.impl_graphs.to_string());

@@ -1116,10 +1116,13 @@ fn c01_the_outer_run_is_musts_uncut_exploration_of_impl() {
     let mut pairs = 0;
     for p in corpus() {
         let v = &p.visible;
-        let cc = built(cb(p.config.clone(), v));
+        // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): `L` is compared with
+        // `ConfConfig::paper_events` on in both engines (the cut and the stop
+        // off: both runs exhaustive).
+        let cc = built(cb(p.config.clone(), v).paper_events(true));
         let o = rw(&cc, &p.imp, &p.spec, true);
         assert_identities(&o, v, true, &p.name);
-        let s = srw(&built(sb(p.config.clone(), v)), &p.imp, &p.spec);
+        let s = srw(&built(sb(p.config.clone(), v).paper_events(true)), &p.imp, &p.spec);
         if keys(&o.kept_impl_graphs, v) != keys(&s.kept_impl_graphs, v) {
             failures.push(format!(
                 "{}: kept Impl multisets differ ({} vs {})",
@@ -1128,7 +1131,7 @@ fn c01_the_outer_run_is_musts_uncut_exploration_of_impl() {
                 s.kept_impl_graphs.len()
             ));
         }
-        if o.max_paper_events != s.max_paper_events {
+        if o.max_paper_events.is_none() || o.max_paper_events != s.max_paper_events {
             failures.push(format!("{}: max_paper_events", p.name));
         }
         let unkept = rw(&cc, &p.imp, &p.spec, false);
@@ -1178,7 +1181,8 @@ fn c01_the_outer_run_is_musts_uncut_exploration_of_impl() {
         assert!(c.per_cover.is_empty() && c.explored_complete_keys.is_empty());
         assert_eq!(c.executions, pc.impl_graphs, "conformance: {}", p.name);
         assert_eq!(
-            c.max_paper_events_per_execution, o.max_paper_events,
+            Some(c.max_paper_events_per_execution),
+            o.max_paper_events,
             "conformance: {}",
             p.name
         );
@@ -1216,7 +1220,12 @@ fn c02_max_iterations_bounds_the_outer_run_only() {
     assert_eq!(o.counters.sweep_graphs_max, 6);
     assert_eq!(o.sweep_ends, vec![SweepEnd::Exhausted, SweepEnd::Exhausted]);
     assert_eq!(o.impl_end, SearchEnd::MaxIterations(2));
-    assert_eq!(o.max_paper_events, 7, "conformance: 2k+1");
+    // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): `None` off by default;
+    // 2k+1 with the knob on.
+    assert_eq!(o.max_paper_events, None, "conformance: L not counted by default");
+    let on = built(cb(bounded(2), &v).paper_events(true));
+    let o_on = rw(&on, &naive(3, 0), &naive(3, 1), false);
+    assert_eq!(o_on.max_paper_events, Some(7), "conformance: 2k+1");
     let un = rw(
         &built(cb(cfg(ConsType::Bag), &v)),
         &naive(3, 0),
@@ -2235,10 +2244,13 @@ fn c08_first_report_mode() {
         let v = naive_visible(k);
         for skip in [true, false] {
             let what = format!("k={k} skip={skip}");
+            // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the knob on, so
+            // the first-report run's `L` (one completed graph) is counted.
             let cc = built(
                 cb(cfg(ConsType::Bag), &v)
                     .stop_at_first_report(true)
-                    .skip_spec_errfree_check(skip),
+                    .skip_spec_errfree_check(skip)
+                    .paper_events(true),
             );
             let o = rw(&cc, &naive(k, 0), &naive(k, 1), false);
             assert_counts(
@@ -2247,7 +2259,7 @@ fn c08_first_report_mode() {
                 &what,
             );
             assert_eq!(o.counters.sweep_sizes, vec![fact]);
-            assert_eq!(o.max_paper_events, 2 * k + 1, "conformance: {what}");
+            assert_eq!(o.max_paper_events, Some(2 * k + 1), "conformance: {what}");
             assert_eq!(o.impl_end, SearchEnd::StoppedAtFirstReport);
             let r = run(cc, &naive(k, 0), &naive(k, 1));
             assert_eq!(class(&r), "reported:1", "conformance: {what}");
@@ -2374,16 +2386,24 @@ fn c11_the_entry_point_fields() {
     let impl_end: SearchEnd = impl_end;
     let spec_errors: Vec<(String, Event, bool)> = spec_errors;
     let impl_notes: Vec<Diagnostic> = impl_notes;
-    let (executions, max_paper_events): (usize, usize) = (executions, max_paper_events);
+    let (executions, max_paper_events): (usize, Option<usize>) = (executions, max_paper_events);
     assert_eq!((reports.len(), counters.reports), (2, 2));
     assert!(cut_reports.is_empty() && witnesses.is_empty() && !aborted);
     assert!(kept_impl_graphs.is_empty() && kept_spec_graphs.is_empty());
     assert_eq!(sweep_ends, vec![SweepEnd::Exhausted, SweepEnd::Exhausted]);
     assert_eq!(impl_end, SearchEnd::StateSpaceExhausted);
     assert!(spec_errors.is_empty() && impl_notes.is_empty());
+    // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): `None` off by default;
+    // the knob on gives `L`.
     assert_eq!(
         (executions, max_paper_events),
-        (2, 5),
+        (2, None),
+        "conformance: L not counted by default"
+    );
+    let on = built(cb(cfg(ConsType::Bag), &v).paper_events(true));
+    assert_eq!(
+        rw(&on, &naive(2, 0), &naive(2, 1), false).max_paper_events,
+        Some(5),
         "conformance: L = 2k+1"
     );
 }
@@ -2776,7 +2796,13 @@ fn c14_outcome_record_by_engine() {
             }
         );
         let c = o.counters();
-        assert_eq!((c.executions, c.max_paper_events_per_execution), (6, 7));
+        // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the public `L` reads
+        // 0 when not counted (the owner's ruling (a), as M8); 7 with the knob on.
+        assert_eq!((c.executions, c.max_paper_events_per_execution), (6, 0));
+        let on = built(cb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(skip).paper_events(true));
+        let r_on = run(on, &naive(3, 0), &naive(3, 1));
+        let c_on = outcome(&r_on).counters();
+        assert_eq!((c_on.executions, c_on.max_paper_events_per_execution), (6, 7));
         assert_eq!(c.paper_events_at_first_report, None);
         assert_eq!((c.cover_calls, c.spec_visit_calls, c.memo_hits), (0, 0, 0));
     }

@@ -2316,10 +2316,12 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // md5 `85a28650…`); `I2B_HUNKS` undo it to `e1a0ca73…`.
     // MIN-ENGINES E1 (2026-10-26, tester re-pin, gate 3): to `24d93d46…` (grid.rs
     // md5 `b4daad38…`, F2's column included); `E1_HUNKS` undo it to `e81c8b53…`.
+    // MIN-ENGINES E3 (2026-10-26, tester re-pin, gate 3): to `5b2e85ba…` (grid.rs
+    // md5 `e21c504d…`); `E3_HUNKS` undo it to `24d93d46…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "24d93d4695912fbded599c96b1d2668b",
+        "5b2e85ba800fdb29d072c057e6e9fe97",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2517,7 +2519,56 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
             ),
         ),
     ];
+    // MIN-ENGINES E3 (2026-10-26, tester re-pin): the lead's two `grid.rs`
+    // hunks (`diff -U2` against grid.rs `b4daad38…`: the stateful and the
+    // complete-first rows' `max_paper_events` pushed with `push_opt`), inside
+    // the prefix. With one line of context the two are the same text, so each
+    // carries two; undoing them gives back the E1 prefix, byte for byte.
+    const E3_HUNKS: [(&str, &str); 2] = [
+        (
+            concat!(
+                "            push_d(&mut row, \"impl_notes\", o.impl_notes.len());\n",
+                "            push_d(&mut row, \"executions\", o.executions);\n",
+                "            // `MIN-ENGINES` E3: blank unless the knob counted `L`.\n",
+                "            push_opt(&mut row, \"max_paper_events\", o.max_paper_events);\n",
+                "            push_d(&mut row, \"kept_impl_graphs\", o.kept_impl_graphs.len());\n",
+                "            push_d(&mut row, \"kept_spec_graphs\", o.kept_spec_graphs.len());\n"
+            ),
+            concat!(
+                "            push_d(&mut row, \"impl_notes\", o.impl_notes.len());\n",
+                "            push_d(&mut row, \"executions\", o.executions);\n",
+                "            push_d(&mut row, \"max_paper_events\", o.max_paper_events);\n",
+                "            push_d(&mut row, \"kept_impl_graphs\", o.kept_impl_graphs.len());\n",
+                "            push_d(&mut row, \"kept_spec_graphs\", o.kept_spec_graphs.len());\n"
+            ),
+        ),
+        (
+            concat!(
+                "            push_d(&mut row, \"impl_notes\", o.impl_notes.len());\n",
+                "            push_d(&mut row, \"executions\", o.executions);\n",
+                "            // `MIN-ENGINES` E3: blank unless the knob counted `L`.\n",
+                "            push_opt(&mut row, \"max_paper_events\", o.max_paper_events);\n",
+                "            push_d(&mut row, \"kept_impl_graphs\", o.kept_impl_graphs.len());\n",
+                "            push_d(\n"
+            ),
+            concat!(
+                "            push_d(&mut row, \"impl_notes\", o.impl_notes.len());\n",
+                "            push_d(&mut row, \"executions\", o.executions);\n",
+                "            push_d(&mut row, \"max_paper_events\", o.max_paper_events);\n",
+                "            push_d(&mut row, \"kept_impl_graphs\", o.kept_impl_graphs.len());\n",
+                "            push_d(\n"
+            ),
+        ),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in E3_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "24d93d4695912fbded599c96b1d2668b",
+        "conformance: the prefix without E3's hunks = the E1 prefix"
+    );
     for (new, old) in E1_HUNKS {
         t = undo(t, new, old);
     }

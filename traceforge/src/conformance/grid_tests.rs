@@ -2403,7 +2403,10 @@ fn naive_rows(k: usize, enc: u8, s: Selector) -> Vec<Row> {
             o.reports.len(),
             grid_paper_events(&o.reports[0].0)
         ),
-        (1, 2 * k + 1, vec![fact], 0, 0, 1, 2 * k + 1),
+        // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the grid route never
+        // sets `ConfConfig::paper_events`, so the complete-first `L` is `None`;
+        // the first report's paper events (2k+1) are the grid's own count.
+        (1, None, vec![fact], 0, 0, 1, 2 * k + 1),
         "conformance: c06 {tag}: complete-first (D2)"
     );
     // Stateful, stop.

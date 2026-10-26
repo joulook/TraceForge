@@ -169,7 +169,9 @@ pub(crate) struct CFirstOutcome {
     pub(crate) impl_notes: Vec<Diagnostic>,
     /// Every outer execution, pruned ones included.
     pub(crate) executions: usize,
-    pub(crate) max_paper_events: usize,
+    /// The paper's `L` over the outer run — `Some` iff `ConfConfig::paper_events`
+    /// is on (`MIN-ENGINES` E3; `None` = not counted).
+    pub(crate) max_paper_events: Option<usize>,
 }
 
 /// What the outer sink accumulates, shared with [`run_with`] through an
@@ -334,9 +336,14 @@ pub(crate) fn run(
 
     let counters = ConfCounters {
         executions: out.executions,
-        max_paper_events_per_execution: out.max_paper_events,
+        // `MIN-ENGINES` E3: both 0 when not counted (`L` with the knob off; M8
+        // never in this engine), as the stateful engine's since `SVERIFY-P` I1.
+        max_paper_events_per_execution: out.max_paper_events.unwrap_or(0),
         wall_time_ms: started.elapsed().as_millis(),
-        invisible_ops_of_visible_threads: out.counters.invisible_ops_of_visible_threads,
+        invisible_ops_of_visible_threads: out
+            .counters
+            .invisible_ops_of_visible_threads
+            .unwrap_or(0),
         ..ConfCounters::default()
     };
 
@@ -438,10 +445,9 @@ pub(crate) fn run_with(
             {
                 let mut st = state.borrow_mut();
                 st.counters.impl_graphs += 1;
-                // `P4-MIXED` M8, in the implementation completion sink.
-                let inv = crate::conformance::ctx::invisible_ops_of_visible_threads(g, &visible);
-                st.counters.invisible_ops_of_visible_threads =
-                    st.counters.invisible_ops_of_visible_threads.max(inv);
+                // `P4-MIXED` M8 was computed here; `MIN-ENGINES` E3 turns the
+                // counter off in this engine (`CFirstCounters::
+                // invisible_ops_of_visible_threads` is `None`).
                 if keep_graphs {
                     st.kept_impl.push(g.clone());
                 }
@@ -645,6 +651,7 @@ pub(crate) fn run_with(
             cut: cc.early_error_cut,
             stop_at_first_report: cc.stop_at_first_report,
             gate_sink: None,
+            paper_events: cc.paper_events,
         },
         implementation,
     );
@@ -687,7 +694,8 @@ pub(crate) fn run_with(
         // cut on, `AfterPrune` entries arise and are kept).
         impl_notes: outer.diagnostics,
         executions: outer.executions,
-        max_paper_events: outer.max_paper_events,
+        // `MIN-ENGINES` E3: the outer run's context counted `L` iff the knob is on.
+        max_paper_events: cc.paper_events.then_some(outer.max_paper_events),
     }
 }
 
@@ -850,6 +858,7 @@ pub(crate) fn sweep_with(
                         cut: false,
                         stop_at_first_report: false,
                         gate_sink: None,
+                        paper_events: false,
                     },
                     &specification,
                 );

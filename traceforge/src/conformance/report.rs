@@ -1005,6 +1005,10 @@ pub struct ConfCounters {
     pub f63_distinct_run_wide: usize,
     pub explored_complete_keys: Vec<String>,
     pub report_keys: Vec<(ReportGate, String)>,
+    /// The paper's `L`. `MIN-ENGINES` E3: the stateful and complete-first
+    /// engines count it only with `ConfConfig::paper_events` on and leave 0
+    /// here otherwise (their own counter records say `None`); the enumerator
+    /// and the gated checker count it regardless.
     pub max_paper_events_per_execution: usize,
     pub paper_events_at_first_report: Option<usize>,
     pub executions: usize,
@@ -1015,8 +1019,9 @@ pub struct ConfCounters {
     /// enumerator at its completion gate and by complete-first and gated in
     /// their implementation completion sinks. Off in every `Enumerate` run
     /// (`SVERIFY-P` I1): the stateful engine leaves it at 0 here and reports
-    /// `None` in `StatefulCounters`. A receive that blocks is no event and is
-    /// not counted.
+    /// `None` in `StatefulCounters`; off in the complete-first engine too
+    /// (`MIN-ENGINES` E3: 0 here, `None` in `CFirstCounters`). A receive that
+    /// blocks is no event and is not counted.
     pub invisible_ops_of_visible_threads: usize,
 }
 
@@ -1332,9 +1337,11 @@ pub struct CFirstCounters {
     pub outer_wall_time_ms: u128,
     /// Summed over every sweep (the sweep threads' own time).
     pub sweep_wall_time_ms: u128,
-    /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`];
-    /// computed in this engine's implementation completion sink.
-    pub invisible_ops_of_visible_threads: usize,
+    /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`].
+    /// `MIN-ENGINES` E3: `None` — this engine no longer counts it (the
+    /// owner's ruling keeps the public counter at 0), as `StatefulCounters`
+    /// since `SVERIFY-P` I1.
+    pub invisible_ops_of_visible_threads: Option<usize>,
     /// `P4-FLAT` F6: `FlatCover`'s counters, `Some` iff `completion_cover = Flat`.
     pub(crate) flat: Option<FlatCounters>,
     /// `P5-CFCFG` F1: stored admissions to `W` (re-admissions included),

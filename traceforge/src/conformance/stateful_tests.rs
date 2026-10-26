@@ -1142,8 +1142,18 @@ fn c02_max_iterations_bounds_the_impl_run_only() {
         "conformance: Impl end"
     );
     assert_counts(&o.counters, [6, 2, 1, 1, 6, 2, 2, 0, 0, 0, 0, 2], "bounded");
+    // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): `L` is counted only with
+    // `ConfConfig::paper_events` on; off by default the record is `None`.
+    assert_eq!(o.max_paper_events, None, "conformance: L not counted by default");
+    let bounded_on = Config::builder()
+        .with_cons_type(ConsType::Bag)
+        .with_seed(0)
+        .with_max_iterations(2)
+        .build();
+    let on = built(sb(bounded_on, &v).paper_events(true));
     assert_eq!(
-        o.max_paper_events, 7,
+        rw(&on, &naive(3, 0), &naive(3, 1), false).max_paper_events,
+        Some(7),
         "conformance: L = 2k+1 events of Impl_3"
     );
 
@@ -2042,7 +2052,7 @@ fn c12_the_entry_point_fields() {
     let (impl_end, spec_end): (SearchEnd, SearchEnd) = (impl_end, spec_end);
     let spec_errors: Vec<(String, Event, bool)> = spec_errors;
     let impl_notes: Vec<Diagnostic> = impl_notes;
-    let (executions, max_paper_events): (usize, usize) = (executions, max_paper_events);
+    let (executions, max_paper_events): (usize, Option<usize>) = (executions, max_paper_events);
     assert_eq!(reports.len(), 2);
     assert_eq!(counters.reports, 2);
     assert_eq!(index.len(), 1);
@@ -2058,9 +2068,17 @@ fn c12_the_entry_point_fields() {
         )
     );
     assert!(spec_errors.is_empty() && impl_notes.is_empty());
+    // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): `None` off by default;
+    // the knob on gives `L`.
     assert_eq!(
         (executions, max_paper_events),
-        (2, 5),
+        (2, None),
+        "conformance: L not counted by default"
+    );
+    let on = built(sb(cfg(ConsType::Bag), &v).paper_events(true));
+    assert_eq!(
+        rw(&on, &naive(2, 0), &naive(2, 1), false).max_paper_events,
+        Some(5),
         "conformance: L = 2k+1 = 5"
     );
     let kept = rw(&cc, &naive(2, 0), &naive(2, 1), true);
@@ -2347,7 +2365,13 @@ fn c14b_outcome_record_by_engine() {
         );
         assert!(!format!("{}", r.as_ref().unwrap()).contains("assumption recorded"));
         let c = o.counters();
-        assert_eq!((c.executions, c.max_paper_events_per_execution), (6, 7));
+        // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the public `L` reads
+        // 0 when not counted (the owner's ruling (a), as M8); 7 with the knob on.
+        assert_eq!((c.executions, c.max_paper_events_per_execution), (6, 0));
+        let on = built(sb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(skip).paper_events(true));
+        let r_on = run(on, &naive(3, 0), &naive(3, 1));
+        let c_on = outcome(&r_on).counters();
+        assert_eq!((c_on.executions, c_on.max_paper_events_per_execution), (6, 7));
         assert_eq!(
             c.paper_events_at_first_report, None,
             "conformance: not filled by T6"

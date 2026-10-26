@@ -715,6 +715,9 @@ pub(crate) fn run_with(
             cut: false,
             stop_at_first_report: false,
             gate_sink: Some(gate_sink),
+            // `MIN-ENGINES` E3: read in the plain-scheduled modes only; this
+            // mode walks the paper's `L` regardless (the literal compiles).
+            paper_events: false,
         },
         implementation,
     );

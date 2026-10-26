@@ -284,6 +284,10 @@ pub struct ConfConfig {
     pub(crate) witness_cache: Capacity,
     /// `P5-CFCFG` F3: silence the sweeps' progress lines (complete-first only).
     pub(crate) quiet_sweeps: bool,
+    /// `MIN-ENGINES` E3: count the paper's `L` in the stateful and
+    /// complete-first engines' implementation runs (off: their records say
+    /// "not counted" and the public counter reads 0).
+    pub(crate) paper_events: bool,
     /// `COMPACT-INDEX` §5 (frozen C1): which index the stateful and
     /// complete-first engines use. `Current` is today's code path byte for
     /// byte; `Compact` is the bucket index of `compact.rs`.
@@ -412,6 +416,7 @@ pub struct ConfBuilder {
     completion_cover: CompletionCover,
     witness_cache: Capacity,
     quiet_sweeps: bool,
+    paper_events: bool,
     index: IndexKind,
     antichain: bool,
     probe_memo: bool,
@@ -454,6 +459,8 @@ impl ConfBuilder {
             // sweeps' progress lines printed.
             witness_cache: Capacity::Unbounded,
             quiet_sweeps: false,
+            // `MIN-ENGINES` E3: the paper-events walk off in the two engines.
+            paper_events: false,
             // `COMPACT-INDEX` §5 (frozen C1, §4, §5): today's index; the
             // antichain and the probe memo on wherever `Compact` reads them.
             index: IndexKind::Current,
@@ -509,6 +516,18 @@ impl ConfBuilder {
     /// only.
     pub fn quiet_sweeps(mut self, on: bool) -> Self {
         self.quiet_sweeps = on;
+        self
+    }
+
+    /// `MIN-ENGINES` E3: count the paper's `L` (the largest paper-event count
+    /// of a complete implementation graph) in the stateful and complete-first
+    /// engines. Default `false`: their records report "not counted" and the
+    /// public `ConfCounters::max_paper_events_per_execution` reads 0. Read by
+    /// [`Engine::Stateful`] and [`Engine::CompleteFirst`] for the
+    /// implementation run only; the enumerator and the gated checker count
+    /// `L` regardless.
+    pub fn paper_events(mut self, on: bool) -> Self {
+        self.paper_events = on;
         self
     }
 
@@ -713,6 +732,7 @@ impl ConfBuilder {
             completion_cover: self.completion_cover,
             witness_cache: self.witness_cache,
             quiet_sweeps: self.quiet_sweeps,
+            paper_events: self.paper_events,
             index: self.index,
             antichain: self.antichain,
             probe_memo: self.probe_memo,

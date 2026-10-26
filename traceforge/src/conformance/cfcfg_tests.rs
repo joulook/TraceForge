@@ -267,6 +267,15 @@ fn c02_unbounded_equals_the_committed_engine() {
                 bad.push(format!("{name}: key label {}", r["key"]));
             }
             for (c, w) in cols.iter().zip(want) {
+                // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the grid route
+                // leaves `L` blank (`ConfConfig::paper_events` off); its value is
+                // pinned below with the knob on, in process.
+                if *c == "max_paper_events" {
+                    if !r[*c].is_empty() {
+                        bad.push(format!("{name} {label}: {c} {:?} (blank expected)", r[*c]));
+                    }
+                    continue;
+                }
                 if n(&r, c) != w {
                     bad.push(format!("{name} {label}: {c} {} (pin {w})", r[*c]));
                 }
@@ -281,6 +290,12 @@ fn c02_unbounded_equals_the_committed_engine() {
                     r["admissions"], want[9]
                 ));
             }
+        }
+        let mut cc = cfg_of(X1_CF).conf_config(&f);
+        cc.paper_events = true;
+        let l = cfirst::run_with(&cc, &f.implementation, &f.specification, false).max_paper_events;
+        if l != Some(want[10] as usize) {
+            bad.push(format!("{name}: L with the knob on {l:?} (pin {})", want[10]));
         }
     }
     let f = fixture("apps/a1/correct/spec/n2r2");

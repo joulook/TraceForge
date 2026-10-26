@@ -1559,6 +1559,7 @@ fn sends_graph(n: usize) -> (ExecutionGraph, Vec<String>) {
             cut: false,
             stop_at_first_report: false,
             gate_sink: None,
+            paper_events: false,
         },
         &p,
     );
@@ -1692,6 +1693,7 @@ fn oracle_trace_stream() {
                 cut: false,
                 stop_at_first_report: false,
                 gate_sink: None,
+                paper_events: false,
             },
             program,
         );
@@ -3264,6 +3266,7 @@ fn e1_record() {
                     cut: false,
                     stop_at_first_report: false,
                     gate_sink: None,
+                    paper_events: false,
                 },
                 program,
             );
@@ -3895,6 +3898,7 @@ fn s7_the_set_index_on_one_cell_in_process() {
                 cut: false,
                 stop_at_first_report: false,
                 gate_sink: None,
+                paper_events: false,
             },
             program,
         );
@@ -3957,6 +3961,7 @@ fn s8_insertion_walls() {
             cut: false,
             stop_at_first_report: false,
             gate_sink: None,
+            paper_events: false,
         },
         &f.specification,
     );
@@ -4448,6 +4453,7 @@ fn spec_summaries_in_process(name: &str) -> Vec<CompactSummary> {
             cut: false,
             stop_at_first_report: false,
             gate_sink: None,
+            paper_events: false,
         },
         &f.specification,
     );
@@ -4559,6 +4565,7 @@ fn e1_enumerate(
             cut: false,
             stop_at_first_report: false,
             gate_sink: None,
+            paper_events: false,
         },
         p,
     );

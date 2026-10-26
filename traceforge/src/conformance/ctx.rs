@@ -497,24 +497,36 @@ pub(crate) fn invisible_ops_of_visible_threads(
 /// contributes its create edge, and (M2)'s assumption is not closed in
 /// general.
 ///
-/// Cost: one pass over the graph's communication events per declared visible
-/// name, with an `in_porf` query each. It runs only when `conf.is_some()`, at
-/// `Gate::Completion` and once in `Cover`'s specification-abort arm
-/// (`SVERIFY-P` I1; before I1 at every gate — 21.66 % of the stateful lock
-/// row's instructions, `P5-OWNER-ITEMS.md` O12).
+/// `MIN-ENGINES` E3: a clock test. A communication event `e` of thread `t` is
+/// porf-before the `TCreate` iff the create's cached porf clock `V` has
+/// `e.index <= V[t]` (`in_porf` on a `TCreate` has no special arm, so it is
+/// `cached_porf(create).contains(e)`); the events of `t` in `V` are a prefix,
+/// so one is a communication iff `t`'s **first** communication index is
+/// `<= V[t]`. The violating thread reported is the least in `thread_ids()`
+/// order and the event its first communication — the pair the per-event
+/// loop it replaces (every communication event, an `in_porf` query each)
+/// returned. Cost: a scan of each thread up to its first communication, then
+/// one clock entry per thread per declared name. It runs only when
+/// `conf.is_some()`, at `Gate::Completion` and once in `Cover`'s
+/// specification-abort arm (`SVERIFY-P` I1; before I1 at every gate —
+/// 21.66 % of the stateful lock row's instructions, `P5-OWNER-ITEMS.md` O12).
 pub(crate) fn check_spawn_order(
     graph: &ExecutionGraph,
     visible: &[String],
 ) -> Result<(), VisibleThreadError> {
-    let comm: Vec<Event> = graph
+    // Per thread, the index of its first send or receive, if any.
+    let first: Vec<_> = graph
         .thread_ids()
         .into_iter()
-        .flat_map(|t| (0..graph.thread_size(t) as u32).map(move |i| Event::new(t, i)))
-        .filter(|e| {
-            matches!(
-                graph.label(*e),
-                LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_)
-            )
+        .filter_map(|t| {
+            (0..graph.thread_size(t) as u32)
+                .find(|&i| {
+                    matches!(
+                        graph.label(Event::new(t, i)),
+                        LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_)
+                    )
+                })
+                .map(|i| (t, i))
         })
         .collect();
 
@@ -529,12 +541,13 @@ pub(crate) fn check_spawn_order(
             continue;
         };
         let create = graph.get_thread_tclab(tid).pos();
-        for e in &comm {
-            if graph.in_porf(*e, create) {
+        let clock = graph.label(create).cached_porf();
+        for &(t, i) in &first {
+            if clock.get(t).is_some_and(|v| i <= v) {
                 return Err(VisibleThreadError::SpawnedLate {
                     name: name.clone(),
                     create,
-                    after: *e,
+                    after: Event::new(t, i),
                 });
             }
         }
@@ -765,6 +778,11 @@ pub(crate) struct ConfCtx {
     counters: ConfCounters,
     /// Criterion 13: key-level counters are computed only when set.
     instrument: bool,
+    /// `MIN-ENGINES` E3: the paper-events walk at completion runs in a
+    /// plain-scheduled mode (`ConfMode::plain_scheduling`) only when this is
+    /// set — the engines set it for their implementation run from
+    /// `ConfConfig::paper_events`; every other mode walks regardless.
+    paper_events: bool,
     /// `P4-STATEFUL` T3: the completion sink of an `Enumerate` run.
     sink: Option<CompletionSink>,
     /// How many gates F42's inertness skip suppressed — a *different* reason
@@ -871,6 +889,7 @@ impl ConfCtx {
             spec_error: None,
             counters: ConfCounters::default(),
             instrument,
+            paper_events: false,
             sink: None,
         }
     }
@@ -912,6 +931,7 @@ impl ConfCtx {
             spec_error: None,
             counters: ConfCounters::default(),
             instrument: false,
+            paper_events: false,
             sink: None,
         }
     }
@@ -996,6 +1016,13 @@ impl ConfCtx {
         );
         self.cut = cut;
         self.stop_at_first_report = cut && stop_at_first_report;
+    }
+
+    /// `MIN-ENGINES` E3: count the paper's `L` on this run although its mode
+    /// is plain-scheduled (the implementation run of the stateful and
+    /// complete-first engines with `ConfConfig::paper_events` on).
+    pub(crate) fn set_paper_events(&mut self, on: bool) {
+        self.paper_events = on;
     }
 
     /// `P4-GATED` G1: install the gate sink on the gated checker's outer run.
@@ -1334,13 +1361,19 @@ impl ConfCtx {
             // key is taken only for unpruned ones (a pruned graph carries
             // `Block(ConfPrune)`, on which the canonical form is unreachable).
             self.counters.executions += 1;
-            let paper: usize = g1
-                .thread_ids()
-                .into_iter()
-                .map(|t| paper_events(g1, t))
-                .sum();
-            self.counters.max_paper_events_per_execution =
-                self.counters.max_paper_events_per_execution.max(paper);
+            // `MIN-ENGINES` E3: the paper's `L` is a walk of every label of
+            // every thread; in the three plain-scheduled modes it runs only
+            // with the knob on (the implementation run asked for `L`), never
+            // on a specification side or a sweep.
+            if !self.mode.plain_scheduling() || self.paper_events {
+                let paper: usize = g1
+                    .thread_ids()
+                    .into_iter()
+                    .map(|t| paper_events(g1, t))
+                    .sum();
+                self.counters.max_paper_events_per_execution =
+                    self.counters.max_paper_events_per_execution.max(paper);
+            }
             if self.instrument && !self.pruned {
                 if let Ok(k) = CanonicalGraph::of(g1, &self.visible) {
                     self.counters
@@ -1356,8 +1389,10 @@ impl ConfCtx {
             // `SVERIFY-P` I1: not computed in a [`ConfMode::Enumerate`] run (the
             // stateful engine, both sides), whose counter is off by the owner's
             // ruling; the field stays 0 there and `StatefulCounters` reports
-            // `None`. Every other mode counts as before.
-            if !self.pruned && self.mode != ConfMode::Enumerate {
+            // `None`. `MIN-ENGINES` E3: nor in the complete-first outer run and
+            // sweeps — the three plain-scheduled modes; `CFirstCounters` reports
+            // `None` too. Every other mode counts as before.
+            if !self.pruned && !self.mode.plain_scheduling() {
                 let n = invisible_ops_of_visible_threads(g1, &self.visible);
                 self.counters.invisible_ops_of_visible_threads =
                     self.counters.invisible_ops_of_visible_threads.max(n);

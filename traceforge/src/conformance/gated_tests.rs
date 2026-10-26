@@ -1395,7 +1395,12 @@ fn c01_never_is_complete_first_plus_bookkeeping() {
         );
         let o = grw(&gc, &p.imp, &p.spec, true);
         identities(&o, v, false, GatePolicy::Never, &p.name);
-        let cc = cb(p.config.clone(), v);
+        // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the complete-first
+        // run counts `L` only with `ConfConfig::paper_events` on; under `Never`
+        // the gated run declines every gate and never prunes, so the two `L`
+        // agree as before.
+        let mut cc = cb(p.config.clone(), v);
+        cc.paper_events = true;
         let c = crw(&cc, &p.imp, &p.spec);
         if report_keys(&o, v) != cfirst_report_keys(&c, v) {
             failures.push(format!("{}: report keys", p.name));
@@ -1445,7 +1450,7 @@ fn c01_never_is_complete_first_plus_bookkeeping() {
         if ks != kc {
             failures.push(format!("{}: swept graphs", p.name));
         }
-        if (o.executions, o.max_paper_events, o.impl_end)
+        if (o.executions, Some(o.max_paper_events), o.impl_end)
             != (c.executions, c.max_paper_events, c.impl_end)
         {
             failures.push(format!("{}: executions/L/end", p.name));
@@ -2915,6 +2920,7 @@ fn l2_the_contexts_gate_report_matches_the_sinks() {
                 cut: false,
                 stop_at_first_report: false,
                 gate_sink: Some(gate_sink),
+                paper_events: false,
             },
             &abc(order, None),
         );

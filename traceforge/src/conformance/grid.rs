@@ -2248,7 +2248,8 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "spec_errors", o.spec_errors.len());
             push_d(&mut row, "impl_notes", o.impl_notes.len());
             push_d(&mut row, "executions", o.executions);
-            push_d(&mut row, "max_paper_events", o.max_paper_events);
+            // `MIN-ENGINES` E3: blank unless the knob counted `L`.
+            push_opt(&mut row, "max_paper_events", o.max_paper_events);
             push_d(&mut row, "kept_impl_graphs", o.kept_impl_graphs.len());
             push_d(&mut row, "kept_spec_graphs", o.kept_spec_graphs.len());
             let c = &o.counters;
@@ -2288,7 +2289,8 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "aborted", o.aborted);
             push_d(&mut row, "impl_notes", o.impl_notes.len());
             push_d(&mut row, "executions", o.executions);
-            push_d(&mut row, "max_paper_events", o.max_paper_events);
+            // `MIN-ENGINES` E3: blank unless the knob counted `L`.
+            push_opt(&mut row, "max_paper_events", o.max_paper_events);
             push_d(&mut row, "kept_impl_graphs", o.kept_impl_graphs.len());
             push_d(
                 &mut row,

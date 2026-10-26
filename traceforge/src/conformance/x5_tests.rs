@@ -1282,7 +1282,16 @@ fn c02_verdict_rows_carry_the_run_with_counters() {
                 );
                 for c in cols.iter() {
                     compared += 1;
-                    if raw[*c].is_empty() {
+                    // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the
+                    // complete-first host leaves `L` blank on every route
+                    // (`ConfConfig::paper_events` off): compared (equal), and
+                    // required blank rather than filled.
+                    let blank_l =
+                        *c == "max_paper_events" && cfg.engine == GridEngine::CompleteFirst;
+                    if blank_l && !(raw[*c].is_empty() && fl[*c].is_empty()) {
+                        bad.push(format!("{what}: {c} filled with the knob off"));
+                    }
+                    if raw[*c].is_empty() && !blank_l {
                         bad.push(format!("{what}: run_with left {c} blank"));
                     }
                     if raw[*c] != ver[*c] {
@@ -1291,7 +1300,7 @@ fn c02_verdict_rows_carry_the_run_with_counters() {
                             raw[*c], ver[*c]
                         ));
                     }
-                    if fl[*c].is_empty() {
+                    if fl[*c].is_empty() && !blank_l {
                         bad.push(format!("{what}: the Flat row left {c} blank"));
                     }
                 }
@@ -1531,7 +1540,16 @@ fn check_store(rows: &[Rec]) -> (Vec<String>, Vec<String>) {
             ("executions", "executions"),
             ("max_paper_events", "max_paper_events"),
         ] {
-            if num(f, a).is_none() || num(f, a) != num(s, b) {
+            // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): `L` is blank on
+            // both arms in the complete-first host (`ConfConfig::paper_events` off:
+            // not counted), a number in the gated host.
+            let blank_l = a == "max_paper_events" && !is_gated_key(k);
+            let differs = if blank_l {
+                !(f[a].is_empty() && s[b].is_empty())
+            } else {
+                num(f, a).is_none() || num(f, a) != num(s, b)
+            };
+            if differs {
                 findings.push(format!("outer: {k}: {a} {:?} vs {:?}", f[a], s[b]));
             }
         }
@@ -1692,7 +1710,15 @@ fn measures(f: &Rec, s: &Rec) -> Result<Measures, String> {
         outer: [
             (g(s, "impl_graphs")?, g(f, "impl_graphs")?),
             (g(s, "executions")?, g(f, "executions")?),
-            (g(s, "max_paper_events")?, g(f, "max_paper_events")?),
+            // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): blank on both arms in
+            // the complete-first host (not counted) reads as (0, 0).
+            if gated {
+                (g(s, "max_paper_events")?, g(f, "max_paper_events")?)
+            } else if s["max_paper_events"].is_empty() && f["max_paper_events"].is_empty() {
+                (0, 0)
+            } else {
+                return Err(format!("L counted on a complete-first pair: {}", f["key"]));
+            },
         ],
     })
 }

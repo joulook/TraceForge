@@ -157,8 +157,11 @@ fn invisible_ops(v: &Result<ConfVerdict, ConfError>) -> usize {
 /// engine's `ConfVerdict` leaves the field at `ConfCounters::default()`'s 0 —
 /// not counted, its `StatefulCounters` record is `None` — so its expectation
 /// on this public path is 0; every other engine counts as before.
+/// `MIN-ENGINES` E3 (the tester's re-pin at gate 3): the complete-first engine
+/// counts M8 nowhere either (its sink's computation is gone, its modes are
+/// plain), so its public value is 0 too.
 fn want_ops(e: Eng, n: usize) -> usize {
-    if e == Eng::Stateful {
+    if e == Eng::Stateful || e == Eng::CFirst {
         0
     } else {
         n
@@ -389,7 +392,8 @@ fn grid_counter(r: &GridResult) -> Option<usize> {
     match &r.raw {
         GridRaw::Enumerator(o) => Some(o.counters.invisible_ops_of_visible_threads),
         GridRaw::Stateful(o) => o.counters.invisible_ops_of_visible_threads,
-        GridRaw::CompleteFirst(o) => Some(o.counters.invisible_ops_of_visible_threads),
+        // `MIN-ENGINES` E3: the complete-first record is `None` ("not counted").
+        GridRaw::CompleteFirst(o) => o.counters.invisible_ops_of_visible_threads,
         GridRaw::Gated(o) => Some(o.counters.invisible_ops_of_visible_threads),
         GridRaw::Verdict(v) => Some(invisible_ops(v)),
         GridRaw::Explore(_) => {
@@ -399,10 +403,13 @@ fn grid_counter(r: &GridResult) -> Option<usize> {
 }
 
 /// The expected M8 record of a run whose measured value would be `n`:
-/// `None` on the stateful engine (`SVERIFY-P` I1), `Some(n)` elsewhere.
+/// `None` on the stateful engine (`SVERIFY-P` I1) and, since `MIN-ENGINES` E3
+/// (the tester's re-pin at gate 3), on the complete-first engine, whose
+/// precheck-route `Verdict` row reads the public 0; `Some(n)` elsewhere.
 fn want_counter(r: &GridResult, n: usize) -> Option<usize> {
     match &r.raw {
-        GridRaw::Stateful(_) => None,
+        GridRaw::Stateful(_) | GridRaw::CompleteFirst(_) => None,
+        GridRaw::Verdict(_) if r.config.engine == GridEngine::CompleteFirst => Some(0),
         _ => Some(n),
     }
 }
@@ -1283,6 +1290,7 @@ fn c06_revisit_survivors_keep_their_annotations() {
             cut: false,
             stop_at_first_report: false,
             gate_sink: Some(gate_sink),
+            paper_events: false,
         },
         &survivor(),
     );
@@ -2684,6 +2692,7 @@ fn i1_the_growing_gates_no_longer_guard() {
                 cut: false,
                 stop_at_first_report: false,
                 gate_sink: Some(gate_sink),
+                paper_events: false,
             },
             &p,
         )
@@ -2698,6 +2707,11 @@ fn i1_the_growing_gates_no_longer_guard() {
     );
 }
 
+/// `MIN-ENGINES` E3-7 (c) (the tester's re-pin at gate 3, formerly
+/// `i1_m8_is_off_in_enumerate_and_only_there`): the M8 counter is computed at
+/// `Gate::Completion` in every mode but the three plain ones (`Enumerate`,
+/// `CFirstOuter`, `CFirstSweep`: `ConfMode::plain_scheduling`), where it is 0.
+///
 /// I1-3: the M8 counter is computed at `Gate::Completion` in every mode but
 /// `ConfMode::Enumerate` exactly. One gate-disabled context per mode fires the
 /// completion gate on `mixed/branch`'s implementation graphs (invisible
@@ -2707,7 +2721,7 @@ fn i1_the_growing_gates_no_longer_guard() {
 /// run is the engine with a gate); its counter is pinned through the
 /// enumerator itself, `c01b` and `c10` (the enumerator's 2 and 2r, unchanged).
 #[test]
-fn i1_m8_is_off_in_enumerate_and_only_there() {
+fn e3_m8_is_off_in_the_three_plain_modes_and_only_there() {
     let f = mixed_fixtures()
         .into_iter()
         .find(|f| f.name == "mixed/branch")
@@ -2745,10 +2759,359 @@ fn i1_m8_is_off_in_enumerate_and_only_there() {
             ctx.end_execution();
         }
         let got = ctx.counters().invisible_ops_of_visible_threads;
-        let exp = if mode == ConfMode::Enumerate { 0 } else { want };
+        let exp = if mode.plain_scheduling() { 0 } else { want };
         if got != exp {
             bad.push(format!("{mode:?}: {got} (expected {exp})"));
         }
     }
-    assert!(bad.is_empty(), "conformance: I1-3: {bad:#?}");
+    assert!(bad.is_empty(), "conformance: E3-7 (c): {bad:#?}");
+}
+
+// =========================================================================
+// MIN-ENGINES E3 (tester, gate 3; criteria/MIN-ENGINES-E3.md rev 1.3, derived
+// §E3 items 1–11): the paper-events knob, the spawn-order guard as a clock
+// test, M8 off in the plain modes
+// =========================================================================
+
+/// A line on stderr (the tests' notes; no print macro in `conformance/`).
+fn e3_note(s: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{s}");
+}
+
+/// The E3 fixtures: the five size-2 cells, the four nested pairs (the existing
+/// corpus programs, as E1's record names them, on `Bag`) and the mixed fixtures.
+fn e3_fixtures() -> Vec<Fixture> {
+    let mut out: Vec<Fixture> = [
+        "apps/a1/correct/spec/n2r2",
+        "apps/a2/pb/spec/k2q2",
+        "apps/a3/fifo/spec/k2q2",
+        "apps/a4/hash/a4a/k2q2m2",
+        "2pc/leader/conf/n2",
+    ]
+    .iter()
+    .map(|n| {
+        crate::conformance::eval::fixture_by_name(n)
+            .unwrap_or_else(|e| panic!("conformance: {n}: {}", e.text()))
+    })
+    .collect();
+    let template = out[0].clone();
+    let local = |name: &str, spec: Prog, imp: Prog, v: &[&str]| -> Fixture {
+        let mut f = template.clone();
+        f.name = name.to_owned();
+        f.specification = spec;
+        f.implementation = imp;
+        f.visible = vis(v);
+        f.config = crate::conformance::grid::cfg(ConsType::Bag);
+        f
+    };
+    let nested4 = crate::conformance::stateful_tests::nested4;
+    let race = crate::conformance::selector_tests::nested_race;
+    let chain = || crate::conformance::grid::prog(crate::conformance::selector_tests::deep_chain);
+    let nested = vec![
+        local("e1:nested4/self", nested4(), nested4(), &["p1", "p2"]),
+        local("e1:race/bag", race(false), race(false), &["r"]),
+        local("e1:race-bad/bag", race(false), race(true), &["r"]),
+        local("e1:chain/bag", chain(), chain(), &["r"]),
+    ];
+    out.extend(nested);
+    out.extend(mixed_fixtures());
+    out
+}
+
+/// One of E3-7 (a)'s two exhaustive references (rev 1.3): `engine` with
+/// `stop_at_first_report` off, `early_error_cut` off, `Config::max_iterations`
+/// `None` (the fixture's) and the knob as given — asserted, not assumed.
+fn e3_reference(f: &Fixture, engine: Engine, paper: bool) -> ConfConfig {
+    let cc = ConfBuilder::new()
+        .config(f.config.clone())
+        .visible_threads(f.visible.clone())
+        .engine(engine)
+        .stop_at_first_report(false)
+        .early_error_cut(false)
+        .paper_events(paper)
+        .build()
+        .expect("conformance: an E3 reference configuration is in scope");
+    assert!(
+        cc.config.max_iterations.is_none() && !cc.stop_at_first_report && !cc.early_error_cut,
+        "conformance: E3-7 (a): a reference must be exhaustive ({})",
+        f.name
+    );
+    cc
+}
+
+/// MIN-ENGINES E3-7 (a) (rev 1.3; derived §E3 items 2–3 and note 11): the
+/// paper-events knob. **Off** (the default): the stateful and complete-first
+/// records are `None`, their grid rows' `max_paper_events` blank, the public
+/// counter 0. **On** (`ConfBuilder::paper_events(true)`): `L`, equal between
+/// the two exhaustive references — the stateful run and the complete-first
+/// run, both with `stop_at_first_report` off, the cut off and
+/// `Config::max_iterations = None` — on the five size-2 cells, the four nested
+/// pairs and the mixed fixtures. The enumerator (memo on, unlimited) is
+/// asserted equal to them where it reports nothing (never pruned) and at most
+/// them elsewhere (its prefix maximum, recorded); the gated engine is recorded
+/// only.
+#[test]
+fn e3_the_paper_events_knob() {
+    use crate::conformance::{cfirst, stateful};
+    let mut bad = Vec::new();
+    let (mut asserted, mut informed) = (0usize, 0usize);
+    for f in e3_fixtures() {
+        let (imp, spec) = (&f.implementation, &f.specification);
+        let st_off =
+            stateful::run_with(&e3_reference(&f, Engine::Stateful, false), imp, spec, false);
+        let cf_off =
+            cfirst::run_with(&e3_reference(&f, Engine::CompleteFirst, false), imp, spec, false);
+        if st_off.max_paper_events.is_some() || cf_off.max_paper_events.is_some() {
+            bad.push(format!("{}: L counted with the knob off", f.name));
+        }
+        let st = stateful::run_with(&e3_reference(&f, Engine::Stateful, true), imp, spec, false);
+        let cf =
+            cfirst::run_with(&e3_reference(&f, Engine::CompleteFirst, true), imp, spec, false);
+        let l = st.max_paper_events;
+        if l.is_none() || l == Some(0) || l != cf.max_paper_events {
+            bad.push(format!(
+                "{}: stateful {l:?}, complete-first {:?}",
+                f.name, cf.max_paper_events
+            ));
+        }
+        for e in [GridEngine::Stateful, GridEngine::CompleteFirst] {
+            let row = row_of(&grun(&f, &GridConfig::new(e)));
+            let cell = row.iter().find(|(k, _)| *k == "max_paper_events").map(|(_, v)| v.clone());
+            if cell.as_deref() != Some("") {
+                bad.push(format!("{} {e:?}: row L {cell:?} (blank expected)", f.name));
+            }
+        }
+        let x1 = crate::conformance::eval::x1_config(GridEngine::Enumerator, Selector::Ltr);
+        let r = grun(&f, &x1);
+        let GridRaw::Enumerator(o) = &r.raw else {
+            unreachable!("conformance: enumerator")
+        };
+        let le = o.counters.max_paper_events_per_execution;
+        let l = l.unwrap_or(0);
+        if o.reports.is_empty() {
+            asserted += 1;
+            if le != l {
+                bad.push(format!("{}: enumerator {le} (no report) vs {l}", f.name));
+            }
+        } else {
+            informed += 1;
+            e3_note(&format!(
+                "e3 (a) {}: enumerator {le} with {} reports (pruned; information), exhaustive {l}",
+                f.name,
+                o.reports.len()
+            ));
+            if le > l {
+                bad.push(format!("{}: enumerator {le} > exhaustive {l}", f.name));
+            }
+        }
+        let g = grun(&f, &GridConfig::new(GridEngine::Gated));
+        if let GridRaw::Gated(go) = &g.raw {
+            e3_note(&format!(
+                "e3 (a) {}: gated {} (information), exhaustive {l}",
+                f.name, go.max_paper_events
+            ));
+        }
+    }
+    // The public counter: 0 with the knob off (the owner's ruling (a)), the
+    // in-process `L` with it on.
+    let f = crate::conformance::eval::fixture_by_name("apps/a3/fifo/spec/k2q2")
+        .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let on = e3_reference(&f, Engine::Stateful, true);
+    let l = crate::conformance::stateful::run_with(&on, &f.implementation, &f.specification, false)
+        .max_paper_events
+        .expect("conformance: L with the knob on");
+    for (paper, want) in [(false, 0usize), (true, l)] {
+        let (imp, spec) = (f.implementation.clone(), f.specification.clone());
+        let v = crate::conformance::run(e3_reference(&f, Engine::Stateful, paper), imp, spec);
+        let got = match &v {
+            Ok(ConfVerdict::Conforms(c)) => c.outcome().counters().max_paper_events_per_execution,
+            other => panic!("conformance: E3-7 (a): the public path: {other:?}"),
+        };
+        if got != want {
+            bad.push(format!("public L, knob {paper}: {got} (expected {want})"));
+        }
+    }
+    e3_note(&format!("e3 (a): enumerator asserted on {asserted}, recorded on {informed}"));
+    assert!(asserted > 0 && informed > 0, "conformance: E3-7 (a) vacuous");
+    assert!(bad.is_empty(), "conformance: E3-7 (a): {bad:#?}");
+}
+
+/// The pre-E3 body of `ctx::check_spawn_order` (`ctx.rs` at `36a2719`, lines
+/// 505–548), kept as E3-7 (b)'s reference: one pass collecting every
+/// `SendMsg`/`RecvMsg` in `thread_ids()` order, then per declared name the
+/// first of them `porf`-before its `TCreate`.
+fn e3_reference_spawn_order(
+    graph: &ExecutionGraph,
+    visible: &[String],
+) -> Result<(), crate::conformance::ctx::VisibleThreadError> {
+    use crate::event_label::AsEventLabel as _;
+    let comm: Vec<Event> = graph
+        .thread_ids()
+        .into_iter()
+        .flat_map(|t| (0..graph.thread_size(t) as u32).map(move |i| Event::new(t, i)))
+        .filter(|e| matches!(graph.label(*e), LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_)))
+        .collect();
+    for name in visible {
+        if name == "main" {
+            continue;
+        }
+        let Ok(Some(tid)) = crate::conformance::obs::resolve_visible(graph, name) else {
+            continue;
+        };
+        let create = graph.get_thread_tclab(tid).pos();
+        for e in &comm {
+            if graph.in_porf(*e, create) {
+                return Err(crate::conformance::ctx::VisibleThreadError::SpawnedLate {
+                    name: name.clone(),
+                    create,
+                    after: *e,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// MIN-ENGINES E3-7 (b) (derived §E3 items 4–6): the landed guard against the
+/// reference, `Result` for `Result`, on every complete graph (both sides, the
+/// stateful engine's kept graphs) of the E3 fixtures, and on one graph each of
+/// a late spawn, an unordered spawn and a spawn whose least violating thread is
+/// not `main` (two candidates); under the declared list, under `main` plus
+/// every named thread, and under `main` plus each named thread alone, so real
+/// graphs give violations with varied payloads. Also `cached_porf(create)` =
+/// `porf(create)` on every named thread. Non-vacuous: violations compared.
+#[test]
+fn e3_the_clock_test_equals_the_reference() {
+    use crate::conformance::ctx::check_spawn_order;
+    use crate::conformance::testing::run_once;
+    use crate::event_label::AsEventLabel as _;
+    let mut graphs: Vec<(String, ExecutionGraph, Vec<String>)> = Vec::new();
+    for f in e3_fixtures() {
+        let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+        let (imp, spec) = (&f.implementation, &f.specification);
+        let o = crate::conformance::stateful::run_with(&cc, imp, spec, true);
+        for g in o.kept_spec_graphs.iter().chain(o.kept_impl_graphs.iter()) {
+            graphs.push((f.name.clone(), g.clone(), f.visible.clone()));
+        }
+    }
+    let late = run_once(cfg(ConsType::FIFO), || {
+        let a = named("a", || {
+            let _: u64 = crate::recv_msg_block();
+        });
+        crate::send_msg(a.thread().id(), 1u64);
+        named("late", || {});
+    });
+    graphs.push(("late".into(), late, vis(&["main", "late"])));
+    let unordered = run_once(cfg(ConsType::FIFO), || {
+        let m = crate::thread::current().id();
+        named("x", move || crate::send_msg(m, 1u64));
+        named("w", || {});
+        let _: Option<u64> = crate::recv_msg();
+    });
+    graphs.push(("unordered".into(), unordered, vis(&["main", "w"])));
+    // `p` (t1) receives from `x` (t2) and then spawns `v`: `v`'s create is
+    // porf-after a communication of t1 and of t2, and of none of `main`'s.
+    let two = run_once(cfg(ConsType::FIFO), || {
+        let p = named("p", || {
+            let _: u64 = crate::recv_msg_block();
+            named("v", || {});
+        });
+        let pid = p.thread().id();
+        named("x", move || crate::send_msg(pid, 2u64));
+    });
+    graphs.push(("two".into(), two, vis(&["main", "v"])));
+    let (mut compared, mut errs) = (0usize, 0usize);
+    let mut bad = Vec::new();
+    for (name, g, declared) in &graphs {
+        let names: Vec<String> = g
+            .thread_ids()
+            .into_iter()
+            .filter_map(|t| g.get_thread_tclab(t).name().clone())
+            .filter(|n| n != "main")
+            .collect();
+        let mut lists = vec![declared.clone()];
+        let mut all = vis(&["main"]);
+        all.extend(names.iter().cloned());
+        lists.push(all);
+        for n in &names {
+            lists.push(vec!["main".to_owned(), n.clone()]);
+        }
+        for v in &lists {
+            let (want, got) = (e3_reference_spawn_order(g, v), check_spawn_order(g, v));
+            compared += 1;
+            errs += usize::from(want.is_err());
+            if want != got {
+                bad.push(format!("{name} {v:?}: reference {want:?}, landed {got:?}"));
+            }
+        }
+        for t in g.thread_ids() {
+            if g.get_thread_tclab(t).name().as_deref() == Some("main") {
+                continue;
+            }
+            let create = g.get_thread_tclab(t).pos();
+            if g.label(create).cached_porf() != &g.porf(create) {
+                bad.push(format!("{name}: cached_porf ≠ porf at {create}"));
+            }
+        }
+    }
+    let two_err = check_spawn_order(&graphs.last().unwrap().1, &vis(&["main", "v"]));
+    e3_note(&format!(
+        "e3 (b): {} graphs, {compared} comparisons, {errs} violations; two: {two_err:?}",
+        graphs.len()
+    ));
+    assert!(errs > 0, "conformance: E3-7 (b) vacuous: no violation compared");
+    assert!(bad.is_empty(), "conformance: E3-7 (b): {bad:#?}");
+}
+
+/// MIN-ENGINES E3-7 (c), the records: on `mixed/server/r1/annotated` the
+/// complete-first record is `None` (M8 computed nowhere) and its public value
+/// 0, while the gated engine still counts the invisible operations (§5).
+#[test]
+fn e3_complete_first_counts_no_m8() {
+    let f = mixed_fixtures()
+        .into_iter()
+        .find(|f| f.name == "mixed/server/r1/annotated")
+        .expect("conformance: the annotated server pair is a registry entry");
+    let r = grun(&f, &GridConfig::new(GridEngine::CompleteFirst));
+    let GridRaw::CompleteFirst(o) = &r.raw else {
+        unreachable!("conformance: complete-first")
+    };
+    let g = grun(&f, &GridConfig::new(GridEngine::Gated));
+    let GridRaw::Gated(go) = &g.raw else {
+        unreachable!("conformance: gated")
+    };
+    let gated = go.counters.invisible_ops_of_visible_threads;
+    assert!(gated > 0, "conformance: E3-7 (c) vacuous: the gated engine counts {gated}");
+    assert_eq!(o.counters.invisible_ops_of_visible_threads, None, "conformance: E3-7 (c)");
+    let cc = e3_reference(&f, Engine::CompleteFirst, false);
+    let v = crate::conformance::run(cc, f.implementation.clone(), f.specification.clone());
+    assert_eq!(invisible_ops(&v), 0, "conformance: E3-7 (c): the public value");
+}
+
+/// MIN-ENGINES E3-7 (d), the source: the stateful sink calls no
+/// `paper_events` walk, the complete-first sink no
+/// `invisible_ops_of_visible_threads`, and the context's two completion
+/// conditions name `plain_scheduling`.
+#[test]
+fn e3_the_sinks_no_longer_walk() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance");
+    let read = |f: &str| {
+        std::fs::read_to_string(dir.join(f)).unwrap_or_else(|e| panic!("conformance: {f}: {e}"))
+    };
+    let (st, cf, ctx) = (read("stateful.rs"), read("cfirst.rs"), read("ctx.rs"));
+    assert!(!st.contains("paper_events(g"), "conformance: the stateful sink walks");
+    assert!(!st.contains("selector::paper_events"), "conformance: stateful.rs imports the walk");
+    assert!(
+        !cf.contains("invisible_ops_of_visible_threads(g"),
+        "conformance: the complete-first sink computes M8"
+    );
+    assert!(
+        ctx.contains("if !self.mode.plain_scheduling() || self.paper_events {"),
+        "conformance: the paper-events condition"
+    );
+    assert!(
+        ctx.contains("if !self.pruned && !self.mode.plain_scheduling() {"),
+        "conformance: the M8 condition"
+    );
 }

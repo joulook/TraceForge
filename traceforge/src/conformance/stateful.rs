@@ -55,7 +55,6 @@ use crate::conformance::report::{
     build_report_for, replay_snapshot, ConfCounters, ConfError, ConfNote, ConfOutcome, ConfVerdict,
     Diagnostics, ReplaySnapshot, SearchEnd, SpecErrFreedom, StatefulCounters,
 };
-use crate::conformance::selector::paper_events;
 use crate::conformance::sig::{SigBuckets, Summary, VisOrder};
 use crate::event::Event;
 use crate::exec_graph::ExecutionGraph;
@@ -90,8 +89,9 @@ pub(crate) struct StatefulOutcome {
     pub(crate) impl_notes: Vec<Diagnostic>,
     /// Impl executions seen at `Completion` (the enumerator's `executions`).
     pub(crate) executions: usize,
-    /// The paper's `L` over the Impl run.
-    pub(crate) max_paper_events: usize,
+    /// The paper's `L` over the Impl run — `Some` iff `ConfConfig::paper_events`
+    /// is on (`MIN-ENGINES` E3; `None` = not counted).
+    pub(crate) max_paper_events: Option<usize>,
 }
 
 /// What a completion sink accumulates (T3), shared with [`run_with`] through
@@ -119,7 +119,6 @@ struct SinkState {
     reports: Vec<(ExecutionGraph, ReplaySnapshot)>,
     kept: Vec<ExecutionGraph>,
     executions: usize,
-    max_paper_events: usize,
 }
 
 /// The public path: [`run_with`] with `keep_graphs = false`, then the
@@ -182,7 +181,8 @@ pub(crate) fn run(
 
     let counters = ConfCounters {
         executions: out.executions,
-        max_paper_events_per_execution: out.max_paper_events,
+        // `MIN-ENGINES` E3: 0 when not counted (the knob off), as M8 below.
+        max_paper_events_per_execution: out.max_paper_events.unwrap_or(0),
         wall_time_ms: started.elapsed().as_millis(),
         // `SVERIFY-P` I1: the M8 counter is off in this engine's `Enumerate`
         // runs; the field keeps the default 0 like every other field this
@@ -288,6 +288,7 @@ pub(crate) fn run_with(
             cut: false,
             stop_at_first_report: false,
             gate_sink: None,
+            paper_events: false,
         },
         specification,
     );
@@ -357,7 +358,7 @@ pub(crate) fn run_with(
             spec_errors,
             impl_notes: Vec::new(),
             executions: 0,
-            max_paper_events: 0,
+            max_paper_events: None,
         };
     }
 
@@ -381,8 +382,8 @@ pub(crate) fn run_with(
             let current = (!compact_on).then(|| summarise(g, &visible, "implementation"));
             let mut st = state.borrow_mut();
             st.executions += 1;
-            let paper: usize = g.thread_ids().into_iter().map(|t| paper_events(g, t)).sum();
-            st.max_paper_events = st.max_paper_events.max(paper);
+            // `MIN-ENGINES` E3: the paper's `L` was walked here too; the Impl
+            // run's context counts it, with the knob on (`paper_events`).
             // `P4-MIXED` M8 was computed here; `SVERIFY-P` I1 turns the
             // counter off in every `Enumerate` run (`StatefulCounters::
             // invisible_ops_of_visible_threads` is `None`).
@@ -499,6 +500,7 @@ pub(crate) fn run_with(
             cut: false,
             stop_at_first_report: false,
             gate_sink: None,
+            paper_events: cc.paper_events,
         },
         implementation,
     );
@@ -535,7 +537,9 @@ pub(crate) fn run_with(
         spec_errors: Vec::new(),
         impl_notes: impl_run.diagnostics,
         executions: st.executions,
-        max_paper_events: st.max_paper_events,
+        // `MIN-ENGINES` E3: the Impl run's context counted `L` iff the knob is on
+        // (`Enumerate` never prunes, so every completion the sink saw counted).
+        max_paper_events: cc.paper_events.then_some(impl_run.max_paper_events),
     }
 }
 
@@ -590,6 +594,9 @@ pub(crate) struct EnumRun {
     pub(crate) stop_at_first_report: bool,
     /// `P4-GATED` G1: the gate sink; `GatedOuter` only.
     pub(crate) gate_sink: Option<GateSink>,
+    /// `MIN-ENGINES` E3: count the paper's `L` on this plain-scheduled run
+    /// (the implementation run with `ConfConfig::paper_events` on).
+    pub(crate) paper_events: bool,
 }
 
 /// One enumerating run of `program` (T1): the oracle's `Collect` mechanism in
@@ -603,6 +610,7 @@ pub(crate) fn enumerate(run: EnumRun, program: &Arc<dyn Fn() + Send + Sync>) -> 
         cut,
         stop_at_first_report,
         gate_sink,
+        paper_events,
     } = run;
     assert!(
         mode.enumerates(),
@@ -613,6 +621,7 @@ pub(crate) fn enumerate(run: EnumRun, program: &Arc<dyn Fn() + Send + Sync>) -> 
     let must = Rc::new(RefCell::new(Must::new(config.clone(), false)));
     let mut ctx = ConfCtx::gate_disabled(config, visible, mode);
     ctx.set_sink(sink);
+    ctx.set_paper_events(paper_events);
     if mode == ConfMode::CFirstOuter {
         ctx.set_cut(cut, stop_at_first_report);
     }
