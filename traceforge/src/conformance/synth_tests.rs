@@ -557,7 +557,7 @@ fn projection(g: &ExecutionGraph, vis: &[String]) -> Vec<(String, Vec<String>)> 
 
 fn summary(g: &ExecutionGraph, vis: &[String]) -> Summary {
     let w = wobs(g, vis).unwrap_or_else(|e| panic!("conformance: no words: {e:?}"));
-    Summary::of(CompleteExecution::assume_finished_at_gate(g), &w, vis)
+    Summary::of(CompleteExecution::assume_finished_at_gate(g), w, vis)
         .unwrap_or_else(|e| panic!("conformance: no summary: {e:?}"))
 }
 

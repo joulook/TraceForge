@@ -19,7 +19,7 @@ use crate::conformance::search::{Cover, Search, SearchOpts};
 use crate::conformance::selector::paper_events;
 use crate::conformance::selector::InnerOrder;
 use crate::event::Event;
-use crate::event_label::{AsEventLabel, LabelEnum};
+use crate::event_label::LabelEnum;
 use crate::exec_graph::ExecutionGraph;
 use crate::must::MustState;
 use crate::Config;
@@ -540,7 +540,7 @@ pub(crate) fn check_spawn_order(
         let Ok(Some(tid)) = resolve_visible(graph, name) else {
             continue;
         };
-        let create = graph.get_thread_tclab(tid).pos();
+        let create = graph.thread_create_pos(tid);
         let clock = graph.label(create).cached_porf();
         for &(t, i) in &first {
             if clock.get(t).is_some_and(|v| i <= v) {

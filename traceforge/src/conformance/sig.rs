@@ -45,14 +45,20 @@
 //! declared visible thread never has `rf = None`.
 //!
 //! **`Val` cannot be hashed.** It is `Box<dyn Message>`, equal only through
-//! `msg_equals`, so a signature cannot key a hash map directly. [`SigKey`] is a
-//! *projection* — the hashable shape of a signature — with the single guarantee
-//! `sig(a) == sig(b)` ⟹ `key(a) == key(b)`, which holds because `msg_equals`
-//! downcasts to one concrete `T` and equal values therefore share
-//! `type_name::<T>()`. The converse is not claimed; [`SigBuckets`] resolves a
-//! bucket by full [`Sig`] equality.
+//! `msg_equals`, so a signature cannot key a hash map directly. [`Sig::hash128`]
+//! is a one-pass 128-bit hash of the signature's *shape* — per name the word's
+//! length and each observation's kind, ⊥ and concrete message type, and the
+//! statuses — with the single guarantee `sig(a) == sig(b)` ⟹ `hash(a) == hash(b)`,
+//! which holds because `msg_equals` downcasts to one concrete `T` and equal values
+//! therefore share `T`'s `TypeId`. The hash reads that `TypeId`, never the public
+//! `Val::type_name` string, which a caller may change without changing equality
+//! (`MIN-ENGINES-E4-CODE` round 01 M1). The converse is not claimed; [`SigBuckets`] resolves
+//! a bucket by full [`Sig`] equality. (`MIN-ENGINES` E4; before it a projection
+//! of the shape was built from cloned strings and hashed twice.)
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 
 use crate::conformance::morphism::{self, statuses, CompleteExecution, Status};
 use crate::conformance::obs::{is_visible, Obs, ObsError, Wobs};
@@ -163,27 +169,40 @@ pub(crate) struct Sig {
 impl Sig {
     pub(crate) fn of(
         exec: CompleteExecution<'_>,
-        wobs: &Wobs,
+        wobs: Wobs,
         visible: &[String],
     ) -> Result<Self, ObsError> {
         // Statuses first: it is the call that refuses an unspawned declared
         // thread, which on a complete graph is a §8 violation rather than an
         // empty row.
-        let statuses = statuses(exec, wobs, visible)?;
-        let mut words = BTreeMap::new();
+        let statuses = statuses(exec, &wobs, visible)?;
+        Ok(Self::from_rows(statuses, wobs, visible))
+    }
+
+    /// `MIN-ENGINES` E4: the signature from its statuses and the rows, which it
+    /// **takes** — the names and the observations `observe` built move in, the
+    /// one clone per value — after every borrowing use of the `Wobs` has run.
+    pub(crate) fn from_rows(
+        statuses: BTreeMap<String, Status>,
+        wobs: Wobs,
+        visible: &[String],
+    ) -> Self {
         for name in visible {
-            let row = wobs.row(name).unwrap_or_else(|| {
-                panic!(
-                    "conformance: `{name}` is not in this wobs; the declared-visible \
-                     list does not match what was extracted"
-                )
-            });
-            words.insert(
-                name.clone(),
-                row.observations().iter().map(|(_, o)| o.clone()).collect(),
+            assert!(
+                wobs.row(name).is_some(),
+                "conformance: `{name}` is not in this wobs; the declared-visible \
+                 list does not match what was extracted"
             );
         }
-        Ok(Self { words, statuses })
+        let words = wobs
+            .into_rows()
+            .into_iter()
+            .map(|(name, row)| {
+                let word: Vec<Obs> = row.into_observations().into_iter().map(|(_, o)| o).collect();
+                (name, word)
+            })
+            .collect();
+        Self { words, statuses }
     }
 
     pub(crate) fn word(&self, name: &str) -> &[Obs] {
@@ -194,79 +213,59 @@ impl Sig {
         self.statuses.get(name).copied()
     }
 
-    /// The hashable projection. `sig(a) == sig(b)` implies `a.key() == b.key()`;
-    /// nothing is claimed the other way.
-    pub(crate) fn key(&self) -> SigKey {
-        SigKey {
-            words: self
-                .words
-                .iter()
-                .map(|(t, w)| (t.clone(), w.iter().map(ObsShape::of).collect()))
-                .collect(),
-            statuses: self
-                .statuses
-                .iter()
-                .map(|(t, s)| (t.clone(), StatusKey::of(*s)))
-                .collect(),
+    /// `MIN-ENGINES` E4: the 128-bit hash of the signature's shape in one pass —
+    /// per name (in `BTreeMap` order) its length and bytes, the word's length,
+    /// and per observation a kind tag (0 send, 1 receive, 2 receive of ⊥) and
+    /// the concrete message type's `TypeId`; then per status name its bytes and
+    /// a tag — fed to two seeded `DefaultHasher`s (the seeds of the former
+    /// `hash128`), no string built. `sig(a) == sig(b)` implies equal hashes:
+    /// the hash reads only kind, ⊥, the `TypeId` and the status; `msg_equals`
+    /// downcasts to one concrete type, so equal values share the `TypeId` — the
+    /// public `Val::type_name` string, which equality ignores and a caller may
+    /// change, is deliberately not read (`MIN-ENGINES-E4-CODE` round 01 M1).
+    /// Nothing is claimed the other way.
+    pub(crate) fn hash128(&self) -> u128 {
+        fn put(a: &mut DefaultHasher, b: &mut DefaultHasher, bytes: &[u8]) {
+            a.write(bytes);
+            b.write(bytes);
         }
+        let mut a = DefaultHasher::new();
+        let mut b = DefaultHasher::new();
+        a.write_u64(0x5f3759df);
+        b.write_u64(0x9e3779b97f4a7c15);
+        for (name, word) in &self.words {
+            put(&mut a, &mut b, &(name.len() as u64).to_le_bytes());
+            put(&mut a, &mut b, name.as_bytes());
+            put(&mut a, &mut b, &(word.len() as u64).to_le_bytes());
+            for o in word {
+                let (tag, ty) = match o {
+                    Obs::Send(v) => (0u8, Some(v.as_any_ref().type_id())),
+                    Obs::Recv(Some(v)) => (1, Some(v.as_any_ref().type_id())),
+                    Obs::Recv(None) => (2, None),
+                };
+                put(&mut a, &mut b, &[tag]);
+                if let Some(ty) = ty {
+                    ty.hash(&mut a);
+                    ty.hash(&mut b);
+                }
+            }
+        }
+        for (name, s) in &self.statuses {
+            put(&mut a, &mut b, &(name.len() as u64).to_le_bytes());
+            put(&mut a, &mut b, name.as_bytes());
+            put(&mut a, &mut b, &[match s {
+                Status::Errored => 0,
+                Status::Done => 1,
+                Status::Blocked => 2,
+            }]);
+        }
+        ((a.finish() as u128) << 64) | b.finish() as u128
     }
 }
 
-/// The shape of one observation: its kind, its Rust type name, and whether a
-/// receive read ⊥. Two observations with equal shape may still differ in value.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ObsShape {
-    Send {
-        type_name: String,
-    },
-    /// `None` is ⊥.
-    Recv {
-        type_name: Option<String>,
-    },
-}
-
-impl ObsShape {
-    fn of(o: &Obs) -> Self {
-        match o {
-            Obs::Send(v) => ObsShape::Send {
-                type_name: v.type_name.clone(),
-            },
-            Obs::Recv(v) => ObsShape::Recv {
-                type_name: v.as_ref().map(|v| v.type_name.clone()),
-            },
-        }
-    }
-}
-
-/// The hashable projection of a [`Sig`]. See the module doc for what it does
-/// and does not guarantee.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct SigKey {
-    words: Vec<(String, Vec<ObsShape>)>,
-    statuses: Vec<(String, StatusKey)>,
-}
-
-/// `Status` as a hash key; `morphism::Status` itself derives no `Hash`, and
-/// this module does not widen that type's derives.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum StatusKey {
-    Errored,
-    Done,
-    Blocked,
-}
-
-impl StatusKey {
-    fn of(s: Status) -> Self {
-        match s {
-            Status::Errored => StatusKey::Errored,
-            Status::Done => StatusKey::Done,
-            Status::Blocked => StatusKey::Blocked,
-        }
-    }
-}
-
-/// A map keyed by signature, resolved exactly: `SigKey → [(Sig, T)]`, grouped
-/// by **full** `Sig` inside a bucket.
+/// A map keyed by signature, resolved exactly: `Sig::hash128 → [(Sig, T)]`,
+/// grouped by **full** `Sig` inside a bucket (`MIN-ENGINES` E4: the key was
+/// a projection of the shape).
 ///
 /// This is what makes §8.3's cost claim survive the projection: on `ex:naive`
 /// a lookup costs one signature comparison per bucket member and no
@@ -274,7 +273,7 @@ impl StatusKey {
 /// slot. The stateful index of Part 3 is `SigBuckets<BTreeSet<VisOrder>>`.
 #[derive(Clone, Debug)]
 pub(crate) struct SigBuckets<T> {
-    buckets: HashMap<SigKey, Vec<(Sig, T)>>,
+    buckets: HashMap<u128, Vec<(Sig, T)>>,
     len: usize,
 }
 
@@ -294,7 +293,7 @@ impl<T> SigBuckets<T> {
 
     /// The slot whose `Sig` equals `sig`, created with `make()` if absent.
     pub(crate) fn entry(&mut self, sig: Sig, make: impl FnOnce() -> T) -> &mut T {
-        let bucket = self.buckets.entry(sig.key()).or_default();
+        let bucket = self.buckets.entry(sig.hash128()).or_default();
         let at = match bucket.iter().position(|(s, _)| *s == sig) {
             Some(i) => i,
             None => {
@@ -309,7 +308,7 @@ impl<T> SigBuckets<T> {
     /// The slot whose `Sig` equals `sig`, if any.
     pub(crate) fn get(&self, sig: &Sig) -> Option<&T> {
         self.buckets
-            .get(&sig.key())
+            .get(&sig.hash128())
             .and_then(|b| b.iter().find(|(s, _)| s == sig))
             .map(|(_, t)| t)
     }
@@ -319,7 +318,7 @@ impl<T> SigBuckets<T> {
         self.len
     }
 
-    /// The number of `SigKey` hash buckets — coarser than [`SigBuckets::len`],
+    /// The number of hash buckets — coarser than [`SigBuckets::len`],
     /// which counts full-`Sig` slots (`P4-STATEFUL` criterion 8).
     pub(crate) fn key_buckets(&self) -> usize {
         self.buckets.len()
@@ -360,12 +359,16 @@ pub(crate) struct Summary {
 impl Summary {
     pub(crate) fn of(
         exec: CompleteExecution<'_>,
-        wobs: &Wobs,
+        wobs: Wobs,
         visible: &[String],
     ) -> Result<Self, ObsError> {
+        // `MIN-ENGINES` E4: the statuses (the §8 refusal first, as before) and
+        // the order borrow the rows; the signature then takes them.
+        let statuses = statuses(exec, &wobs, visible)?;
+        let ord = ord(exec.graph(), &wobs, visible);
         Ok(Self {
-            sig: Sig::of(exec, wobs, visible)?,
-            ord: ord(exec.graph(), wobs, visible),
+            sig: Sig::from_rows(statuses, wobs, visible),
+            ord,
         })
     }
 }

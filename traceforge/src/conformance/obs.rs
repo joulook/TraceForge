@@ -45,11 +45,43 @@ use crate::thread::ThreadId;
 /// both sides of every comparison the algorithm performs. That is a property
 /// of the matching — if the matching ever stops being thread-preserving, this
 /// reasoning lapses with it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) enum Obs {
     Send(Val),
     /// `None` is ⊥: a receive that read nothing.
     Recv(Option<Val>),
+}
+
+// `MIN-ENGINES` E4-6 (b), test builds only: how many times this thread cloned
+// an `Obs` — `observe` constructs one from the graph's value (not a clone of
+// an `Obs`), so this counts the *second* clones the tester asserts are gone
+// from every engine's summary path.
+#[cfg(test)]
+thread_local! {
+    static OBS_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `MIN-ENGINES` E4-6 (b), test builds only: the thread's `Obs` clones.
+#[cfg(test)]
+pub(crate) fn obs_clones_for_test() -> usize {
+    OBS_CLONES.with(|c| c.get())
+}
+
+/// `MIN-ENGINES` E4-6 (b), test builds only: reset the count.
+#[cfg(test)]
+pub(crate) fn reset_obs_clones_for_test() {
+    OBS_CLONES.with(|c| c.set(0));
+}
+
+impl Clone for Obs {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        OBS_CLONES.with(|c| c.set(c.get() + 1));
+        match self {
+            Obs::Send(v) => Obs::Send(v.clone()),
+            Obs::Recv(v) => Obs::Recv(v.clone()),
+        }
+    }
 }
 
 impl Obs {
@@ -122,6 +154,15 @@ impl Row {
         }
     }
 
+    /// `MIN-ENGINES` E4: the row's observations, taken (the signature owns
+    /// them instead of cloning them); unspawned reads as empty.
+    pub(crate) fn into_observations(self) -> Vec<(Event, Obs)> {
+        match self {
+            Row::Resolved(_, evs) => evs,
+            Row::Unspawned => Vec::new(),
+        }
+    }
+
     pub(crate) fn is_unspawned(&self) -> bool {
         matches!(self, Row::Unspawned)
     }
@@ -147,6 +188,12 @@ pub(crate) struct Wobs {
 impl Wobs {
     pub(crate) fn row(&self, name: &str) -> Option<&Row> {
         self.rows.get(name)
+    }
+
+    /// `MIN-ENGINES` E4: the rows, taken — the signature's constructor moves
+    /// the names and the observations out instead of cloning them.
+    pub(crate) fn into_rows(self) -> BTreeMap<String, Row> {
+        self.rows
     }
 
     /// The observation values of `name`, unspawned reading as empty.
@@ -202,7 +249,7 @@ pub(crate) fn resolve_visible(
 fn resolve(graph: &ExecutionGraph, name: &str) -> Result<Option<ThreadId>, ObsError> {
     let mut found = None;
     for tid in graph.thread_ids() {
-        if graph.get_thread_tclab(tid).name().as_deref() == Some(name) {
+        if graph.thread_name(tid) == Some(name) {
             if found.is_some() {
                 return Err(ObsError::AmbiguousName {
                     name: name.to_owned(),
@@ -309,10 +356,9 @@ pub(crate) fn is_visible(graph: &ExecutionGraph, e: Event, visible: &[String]) -
         LabelEnum::RecvMsg(l) => l.annotation(),
         _ => return false,
     };
+    // `MIN-ENGINES` E4: the name borrowed from the graph, no label clone.
     let named = graph
-        .get_thread_tclab(e.thread)
-        .name()
-        .as_deref()
+        .thread_name(e.thread)
         .is_some_and(|n| visible.iter().any(|v| v == n));
     named
         && match annotation {
@@ -351,16 +397,14 @@ pub(crate) fn check_annotation_at(
     if annotation != Annotation::Explicit(Visibility::Visible) {
         return Ok(());
     }
-    let name: Option<String> = graph.get_thread_tclab(pos.thread).name().clone();
-    let declared = name
-        .as_deref()
-        .is_some_and(|n| visible.iter().any(|v| v == n));
+    let name = graph.thread_name(pos.thread);
+    let declared = name.is_some_and(|n| visible.iter().any(|v| v == n));
     if declared {
         return Ok(());
     }
     Err(
         crate::conformance::ctx::VisibleThreadError::UndeclaredVisible {
-            thread: name.unwrap_or_else(|| pos.thread.to_string()),
+            thread: name.map_or_else(|| pos.thread.to_string(), str::to_owned),
             pos,
             site: site.to_owned(),
         },

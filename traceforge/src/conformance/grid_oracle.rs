@@ -134,7 +134,10 @@ pub(super) struct Families {
 }
 
 fn summary_of(g: &ExecutionGraph, w: &Wobs, visible: &[String]) -> Summary {
-    Summary::of(CompleteExecution::assume_finished_at_gate(g), w, visible)
+    // `MIN-ENGINES` E4: the families keep the spec graphs' `Wobs`, and this
+    // shared helper clones its `Wobs` for the signature to take on every call
+    // (counted: one `Wobs` clone per family graph, spec and impl — test-side).
+    Summary::of(CompleteExecution::assume_finished_at_gate(g), w.clone(), visible)
         .unwrap_or_else(|e| panic!("conformance: no summary for a complete grid graph: {e:?}"))
 }
 

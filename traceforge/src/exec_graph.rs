@@ -329,6 +329,16 @@ impl ExecutionGraph {
         self.get_thr(&tid).tclab.clone()
     }
 
+    /// `MIN-ENGINES` E4: the thread's declared name, borrowed — no label clone.
+    pub(crate) fn thread_name(&self, tid: ThreadId) -> Option<&str> {
+        self.get_thr(&tid).tclab.name().as_deref()
+    }
+
+    /// `MIN-ENGINES` E4: the position of the thread's create event — no label clone.
+    pub(crate) fn thread_create_pos(&self, tid: ThreadId) -> Event {
+        self.get_thr(&tid).tclab.pos()
+    }
+
     pub(crate) fn tid_for_spawn(&self, pos: &Event, origination_vec: &[u32]) -> ThreadId {
         assert_eq!(origination_vec.last(), Some(&pos.index));
 

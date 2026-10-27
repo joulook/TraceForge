@@ -18,8 +18,10 @@
 //! beyond `u16::MAX` visible events is refused (gate 4 B2).
 //!
 //! **The bucket key** (phase 2 D1, P2-frozen §1) is a 128-bit hash of the
-//! signature's **shape**, [`SigKey`] (`sig.rs`: per thread the observation
-//! shapes and the status), through its derived `Hash` — never of a rendering.
+//! signature's **shape** (`Sig::hash128`, `sig.rs`: per thread the observation
+//! shapes and the status, walked once into two seeded hashers — `MIN-ENGINES`
+//! E4; before it a projection of the shape through a derived `Hash`) — never of
+//! a rendering.
 //! `sig(a) == sig(b)` implies `key(a) == key(b)`, so equal signatures always
 //! meet in one bucket; unequal signatures of one shape share it, each in its
 //! own **slot**, resolved by `Sig ==` (`msg_equals`) at every insertion and
@@ -27,13 +29,14 @@
 //! signature miss, never an answer. A 128-bit collision between two shapes
 //! only puts them in one bucket, where `Sig ==` still separates them.
 //!
-//! **The rendering hint** (P3, P2-frozen §7). Each bucket maps a 64-bit hash
-//! of a signature's `Debug` rendering to slot indices; resolution tries the
-//! hinted slots first and then the others, all by `Sig ==`, so the hint
-//! orders candidates and decides nothing. A slot found only by the second
-//! pass is an alias (equal signatures, different renderings), recorded in the
-//! hint and counted. Under the `print_vals` feature only; without it there is
-//! no rendering and resolution is the plain scan.
+//! **The rendering hint** (P3, P2-frozen §7) — gone since `MIN-ENGINES` E4.
+//! Each bucket mapped a 64-bit hash of a signature's `Debug` rendering to slot
+//! indices (under the `print_vals` feature only); resolution tried the hinted
+//! slots first and then the others, all by `Sig ==`, so the hint ordered
+//! candidates and decided nothing, and a slot found only by the second pass
+//! was an alias, counted. Now `render_hash` is `None` under both feature
+//! sets, the hint maps stay empty, resolution is the plain creation-order
+//! scan, `sig_aliases` is 0 and `sig_tests` counts to the hit's position + 1.
 //!
 //! **Signature ids** (P1, P2; P2-frozen §7). Only an insertion creates a slot,
 //! with a run-wide `sig_id` (allocation checked); a query never creates one.
@@ -78,14 +81,13 @@
 //! slots' own admission order.
 
 use std::cmp::Ordering;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 
 use crate::conformance::config::{BucketKind, Capacity};
-use crate::conformance::morphism::CompleteExecution;
+use crate::conformance::morphism::{statuses, CompleteExecution};
 use crate::conformance::obs::{wobs, Wobs};
-use crate::conformance::sig::{Sig, SigKey};
+use crate::conformance::sig::Sig;
 use crate::exec_graph::ExecutionGraph;
 
 /// The bucket key: a 128-bit hash of the signature's shape (P2-frozen §1).
@@ -98,39 +100,11 @@ pub(crate) type SigId = u32;
 /// counts)` (P2-frozen §1, §7).
 pub(crate) type MemoKey = (SigId, OrdCounts);
 
-/// Two seeded 64-bit `DefaultHasher` values of the shape `key` through its
-/// derived `Hash` (the seeds of `witness.rs::fingerprint_of`).
-fn hash128(key: &SigKey) -> u128 {
-    let mut a = DefaultHasher::new();
-    0x5f3759dfu64.hash(&mut a);
-    key.hash(&mut a);
-    let mut b = DefaultHasher::new();
-    0x9e3779b97f4a7c15u64.hash(&mut b);
-    key.hash(&mut b);
-    ((a.finish() as u128) << 64) | b.finish() as u128
-}
-
-/// P3 (P2-frozen §7): a 64-bit hash of the signature's `Debug` rendering,
-/// written straight into a seeded `DefaultHasher` (SipHash reads a byte
-/// stream, so this is the hash of the rendered text; no string is built).
-/// Only under `print_vals`, where a value renders through `Debug`.
-#[cfg(feature = "print_vals")]
-fn render_hash(sig: &Sig) -> Option<u64> {
-    struct Sink(DefaultHasher);
-    impl std::fmt::Write for Sink {
-        fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            self.0.write(s.as_bytes());
-            Ok(())
-        }
-    }
-    let mut sink = Sink(DefaultHasher::new());
-    0x5f3759dfu64.hash(&mut sink.0);
-    std::fmt::write(&mut sink, format_args!("{sig:?}")).expect("conformance: a signature renders");
-    Some(sink.0.finish())
-}
-
-/// Without `print_vals` no rendering exists: no hint, the plain scan.
-#[cfg(not(feature = "print_vals"))]
+/// P3 (P2-frozen §7) had here, under `print_vals`, a 64-bit hash of the
+/// signature's `Debug` rendering as a hint ordering the slot search.
+/// `MIN-ENGINES` E4: no hint — `None` under both feature sets, so the hint
+/// maps stay empty and the slot search is the plain creation-order scan
+/// (`sig_aliases` is 0; `sig_tests` counts to the hit's position + 1).
 fn render_hash(_sig: &Sig) -> Option<u64> {
     None
 }
@@ -321,19 +295,24 @@ impl CompactSummary {
     /// (`Sig::of`): a declared visible name never spawned.
     pub(crate) fn of(
         exec: CompleteExecution<'_>,
-        wobs: &Wobs,
+        wobs: Wobs,
         visible: &[String],
     ) -> Result<Self, crate::conformance::obs::ObsError> {
-        let sig = Sig::of(exec, wobs, visible)?;
+        // `MIN-ENGINES` E4: the statuses (the §8 refusal first, as before), the
+        // count and the order borrow the rows; the signature then takes them
+        // and is hashed in one pass.
+        let statuses = statuses(exec, &wobs, visible)?;
         let mut names: Vec<&str> = visible.iter().map(String::as_str).collect();
         names.sort_unstable();
         names.dedup();
         let observations: usize = names.iter().map(|n| wobs.of(n).len()).sum();
-        let ord = OrdCounts::of(exec.graph(), wobs, visible);
+        let ord = OrdCounts::of(exec.graph(), &wobs, visible);
+        let sig_est = 32 * observations + 16 * names.len();
+        let sig = Sig::from_rows(statuses, wobs, visible);
         Ok(Self {
-            hash: hash128(&sig.key()),
+            hash: sig.hash128(),
             sig,
-            sig_est: 32 * observations + 16 * names.len(),
+            sig_est,
             ord,
         })
     }
@@ -345,7 +324,7 @@ impl CompactSummary {
         let w = wobs(graph, visible).unwrap_or_else(|e| {
             panic!("conformance: the {program} program is not a valid input: {e}")
         });
-        Self::of(exec, &w, visible).unwrap_or_else(|e| {
+        Self::of(exec, w, visible).unwrap_or_else(|e| {
             panic!("conformance: the {program} program is not a valid input: {e}")
         })
     }

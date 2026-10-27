@@ -89,12 +89,12 @@ fn w(g: &ExecutionGraph, v: &[String]) -> Wobs {
 
 fn summary(g: &ExecutionGraph, v: &[String]) -> Summary {
     let exec = CompleteExecution::assume_finished_at_gate(g);
-    Summary::of(exec, &w(g, v), v).expect("conformance: summary on a fixture graph")
+    Summary::of(exec, w(g, v), v).expect("conformance: summary on a fixture graph")
 }
 
 fn sig(g: &ExecutionGraph, v: &[String]) -> Sig {
     let exec = CompleteExecution::assume_finished_at_gate(g);
-    Sig::of(exec, &w(g, v), v).expect("conformance: sig on a fixture graph")
+    Sig::of(exec, w(g, v), v).expect("conformance: sig on a fixture graph")
 }
 
 fn ordv(g: &ExecutionGraph, v: &[String]) -> VisOrder {
@@ -490,12 +490,13 @@ fn c03_sigkey_is_a_sound_projection_and_buckets_resolve_it() {
     let gb = only_graph(direct_of(true), &v);
     let (s1, s1b, s2, sb) = (sig(&g1, &v), sig(&g1b, &v), sig(&g2, &v), sig(&gb, &v));
     assert!(
-        s1 == s1b && s1.key() == s1b.key(),
+        s1 == s1b && s1.hash128() == s1b.hash128(),
         "conformance: equal sig, equal key"
     );
     assert!(s1 != s2, "conformance: values 1 and 2 differ");
-    assert_eq!(s1.key(), s2.key(), "conformance: same shape, same key");
-    assert_ne!(s1.key(), sb.key(), "conformance: type name is in the key");
+    // `MIN-ENGINES` E4 (the tester's re-pin): the key is the one-pass shape hash.
+    assert_eq!(s1.hash128(), s2.hash128(), "conformance: same shape, same key");
+    assert_ne!(s1.hash128(), sb.hash128(), "conformance: type name is in the key");
 
     let mut idx: SigBuckets<Vec<&'static str>> = SigBuckets::new();
     idx.entry(s1.clone(), Vec::new).push("one");

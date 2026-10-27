@@ -355,7 +355,7 @@ fn admit(w: &mut WitnessCache, g: &crate::exec_graph::ExecutionGraph) -> bool {
 fn summary(g: &crate::exec_graph::ExecutionGraph, visible: &[String]) -> Summary {
     let exec = CompleteExecution::try_finished(g).expect("conformance: a complete graph");
     let w = wobs(g, visible).expect("conformance: wobs");
-    Summary::of(exec, &w, visible).expect("conformance: summary")
+    Summary::of(exec, w, visible).expect("conformance: summary")
 }
 
 /// C3 (derived.md §3) on `WitnessCache::with_capacity(_, Bounded(2))`: admit a,

@@ -903,14 +903,14 @@ pub struct ConfOutcome {
 /// there. Identities: `lookups = lookups_signature_miss + lookups_containment_tested`;
 /// `lookups_containment_tested = lookups_succeeded + lookups_failed_after_tests`;
 /// `reports = lookups_signature_miss + lookups_failed_after_tests`; `containment_tests ≥ lookups_containment_tested`.
-/// A `SigKey` hit followed by a full-`Sig` miss is a signature miss.
+/// A shape-hash hit (`Sig::hash128`) followed by a full-`Sig` miss is a signature miss.
 /// `orders_held` counts after `BTreeSet` deduplication. The index size the plan
 /// calls the point of comparison is `signatures + orders_held`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatefulCounters {
     pub spec_graphs: usize,
     pub impl_graphs: usize,
-    /// `SigKey` hash buckets of the index — coarser than `signatures`.
+    /// Shape-hash (`Sig::hash128`) buckets of the index — coarser than `signatures`.
     pub sig_key_buckets: usize,
     /// Full-`Sig` slots of the index.
     pub signatures: usize,

@@ -202,8 +202,8 @@ fn items(f: &Fixture) -> Vec<Item> {
 fn item(side: &'static str, g: &ExecutionGraph, vis: &[String]) -> Item {
     let w: Wobs = wobs(g, vis).expect("conformance: wobs of a complete graph");
     let exec = CompleteExecution::try_finished(g).expect("conformance: a complete graph");
-    let summary = Summary::of(exec, &w, vis).expect("conformance: a summary");
     let counts = OrdCounts::of(g, &w, vis);
+    let summary = Summary::of(exec, w, vis).expect("conformance: a summary");
     Item {
         side,
         summary,
@@ -422,7 +422,7 @@ fn oracle_trace_dump() {
         for (side, gs) in [("spec", &o.kept_spec_graphs), ("impl", &o.kept_impl_graphs)] {
             for (i, g) in gs.iter().enumerate() {
                 let w = wobs(g, &f.visible).unwrap();
-                let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, &f.visible)
+                let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, &f.visible)
                     .unwrap();
                 lines.push(dump_line(side, i, &s, &f.visible));
             }
@@ -950,7 +950,7 @@ fn real_summary(name: &str) -> CompactSummary {
     let o = stateful::run_with(&cc, &f.implementation, &f.specification, true);
     let g = &o.kept_spec_graphs[0];
     let w = wobs(g, &f.visible).unwrap();
-    CompactSummary::of(CompleteExecution::try_finished(g).unwrap(), &w, &f.visible).unwrap()
+    CompactSummary::of(CompleteExecution::try_finished(g).unwrap(), w, &f.visible).unwrap()
 }
 
 /// The same signature with a synthetic order of `base`'s length.
@@ -1411,8 +1411,9 @@ fn forged(base: &CompactSummary) -> CompactSummary {
 /// never a panic — at a memo probe after an admission and after a bucket hit
 /// (`(Miss, None)`), and at a bucket query (`(None, NoSig)`: no `≤` test and,
 /// P1, no slot). Stored, it gets its own slot, and each summary then answers
-/// only from its own slot; through the rendering hint (P3) each resolution of
-/// an existing slot costs one `Sig` test and no alias arises.
+/// only from its own slot. `MIN-ENGINES` E4: the rendering hint (P3) is gone;
+/// each resolution scans the bucket's slots in creation order, one `Sig` test
+/// per slot up to the hit, and no alias arises.
 #[test]
 fn m8_a_forged_equal_hash_different_sig_is_a_signature_miss() {
     let base = real_summary(MECH_CELL);
@@ -1505,12 +1506,13 @@ fn m8_a_forged_equal_hash_different_sig_is_a_signature_miss() {
         base.sig_est + bad.sig_est,
         "conformance: the two occupied slots"
     );
-    // P2-derived §13: insert base 0; covers bad 1 (second pass, miss);
-    // insert bad 1 (second pass, new slot); covers base 1 and covers bad 1
-    // (each through its hint).
+    // `MIN-ENGINES` E4 (the tester's re-pin at gate 3; 4 through the P3 hint
+    // before): no hint, the creation-order scan — insert base 0; covers bad 1
+    // (slot 0, miss); insert bad 1 (slot 0, miss; new slot 1); covers base 1
+    // (slot 0); covers bad 2 (slot 0, then slot 1) = 5; no alias.
     assert_eq!(
         (s.sig_tests, s.sig_aliases),
-        (4, 0),
+        (5, 0),
         "conformance: Sig == comparisons"
     );
 }
@@ -1599,7 +1601,7 @@ fn m9_the_u16_bound_refuses_65536_visible_events() {
         (
             "CompactSummary::of",
             panic_text(|| {
-                CompactSummary::of(CompleteExecution::try_finished(&g).unwrap(), &w, &vis)
+                CompactSummary::of(CompleteExecution::try_finished(&g).unwrap(), w.clone(), &vis)
             }),
         ),
     ] {
@@ -1654,7 +1656,7 @@ fn oracle_trace_stream() {
                 let w = wobs(g, &vis).expect("conformance: wobs");
                 let s = Summary::of(
                     CompleteExecution::try_finished(g).expect("conformance: complete"),
-                    &w,
+                    w,
                     &vis,
                 )
                 .expect("conformance: a summary");
@@ -1831,8 +1833,11 @@ fn m10_d1_two_signatures_of_one_shape_in_sverify_s() {
             s.sig_tests,
             s.sig_bytes_est
         ),
-        (0, 1, 2, 2, 2, 2, 0, 2, 6, 3, 256),
-        "conformance: D1-self, SVerify-S compact (P2-frozen §7: hint)"
+        // `MIN-ENGINES` E4 (the tester's re-pin at gate 3): `sig_tests` 3 → 4,
+        // no hint — the second insertion scans slot 0 (1), the query of slot
+        // 0's graph costs 1 and of slot 1's 2 (the hint answered it at 1).
+        (0, 1, 2, 2, 2, 2, 0, 2, 6, 4, 256),
+        "conformance: D1-self, SVerify-S compact (E4: no hint, the plain scan)"
     );
     assert_eq!(cur.reports.len(), 0);
     assert_eq!(
@@ -1865,7 +1870,10 @@ fn m10_d1_two_signatures_of_one_shape_in_sverify_s() {
             s.sig_tests,
             s.sig_bytes_est
         ),
-        (1, 1, 2, 2, 2, 1, 3, 4, 256),
+        // `MIN-ENGINES` E4 (the tester's re-pin at gate 3): `sig_tests` 4 →
+        // 4 + G(1)'s slot, no hint — the second insertion 1, G(1)'s query its
+        // slot + 1 (the hint answered it at 1), G(3)'s query both slots (2).
+        (1, 1, 2, 2, 2, 1, 3, 4 + g1_slot, 256),
         "conformance: D1-miss, SVerify-S compact (G(1)'s slot at {g1_slot}; P1: no slot for Sig(3))"
     );
     let c = &cmp.counters;
@@ -2343,11 +2351,13 @@ fn pn_prog() -> crate::conformance::grid::Prog {
     })
 }
 
-/// m16 (P3, P2-frozen §7): an alias. `PN`'s two graphs have equal `Sig` and
-/// different renderings; the second insertion's rendering has no hint, the
-/// second pass finds slot 0 by `Sig ==` (an alias, appended to its hint
-/// list), and the insertion is a duplicate; each query then costs one test
-/// through its hint. Current agrees (one signature, no report).
+/// m16 (P3, P2-frozen §7): what was an alias. `PN`'s two graphs have equal
+/// `Sig` and different renderings. `MIN-ENGINES` E4 (the tester's re-pin at
+/// gate 3): the rendering hint is gone, so there is no second pass and no
+/// alias — the second insertion finds slot 0 by `Sig ==` in the plain scan
+/// (one test) and is a duplicate, and each query costs one test (slot 0):
+/// `sig_tests` 3 as before, `sig_aliases` 1 → 0. Current agrees (one
+/// signature, no report).
 #[test]
 fn m16_p3_an_alias_is_found_by_the_second_pass() {
     let f = local_fixture("compact/p3-alias", pn_prog(), pn_prog(), &["a", "r"]);
@@ -2370,8 +2380,8 @@ fn m16_p3_an_alias_is_found_by_the_second_pass() {
             s.duplicates,
             s.buckets
         ),
-        (0, 3, 1, 1, 1, 1, 1, 1),
-        "conformance: one alias, found once, then hinted"
+        (0, 3, 0, 1, 1, 1, 1, 1),
+        "conformance: no alias (E4: no hint), one test per resolution"
     );
     assert_eq!(
         (cur.reports.len(), cur.counters.signatures),
@@ -3018,12 +3028,12 @@ fn i1_sverify_s_uncovered_multiset() {
     let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
     for (g, _) in &o.reports {
         let w = wobs(g, &f.visible).expect("conformance: wobs");
-        let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, &f.visible)
-            .expect("conformance: a summary");
         let counts = match OrdCounts::of(g, &w, &f.visible) {
             OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
             OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
         };
+        let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, &f.visible)
+            .expect("conformance: a summary");
         note!("UNC\t{:?}\t{}", s.sig, counts.join(","));
     }
     note!("UNCN\t{}", o.reports.len());
@@ -3068,7 +3078,10 @@ fn e1_fixture(name: &str) -> Fixture {
 ///   engine's mode), one `E1E` line per side: completions, distinct, a digest
 ///   of the multiset (sorted lines `mult\tsig\tcounts`) and of the completion
 ///   order (the sequence of `sig\tcounts`), the longest origination vector,
-///   and whether a visible value's rendering names a `ThreadId`.
+///   and whether a visible value's rendering names a `ThreadId`; then, per
+///   side, an `E4C` line (`MIN-ENGINES` E4-6 (c), outside the record's `E1`
+///   lines): completions sharing a rendering are compared by `Sig ==`, and
+///   equal signatures must have equal `Sig::hash128` (asserted).
 /// Digests are std's `DefaultHasher` (fixed keys): comparable across runs of
 /// one toolchain, not across toolchains.
 #[test]
@@ -3090,12 +3103,12 @@ fn e1_record() {
     let f = e1_fixture(&name);
     let line_of = |g: &ExecutionGraph| -> String {
         let w = wobs(g, &f.visible).expect("conformance: wobs");
-        let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, &f.visible)
-            .expect("conformance: a summary");
         let counts = match OrdCounts::of(g, &w, &f.visible) {
             OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
             OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
         };
+        let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, &f.visible)
+            .expect("conformance: a summary");
         format!("{:?}\t{}", s.sig, counts.join(","))
     };
     let digest = |lines: &[String]| -> String {
@@ -3228,18 +3241,24 @@ fn e1_record() {
         for (side, program) in sides {
             type Acc = (Vec<String>, usize, bool);
             let acc: std::rc::Rc<std::cell::RefCell<Acc>> = Default::default();
+            // `MIN-ENGINES` E4-6 (c): per rendering, its signatures and their
+            // hashes; equal-`Sig` pairs compared; pairs whose hashes differ.
+            type E4c = (std::collections::HashMap<String, Vec<(Sig, u128)>>, usize, usize);
+            let e4c: std::rc::Rc<std::cell::RefCell<E4c>> = Default::default();
             let sink: CompletionSink = {
                 let (acc, vis) = (std::rc::Rc::clone(&acc), f.visible.clone());
+                let e4c = std::rc::Rc::clone(&e4c);
                 Box::new(move |g: &ExecutionGraph, _| {
                     let w = wobs(g, &vis).expect("conformance: wobs");
-                    let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, &vis)
-                        .expect("conformance: a summary");
                     let counts = match OrdCounts::of(g, &w, &vis) {
                         OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
                         OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
                     };
+                    let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, &vis)
+                        .expect("conformance: a summary");
+                    let r = format!("{:?}", s.sig);
                     let mut a = acc.borrow_mut();
-                    a.0.push(format!("{:?}\t{}", s.sig, counts.join(",")));
+                    a.0.push(format!("{r}\t{}", counts.join(",")));
                     let depth = g
                         .thread_ids()
                         .into_iter()
@@ -3248,9 +3267,22 @@ fn e1_record() {
                         .unwrap_or(0);
                     a.1 = a.1.max(depth);
                     if !a.2 {
+                        // `MIN-ENGINES` E4: the row's observations moved into the
+                        // signature's word, read there.
                         a.2 = vis.iter().any(|n| {
-                            w.of(n).iter().any(|(_, o)| format!("{o:?}").contains("ThreadId"))
+                            s.sig.word(n).iter().any(|o| format!("{o:?}").contains("ThreadId"))
                         });
+                    }
+                    let h = s.sig.hash128();
+                    let mut e = e4c.borrow_mut();
+                    let (groups, compared, differ) = &mut *e;
+                    let group = groups.entry(r).or_default();
+                    match group.iter().find(|(g, _)| *g == s.sig) {
+                        Some((_, h0)) => {
+                            *compared += 1;
+                            *differ += usize::from(*h0 != h);
+                        }
+                        None => group.push((s.sig, h)),
                     }
                     SinkVerdict::Continue
                 })
@@ -3283,6 +3315,17 @@ fn e1_record() {
                 ms.len(),
                 digest(&ms),
                 digest(&order)
+            );
+            let (groups, compared, differ) = std::mem::take(&mut *e4c.borrow_mut());
+            let sigs: usize = groups.values().map(Vec::len).sum();
+            note!(
+                "E4C\t{name}\t{sel:?}\t{side}\trenderings {}\tsignatures {sigs}\t\
+                 equal_sig_pairs {compared}\thash_differs {differ}",
+                groups.len()
+            );
+            assert_eq!(
+                differ, 0,
+                "conformance: E4-6 (c): equal signatures with different hash128 ({side})"
             );
         }
     }
@@ -3573,7 +3616,8 @@ fn shuffled<T: Clone>(v: &[T], mut seed: u64) -> Vec<T> {
 /// and a seeded shuffle; each inserted in full, then the same queries (A3's
 /// implementation summaries, `PN`'s, a forged `NoSig` and a `NoBucket`).
 /// Equal across orders: the held identities (by `Sig ==` and counts), the
-/// occupancy counters, `sig_aliases` (1), the outcome-class counts and each
+/// occupancy counters, `sig_aliases` (0 since `MIN-ENGINES` E4, which removed
+/// the rendering hint; 1 before), the outcome-class counts and each
 /// query's `Covers` discriminant. Between the order and its reverse, the
 /// `Noisy` pair's `Stored`/`Duplicate` assignment and the stored
 /// representative's rendering swap. The order-dependent quantities are
@@ -3642,7 +3686,9 @@ fn s3_order_dependence_with_a_noisy_alias_pair() {
         } else {
             first = Some((inv, d.clone(), classes));
         }
-        if s.sig_aliases != 1 {
+        // `MIN-ENGINES` E4 (the tester's re-pin at gate 3): no hint, no alias
+        // (1 under `print_vals` before).
+        if s.sig_aliases != 0 {
             bad.push(format!("{what}: sig_aliases {}", s.sig_aliases));
         }
         if s.exact_hits == 0 {
@@ -3699,8 +3745,9 @@ fn s3_order_dependence_with_a_noisy_alias_pair() {
 }
 
 /// s4 (I2-5): the `Noisy` pair (equal by `PartialEq`, different `Debug`) is one
-/// entry and one `Duplicate` through the alias path (`sig_aliases` 1), the
-/// query finds it, and every counter equals the reference's.
+/// entry and one `Duplicate` — by the plain scan since `MIN-ENGINES` E4
+/// (`sig_aliases` 0; through the alias path before, 1) — the query finds it,
+/// and every counter equals the reference's.
 #[test]
 fn s4_equality_is_never_by_rendering() {
     let pn = local_fixture("compact/i2-noisy", pn_prog(), pn_prog(), &["a", "r"]);
@@ -3714,7 +3761,8 @@ fn s4_equality_is_never_by_rendering() {
         assert_eq!(ix.covers(q), (Some(0), Covers::Found(0)));
     }
     let s = ix.stats();
-    assert_eq!((s.entries, s.duplicates, s.sig_aliases, s.signatures), (1, 1, 1, 1));
+    // `MIN-ENGINES` E4 (the tester's re-pin at gate 3): `sig_aliases` 1 → 0.
+    assert_eq!((s.entries, s.duplicates, s.sig_aliases, s.signatures), (1, 1, 0, 1));
     // I2b-3: both queries are exact hits, answered by the probe alone.
     assert_eq!((s.exact_hits, s.containment_tests, s.coordinates_compared), (2, 0, 0));
 }
@@ -4528,12 +4576,12 @@ fn s16_bytes_per_entry() {
 /// as the before/after record prints it (`e1_record`'s `line_of`).
 fn e1_line(g: &ExecutionGraph, visible: &[String]) -> String {
     let w = wobs(g, visible).expect("conformance: wobs");
-    let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), &w, visible)
-        .expect("conformance: a summary");
     let counts = match OrdCounts::of(g, &w, visible) {
         OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
         OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
     };
+    let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, visible)
+        .expect("conformance: a summary");
     format!("{:?}\t{}", s.sig, counts.join(","))
 }
 
@@ -5324,4 +5372,572 @@ fn e2_the_returns_precede_the_take_and_the_clone() {
             "conformance: conf_revisit_gate: `{later}` before the return: {r}"
         );
     }
+}
+
+// =========================================================================
+// MIN-ENGINES E4 (the tester, gate 3; criteria/MIN-ENGINES-E4.md rev 1.4,
+// E4-6 (a)–(d); derived §E4 items 1–5): the summary borrows the thread names,
+// clones each value once, keys on the shape in one pass, and has no hint
+// =========================================================================
+
+/// A source check's window: the text of `src` from `head` to the first `end`
+/// after it.
+fn e4_window<'a>(src: &'a str, head: &str, end: &str) -> &'a str {
+    let at = src.find(head).unwrap_or_else(|| panic!("conformance: no `{head}`"));
+    let rest = &src[at..];
+    &rest[..rest.find(end).unwrap_or_else(|| panic!("conformance: no end of `{head}`"))]
+}
+
+/// E4-6 (a), a source check (the gate-1 reading: no counter in
+/// `exec_graph.rs`). The summary path's name resolution borrows the thread's
+/// creation label: `get_thread_tclab`, which returns a cloned `TCreate`, is
+/// named nowhere in `obs.rs` and not in `ctx.rs`'s spawn-order guard;
+/// `resolve`, `is_visible` and `check_annotation_at` read `thread_name`, the
+/// guard reads `thread_create_pos`, and both getters borrow
+/// (`self.get_thr(&tid).tclab`). Fails before E4, where all four sites called
+/// `get_thread_tclab`.
+#[test]
+fn e4_a_the_summary_path_borrows_the_thread_names() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let read = |p: &str| {
+        std::fs::read_to_string(root.join(p)).unwrap_or_else(|_| panic!("conformance: {p}"))
+    };
+    let (obs, ctx, eg) = (
+        read("conformance/obs.rs"),
+        read("conformance/ctx.rs"),
+        read("exec_graph.rs"),
+    );
+    let mut bad = Vec::new();
+    if obs.contains("get_thread_tclab") {
+        bad.push("obs.rs names `get_thread_tclab`".to_owned());
+    }
+    for head in [
+        "fn resolve(",
+        "pub(crate) fn is_visible(",
+        "pub(crate) fn check_annotation_at(",
+    ] {
+        if !e4_window(&obs, head, "\n}\n").contains(".thread_name(") {
+            bad.push(format!("obs.rs `{head}` does not read `thread_name`"));
+        }
+    }
+    let guard = e4_window(&ctx, "pub(crate) fn check_spawn_order(", "\n}\n");
+    if guard.contains("get_thread_tclab") || !guard.contains(".thread_create_pos(") {
+        bad.push(format!("ctx.rs `check_spawn_order`: {guard}"));
+    }
+    for (head, borrow) in [
+        (
+            "pub(crate) fn thread_name(&self, tid: ThreadId) -> Option<&str> {",
+            "self.get_thr(&tid).tclab.name().as_deref()",
+        ),
+        (
+            "pub(crate) fn thread_create_pos(&self, tid: ThreadId) -> Event {",
+            "self.get_thr(&tid).tclab.pos()",
+        ),
+    ] {
+        let body = e4_window(&eg, head, "\n    }\n");
+        if !body.contains(borrow) || body.contains("get_thread_tclab") {
+            bad.push(format!("exec_graph.rs: {body}"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E4-6 (a): {bad:#?}");
+}
+
+/// E4-6 (b): one value clone per observation, read with the test-only
+/// `OBS_CLONES` (`obs.rs`). `observe` constructs an `Obs` from the graph's
+/// value, which is not a clone of an `Obs`, so the counter reads the second
+/// clones only; a move is not a clone (the gate-1 reading). Over the size-2
+/// cells' complete graphs (both sides, in the stateful engine's kept order),
+/// the counter reads 0 around each summary path:
+/// - `CompactSummary::at_completion`, the one function both engines'
+///   completion sinks (`stateful.rs`'s specification and implementation
+///   sinks, `cfirst.rs`'s implementation sink) and the complete-first sweep
+///   call;
+/// - `stateful::summarise` (the `Current` sinks);
+/// - `FlatWitness::of`, on a probe of the specification graph, which offers
+///   nothing;
+/// - `WitnessCache::admit_from_sweep`, the `Current` witness admission.
+/// Before E4 each read `O`, the graph's observations (summed over its rows):
+/// `Sig::of` cloned every observation out of the borrowed `Wobs`. Around the
+/// test-side `Families::new` (the grid oracle) the counter reads
+/// `O_spec + O_impl`, before E4 and after: its shared helper `summary_of`
+/// clones each family graph's `Wobs`. This is criteria E4-2's one `2·O` path
+/// and not an engine path; it is said here, and it is pinned. `O > 0`, a
+/// probe that completes, and the `Families` reading make the zeros
+/// non-vacuous: the counter is this thread's, and every call runs here.
+#[test]
+fn e4_b_one_value_clone_per_observation_on_every_summary_path() {
+    use crate::conformance::grid_oracle::Families;
+    use crate::conformance::obs::{obs_clones_for_test, reset_obs_clones_for_test};
+    use crate::conformance::prober::probe_from;
+    use crate::conformance::witness::{FlatWitness, WitnessCache};
+    fn around(f: impl FnOnce()) -> usize {
+        reset_obs_clones_for_test();
+        f();
+        obs_clones_for_test()
+    }
+    let mut bad = Vec::new();
+    let (mut graphs, mut observations, mut probes) = (0usize, 0usize, 0usize);
+    for name in SIZE2_CELLS {
+        let f = fx(name);
+        let vis = &f.visible;
+        let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+        let o = stateful::run_with(&cc, &f.implementation, &f.specification, true);
+        let (spec, imp) = (&o.kept_spec_graphs, &o.kept_impl_graphs);
+        let o_of = |gs: &[ExecutionGraph]| -> usize {
+            gs.iter()
+                .map(|g| {
+                    let w = wobs(g, vis).expect("conformance: wobs");
+                    w.names().map(|n| w.of(n).len()).sum::<usize>()
+                })
+                .sum()
+        };
+        let (o_spec, o_imp) = (o_of(spec), o_of(imp));
+        graphs += spec.len() + imp.len();
+        observations += o_spec + o_imp;
+        let compact = around(|| {
+            for g in spec.iter().chain(imp) {
+                let _ = CompactSummary::at_completion(g, vis, "test");
+            }
+        });
+        let current = around(|| {
+            for g in spec.iter().chain(imp) {
+                let _ = stateful::summarise(g, vis, "test");
+            }
+        });
+        let mut flat = 0;
+        for g in spec {
+            let p = f.specification.clone();
+            let probed = probe_from(cc.config.clone(), g.clone(), move || p());
+            if probed.complete().is_none() {
+                continue;
+            }
+            probes += 1;
+            flat += around(|| {
+                let w = FlatWitness::of(&probed, vis).expect("conformance: a flat witness");
+                assert!(w.is_some(), "conformance: a complete probe's witness");
+            });
+        }
+        let mut wc = WitnessCache::new(vis.clone());
+        let mut admitted = 0usize;
+        let admit = around(|| {
+            for g in spec {
+                let exec = CompleteExecution::assume_finished_at_gate(g);
+                let new = wc.admit_from_sweep(exec).expect("conformance: an admission");
+                admitted += usize::from(new);
+            }
+        });
+        let families = around(|| {
+            let _ = Families::new(spec, imp, 0, vis);
+        });
+        note!(
+            "e4 (b) {name}: graphs {}+{} O {o_spec}+{o_imp}; at_completion {compact} \
+             summarise {current} flat {flat} admit {admit} ({admitted} admitted) \
+             families {families}",
+            spec.len(),
+            imp.len()
+        );
+        if (compact, current, flat, admit) != (0, 0, 0, 0) {
+            bad.push(format!(
+                "{name}: at_completion {compact} summarise {current} flat {flat} admit {admit}"
+            ));
+        }
+        if families != o_spec + o_imp {
+            bad.push(format!("{name}: families {families}, O {o_spec}+{o_imp}"));
+        }
+    }
+    note!("e4 (b): {graphs} graphs, {observations} observations, {probes} complete probes");
+    assert!(
+        graphs > 0 && observations > 0 && probes > 0,
+        "conformance: E4-6 (b) is not vacuous"
+    );
+    assert!(bad.is_empty(), "conformance: E4-6 (b): {bad:#?}");
+}
+
+/// `a` sends one value to `b`, which receives nothing: an `i64` if `wide`,
+/// else an `i32` (E4-6 (c)'s pair of concrete types).
+fn e4_one_send(wide: bool) -> crate::conformance::grid::Prog {
+    crate::conformance::grid::prog(move || {
+        let b = crate::thread::Builder::new()
+            .name("b".to_owned())
+            .spawn(|| {})
+            .unwrap();
+        let bid = b.thread().id();
+        crate::thread::Builder::new()
+            .name("a".to_owned())
+            .spawn(move || {
+                if wide {
+                    crate::send_msg(bid, 1i64);
+                } else {
+                    crate::send_msg(bid, 1i32);
+                }
+            })
+            .unwrap();
+    })
+}
+
+/// E4-6 (c): the bucket key is a function of the shape.
+/// (1) Equal `Sig` ⟹ equal `Sig::hash128`, and each compact summary's key is
+/// its signature's `hash128`. This is checked over every pair of the size-2
+/// cells' summaries (both sides) and `PN`'s, whose pair has equal `Sig` and
+/// different renderings — the pair a rendering-keyed hash would split. It is
+/// green before E4 and after, by design: the hash reads only kind, ⊥, the
+/// concrete message type and status, and `msg_equals` downcasts to one type.
+/// (Since gate 4's M1 the type is read as its `TypeId`, what `msg_equals`
+/// downcasts on; before, as the public `type_name` string — the regression is
+/// `e4_m1_a_reassigned_type_name_keeps_the_bucket`.) The record's summaries
+/// are checked in `e1_record`'s `E4C` line.
+/// (2) A differing status, word length or concrete type ⟹ a differing hash
+/// (with overwhelming probability): `b`'s status flipped through
+/// `Sig::from_rows`; `a` sending one value against two; one `i32` against one
+/// `i64`.
+#[test]
+fn e4_c_the_bucket_key_is_a_function_of_the_shape() {
+    use crate::conformance::morphism::{statuses, Status};
+    let mut bad = Vec::new();
+    let (mut pairs, mut equal, mut split) = (0usize, 0usize, 0usize);
+    let mut fixtures: Vec<Fixture> = SIZE2_CELLS.iter().map(|n| fx(n)).collect();
+    fixtures.push(local_fixture("compact/e4-noisy", pn_prog(), pn_prog(), &["a", "r"]));
+    for f in &fixtures {
+        let (spec, imp) = kept_summaries(f);
+        let all: Vec<&CompactSummary> = spec.iter().chain(&imp).collect();
+        let shown: Vec<String> = all.iter().map(|s| format!("{:?}", s.sig)).collect();
+        for (i, a) in all.iter().enumerate() {
+            if a.hash != a.sig.hash128() {
+                bad.push(format!("{}: summary {i}'s key is not its hash128", f.name));
+            }
+            for (j, b) in all.iter().enumerate().skip(i + 1) {
+                pairs += 1;
+                if a.sig == b.sig {
+                    equal += 1;
+                    split += usize::from(shown[i] != shown[j]);
+                    if a.hash != b.hash {
+                        bad.push(format!("{}: summaries {i}, {j}: equal Sig, two hashes", f.name));
+                    }
+                }
+            }
+        }
+    }
+    note!("e4 (c): {pairs} pairs, {equal} with equal Sig, {split} of those rendered apart");
+    assert!(equal > 0 && split > 0, "conformance: E4-6 (c) (1) is not vacuous");
+    // (2) Word length: one send against two.
+    let sig_of = |g: &ExecutionGraph, vis: &[String]| -> Sig {
+        let w = wobs(g, vis).expect("conformance: wobs");
+        Sig::of(CompleteExecution::try_finished(g).unwrap(), w, vis)
+            .expect("conformance: a signature")
+    };
+    let (g1, vis) = sends_graph(1);
+    let (g2, _) = sends_graph(2);
+    let (one, two) = (sig_of(&g1, &vis), sig_of(&g2, &vis));
+    assert_eq!((one.word("a").len(), two.word("a").len()), (1, 2));
+    if one.hash128() == two.hash128() {
+        bad.push("word length: one hash".to_owned());
+    }
+    // Status: `b`'s flipped, the rows the same.
+    let exec = CompleteExecution::try_finished(&g1).unwrap();
+    let w = wobs(&g1, &vis).expect("conformance: wobs");
+    let st = statuses(exec, &w, &vis).expect("conformance: statuses");
+    let mut flipped = st.clone();
+    let b = flipped.get_mut("b").expect("conformance: `b`'s status");
+    *b = if *b == Status::Done { Status::Blocked } else { Status::Done };
+    let same = Sig::from_rows(st, w.clone(), &vis);
+    let other = Sig::from_rows(flipped, w, &vis);
+    assert!(same == one && other != one, "conformance: the status pair");
+    if same.hash128() == other.hash128() {
+        bad.push("status: one hash".to_owned());
+    }
+    // The concrete type: an `i32` against an `i64`, one send each.
+    let one_send = |wide: bool| -> CompactSummary {
+        let p = e4_one_send(wide);
+        let f = local_fixture("compact/e4-type", p.clone(), p, &["a", "b"]);
+        let (spec, _) = kept_summaries(&f);
+        assert_eq!(spec.len(), 1, "conformance: one execution");
+        spec.into_iter().next().unwrap()
+    };
+    let (narrow, wide) = (one_send(false), one_send(true));
+    assert!(
+        narrow.sig != wide.sig
+            && narrow.sig.word("a").len() == 1
+            && wide.sig.word("a").len() == 1
+            && narrow.sig.status("a") == wide.sig.status("a")
+            && narrow.sig.status("b") == wide.sig.status("b"),
+        "conformance: the `i32`/`i64` pair differs in the concrete type only"
+    );
+    if narrow.hash == wide.hash {
+        bad.push("concrete type: one hash".to_owned());
+    }
+    assert!(bad.is_empty(), "conformance: E4-6 (c): {bad:#?}");
+}
+
+/// A summary in `base`'s bucket and with `base`'s counts, carrying `other`'s
+/// real signature (`forged`'s construction, another source).
+fn e4_into_bucket(base: &CompactSummary, other: &str) -> CompactSummary {
+    let o = real_summary(other);
+    CompactSummary {
+        hash: base.hash,
+        ord: base.ord.clone(),
+        sig: o.sig,
+        sig_est: o.sig_est,
+    }
+}
+
+/// E4-6 (d): no rendering hint. A source check: `render_hash` has one body,
+/// `None`, and `compact.rs` names `print_vals` only in comments, so there is
+/// no feature-gated variant and the hint maps stay empty under both feature
+/// sets. Then a built three-slot bucket — one shape hash with three
+/// signatures: `MECH_CELL`'s, and forged with 2pc n2's and A3 fifo k2q2's —
+/// in `CompactIndex` and in `SetIndex`:
+/// - inserting the slot-k signature costs k `Sig` tests;
+/// - a query of slot k's signature costs k + 1, on every repeat (the hint
+///   answered a repeat at 1);
+/// - a signature with no slot (A1 correct n2r2's) costs 3 and is `NoSig`;
+/// - `PN`'s pair (equal `Sig`, different renderings) is one slot, and its
+///   second insertion is a duplicate at one test;
+/// - `sig_aliases` stays 0.
+/// Fails before E4 under `print_vals` (the default features): the repeated
+/// queries, and `PN`'s alias.
+#[test]
+fn e4_d_no_rendering_hint() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = std::fs::read_to_string(root.join("conformance/compact.rs"))
+        .expect("conformance: compact.rs");
+    let code: Vec<&str> = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+    let code = code.join("\n");
+    assert!(!code.contains("print_vals"), "conformance: a `print_vals` gate in compact.rs");
+    assert_eq!(code.matches("fn render_hash(").count(), 1, "conformance: one `render_hash`");
+    let body = e4_window(&code, "fn render_hash(", "\n}");
+    assert_eq!(
+        body[body.find('{').expect("conformance: a body") + 1..].trim(),
+        "None",
+        "conformance: `render_hash`'s body"
+    );
+    let base = real_summary(MECH_CELL);
+    let slots = [
+        base.clone(),
+        e4_into_bucket(&base, "2pc/leader/conf/n2"),
+        e4_into_bucket(&base, "apps/a3/fifo/spec/k2q2"),
+    ];
+    let stranger = e4_into_bucket(&base, "apps/a1/correct/spec/n2r2");
+    let sigs = [&slots[0].sig, &slots[1].sig, &slots[2].sig, &stranger.sig];
+    for (i, a) in sigs.iter().enumerate() {
+        for b in &sigs[i + 1..] {
+            assert!(a != b, "conformance: four signatures");
+        }
+    }
+    let pn = local_fixture("compact/e4-noisy", pn_prog(), pn_prog(), &["a", "r"]);
+    let (pn_spec, _) = kept_summaries(&pn);
+    assert!(pn_spec.len() == 2 && pn_spec[0].sig == pn_spec[1].sig);
+    let mut bad = Vec::new();
+    // The compact index.
+    let mut ix = CompactIndex::new(true);
+    for (k, s) in slots.iter().enumerate() {
+        let t = ix.stats().sig_tests;
+        let (id, ins) = ix.insert(s);
+        let cost = ix.stats().sig_tests - t;
+        if id as usize != k || !matches!(ins, Inserted::Stored(_)) || cost != k {
+            bad.push(format!("compact insert {k}: ({id}, {ins:?}) at {cost} tests"));
+        }
+    }
+    for round in 0..2 {
+        for k in [2, 0, 1] {
+            let t = ix.stats().sig_tests;
+            let got = ix.covers(&slots[k]);
+            let cost = ix.stats().sig_tests - t;
+            if got.0 != Some(k as u32) || !matches!(got.1, Covers::Found(_)) || cost != k + 1 {
+                bad.push(format!("compact query {round}/{k}: {got:?} at {cost} tests"));
+            }
+        }
+    }
+    let t = ix.stats().sig_tests;
+    let got = ix.covers(&stranger);
+    let cost = ix.stats().sig_tests - t;
+    if got != (None, Covers::NoSig) || cost != 3 {
+        bad.push(format!("compact stranger: {got:?} at {cost} tests"));
+    }
+    if ix.stats().sig_aliases != 0 {
+        bad.push(format!("compact sig_aliases {}", ix.stats().sig_aliases));
+    }
+    let mut ix = CompactIndex::new(true);
+    ix.insert(&pn_spec[0]);
+    let t = ix.stats().sig_tests;
+    let got = ix.insert(&pn_spec[1]);
+    let cost = ix.stats().sig_tests - t;
+    if got != (0, Inserted::Duplicate) || cost != 1 || ix.stats().sig_aliases != 0 {
+        bad.push(format!("compact PN: {got:?} at {cost} tests, {:?}", ix.stats().sig_aliases));
+    }
+    // The set index.
+    let mut set = SetIndex::new();
+    for (k, s) in slots.iter().enumerate() {
+        let t = set.stats().sig_tests;
+        let (id, ins) = set.insert(s);
+        let cost = set.stats().sig_tests - t;
+        if id as usize != k || !matches!(ins, Inserted::Stored(_)) || cost != k {
+            bad.push(format!("set insert {k}: ({id}, {ins:?}) at {cost} tests"));
+        }
+    }
+    for round in 0..2 {
+        for k in [2, 0, 1] {
+            let t = set.stats().sig_tests;
+            let got = set.covers(&slots[k]);
+            let cost = set.stats().sig_tests - t;
+            if got.0 != Some(k as u32) || !matches!(got.1, Covers::Found(_)) || cost != k + 1 {
+                bad.push(format!("set query {round}/{k}: {got:?} at {cost} tests"));
+            }
+        }
+    }
+    let t = set.stats().sig_tests;
+    let got = set.covers(&stranger);
+    let cost = set.stats().sig_tests - t;
+    if got != (None, Covers::NoSig) || cost != 3 {
+        bad.push(format!("set stranger: {got:?} at {cost} tests"));
+    }
+    if set.stats().sig_aliases != 0 {
+        bad.push(format!("set sig_aliases {}", set.stats().sig_aliases));
+    }
+    let mut set = SetIndex::new();
+    set.insert(&pn_spec[0]);
+    let t = set.stats().sig_tests;
+    let got = set.insert(&pn_spec[1]);
+    let cost = set.stats().sig_tests - t;
+    if got != (0, Inserted::Duplicate) || cost != 1 || set.stats().sig_aliases != 0 {
+        bad.push(format!("set PN: {got:?} at {cost} tests, {:?}", set.stats().sig_aliases));
+    }
+    assert!(bad.is_empty(), "conformance: E4-6 (d): {bad:#?}");
+}
+
+/// E4 gate 4 round 01 M1 (Codex), the regression. `Val::type_name` is a public
+/// `String` that takes no part in equality (`msg_equals` downcasts to the
+/// concrete type; `Obs::eq` ignores the name), so the bucket key must not read
+/// it. A graph and its copy whose one send has its value's `type_name`
+/// reassigned give equal observations and equal signatures with different
+/// public type names, and must give:
+/// - equal `hash128` (and equal compact keys);
+/// - one slot in `SigBuckets` (`entry` twice, `get` of either: one key bucket);
+/// - one slot in the compact bucket's `Sig ==` resolution, in `CompactIndex`
+///   and in `SetIndex`: the copy's insertion a `Duplicate` of the original's
+///   slot, each one's query `Found` there, `sig_aliases` 0.
+/// Fails on the type-name-hashing body (`sig.rs` 65a044c5, kept below as a
+/// reference over the same byte stream): it gives the pair two keys, so every
+/// index above put the copy in a bucket of its own (`SigKey` had the same
+/// defect: `COMPACT-INDEX-P2-CODE` reopened).
+#[test]
+fn e4_m1_a_reassigned_type_name_keeps_the_bucket() {
+    use crate::conformance::morphism::Status;
+    use crate::conformance::obs::Obs;
+    use crate::conformance::sig::SigBuckets;
+    let (g, vis) = sends_graph(1);
+    let e = wobs(&g, &vis).expect("conformance: wobs").of("a")[0].0;
+    let mut forged = g.clone();
+    let val = &mut forged.send_label_mut(e).expect("conformance: `a`'s send").val;
+    let original = val.clone();
+    val.type_name = format!("forged::{}", val.type_name);
+    assert!(
+        *val == original && val.type_name != original.type_name,
+        "conformance: equal values, different public type names"
+    );
+    let summary = |g: &ExecutionGraph| -> CompactSummary {
+        let exec = CompleteExecution::try_finished(g).expect("conformance: complete");
+        CompactSummary::of(exec, wobs(g, &vis).expect("conformance: wobs"), &vis)
+            .expect("conformance: a summary")
+    };
+    let (s, t) = (summary(&g), summary(&forged));
+    let names = |s: &CompactSummary| -> Vec<String> {
+        s.sig.word("a").iter().filter_map(|o| o.type_name().map(str::to_owned)).collect()
+    };
+    assert!(
+        s.sig.word("a") == t.sig.word("a") && s.sig == t.sig && names(&s) != names(&t),
+        "conformance: equal observations and signatures, different type names"
+    );
+    // The pre-fix body: per name (sorted) its length and bytes, the word's
+    // length, per observation a kind tag and the `type_name` string's length
+    // and bytes; per status name its length, bytes and tag.
+    let by_type_name = |sig: &Sig| -> u128 {
+        use std::hash::Hasher as _;
+        let mut a = std::collections::hash_map::DefaultHasher::new();
+        let mut b = std::collections::hash_map::DefaultHasher::new();
+        a.write_u64(0x5f3759df);
+        b.write_u64(0x9e3779b97f4a7c15);
+        let mut put = |bytes: &[u8]| {
+            a.write(bytes);
+            b.write(bytes);
+        };
+        let mut names: Vec<&String> = vis.iter().collect();
+        names.sort();
+        names.dedup();
+        for n in &names {
+            let word = sig.word(n);
+            put(&(n.len() as u64).to_le_bytes());
+            put(n.as_bytes());
+            put(&(word.len() as u64).to_le_bytes());
+            for o in word {
+                let (tag, ty) = match o {
+                    Obs::Send(v) => (0u8, v.type_name.as_str()),
+                    Obs::Recv(Some(v)) => (1, v.type_name.as_str()),
+                    Obs::Recv(None) => (2, ""),
+                };
+                put(&[tag]);
+                put(&(ty.len() as u64).to_le_bytes());
+                put(ty.as_bytes());
+            }
+        }
+        for n in &names {
+            put(&(n.len() as u64).to_le_bytes());
+            put(n.as_bytes());
+            put(&[match sig.status(n).expect("conformance: a status") {
+                Status::Errored => 0,
+                Status::Done => 1,
+                Status::Blocked => 2,
+            }]);
+        }
+        ((a.finish() as u128) << 64) | b.finish() as u128
+    };
+    assert_ne!(
+        by_type_name(&s.sig),
+        by_type_name(&t.sig),
+        "conformance: the type-name-hashing body splits the pair"
+    );
+    let mut bad = Vec::new();
+    if s.sig.hash128() != t.sig.hash128() || s.hash != t.hash {
+        bad.push("hash128 differs: the key reads the public type name".to_owned());
+    }
+    // `SigBuckets`: `entry` with each, `get` with each.
+    let mut sb: SigBuckets<usize> = SigBuckets::new();
+    *sb.entry(s.sig.clone(), || 0) += 1;
+    *sb.entry(t.sig.clone(), || 0) += 1;
+    let got = (sb.len(), sb.key_buckets(), sb.get(&s.sig).copied(), sb.get(&t.sig).copied());
+    if got != (1, 1, Some(2), Some(2)) {
+        bad.push(format!("SigBuckets (len, key_buckets, get s, get t): {got:?}"));
+    }
+    // The compact index, either insertion first.
+    for (what, a, b) in [("compact s, t", &s, &t), ("compact t, s", &t, &s)] {
+        let mut ix = CompactIndex::new(true);
+        let first = ix.insert(a);
+        let second = ix.insert(b);
+        let (qa, qb) = (ix.covers(a), ix.covers(b));
+        let st = ix.stats();
+        let got = (st.buckets, st.signatures, st.signatures_seen, st.sig_aliases);
+        if second != (first.0, Inserted::Duplicate)
+            || qa != (Some(first.0), Covers::Found(0))
+            || qb != (Some(first.0), Covers::Found(0))
+            || got != (1, 1, 1, 0)
+        {
+            bad.push(format!("{what}: {first:?} {second:?} {qa:?} {qb:?} {got:?}"));
+        }
+    }
+    // The set index, either insertion first.
+    for (what, a, b) in [("set s, t", &s, &t), ("set t, s", &t, &s)] {
+        let mut ix = SetIndex::new();
+        let first = ix.insert(a);
+        let second = ix.insert(b);
+        let (qa, qb) = (ix.covers(a), ix.covers(b));
+        let st = ix.stats();
+        let got = (st.buckets, st.signatures, st.signatures_seen, st.sig_aliases);
+        if second != (first.0, Inserted::Duplicate)
+            || qa != (Some(first.0), Covers::Found(0))
+            || qb != (Some(first.0), Covers::Found(0))
+            || got != (1, 1, 1, 0)
+        {
+            bad.push(format!("{what}: {first:?} {second:?} {qa:?} {qb:?} {got:?}"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: gate-4 M1: {bad:#?}");
 }

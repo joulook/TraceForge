@@ -298,7 +298,7 @@ pub(crate) fn run_with(
         st.counters.sig_key_buckets = st.index.key_buckets();
         st.counters.signatures = st.index.len();
         if let Some(ci) = st.compact.as_ref() {
-            // Phase 2 D1: the shape buckets are `SigKey` buckets and the
+            // Phase 2 D1: the shape buckets are the shape-hash buckets and the
             // occupied slots are the full-`Sig` slots, the current index's two
             // counts; D7: `orders_held` is the held orders (antichain removals
             // subtracted).
@@ -550,7 +550,7 @@ pub(crate) fn summarise(graph: &ExecutionGraph, visible: &[String], program: &st
     let exec = CompleteExecution::assume_finished_at_gate(graph);
     let w = wobs(graph, visible)
         .unwrap_or_else(|e| panic!("conformance: the {program} program is not a valid input: {e}"));
-    Summary::of(exec, &w, visible)
+    Summary::of(exec, w, visible)
         .unwrap_or_else(|e| panic!("conformance: the {program} program is not a valid input: {e}"))
 }
 

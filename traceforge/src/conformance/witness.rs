@@ -47,11 +47,11 @@ use crate::exec_graph::ExecutionGraph;
 /// A complete graph of Spec, with what the two tests read of it computed once.
 #[derive(Clone, Debug)]
 pub(crate) struct Witness {
-    // `wobs` is read by nothing on the probe path since `probe_cone` moved to
-    // `cone_from` (gate-4 round 01 m1); it is kept for the reference `cone`
-    // and for Part 6's diagnostics, which explain a witness by its words.
+    // `MIN-ENGINES` E4: the `wobs` field that sat here was read by nothing
+    // since `probe_cone` moved to `cone_from` (which takes the outer graph's
+    // rows from its caller); dropping it lets the summary take the admission's
+    // rows instead of cloning every observed value a second time.
     graph: ExecutionGraph,
-    wobs: Wobs,
     summary: Summary,
     /// `P5-CFCFG` F1 (gate 4 M1/m1): under `Bounded(n)` only, a 128-bit
     /// fingerprint of the canonical form, so that an eviction can record it
@@ -99,7 +99,7 @@ impl FlatWitness {
         };
         let graph = exec.graph();
         let w = wobs(graph, visible)?;
-        let summary = Summary::of(exec, &w, visible)?;
+        let summary = Summary::of(exec, w, visible)?;
         Ok(Some(Self {
             graph: graph.clone(),
             summary,
@@ -212,7 +212,7 @@ impl WitnessCache {
         // leave `W` as it was, or a retry would be answered "already held"
         // for a graph `W` does not hold (tester finding P4-APPARATUS-T1).
         let w = wobs(graph, &self.visible)?;
-        let summary = Summary::of(exec, &w, &self.visible)?;
+        let summary = Summary::of(exec, w, &self.visible)?;
         // FIFO eviction when full (`Bounded(n)`): the oldest entry leaves,
         // is forgotten by `seen` (its canonical form recomputed from the
         // graph, which succeeded at its admission) and remembered by
@@ -245,7 +245,6 @@ impl WitnessCache {
         self.admissions += 1;
         self.entries.push(Witness {
             graph: graph.clone(),
-            wobs: w,
             summary,
             fingerprint,
         });

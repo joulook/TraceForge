@@ -168,7 +168,7 @@ fn label_count(g: &ExecutionGraph) -> usize {
 
 fn summary(g: &ExecutionGraph, v: &[String]) -> Summary {
     let w = wobs(g, v).expect("conformance: wobs on a fixture graph");
-    Summary::of(CompleteExecution::assume_finished_at_gate(g), &w, v)
+    Summary::of(CompleteExecution::assume_finished_at_gate(g), w, v)
         .expect("conformance: summary on a fixture graph")
 }
 

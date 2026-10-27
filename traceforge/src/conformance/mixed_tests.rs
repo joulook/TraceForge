@@ -244,7 +244,7 @@ fn shape(g: &ExecutionGraph, v: &[String], n: &str) -> String {
 }
 
 fn summary(g: &ExecutionGraph, v: &[String]) -> Summary {
-    Summary::of(CompleteExecution::assume_finished_at_gate(g), &w(g, v), v)
+    Summary::of(CompleteExecution::assume_finished_at_gate(g), w(g, v), v)
         .expect("conformance: summary on a fixture graph")
 }
 
