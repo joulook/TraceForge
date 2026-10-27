@@ -1971,6 +1971,9 @@ fn l6_the_sweeping_engines_ignore_the_search_budget() {
                         let mut c = o.counters.clone();
                         c.spec_wall_time_ms = 0;
                         c.impl_wall_time_ms = 0;
+                        // `MIN-ENGINES` E9 re-pin: the first-report wall and memory.
+                        c.wall_ms_at_first_report = None;
+                        c.vmhwm_kb_at_first_report = None;
                         format!("{c:?} {:?}", o.impl_end)
                     }
                     GridRaw::CompleteFirst(o) => {

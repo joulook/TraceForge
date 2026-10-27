@@ -2331,10 +2331,12 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // MIN-ENGINES E7b gate 4 round 02 m1 (2026-10-27, tester re-pin): to
     // `92d0c443…` (grid.rs md5 `4ff398e4…`); `E7B_G4R2_HUNKS` undo it to
     // `32c67c7e…`.
+    // MIN-ENGINES E9 (2026-10-27, tester re-pin, gate 3): to `23713aaa…`
+    // (grid.rs md5 `21fdc1cd…`); `E9_HUNKS` undo it to `92d0c443…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "92d0c443ef1b84bfa7e8ca931a31171f",
+        "23713aaac056630ab1428baf94107ea7",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2912,7 +2914,37 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
             ),
         ),
     ];
+    // MIN-ENGINES E9 (2026-10-27, tester re-pin, gate 3): the lead's one
+    // `grid.rs` hunk (`diff -U1` against grid.rs `4ff398e4…`: the stateful
+    // row's two first-report columns), inside the prefix; undoing it gives
+    // back the E7b prefix, byte for byte.
+    const E9_HUNKS: [(&str, &str); 1] = [
+        (
+            concat!(
+                "            push_d(&mut row, \"impl_wall_time_ms\", c.impl_wall_time_ms);\n",
+                "            // `MIN-ENGINES` E9: the two first-report columns, as the\n",
+                "            // complete-first row's (blank for `None`).\n",
+                "            push_opt(&mut row, \"wall_ms_at_first_report\", c.wall_ms_at_first_re",
+                "port);\n",
+                "            push_opt(&mut row, \"vmhwm_kb_at_first_report\", c.vmhwm_kb_at_first_",
+                "report);\n",
+                "            // `COMPACT-INDEX` §5.1 items 1 and 5.\n"
+            ),
+            concat!(
+                "            push_d(&mut row, \"impl_wall_time_ms\", c.impl_wall_time_ms);\n",
+                "            // `COMPACT-INDEX` §5.1 items 1 and 5.\n"
+            ),
+        ),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in E9_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "92d0c443ef1b84bfa7e8ca931a31171f",
+        "conformance: the prefix without E9's hunk = the E7b prefix"
+    );
     for (new, old) in E7B_G4R2_HUNKS {
         t = undo(t, new, old);
     }

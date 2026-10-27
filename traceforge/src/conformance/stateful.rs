@@ -41,6 +41,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::conformance::cfirst::note_first_report;
 use crate::conformance::compact::{
     CompactIndex, CompactSummary, Covers, Inserted, OrdCounts, SetIndex,
 };
@@ -69,7 +70,7 @@ pub(crate) struct StatefulOutcome {
     /// completion.
     pub(crate) reports: Vec<(ExecutionGraph, ReplaySnapshot)>,
     pub(crate) counters: StatefulCounters,
-    /// The index under `IndexKind::Current`; empty under `Compact`.
+    /// The index under `IndexKind::Current`; empty under `Compact` and `Set`.
     pub(crate) index: SigBuckets<BTreeSet<VisOrder>>,
     /// `COMPACT-INDEX` §5.1 item 4(a): the bucket index, `Some` iff
     /// `index = Compact`.
@@ -110,8 +111,9 @@ struct SinkState {
     /// implementation summaries, exact `(Sig, ord)`, in the engine's own
     /// structure.
     impl_seen: SigBuckets<BTreeSet<VisOrder>>,
-    /// Step 0 under `Compact`: the same count by the exact `(Sig,
-    /// OrdCounts)` (phase 2 P1, P2-frozen §7).
+    /// Step 0 under `Compact` or `Set`: the same count by the exact
+    /// `(Sig, OrdCounts)` (phase 2 P1, P2-frozen §7; `Set` since
+    /// `SVERIFY-P` I2b-7).
     impl_seen_compact: SigBuckets<std::collections::HashSet<OrdCounts>>,
     /// Phase 2 D6: the distinct-summary sets exist only when asked for.
     impl_distinct: bool,
@@ -483,6 +485,15 @@ pub(crate) fn run_with(
                 return SinkVerdict::Continue;
             }
             st.counters.reports += 1;
+            // `MIN-ENGINES` E9: at the first report, the wall since the
+            // implementation run started (after the index run) and `VmHWM`,
+            // by the stateless engine's reader; nothing at a later report.
+            let c = &mut st.counters;
+            note_first_report(
+                &mut c.wall_ms_at_first_report,
+                &mut c.vmhwm_kb_at_first_report,
+                impl_started,
+            );
             // `MIN-ENGINES` E6: the first report keeps its graph clone and its
             // snapshot (T3: taken here, with the live state, so it is
             // `Serialized` like the enumerator's completion reports); the rest

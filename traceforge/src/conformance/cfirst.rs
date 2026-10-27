@@ -164,7 +164,7 @@ pub(crate) struct CFirstOutcome {
     /// in the order raised; empty with the cut off.
     pub(crate) cut_reports: Vec<Report>,
     pub(crate) counters: CFirstCounters,
-    /// `W` under `IndexKind::Current`; empty under `Compact`.
+    /// `W` under `IndexKind::Current`; empty under `Compact` and `Set`.
     pub(crate) witnesses: WitnessCache,
     /// `COMPACT-INDEX` §5.1 item 4(b): `W` on the bucket index, `Some` iff
     /// `index = Compact`.
@@ -609,7 +609,12 @@ pub(crate) fn run_with(
                     }
                     None => {
                         st.counters.reports += 1;
-                        note_first_report(&mut st.counters, started);
+                        let c = &mut st.counters;
+                        note_first_report(
+                            &mut c.wall_ms_at_first_report,
+                            &mut c.vmhwm_kb_at_first_report,
+                            started,
+                        );
                         // `MIN-ENGINES` E6: the first report keeps its graph
                         // clone and snapshot; the rest are counted.
                         if all_reports || st.reports.is_empty() {
@@ -733,7 +738,12 @@ pub(crate) fn run_with(
                         st.sweep_ends.push(SweepEnd::Exhausted);
                     }
                     st.counters.reports += 1;
-                    note_first_report(&mut st.counters, started);
+                    let c = &mut st.counters;
+                    note_first_report(
+                        &mut c.wall_ms_at_first_report,
+                        &mut c.vmhwm_kb_at_first_report,
+                        started,
+                    );
                     // `MIN-ENGINES` E6: as at the flat-cover miss above.
                     if all_reports || st.reports.is_empty() {
                         let snapshot = replay_snapshot(g, must_state, &config, None);
@@ -879,13 +889,42 @@ pub(crate) fn sweep(
 }
 
 /// `P5-CFCFG` F2: at the first uncovered completion of a run, the elapsed
-/// wall since the outer run started and the process's `VmHWM`. Later reports
-/// leave both as they are.
-fn note_first_report(c: &mut CFirstCounters, started: Instant) {
-    if c.wall_ms_at_first_report.is_none() {
-        c.wall_ms_at_first_report = Some(started.elapsed().as_millis());
-        c.vmhwm_kb_at_first_report = vm_hwm_kb();
+/// wall since `started` and the process's `VmHWM`: one clock read, then one
+/// `/proc/self/status` read. Later reports leave both as they are and read
+/// nothing. `MIN-ENGINES` E9: the one reader of both engines' two columns —
+/// `started` is the stateless engine's outer run, or the stateful engine's
+/// implementation run (after its index run).
+pub(crate) fn note_first_report(
+    wall: &mut Option<u128>,
+    vmhwm: &mut Option<u64>,
+    started: Instant,
+) {
+    if wall.is_none() {
+        *wall = Some(started.elapsed().as_millis());
+        *vmhwm = vm_hwm_kb();
+        #[cfg(test)]
+        FIRST_REPORT_READS.with(|c| c.set(c.get() + 1));
     }
+}
+
+// `MIN-ENGINES` E9-6 (c), test builds only: how many times this thread took
+// the first-report reads, for both engines (the sinks run on the caller's
+// thread; the sweeps' threads never report).
+#[cfg(test)]
+thread_local! {
+    static FIRST_REPORT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `MIN-ENGINES` E9-6 (c), test builds only: the thread's first-report reads.
+#[cfg(test)]
+pub(crate) fn first_report_reads_for_test() -> usize {
+    FIRST_REPORT_READS.with(|c| c.get())
+}
+
+/// `MIN-ENGINES` E9-6 (c), test builds only: reset the count.
+#[cfg(test)]
+pub(crate) fn reset_first_report_reads_for_test() {
+    FIRST_REPORT_READS.with(|c| c.set(0));
 }
 
 /// The process's `VmHWM` in kB from `/proc/self/status`; `None` when the

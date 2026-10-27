@@ -3121,6 +3121,12 @@ fn e1_fixture(name: &str) -> Fixture {
 /// with an `E7R` line of its row's knob columns) — all outside the `E1` filter.
 /// `MIN-ENGINES` E7b: and `e7s`, the stateless engine at its new default
 /// (`Set`), the sweep record on, its E7 record outside the filter.
+/// `MIN-ENGINES` E9 (E9-5 (ii)): `e9s` (the stateful engine at x1's
+/// configuration under `Current` and under its default `Set`) and `e9c` (the
+/// stateless engine at x1's), one `E9` line per run outside the filter: the
+/// report count, whether both first-report fields are `Some`, and whether the
+/// bounds hold (`W` within the run's own wall, `H` between the run's
+/// `VmHWM` before and after) — never a value.
 /// `MIN-ENGINES` E6: every engine part above keeps every report (`all_reports`
 /// on, today's lists); two more parts run the default (off): `e6s` (stateful
 /// under `Set`) and `e6c` (stateless), each an `E6T`/`E6C` line outside the
@@ -3359,6 +3365,54 @@ fn e1_record() {
             panic!("conformance: {name} e7s: not a complete-first outcome")
         };
         note!("E7\t{name}\t{sel:?}\te7s\t{}", e7_record(o, &line_of));
+    }
+    // `MIN-ENGINES` E9 (the tester, gate 3; E9-5 (ii)): the first-report
+    // columns' presence and bounds, never a value.
+    for (part, engine) in [("e9s", GridEngine::Stateful), ("e9c", GridEngine::CompleteFirst)] {
+        use crate::conformance::config::IndexKind;
+        use crate::conformance::grid::{GridEnd, GridRaw};
+        if !parts.contains(part) {
+            continue;
+        }
+        let kinds: &[IndexKind] = if engine == GridEngine::Stateful {
+            &[IndexKind::Current, IndexKind::Set]
+        } else {
+            &[IndexKind::Set]
+        };
+        for &k in kinds {
+            let g = crate::conformance::eval::x1_config(engine, sel).index(k);
+            let r = match crate::conformance::eval::run_row_in_process(&f, &g, false) {
+                GridEnd::Ok(r) => r,
+                other => panic!("conformance: {name} {part}: {other:?}"),
+            };
+            let (n, wall, kb, end) = match &r.raw {
+                GridRaw::Stateful(o) => {
+                    let c = &o.counters;
+                    let fr = (c.wall_ms_at_first_report, c.vmhwm_kb_at_first_report);
+                    (c.reports, fr.0, fr.1, c.impl_wall_time_ms)
+                }
+                GridRaw::CompleteFirst(o) => {
+                    let c = &o.counters;
+                    let fr = (c.wall_ms_at_first_report, c.vmhwm_kb_at_first_report);
+                    (c.reports, fr.0, fr.1, c.outer_wall_time_ms)
+                }
+                _ => panic!("conformance: {name} {part}: an unexpected outcome"),
+            };
+            let first = match (wall, kb) {
+                (Some(_), Some(_)) => "some",
+                (None, None) => "none",
+                _ => "mixed",
+            };
+            let bounds = match (wall, kb, r.vm_hwm_kb) {
+                (Some(w), Some(h), (Some(b), Some(a))) => w <= end && b <= h && h <= a,
+                (None, None, _) => true,
+                _ => false,
+            };
+            note!(
+                "E9\t{name}\t{sel:?}\t{part}\t{k:?}\treports {n}\tfirst {first}\tbounds {}",
+                if bounds { "ok" } else { "BAD" }
+            );
+        }
     }
     if parts.contains("plain") {
         let sides = [("specification", &f.specification), ("implementation", &f.implementation)];
@@ -6170,7 +6224,10 @@ fn e6_a_the_sites_count_then_keep_the_first() {
             bad.push(format!("{file}: {} counter sites", at.len()));
         }
         for i in at {
-            let w = &src[i..(i + 900).min(src.len())];
+            // `MIN-ENGINES` E9 (the tester's re-pin at gate 3): the first-report
+            // reader's call now sits between the counter and the retention
+            // test (E9-2), so the window is 1400 bytes (was 900).
+            let w = &src[i..(i + 1400).min(src.len())];
             let (knob, empty) = (w.find("all_reports"), w.find("st.reports.is_empty()"));
             let snap = w.find("replay_snapshot(g, must_state");
             let push = w.find("st.reports.push(");
@@ -7045,4 +7102,373 @@ fn e7b_g4_m1_the_distinct_knob_under_set_is_in_the_key() {
         let got = o.counters.compact.as_ref().map(|s| s.impl_distinct_summaries);
         assert_eq!(got, Some(want), "conformance: the cache statistics, knob {}", c.impl_distinct);
     }
+}
+
+// =========================================================================
+// MIN-ENGINES E9 (the tester, gate 3; criteria/MIN-ENGINES-E9.md rev 1.0,
+// E9-6 (a)–(e); derived §E9 item 4): the stateful engine's first-report
+// wall and `VmHWM`, in the stateless engine's two columns
+// =========================================================================
+
+/// E9-6's fixtures besides [`E6_FIXTURES`]: `cfcfg` c04's four
+/// (`ex:naive/k2/enc1`, two reports; `apps/a1/eager/spec/n2r2`, 55; two
+/// conforming pairs).
+const E9_C04: [&str; 4] = [
+    "ex:naive/k2/enc1",
+    "apps/a1/eager/spec/n2r2",
+    "apps/a1/correct/spec/n2r2",
+    "synth/share/m2c1",
+];
+
+/// E9-6 (a): the stateful columns follow the report count. On [`E6_FIXTURES`]
+/// and [`E9_C04`], the stateful engine through `run_grid` at x1's
+/// configuration under `Current`, `Compact` and `Set`, `stop` off and on,
+/// `all_reports` off and on: `wall_ms_at_first_report` and
+/// `vmhwm_kb_at_first_report` are `Some` iff `counters.reports ≥ 1`; then
+/// `W ≤ impl_wall_time_ms` (both floors of elapsed times from the one
+/// `impl_started`, read in that order) and `vm_hwm_kb_before ≤ H ≤
+/// vm_hwm_kb_after` (the grid run's own reads; `VmHWM` never decreases); the
+/// row's two cells are the values' text, blank for `None`; the report count
+/// and the presence are equal across `all_reports`. Fails before E9 (no
+/// fields; the row has no such cells).
+#[test]
+fn e9_a_the_stateful_columns_follow_the_reports() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::grid::{row_of, run_grid, GridEnd, GridRaw};
+    use crate::conformance::selector::Selector;
+    let mut bad = Vec::new();
+    let (mut violating, mut conforming) = (0usize, 0usize);
+    for name in E6_FIXTURES.iter().chain(E9_C04.iter()) {
+        let f = e1_fixture(name);
+        for k in [IndexKind::Current, IndexKind::Compact, IndexKind::Set] {
+            for stop in [false, true] {
+                let mut seen = Vec::new();
+                for all in [false, true] {
+                    let mut g = x1_config(GridEngine::Stateful, Selector::Ltr).index(k).stop(stop);
+                    g.all_reports = all;
+                    let what = format!("{name} {k:?} stop={stop} all={all}");
+                    let r = match run_grid(&f, &g, None) {
+                        GridEnd::Ok(r) => r,
+                        other => panic!("conformance: {what}: {other:?}"),
+                    };
+                    let GridRaw::Stateful(o) = &r.raw else {
+                        panic!("conformance: {what}: not a stateful outcome")
+                    };
+                    let c = &o.counters;
+                    let n = c.reports;
+                    let (w, h) = (c.wall_ms_at_first_report, c.vmhwm_kb_at_first_report);
+                    if w.is_some() != (n >= 1) || h.is_some() != (n >= 1) {
+                        bad.push(format!("{what}: reports {n}, {w:?} {h:?}"));
+                    }
+                    if let (Some(w), Some(h)) = (w, h) {
+                        let (before, after) = r.vm_hwm_kb;
+                        let ok = w <= c.impl_wall_time_ms
+                            && before.is_some_and(|b| b <= h)
+                            && after.is_some_and(|a| h <= a);
+                        if !ok {
+                            bad.push(format!(
+                                "{what}: {w} ms of {} ms; {before:?} <= {h} <= {after:?}",
+                                c.impl_wall_time_ms
+                            ));
+                        }
+                    }
+                    let row = row_of(&r);
+                    let cells = (
+                        e6_col(&row, "wall_ms_at_first_report"),
+                        e6_col(&row, "vmhwm_kb_at_first_report"),
+                    );
+                    let want = (
+                        w.map(|v| v.to_string()).unwrap_or_default(),
+                        h.map(|v| v.to_string()).unwrap_or_default(),
+                    );
+                    if cells != want {
+                        bad.push(format!("{what}: cells {cells:?}, want {want:?}"));
+                    }
+                    if n >= 1 {
+                        violating += 1;
+                    } else {
+                        conforming += 1;
+                    }
+                    seen.push((n, w.is_some(), h.is_some()));
+                }
+                if seen[0] != seen[1] {
+                    bad.push(format!("{name} {k:?} stop={stop}: across all_reports {seen:?}"));
+                }
+            }
+        }
+    }
+    note!("e9_a: {violating} runs with a report, {conforming} without");
+    assert!(violating > 0 && conforming > 0, "conformance: E9-6 (a) is vacuous");
+    assert!(bad.is_empty(), "conformance: E9-6 (a): {bad:#?}");
+}
+
+/// E9-6 (b)'s child, run by [`e9_b_the_origin_is_the_implementation_run`]
+/// (`E9_CASE=origin`): `a27`'s violating pair (two completions, two reports)
+/// whose specification sleeps 400 ms at its first invocation and whose
+/// implementation, from its second invocation on, sleeps 400 ms and touches a
+/// 300 MiB allocation; the stateful engine at x1's configuration under `Set`
+/// (first) and `Current`. Writes one `CASE\t` line: per run
+/// `kind,reports,spec_calls,impl_calls,spec_ms,impl_ms,first_ms,first_kb,
+/// before_kb,after_kb`, `;`-separated.
+#[test]
+#[ignore]
+fn e9_child() {
+    use crate::conformance::config::IndexKind;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    if std::env::var("E9_CASE").as_deref() != Ok("origin") {
+        return;
+    }
+    let base = e1_fixture("a27");
+    let mut out = Vec::new();
+    for k in [IndexKind::Set, IndexKind::Current] {
+        let spec_calls = Arc::new(AtomicUsize::new(0));
+        let impl_calls = Arc::new(AtomicUsize::new(0));
+        let mut f = base.clone();
+        let (spec, sc) = (base.specification.clone(), spec_calls.clone());
+        f.specification = Arc::new(move || {
+            if sc.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+            }
+            spec()
+        });
+        let (imp, ic) = (base.implementation.clone(), impl_calls.clone());
+        f.implementation = Arc::new(move || {
+            if ic.fetch_add(1, Ordering::SeqCst) >= 1 {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let v = vec![1u8; 300 << 20];
+                std::hint::black_box(&v);
+            }
+            imp()
+        });
+        let cc = crate::conformance::eval::x1_config(
+            GridEngine::Stateful,
+            crate::conformance::selector::Selector::Ltr,
+        )
+        .index(k)
+        .conf_config(&f);
+        let before = crate::conformance::grid::vm_hwm_kb().unwrap_or(0);
+        let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
+        let after = crate::conformance::grid::vm_hwm_kb().unwrap_or(0);
+        let c = &o.counters;
+        let text = |v: Option<String>| v.unwrap_or_default();
+        out.push(format!(
+            "{k:?},{},{},{},{},{},{},{},{before},{after}",
+            c.reports,
+            spec_calls.load(Ordering::SeqCst),
+            impl_calls.load(Ordering::SeqCst),
+            c.spec_wall_time_ms,
+            c.impl_wall_time_ms,
+            text(c.wall_ms_at_first_report.map(|v| v.to_string())),
+            text(c.vmhwm_kb_at_first_report.map(|v| v.to_string())),
+        ));
+    }
+    use std::io::Write as _;
+    writeln!(std::io::stdout().lock(), "CASE\t{}", out.join(";")).unwrap();
+}
+
+/// E9-6 (b): the origin and the first report's values, in a child process
+/// (its `VmHWM` is its own), from [`e9_child`]'s line. Per run: two reports;
+/// `spec_wall_time_ms ≥ 400 > W` (the clock starts after the index run, whose
+/// first specification invocation slept 400 ms); `W < 400 ≤
+/// impl_wall_time_ms` (the value is the first report's, read before the
+/// second completion's sleep and never overwritten); in the child's first run
+/// `H` is below the pre-run mark + 100 MiB while `VmHWM` after the run is at
+/// least 250 MiB above it (the read is at the first report, before the late
+/// allocation). Fails before E9 (no fields). Run alone.
+#[test]
+#[ignore]
+fn e9_b_the_origin_is_the_implementation_run() {
+    let o = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "conformance::compact_tests::e9_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("E9_CASE", "origin")
+        .output()
+        .unwrap();
+    let got = String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .find_map(|l| l.find("CASE\t").map(|k| l[k + 5..].to_owned()))
+        .unwrap_or_else(|| {
+            panic!(
+                "conformance: E9-6 (b): no case line: {}",
+                String::from_utf8_lossy(&o.stderr)
+            )
+        });
+    note!("e9_b: {got}");
+    let mut bad = Vec::new();
+    for (i, part) in got.split(';').enumerate() {
+        let f: Vec<&str> = part.split(',').collect();
+        if f.len() != 10 {
+            bad.push(format!("unparsed: {part}"));
+            continue;
+        }
+        let num = |j: usize| f[j].parse::<u64>().unwrap_or(u64::MAX);
+        let (reports, spec_calls, impl_calls) = (num(1), num(2), num(3));
+        let (spec_ms, impl_ms, first_ms) = (num(4), num(5), num(6));
+        let (first_kb, before, after) = (num(7), num(8), num(9));
+        if reports != 2 || spec_calls < 1 || impl_calls < 2 {
+            bad.push(format!("{}: reports {reports}, calls {spec_calls}/{impl_calls}", f[0]));
+        }
+        if !(spec_ms >= 400 && first_ms < 400 && impl_ms >= 400) {
+            bad.push(format!(
+                "{}: spec {spec_ms} ms, first {first_ms} ms, impl {impl_ms} ms",
+                f[0]
+            ));
+        }
+        if i == 0 && !(first_kb < before + 100 * 1024 && after >= before + 250 * 1024) {
+            bad.push(format!(
+                "{}: first-report VmHWM {first_kb} kB, before {before}, after {after}",
+                f[0]
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E9-6 (b): {bad:#?}");
+}
+
+/// E9-6 (c): exactly `min(1, N)` first-report reads per run, for both
+/// engines, by the lead's test-only hook (`cfirst::first_report_reads_for_test`,
+/// a thread-local count of `note_first_report`'s first-report branch): on
+/// [`E6_FIXTURES`] and [`E9_C04`], the stateful engine (`stateful::run_with`,
+/// on this thread) and the stateless engine (`cfirst::run_with`, quiet) at
+/// x1's configuration under `Current`, `Compact` and `Set`, `stop` off and on,
+/// `all_reports` off and on. And the source: at each of the three report sites
+/// (`stateful.rs` one, `cfirst.rs` two) the statement after
+/// `st.counters.reports += 1;` (comments aside) is `let c = &mut
+/// st.counters;`, then the reader's call, before the first report's snapshot;
+/// `note_first_report(` occurs there and, in `cfirst.rs`, at its definition,
+/// nowhere else; `stateful.rs` keeps its three `Instant::now()` and three
+/// `.elapsed()` (`run`, the index run, the implementation run: no new clock)
+/// and names no `vm_hwm`. Fails before E9 (no hook; the stateful count is 0 at
+/// `N ≥ 1`); the stateless half passes before and after (E9-6 (e)).
+#[test]
+fn e9_c_one_read_per_run() {
+    use crate::conformance::cfirst::{
+        first_report_reads_for_test, reset_first_report_reads_for_test,
+    };
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::selector::Selector;
+    let mut bad = Vec::new();
+    let (mut runs, mut reads) = (0usize, 0usize);
+    for name in E6_FIXTURES.iter().chain(E9_C04.iter()) {
+        let f = e1_fixture(name);
+        for engine in [GridEngine::Stateful, GridEngine::CompleteFirst] {
+            for k in [IndexKind::Current, IndexKind::Compact, IndexKind::Set] {
+                for stop in [false, true] {
+                    for all in [false, true] {
+                        let mut g = x1_config(engine, Selector::Ltr).index(k).stop(stop);
+                        if engine == GridEngine::CompleteFirst {
+                            g = g.quiet(true);
+                        }
+                        g.all_reports = all;
+                        let cc = g.conf_config(&f);
+                        reset_first_report_reads_for_test();
+                        let n = if engine == GridEngine::Stateful {
+                            stateful::run_with(&cc, &f.implementation, &f.specification, false)
+                                .counters
+                                .reports
+                        } else {
+                            crate::conformance::cfirst::run_with(
+                                &cc,
+                                &f.implementation,
+                                &f.specification,
+                                false,
+                            )
+                            .counters
+                            .reports
+                        };
+                        let got = first_report_reads_for_test();
+                        if got != n.min(1) {
+                            bad.push(format!(
+                                "{name} {engine:?} {k:?} stop={stop} all={all}: {got} reads, N {n}"
+                            ));
+                        }
+                        runs += 1;
+                        reads += got;
+                    }
+                }
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance");
+    for (file, sites, calls) in [("stateful.rs", 1, 1), ("cfirst.rs", 2, 3)] {
+        let src = std::fs::read_to_string(root.join(file)).expect("conformance: a source file");
+        let at: Vec<usize> =
+            src.match_indices("st.counters.reports += 1;").map(|(i, _)| i).collect();
+        if at.len() != sites {
+            bad.push(format!("{file}: {} report sites", at.len()));
+        }
+        for i in at {
+            let w = &src[i + "st.counters.reports += 1;".len()..];
+            let call = w.find("note_first_report(");
+            let snap = w.find("replay_snapshot(g, must_state");
+            match (call, snap) {
+                (Some(c), Some(s)) if c < s => {
+                    let between: Vec<&str> = w[..c]
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+                        .collect();
+                    if between != ["let c = &mut st.counters;"] {
+                        bad.push(format!("{file} at {i}: before the call {between:?}"));
+                    }
+                }
+                other => bad.push(format!("{file} at {i}: call/snapshot {other:?}")),
+            }
+        }
+        let n = src.matches("note_first_report(").count();
+        if n != calls {
+            bad.push(format!("{file}: {n} `note_first_report(`"));
+        }
+    }
+    let st = std::fs::read_to_string(root.join("stateful.rs")).expect("conformance: stateful.rs");
+    let clocks = (st.matches("Instant::now()").count(), st.matches(".elapsed()").count());
+    if clocks != (3, 3) || st.contains("vm_hwm") {
+        bad.push(format!("stateful.rs: clocks {clocks:?}, vm_hwm {}", st.contains("vm_hwm")));
+    }
+    note!("e9_c: {runs} runs, {reads} reads");
+    assert!(reads > 0 && reads < runs, "conformance: E9-6 (c) is vacuous");
+    assert!(bad.is_empty(), "conformance: E9-6 (c): {bad:#?}");
+}
+
+/// E9-6 (d): the public route, `conformance::run` with `Engine::Stateful` at
+/// x1's configuration (`Set`): on `ex:naive/k2/enc1` (two reports) and
+/// `apps/a1/correct/spec/n2r2` (none), `stateful_counters()` carries both
+/// fields `Some` iff `report_count() ≥ 1`, with `W ≤ impl_wall_time_ms`; the
+/// engine-independent `ConfCounters` names no first-report wall or memory
+/// field (its `Debug` text). Fails before E9 (no fields).
+#[test]
+fn e9_d_the_public_route() {
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::selector::Selector;
+    let mut bad = Vec::new();
+    for (name, violating) in [("ex:naive/k2/enc1", true), ("apps/a1/correct/spec/n2r2", false)] {
+        let f = e1_fixture(name);
+        let cc = x1_config(GridEngine::Stateful, Selector::Ltr).conf_config(&f);
+        let v = crate::conformance::run(cc, f.implementation.clone(), f.specification.clone())
+            .unwrap_or_else(|e| panic!("conformance: {name}: {e:?}"));
+        let out = v.outcome();
+        let sc = out
+            .stateful_counters()
+            .unwrap_or_else(|| panic!("conformance: {name}: no stateful counters"));
+        let n = out.report_count();
+        let (w, h) = (sc.wall_ms_at_first_report, sc.vmhwm_kb_at_first_report);
+        if (n >= 1) != violating || w.is_some() != violating || h.is_some() != violating {
+            bad.push(format!("{name}: report_count {n}, {w:?} {h:?}"));
+        }
+        if w.is_some_and(|w| w > sc.impl_wall_time_ms) {
+            bad.push(format!("{name}: {w:?} ms of {} ms", sc.impl_wall_time_ms));
+        }
+        let pc = format!("{:?}", out.counters());
+        if pc.contains("wall_ms_at_first_report") || pc.contains("vmhwm_kb_at_first_report") {
+            bad.push(format!("{name}: ConfCounters names a first-report column: {pc}"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E9-6 (d): {bad:#?}");
 }

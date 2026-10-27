@@ -2315,6 +2315,10 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "counter_reports", c.reports);
             push_d(&mut row, "spec_wall_time_ms", c.spec_wall_time_ms);
             push_d(&mut row, "impl_wall_time_ms", c.impl_wall_time_ms);
+            // `MIN-ENGINES` E9: the two first-report columns, as the
+            // complete-first row's (blank for `None`).
+            push_opt(&mut row, "wall_ms_at_first_report", c.wall_ms_at_first_report);
+            push_opt(&mut row, "vmhwm_kb_at_first_report", c.vmhwm_kb_at_first_report);
             // `COMPACT-INDEX` §5.1 items 1 and 5.
             push_opt(&mut row, "impl_distinct_summaries", c.impl_distinct_summaries);
             // `SVERIFY-P` I2b-7: the kind from the configuration (stateful row).

@@ -929,17 +929,27 @@ pub struct StatefulCounters {
     pub reports: usize,
     pub spec_wall_time_ms: u128,
     pub impl_wall_time_ms: u128,
+    /// `MIN-ENGINES` E9: the elapsed wall since the implementation run started
+    /// (after the index run), and the process's `VmHWM` (kB, from
+    /// `/proc/self/status`), both read at the run's first report (its first
+    /// uncovered implementation completion) by the stateless engine's reader;
+    /// `None` on a run with no report (or, for the memory, when the file
+    /// cannot be read). Never reset.
+    pub wall_ms_at_first_report: Option<u128>,
+    pub vmhwm_kb_at_first_report: Option<u64>,
     /// `P4-MIXED` M8: see [`ConfCounters::invisible_ops_of_visible_threads`].
     /// `None` since `SVERIFY-P` I1: the counter is off in every
     /// [`ConfMode::Enumerate`](crate::conformance::ctx::ConfMode) run, and this
     /// engine runs both sides in that mode — not counted, never a measured zero.
     pub invisible_ops_of_visible_threads: Option<usize>,
     /// `COMPACT-INDEX` §5.1 item 1 (step 0): distinct implementation
-    /// summaries `(Sig, ord)` over the Impl run, under both index kinds
-    /// (frozen §6); `Some` iff the `impl_distinct` knob is on (phase 2 D6).
+    /// summaries `(Sig, ord)` over the Impl run, under every index kind
+    /// (frozen §6; `Set` since `SVERIFY-P` I2b-7); `Some` iff the
+    /// `impl_distinct` knob is on (phase 2 D6).
     pub impl_distinct_summaries: Option<usize>,
     /// `COMPACT-INDEX` §5.1 item 5: the bucket index's counters, `Some` iff
-    /// `index = Compact`.
+    /// `index` is `Compact` or `Set` (`SVERIFY-P` I2b-7: the set index's,
+    /// through `SetStats::as_compact_stats`).
     pub(crate) compact: Option<crate::conformance::compact::CompactStats>,
 }
 
@@ -1368,8 +1378,9 @@ pub struct CFirstCounters {
     pub wall_ms_at_first_report: Option<u128>,
     pub vmhwm_kb_at_first_report: Option<u64>,
     /// `COMPACT-INDEX` §5.1 item 5: the compact cache's counters, `Some` iff
-    /// `index = Compact` (frozen §7); `cache_tests` then counts the bucket
-    /// queries' comparisons and `witnesses` the held entries.
+    /// `index` is `Compact` (frozen §7) or `Set` (`MIN-ENGINES` E7b: the set
+    /// cache's, through `SetCache::stats`); `cache_tests` then counts the
+    /// bucket queries' comparisons and `witnesses` the held entries.
     pub(crate) compact: Option<crate::conformance::compact::CompactStats>,
 }
 
