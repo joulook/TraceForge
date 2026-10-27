@@ -1353,6 +1353,9 @@ pub(super) struct GridConfig {
     /// `P5-CFCFG` F3/F4: the complete-first sweeps' quiet flag
     /// (`quiet=<bool>` in the label).
     pub(super) quiet: bool,
+    /// `MIN-ENGINES` E6: keep every report's graph, snapshot and dump (not in
+    /// the label: off is the default and no campaign row turns it on).
+    pub(super) all_reports: bool,
     /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and
     /// complete-first engines (`index=compact` in the label when `Compact`;
     /// the label is today's byte for byte under `Current`).
@@ -1388,6 +1391,7 @@ impl GridConfig {
             completion_cover: CompletionCover::Sweep,
             witness_cache: Capacity::Unbounded,
             quiet: false,
+            all_reports: false,
             index: IndexKind::Current,
             antichain: true,
             probe_memo: true,
@@ -1518,6 +1522,7 @@ impl GridConfig {
             .completion_cover(self.completion_cover)
             .witness_cache(self.witness_cache)
             .quiet_sweeps(self.quiet)
+            .all_reports(self.all_reports)
             .index(self.index)
             .antichain(self.antichain)
             .probe_memo(self.probe_memo)
@@ -1681,14 +1686,15 @@ impl std::fmt::Debug for GridRaw {
                 .finish(),
             GridRaw::Stateful(o) => f
                 .debug_struct("Stateful")
-                .field("reports", &o.reports.len())
+                .field("reports", &o.counters.reports)
                 .field("impl_end", &o.impl_end)
                 .field("spec_end", &o.spec_end)
                 .field("spec_errors", &o.spec_errors.len())
                 .finish(),
             GridRaw::CompleteFirst(o) => f
                 .debug_struct("CompleteFirst")
-                .field("reports", &o.reports.len())
+                .field("reports", &o.counters.reports)
+                .field("cut_reports", &o.cut_reports.len())
                 .field("impl_end", &o.impl_end)
                 .field("aborted", &o.aborted)
                 .field("spec_errors", &o.spec_errors.len())
@@ -2242,7 +2248,8 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "per_cover_detail", per.join("; "));
         }
         GridRaw::Stateful(o) => {
-            push_d(&mut row, "reports", o.reports.len());
+            // `MIN-ENGINES` E6: the count, kept or not.
+            push_d(&mut row, "reports", o.counters.reports);
             push(&mut row, "impl_end", o.impl_end);
             push(&mut row, "spec_end", o.spec_end);
             push_d(&mut row, "spec_errors", o.spec_errors.len());
@@ -2282,7 +2289,8 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             compact_columns(&mut row, c.compact.as_ref());
         }
         GridRaw::CompleteFirst(o) => {
-            push_d(&mut row, "reports", o.reports.len());
+            // `MIN-ENGINES` E6: the completion count, kept or not.
+            push_d(&mut row, "reports", o.counters.reports);
             push_d(&mut row, "cut_reports_list", o.cut_reports.len());
             push(&mut row, "impl_end", o.impl_end);
             push_d(&mut row, "spec_errors", o.spec_errors.len());
@@ -2460,7 +2468,7 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "verdict", class);
             if let Ok(verdict) = v {
                 let o = verdict.outcome();
-                push_d(&mut row, "reports", o.reports.len());
+                push_d(&mut row, "reports", o.report_count());
                 push_d(&mut row, "exhaustions", o.exhaustions.len());
                 push_d(&mut row, "notes", o.notes.len());
                 push(&mut row, "end", o.end);

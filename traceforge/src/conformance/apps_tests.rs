@@ -882,7 +882,11 @@ fn ok(end: GridEnd) -> GridResult {
 /// `P5-README.md`): `eval::run_row_in_process(.., keep_graphs = false)` —
 /// the reports keep their graphs, the families are not kept.
 fn grun(f: &Fixture, c: &GridConfig) -> GridResult {
-    ok(crate::conformance::eval::run_row_in_process(f, c, false))
+    // `MIN-ENGINES` E6 (the tester, gate 3): these tests read the report list
+    // (sets, counts against the derivation), so every report is kept.
+    let mut c = c.clone();
+    c.all_reports = true;
+    ok(crate::conformance::eval::run_row_in_process(f, &c, false))
 }
 
 /// One report of a grid run, engine-independently.

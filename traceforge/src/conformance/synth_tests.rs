@@ -219,7 +219,12 @@ fn ok(end: GridEnd) -> GridResult {
 
 /// One engine run on the lean path (`keep_graphs = false`).
 fn grun(f: &Fixture, c: &GridConfig) -> GridResult {
-    ok(run_row_in_process(f, c, false))
+    // `MIN-ENGINES` E6 (the tester, gate 3): every report kept (the list is read).
+    let mut c = c.clone();
+    c.all_reports = true;
+    // `MIN-ENGINES` E7a (the tester, gate 3): the sweep sizes are read.
+    c.sweep_record = true;
+    ok(run_row_in_process(f, &c, false))
 }
 
 fn cell<'a>(row: &'a Row, k: &str) -> &'a str {

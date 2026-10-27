@@ -911,6 +911,8 @@ fn run(
         .collect();
 
     Ok(ConfVerdict::of(ConfOutcome {
+        // `MIN-ENGINES` E6: the enumerator keeps every report (the literal compiles).
+        report_count: reports.len(),
         reports,
         exhaustions,
         notes,

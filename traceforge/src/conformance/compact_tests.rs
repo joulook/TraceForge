@@ -492,7 +492,8 @@ fn step0_impl_distinct_summaries() {
         c.spec_graphs,
         c.orders_held,
         c.signatures,
-        o.reports.len(),
+        // `MIN-ENGINES` E6: the count is the counter (the list keeps the first).
+        c.reports,
         t0.elapsed().as_millis()
     );
 }
@@ -597,7 +598,8 @@ fn engine_counters_on_the_size2_cells() {
                 let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
                 let c = &o.counters;
                 serde_json::json!({
-                    "cell": name, "row": row, "label": gc.label(), "reports": o.reports.len(),
+                    // `MIN-ENGINES` E6: the count is the counter.
+                    "cell": name, "row": row, "label": gc.label(), "reports": c.reports,
                     "spec_graphs": c.spec_graphs, "impl_graphs": c.impl_graphs,
                     "orders_held": c.orders_held, "signatures": c.signatures,
                     "lookups": c.lookups, "lookups_signature_miss": c.lookups_signature_miss,
@@ -616,7 +618,8 @@ fn engine_counters_on_the_size2_cells() {
                 );
                 let c = &o.counters;
                 serde_json::json!({
-                    "cell": name, "row": row, "label": gc.label(), "reports": o.reports.len(),
+                    // `MIN-ENGINES` E6: the count is the counter.
+                    "cell": name, "row": row, "label": gc.label(), "reports": c.reports,
                     "impl_graphs": c.impl_graphs, "cache_probes": c.cache_probes,
                     "cache_hits": c.cache_hits, "cache_tests": c.cache_tests,
                     "sweeps": c.sweeps, "sweeps_successful": c.sweeps_successful,
@@ -755,7 +758,8 @@ fn t1_on(f: &Fixture, tally: &mut T1Tally) -> Vec<String> {
             .antichain(true)
             .probe_memo(true)
             .conf_config(f);
-        stateful::run_with(&cc, &f.implementation, &f.specification, false)
+        // `MIN-ENGINES` E6: T1 compares the report sequences: every report kept.
+        stateful::run_with(&e6_all(cc), &f.implementation, &f.specification, false)
     };
     let other = if std::env::var("T1_SELF").is_ok() {
         IndexKind::Current
@@ -806,6 +810,8 @@ fn t1_on(f: &Fixture, tally: &mut T1Tally) -> Vec<String> {
                 .antichain(anti)
                 .probe_memo(true)
                 .conf_config(f);
+            // `MIN-ENGINES` E6: every report kept (the sequences are compared).
+            let cc = e6_all(cc);
             crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false)
         };
         let (a, b) = (cf(IndexKind::Current), cf(other));
@@ -1268,6 +1274,8 @@ fn m6_zero_admits_nothing() {
             .antichain(true)
             .probe_memo(true)
             .conf_config(&f);
+        // `MIN-ENGINES` E6: every report kept (the sequences are compared).
+        let cc = e6_all(cc);
         crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false)
     };
     let (a, b) = (run(IndexKind::Current), run(IndexKind::Compact));
@@ -1785,7 +1793,8 @@ fn sverify_pair(
             .antichain(true)
             .impl_distinct(true)
             .conf_config(f);
-        stateful::run_with(&cc, &f.implementation, &f.specification, false)
+        // `MIN-ENGINES` E6: every report kept (the lists are compared).
+        stateful::run_with(&e6_all(cc), &f.implementation, &f.specification, false)
     };
     (run(IndexKind::Current), run(IndexKind::Compact))
 }
@@ -1917,6 +1926,8 @@ fn cfirst_compact(f: &Fixture, cap: Capacity) -> crate::conformance::cfirst::CFi
         .probe_memo(true)
         .impl_distinct(true)
         .conf_config(f);
+    // `MIN-ENGINES` E6: every report kept (m11 compares the sequences).
+    let cc = e6_all(cc);
     crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false)
 }
 
@@ -1925,6 +1936,8 @@ fn cfirst_current(f: &Fixture, cap: Capacity) -> crate::conformance::cfirst::CFi
         .witness_cache(cap)
         .quiet(true)
         .conf_config(f);
+    // `MIN-ENGINES` E6: as `cfirst_compact`.
+    let cc = e6_all(cc);
     crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false)
 }
 
@@ -3025,7 +3038,8 @@ fn i1_sverify_s_uncovered_multiset() {
         crate::conformance::selector::Selector::Ltr,
     )
     .conf_config(&f);
-    let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
+    // `MIN-ENGINES` E6: the multiset is of every report.
+    let o = stateful::run_with(&e6_all(cc), &f.implementation, &f.specification, false);
     for (g, _) in &o.reports {
         let w = wobs(g, &f.visible).expect("conformance: wobs");
         let counts = match OrdCounts::of(g, &w, &f.visible) {
@@ -3082,6 +3096,17 @@ fn e1_fixture(name: &str) -> Fixture {
 ///   side, an `E4C` line (`MIN-ENGINES` E4-6 (c), outside the record's `E1`
 ///   lines): completions sharing a rendering are compared by `Sig ==`, and
 ///   equal signatures must have equal `Sig::hash128` (asserted).
+/// `MIN-ENGINES` E7a: the engine parts above pin the before-state ([`e7_before`]:
+/// the index they ran, the memo on, the sweep record on, every report kept);
+/// the stateless part prints the E7 record of its `Current` run, and two more
+/// parts print theirs: `e7c` (`Compact`, the sweep record on, the memo at its
+/// new default, off) and `e7d` (`Compact` at E7a's defaults, through the grid,
+/// with an `E7R` line of its row's knob columns) — all outside the `E1` filter.
+/// `MIN-ENGINES` E6: every engine part above keeps every report (`all_reports`
+/// on, today's lists); two more parts run the default (off): `e6s` (stateful
+/// under `Set`) and `e6c` (stateless), each an `E6T`/`E6C` line outside the
+/// `E1` filter — the verdict, the count, the kept length and the first kept
+/// entry's `UNC` text, compared offline with `E1T`/`UNCSET` and `E1C`/`UNCS`.
 /// Digests are std's `DefaultHasher` (fixed keys): comparable across runs of
 /// one toolchain, not across toolchains.
 #[test]
@@ -3120,6 +3145,8 @@ fn e1_record() {
     };
     if parts.contains("stateful") {
         let cc = crate::conformance::eval::x1_config(GridEngine::Stateful, sel).conf_config(&f);
+        // `MIN-ENGINES` E6/E7a: the before-state, every report kept.
+        let cc = e7_before(cc, crate::conformance::config::IndexKind::Current);
         let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
         for (g, _) in &o.reports {
             note!("UNC\t{}", line_of(g));
@@ -3141,6 +3168,7 @@ fn e1_record() {
     if parts.contains("stateless") {
         let cc =
             crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel).conf_config(&f);
+        let cc = e7_before(cc, crate::conformance::config::IndexKind::Current);
         let o =
             crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false);
         for (g, _) in &o.reports {
@@ -3164,6 +3192,7 @@ fn e1_record() {
             c.evictions,
             c.witnesses
         );
+        note!("E7\t{name}\t{sel:?}\tcurrent\t{}", e7_record(&o, &line_of));
     }
     // Rev 1.1 E1-4 (the record's missing fields), three further parts:
     // `stateful_set` — SVerify-S at X1 on `Set`: verdict, `UNCSET` lines,
@@ -3178,6 +3207,7 @@ fn e1_record() {
         let cc = crate::conformance::eval::x1_config(GridEngine::Stateful, sel)
             .index(crate::conformance::config::IndexKind::Set)
             .conf_config(&f);
+        let cc = e7_before(cc, crate::conformance::config::IndexKind::Set);
         let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
         for (g, _) in &o.reports {
             note!("UNCSET\t{}", line_of(g));
@@ -3194,6 +3224,7 @@ fn e1_record() {
     if parts.contains("stateless_keep") {
         let cc =
             crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel).conf_config(&f);
+        let cc = e7_before(cc, crate::conformance::config::IndexKind::Current);
         let o =
             crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, true);
         let outer: Vec<String> = o.kept_impl_graphs.iter().map(|g| line_of(g)).collect();
@@ -3224,6 +3255,71 @@ fn e1_record() {
             o.counters.evictions,
             o.counters.witnesses
         );
+    }
+    if parts.contains("e6s") {
+        let cc = crate::conformance::eval::x1_config(GridEngine::Stateful, sel)
+            .index(crate::conformance::config::IndexKind::Set)
+            .conf_config(&f);
+        let o = stateful::run_with(&cc, &f.implementation, &f.specification, false);
+        note!(
+            "E6T\t{name}\t{sel:?}\tverdict {}\tcount {}\tkept {}\tfirst {}",
+            if o.reports.is_empty() { "conforms" } else { "reported" },
+            o.counters.reports,
+            o.reports.len(),
+            o.reports.first().map_or_else(|| "-".to_owned(), |(g, _)| line_of(g))
+        );
+    }
+    if parts.contains("e6c") {
+        let cc =
+            crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel).conf_config(&f);
+        let o =
+            crate::conformance::cfirst::run_with(&cc, &f.implementation, &f.specification, false);
+        note!(
+            "E6C\t{name}\t{sel:?}\tverdict {}\tcount {}\tkept {}\tfirst {}",
+            if o.reports.is_empty() { "conforms" } else { "reported" },
+            o.counters.reports,
+            o.reports.len(),
+            o.reports.first().map_or_else(|| "-".to_owned(), |(g, _)| line_of(g))
+        );
+    }
+    if parts.contains("e7c") || parts.contains("e7d") {
+        use crate::conformance::grid::{row_of, run_grid, GridEnd, GridRaw};
+        let compact = crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel)
+            .index(crate::conformance::config::IndexKind::Compact);
+        for (part, record) in [("e7c", true), ("e7d", false)] {
+            if !parts.contains(part) {
+                continue;
+            }
+            // `e7c`: the sweep record on; `e7d`: E7a's defaults. Both keep every
+            // report (E6's knob) so the uncovered multiset is comparable.
+            let mut g = compact.clone();
+            g.sweep_record = record;
+            g.all_reports = true;
+            let r = match run_grid(&f, &g, None) {
+                GridEnd::Ok(r) => r,
+                other => panic!("conformance: {name} {part}: {other:?}"),
+            };
+            let row = row_of(&r);
+            let GridRaw::CompleteFirst(o) = &r.raw else {
+                panic!("conformance: {name} {part}: not a complete-first outcome")
+            };
+            note!("E7\t{name}\t{sel:?}\t{part}\t{}", e7_record(o, &line_of));
+            let col = |k: &str| {
+                row.iter()
+                    .find(|(c, _)| *c == k)
+                    .map_or_else(|| "-".to_owned(), |(_, v)| v.clone())
+            };
+            note!(
+                "E7R\t{name}\t{sel:?}\t{part}\tsweep_sizes {}\tsweep_ends {}\tmemo_on {}\t\
+                 memo_hits {}\tmemo_entries {}\tmemo_clears {}",
+                col("sweep_sizes"),
+                col("sweep_ends"),
+                col("memo_on"),
+                col("memo_hits"),
+                col("memo_entries"),
+                col("memo_clears")
+            );
+        }
     }
     if parts.contains("plain") {
         let sides = [("specification", &f.specification), ("implementation", &f.implementation)];
@@ -4120,7 +4216,10 @@ fn knob_run(
     g: &GridConfig,
 ) -> (stateful::StatefulOutcome, crate::conformance::grid::Row) {
     use crate::conformance::grid::{row_of, run_grid, GridEnd, GridRaw};
-    match run_grid(f, g, None) {
+    // `MIN-ENGINES` E6: the uncovered sequences are compared: every report kept.
+    let mut g = g.clone();
+    g.all_reports = true;
+    match run_grid(f, &g, None) {
         GridEnd::Ok(r) => {
             let row = row_of(&r);
             match r.raw {
@@ -5940,4 +6039,730 @@ fn e4_m1_a_reassigned_type_name_keeps_the_bucket() {
         }
     }
     assert!(bad.is_empty(), "conformance: gate-4 M1: {bad:#?}");
+}
+
+// =========================================================================
+// MIN-ENGINES E6 (the tester, gate 3; criteria/MIN-ENGINES-E6.md rev 1.1,
+// E6-6 (a)–(e); derived §E6): every report counted; the first report's graph,
+// snapshot and dump kept; the rest behind `all_reports` (off)
+// =========================================================================
+
+/// `cc` with every report kept (`all_reports` on): the list's tests (E6-6 (e)).
+/// `MIN-ENGINES` E7a (the tester, gate 3): and the sweep record on — its users
+/// (T1, m6, m11's complete-first pair, the record's parts) compare the sweep
+/// sizes too, which the default would leave empty on both sides.
+fn e6_all(mut cc: crate::conformance::ConfConfig) -> crate::conformance::ConfConfig {
+    cc.all_reports = true;
+    cc.sweep_record = true;
+    cc
+}
+
+/// E6-6 (b)'s violating fixtures (the record's `N`: 2, 4, 5, 24) and one
+/// conforming fixture (`N` = 0).
+const E6_FIXTURES: [&str; 5] = [
+    "apps/a1/correct/spec/n2r1",
+    "apps/a2/silent-put/spec/k2q1",
+    "apps/a3/double-grant/spec/k2q1",
+    "apps/a1/eager/spec/n2r1",
+    "e1:race-bad/bag",
+];
+
+/// E6-6 (a), a source check of the three sites (`stateful.rs` one,
+/// `cfirst.rs` two): each increments the counter, and only then tests
+/// `all_reports || st.reports.is_empty()`; the snapshot and the graph clone
+/// are inside that test; no other `replay_snapshot(g, must_state` in the two
+/// files. Fails before E6 (no retention test).
+#[test]
+fn e6_a_the_sites_count_then_keep_the_first() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut bad = Vec::new();
+    for (file, sites) in [("conformance/stateful.rs", 1), ("conformance/cfirst.rs", 2)] {
+        let src = std::fs::read_to_string(root.join(file)).expect("conformance: a source file");
+        let at: Vec<usize> =
+            src.match_indices("st.counters.reports += 1;").map(|(i, _)| i).collect();
+        if at.len() != sites {
+            bad.push(format!("{file}: {} counter sites", at.len()));
+        }
+        for i in at {
+            let w = &src[i..(i + 900).min(src.len())];
+            let (knob, empty) = (w.find("all_reports"), w.find("st.reports.is_empty()"));
+            let snap = w.find("replay_snapshot(g, must_state");
+            let push = w.find("st.reports.push(");
+            let ok = matches!(
+                (knob, empty, snap, push),
+                (Some(k), Some(e), Some(s), Some(p)) if k < s && e < s && s < p
+            );
+            if !ok {
+                bad.push(format!("{file} at {i}: {knob:?} {empty:?} {snap:?} {push:?}"));
+            }
+        }
+        let snaps = src.matches("replay_snapshot(g, must_state").count();
+        if snaps != sites {
+            bad.push(format!("{file}: {snaps} snapshot calls"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E6-6 (a): {bad:#?}");
+}
+
+/// The first entries of two report lists, compared: graph text and the
+/// snapshot through [`normalised`] (two runs' snapshots differ in
+/// per-instance hash-map order, as T1 measured).
+fn e6_first(
+    what: &str,
+    on: &[(ExecutionGraph, crate::conformance::report::ReplaySnapshot)],
+    off: &[(ExecutionGraph, crate::conformance::report::ReplaySnapshot)],
+    bad: &mut Vec<String>,
+) {
+    if let (Some(a), Some(b)) = (on.first(), off.first()) {
+        if a.0.to_string() != b.0.to_string() {
+            bad.push(format!("{what}: the first graph differs"));
+        }
+        if normalised(&a.1) != normalised(&b.1) {
+            bad.push(format!("{what}: the first snapshot differs"));
+        }
+    }
+}
+
+/// One grid column of `row`.
+fn e6_col(row: &crate::conformance::grid::Row, k: &str) -> String {
+    row.iter()
+        .find(|(c, _)| *c == k)
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| panic!("conformance: no `{k}` column"))
+}
+
+/// E6-6 (b): the knob off against on, on [`E6_FIXTURES`] × stateful under
+/// `Current`/`Compact`/`Set` and complete-first under `Current`/`Compact` ×
+/// stop-at-first off/on, through the grid (`run_grid`, the row too). With N
+/// the knob-on list's length: both counters N; the off list min(N, 1); the
+/// first graph and snapshot equal; the verdict and the end equal; the grid's
+/// `reports` and `counter_reports` columns equal (`reports` from the counter);
+/// complete-first's first-report columns present iff N ≥ 1 on both, and
+/// `paper_events_at_first_report(grid)` equal. Complete-first × `Set` is
+/// still refused (I2b; admitting it is E7's). Then the public route, both
+/// engines under `Current`: `report_count` N on both; `reports()` N on, min(N,
+/// 1) off; the first `ConfReport`'s dump, tag, gate, events and (normalised)
+/// snapshot equal. Fails before E6: the off list is N long.
+#[test]
+fn e6_b_the_knob_off_against_on() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::grid::{row_of, run_grid, GridEnd, GridRaw};
+    use crate::conformance::selector::Selector;
+    let mut bad = Vec::new();
+    let (mut runs, mut many) = (0usize, 0usize);
+    for name in E6_FIXTURES {
+        let f = e1_fixture(name);
+        let mut cfgs = Vec::new();
+        for k in [IndexKind::Current, IndexKind::Compact, IndexKind::Set] {
+            for stop in [false, true] {
+                cfgs.push(x1_config(GridEngine::Stateful, Selector::Ltr).index(k).stop(stop));
+            }
+        }
+        for k in [IndexKind::Current, IndexKind::Compact] {
+            for stop in [false, true] {
+                let g = x1_config(GridEngine::CompleteFirst, Selector::Ltr).quiet(true);
+                cfgs.push(g.index(k).stop(stop));
+            }
+        }
+        for g in cfgs {
+            let run = |on: bool| {
+                let mut g = g.clone();
+                g.all_reports = on;
+                match run_grid(&f, &g, None) {
+                    GridEnd::Ok(r) => r,
+                    other => panic!("conformance: {name}: {other:?}"),
+                }
+            };
+            let (on, off) = (run(true), run(false));
+            let what = format!("{name} {}", g.label());
+            runs += 1;
+            let n = match (&on.raw, &off.raw) {
+                (GridRaw::Stateful(a), GridRaw::Stateful(b)) => {
+                    let n = a.reports.len();
+                    let got = (a.counters.reports, b.counters.reports, b.reports.len());
+                    if got != (n, n, n.min(1)) || a.impl_end != b.impl_end {
+                        bad.push(format!("{what}: (on, off, kept) {got:?}, N {n}"));
+                    }
+                    e6_first(&what, &a.reports, &b.reports, &mut bad);
+                    n
+                }
+                (GridRaw::CompleteFirst(a), GridRaw::CompleteFirst(b)) => {
+                    let n = a.reports.len();
+                    let got = (a.counters.reports, b.counters.reports, b.reports.len());
+                    if got != (n, n, n.min(1))
+                        || a.impl_end != b.impl_end
+                        || a.cut_reports.len() != b.cut_reports.len()
+                    {
+                        bad.push(format!("{what}: (on, off, kept) {got:?}, N {n}"));
+                    }
+                    let first = |c: &crate::conformance::CFirstCounters| {
+                        let w = c.wall_ms_at_first_report.is_some();
+                        (w, c.vmhwm_kb_at_first_report.is_some())
+                    };
+                    let (fa, fb) = (first(&a.counters), first(&b.counters));
+                    if fa.0 != (n >= 1) || fa != fb {
+                        bad.push(format!("{what}: the first-report columns {fa:?} {fb:?}"));
+                    }
+                    e6_first(&what, &a.reports, &b.reports, &mut bad);
+                    n
+                }
+                _ => panic!("conformance: {what}: an unexpected outcome"),
+            };
+            many += usize::from(n >= 2);
+            let (ra, rb) = (row_of(&on), row_of(&off));
+            for col in ["reports", "counter_reports"] {
+                if e6_col(&ra, col) != e6_col(&rb, col) || e6_col(&ra, col) != n.to_string() {
+                    bad.push(format!("{what}: column `{col}`"));
+                }
+            }
+            if g.engine == GridEngine::CompleteFirst {
+                let col = "paper_events_at_first_report(grid)";
+                if e6_col(&ra, col) != e6_col(&rb, col) {
+                    bad.push(format!("{what}: column `{col}`"));
+                }
+            }
+        }
+        // Complete-first × `Set` stays refused (I2b).
+        let set = x1_config(GridEngine::CompleteFirst, Selector::Ltr).index(IndexKind::Set);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            set.conf_config(&f)
+        }))
+        .is_err();
+        std::panic::set_hook(prev);
+        if !refused {
+            bad.push(format!("{name}: complete-first × Set was admitted"));
+        }
+        // The public route.
+        for engine in [GridEngine::Stateful, GridEngine::CompleteFirst] {
+            let public = |on: bool| {
+                let mut cc = x1_config(engine, Selector::Ltr).quiet(true).conf_config(&f);
+                cc.all_reports = on;
+                crate::conformance::run(cc, f.implementation.clone(), f.specification.clone())
+                    .unwrap_or_else(|e| panic!("conformance: {name}: {e:?}"))
+            };
+            let (a, b) = (public(true), public(false));
+            let (a, b) = (a.outcome(), b.outcome());
+            let n = a.reports().len();
+            let what = format!("{name} {engine:?} public");
+            let got = (a.report_count(), b.report_count(), b.reports().len());
+            if got != (n, n, n.min(1)) {
+                bad.push(format!("{what}: (on, off, kept) {got:?}, N {n}"));
+            }
+            if let (Some(x), Some(y)) = (a.reports().first(), b.reports().first()) {
+                if (x.graph_dump(), x.tag(), x.gate(), x.events())
+                    != (y.graph_dump(), y.tag(), y.gate(), y.events())
+                    || normalised(x.replay_snapshot()) != normalised(y.replay_snapshot())
+                {
+                    bad.push(format!("{what}: the first report differs"));
+                }
+            }
+        }
+    }
+    note!("e6 (b): {runs} configurations, {many} with N ≥ 2");
+    assert!(many > 0, "conformance: E6-6 (b) is not vacuous");
+    assert!(bad.is_empty(), "conformance: E6-6 (b): {bad:#?}");
+}
+
+/// E6-6 (c): the test-only snapshot counter (`report.rs`), on this thread
+/// (the engines' completion sinks run here; `run_grid` would not). On A1
+/// eager n2r1 (N = 5) and A1 correct n2r1 (N = 0), stateful and
+/// complete-first: min(N, 1) snapshots with the knob off, N with it on.
+/// Fails before E6: off took N.
+#[test]
+fn e6_c_later_snapshots_are_not_computed() {
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::report::{replay_snapshots_for_test, reset_replay_snapshots_for_test};
+    use crate::conformance::selector::Selector;
+    let mut bad = Vec::new();
+    let mut seen = Vec::new();
+    for name in ["apps/a1/eager/spec/n2r1", "apps/a1/correct/spec/n2r1"] {
+        let f = e1_fixture(name);
+        for engine in [GridEngine::Stateful, GridEngine::CompleteFirst] {
+            for on in [false, true] {
+                let mut cc = x1_config(engine, Selector::Ltr).quiet(true).conf_config(&f);
+                cc.all_reports = on;
+                let (imp, spec) = (&f.implementation, &f.specification);
+                reset_replay_snapshots_for_test();
+                let n = if engine == GridEngine::Stateful {
+                    stateful::run_with(&cc, imp, spec, false).counters.reports
+                } else {
+                    crate::conformance::cfirst::run_with(&cc, imp, spec, false).counters.reports
+                };
+                let s = replay_snapshots_for_test();
+                seen.push((name, engine, on, n, s));
+                if s != if on { n } else { n.min(1) } {
+                    bad.push(format!("{name} {engine:?} on={on}: N {n}, {s} snapshots"));
+                }
+            }
+        }
+    }
+    note!("e6 (c): {seen:?}");
+    assert!(
+        seen.iter().any(|&(_, _, on, n, s)| on && n >= 2 && s == n),
+        "conformance: E6-6 (c) is not vacuous"
+    );
+    assert!(bad.is_empty(), "conformance: E6-6 (c): {bad:#?}");
+}
+
+/// E6-6 (d)'s cut fixture: visible `a` and `r`; `r` receives one `i32` from one
+/// of the invisible senders and forwards it to `a`. The implementation's
+/// senders send 1, 2 and 3 and `a` asserts the value is not 3; the
+/// specification's one sender sends 7 and `a` asserts nothing. Complete-first
+/// with the cut on: two uncovered completions (1, 2) and one cut report (3's
+/// visible failure); with the cut off three uncovered completions.
+fn e6_cut_prog(spec: bool) -> crate::conformance::grid::Prog {
+    crate::conformance::grid::prog(move || {
+        let a = crate::thread::Builder::new()
+            .name("a".to_owned())
+            .spawn(move || {
+                let y: i32 = crate::recv_msg_block();
+                if !spec {
+                    crate::assert(y != 3);
+                }
+            })
+            .unwrap();
+        let aid = a.thread().id();
+        let r = crate::thread::Builder::new()
+            .name("r".to_owned())
+            .spawn(move || {
+                let x: i32 = crate::recv_msg_block();
+                crate::send_msg(aid, x);
+            })
+            .unwrap();
+        let rid = r.thread().id();
+        let vals: Vec<i32> = if spec { vec![7] } else { vec![1, 2, 3] };
+        for (k, v) in vals.into_iter().enumerate() {
+            crate::thread::Builder::new()
+                .name(format!("s{k}"))
+                .spawn(move || crate::send_msg(rid, v))
+                .unwrap();
+        }
+    })
+}
+
+/// E6-6 (d): the rendering counts what it does not list (rev 1.1; Codex's
+/// readings: N completion reports, C cut reports; knob off: the header N + C,
+/// kept min(N, 1) + C, the elision N − 1 when N ≥ 1, `not_a_certificate`'s
+/// count N + C; knob on: N + C kept, no elision; the "exactly" sentence of N
+/// alone, complete-first's only when the outer run completed and no cut fired,
+/// the stateful one under its completed enumerations). Pinned:
+/// - A1 eager n2r1 (N = 5), stateful and complete-first (cut off): off, the
+///   header "5 candidate violation(s)", "The list holds 1 of them; 4 further
+///   candidate violation(s) counted, not kept (ConfBuilder::all_reports).",
+///   "There are exactly 5 " and the engine's tail; on, the same header and
+///   sentence and no elision line;
+/// - [`e6_cut_prog`] under complete-first with the cut on (N = 2, C = 1): off,
+///   the header 3, kept 2 (one completion report, the cut report), "The list
+///   holds 2 of them; 1 further …", `not_a_certificate` `Reported { count: 3 }`,
+///   the cut line and no "exactly" sentence; on, kept 3 and no elision; with the
+///   cut off (N = 3, C = 0): the header 3, kept 1 off, "There are exactly 3 ".
+/// Fails before E6: the header counted the list and the sentence was "The list
+/// is exactly the set".
+#[test]
+fn e6_d_the_rendering_counts_what_it_does_not_list() {
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::report::{
+        CFIRST_CUT_PREFIXES, CFIRST_EXACTLY_THE_SET, STATEFUL_EXACTLY_THE_SET,
+    };
+    use crate::conformance::selector::Selector;
+    use crate::conformance::{ConfBuilder, ConfVerdict, Engine, NotACertificate};
+    let elision = |kept: usize, more: usize| {
+        format!(
+            "The list holds {kept} of them; {more} further candidate violation(s) counted, \
+             not kept (ConfBuilder::all_reports)."
+        )
+    };
+    let mut bad = Vec::new();
+    // A1 eager n2r1, N = 5, both engines, the cut off.
+    let f = e1_fixture("apps/a1/eager/spec/n2r1");
+    for (engine, tail) in [
+        (GridEngine::Stateful, STATEFUL_EXACTLY_THE_SET),
+        (GridEngine::CompleteFirst, CFIRST_EXACTLY_THE_SET),
+    ] {
+        for on in [false, true] {
+            let mut cc = x1_config(engine, Selector::Ltr).quiet(true).conf_config(&f);
+            cc.all_reports = on;
+            let v = crate::conformance::run(cc, f.implementation.clone(), f.specification.clone())
+                .unwrap_or_else(|e| panic!("conformance: {e:?}"));
+            let s = v.to_string();
+            let o = v.outcome();
+            let what = format!("eager {engine:?} on={on}");
+            let kept = if on { 5 } else { 1 };
+            if !matches!(v, ConfVerdict::Reported(_))
+                || (o.report_count(), o.reports().len()) != (5, kept)
+                || !s.contains("conformance: 5 candidate violation(s).")
+                || s.contains(&elision(1, 4)) == on
+                || s.contains("The list holds") == on
+                || !s.contains(&format!("There are exactly 5 {tail}"))
+                || s.contains("The list is exactly")
+            {
+                bad.push(format!("{what}: {s}"));
+            }
+        }
+    }
+    // The cut fixture, complete-first.
+    let f = local_fixture("compact/e6-cut", e6_cut_prog(true), e6_cut_prog(false), &["a", "r"]);
+    for (cut, on) in [(true, false), (true, true), (false, false), (false, true)] {
+        let cc = ConfBuilder::new()
+            .config(f.config.clone())
+            .visible_threads(f.visible.clone())
+            .engine(Engine::CompleteFirst)
+            .early_error_cut(cut)
+            .all_reports(on)
+            .build()
+            .expect("conformance: in scope");
+        let v = crate::conformance::run(cc, f.implementation.clone(), f.specification.clone())
+            .unwrap_or_else(|e| panic!("conformance: {e:?}"));
+        let s = v.to_string();
+        let o = v.outcome();
+        let c = o.cfirst_counters().expect("conformance: complete-first counters");
+        let what = format!("cut={cut} on={on}");
+        let (n, k) = (c.reports, c.cut_reports);
+        let want_nk = if cut { (2, 1) } else { (3, 0) };
+        let kept = if on { n + k } else { n.min(1) + k };
+        let reported = o
+            .not_a_certificate()
+            .into_iter()
+            .any(|x| matches!(x, NotACertificate::Reported { count } if count == n + k));
+        let exactly = format!("There are exactly {n} {CFIRST_EXACTLY_THE_SET}");
+        if (n, k) != want_nk
+            || (o.report_count(), o.reports().len()) != (n + k, kept)
+            || !reported
+            || !s.contains(&format!("conformance: {} candidate violation(s).", n + k))
+            || s.contains(&elision(kept, n + k - kept)) == on
+            || s.contains("The list holds") == on
+            || s.contains(&exactly) == cut
+            || s.contains(CFIRST_CUT_PREFIXES) != cut
+        {
+            bad.push(format!("{what}: N {n} C {k} kept {}: {s}", o.reports().len()));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E6-6 (d): {bad:#?}");
+}
+
+// =========================================================================
+// MIN-ENGINES E7a (the tester, gate 3; criteria/MIN-ENGINES-E7A.md rev 1.3,
+// E7a-6 (a)–(f); derived §E7): the compact summary end to end on the
+// stateless engine, the probe memo off by default, the sweep record behind a
+// knob
+// =========================================================================
+
+/// The before-state of the record's engine parts (E7a-5 (i)): `index`, the
+/// memo on, the sweep record on, every report kept (E6).
+fn e7_before(
+    cc: crate::conformance::ConfConfig,
+    index: crate::conformance::config::IndexKind,
+) -> crate::conformance::ConfConfig {
+    let mut cc = e6_all(cc);
+    cc.index = index;
+    cc.probe_memo = true;
+    cc.sweep_record = true;
+    cc
+}
+
+/// The E7 record of a stateless outcome (rev 1.3): the verdict class, the md5
+/// of the sorted uncovered lines, the fifteen counters, the `sweep_ends` text
+/// from the scalars and `sweep_sizes` entry by entry.
+fn e7_record(
+    o: &crate::conformance::cfirst::CFirstOutcome,
+    line_of: &dyn Fn(&ExecutionGraph) -> String,
+) -> String {
+    let c = &o.counters;
+    let mut unc: Vec<String> = o.reports.iter().map(|(g, _)| line_of(g)).collect();
+    unc.sort();
+    let unc = crate::conformance::campaign_tests::md5_hex(unc.join("\n").as_bytes());
+    let verdict = if c.reports + c.cut_reports > 0 { "reported" } else { "conforms" };
+    format!(
+        "verdict {verdict}\tunc {unc}\timpl_graphs {}\tcache_probes {}\tcache_hits {}\t\
+         sweeps {}\tsweeps_successful {}\tsweeps_failing {}\tsweeps_aborted {}\t\
+         sweep_graphs {}\tsweep_graphs_max {}\tadmissions {}\tevictions {}\treadmissions {}\t\
+         reports {}\tcut_reports {}\timpl_end {:?}\t\
+         sweep_ends witness={} exhausted={} aborted={} budgeted=0\tsweep_sizes {:?}",
+        c.impl_graphs,
+        c.cache_probes,
+        c.cache_hits,
+        c.sweeps,
+        c.sweeps_successful,
+        c.sweeps_failing,
+        c.sweeps_aborted,
+        c.sweep_graphs,
+        c.sweep_graphs_max,
+        c.admissions,
+        c.evictions,
+        c.readmissions,
+        c.reports,
+        c.cut_reports,
+        o.impl_end,
+        c.sweeps_successful,
+        c.sweeps_failing,
+        c.sweeps_aborted,
+        c.sweep_sizes
+    )
+}
+
+/// The compact sweep relation, as `cfirst::covers_compact` states it (that
+/// function is private to the engine; E7a-6 (c) pins its text to this one).
+fn e7_covers(spec: &CompactSummary, query: &CompactSummary) -> bool {
+    spec.hash == query.hash && spec.sig == query.sig && spec.ord.le(&query.ord)
+}
+
+/// E7a-6 (a): no pair-set summary on the compact path. The test-only counter
+/// of `Summary::of` calls (`sig.rs`, this thread: the outer sink's) reads 0
+/// over a stateless `Compact` run on each size-2 cell — runs with misses and
+/// witnesses — and more than 0 under `Current` (the control: today's path
+/// summarises every completion). Fails before E7a: a `Compact` miss built the
+/// pair-set summary of the query (`lazy`) on this thread.
+#[test]
+fn e7a_a_no_pair_set_summary_on_the_compact_path() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::x1_config;
+    use crate::conformance::selector::Selector;
+    use crate::conformance::sig::{reset_summaries_built_for_test, summaries_built_for_test};
+    let mut bad = Vec::new();
+    let (mut misses, mut witnesses) = (0usize, 0usize);
+    for name in SIZE2_CELLS {
+        let f = fx(name);
+        for index in [IndexKind::Compact, IndexKind::Current] {
+            let g = x1_config(GridEngine::CompleteFirst, Selector::Ltr).index(index).quiet(true);
+            let cc = g.conf_config(&f);
+            reset_summaries_built_for_test();
+            let o = crate::conformance::cfirst::run_with(
+                &cc,
+                &f.implementation,
+                &f.specification,
+                false,
+            );
+            let n = summaries_built_for_test();
+            note!(
+                "e7a (a) {name} {index:?}: summaries {n} sweeps {} successful {}",
+                o.counters.sweeps,
+                o.counters.sweeps_successful
+            );
+            if index == IndexKind::Compact {
+                misses += o.counters.sweeps;
+                witnesses += o.counters.sweeps_successful;
+                if n != 0 {
+                    bad.push(format!("{name} Compact: {n} pair-set summaries"));
+                }
+            } else if n == 0 {
+                bad.push(format!("{name} Current: no summary counted (the control)"));
+            }
+        }
+    }
+    assert!(misses > 0 && witnesses > 0, "conformance: E7a-6 (a) is not vacuous");
+    assert!(bad.is_empty(), "conformance: E7a-6 (a): {bad:#?}");
+}
+
+/// E7a-6 (b): no witness clone. A compact sweep (`SweepTest::Compact`) of
+/// `MECH_CELL`'s specification for each of its implementation summaries
+/// returns the witness's compact summary (`witness_summary`), no graph
+/// (`witness` `None`), and the query moved back (`query`); the witness's
+/// summary satisfies the compact relation against the query. A query of
+/// another fixture's signature finds none (both `None`). And the source: the
+/// sweep sink's compact arm keeps `Some(spec)`, the summary, and clones no
+/// graph. Fails before E7a (no compact arm; the witness was `m.clone()`).
+#[test]
+fn e7a_b_the_witness_is_not_cloned() {
+    use crate::conformance::cfirst::{sweep_with, SweepTest};
+    use crate::conformance::ctx::ConfMode;
+    let f = fx(MECH_CELL);
+    let cc = GridConfig::new(GridEngine::CompleteFirst).conf_config(&f);
+    let (_, imp) = kept_summaries(&f);
+    let stranger = real_summary("2pc/leader/conf/n2");
+    let mut bad = Vec::new();
+    let mut found = 0usize;
+    for q in imp.iter().chain(std::iter::once(&stranger)) {
+        let swept = sweep_with(
+            &cc.config,
+            &f.visible,
+            &f.specification,
+            SweepTest::Compact(q.clone()),
+            None,
+            false,
+            ConfMode::CFirstSweep,
+            true,
+        );
+        let back = swept.query.as_ref().is_some_and(|b| b.sig == q.sig && b.ord == q.ord);
+        match (&swept.witness, &swept.witness_summary) {
+            (None, Some(w)) => {
+                found += 1;
+                if !e7_covers(w, q) || !back {
+                    bad.push("a witness summary that does not cover its query".to_owned());
+                }
+            }
+            (None, None) => {
+                if !back {
+                    bad.push("the query was not returned".to_owned());
+                }
+            }
+            (Some(_), _) => bad.push("a witness graph on the compact arm".to_owned()),
+        }
+    }
+    assert!(found > 0, "conformance: E7a-6 (b) is not vacuous");
+    let last = sweep_with(
+        &cc.config,
+        &f.visible,
+        &f.specification,
+        SweepTest::Compact(stranger),
+        None,
+        false,
+        ConfMode::CFirstSweep,
+        true,
+    );
+    if last.witness_summary.is_some() || last.witness.is_some() {
+        bad.push("a stranger's query found a witness".to_owned());
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = std::fs::read_to_string(root.join("conformance/cfirst.rs"))
+        .expect("conformance: cfirst.rs");
+    let head = "if let Some(cs) = query.borrow().as_ref() {";
+    let arm = e4_window(&src, head, "return SinkVerdict::Continue;");
+    if !arm.contains("*found_summary.borrow_mut() = Some(spec);") || arm.contains(".clone()") {
+        bad.push(format!("the compact arm: {arm}"));
+    }
+    assert!(bad.is_empty(), "conformance: E7a-6 (b): {bad:#?}");
+}
+
+/// E7a-6 (c): the compact test's equality, in process. On each size-2 cell,
+/// for every pair (a specification graph `m`, an implementation graph `g`) of
+/// the stateful engine's kept families, `covers_compact(cs(m), cs(g))` equals
+/// `covered(summary(g), summary(m))` on the pair-set summaries. Green by
+/// design (COMPACT-INDEX phase 2's T2: equal signatures align positions,
+/// `po ⊆ porf` makes each predecessor set a prefix, equal prefix lengths give
+/// equal transported-order membership); the function is E7a's — its text in
+/// `cfirst.rs` is pinned to [`e7_covers`]'s. The pilot's share is T2, s2 and s7.
+#[test]
+fn e7a_c_the_compact_test_equals_covered() {
+    use crate::conformance::sig::covered;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = std::fs::read_to_string(root.join("conformance/cfirst.rs"))
+        .expect("conformance: cfirst.rs");
+    assert!(
+        src.contains(
+            "fn covers_compact(spec: &CompactSummary, query: &CompactSummary) -> bool {\n    \
+             spec.hash == query.hash && spec.sig == query.sig && spec.ord.le(&query.ord)\n}"
+        ),
+        "conformance: `covers_compact`'s text"
+    );
+    let mut bad = Vec::new();
+    let (mut pairs, mut hits) = (0usize, 0usize);
+    for name in SIZE2_CELLS {
+        let f = fx(name);
+        let cc = GridConfig::new(GridEngine::Stateful).conf_config(&f);
+        let o = stateful::run_with(&cc, &f.implementation, &f.specification, true);
+        let both = |g: &ExecutionGraph| {
+            (
+                CompactSummary::at_completion(g, &f.visible, "test"),
+                stateful::summarise(g, &f.visible, "test"),
+            )
+        };
+        let spec: Vec<_> = o.kept_spec_graphs.iter().map(both).collect();
+        let imp: Vec<_> = o.kept_impl_graphs.iter().map(both).collect();
+        for (mc, ms) in &spec {
+            for (gc, gs) in &imp {
+                pairs += 1;
+                let (a, b) = (e7_covers(mc, gc), covered(gs, ms));
+                hits += usize::from(b);
+                if a != b {
+                    bad.push(format!("{name}: compact {a}, pair-set {b}"));
+                }
+            }
+        }
+    }
+    note!("e7a (c): {pairs} pairs, {hits} covered");
+    assert!(hits > 0 && hits < pairs, "conformance: E7a-6 (c) is not vacuous");
+    assert!(bad.is_empty(), "conformance: E7a-6 (c): {bad:#?}");
+}
+
+/// E7a-6 (d): the probe memo off by default. `ConfBuilder::new()`'s built
+/// configuration and `GridConfig::new` have `probe_memo` false; a default
+/// `Compact` key prints `pmemo=false` and round-trips through `parse_label`; a
+/// `pmemo=true` key still parses with the memo on; a stateless `Compact` run at
+/// the defaults reports `memo_on` false, and with `probe_memo(true)` true
+/// (the memo-subject tests set it at their own configuration). Fails before
+/// E7a (the default was on).
+#[test]
+fn e7a_d_the_probe_memo_is_off_by_default() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::parse_label;
+    let cc = crate::conformance::ConfBuilder::new().build().expect("conformance: in scope");
+    let g = GridConfig::new(GridEngine::CompleteFirst).index(IndexKind::Compact);
+    assert!(!cc.probe_memo && !g.probe_memo, "conformance: the memo's default");
+    let key = g.label();
+    assert!(key.ends_with("/pmemo=false"), "conformance: {key}");
+    assert_eq!(parse_label(&key), Some(g.clone()), "conformance: the key round-trips");
+    let on = g.clone().probe_memo(true);
+    assert!(on.label().ends_with("/pmemo=true"));
+    assert_eq!(parse_label(&on.label()), Some(on.clone()));
+    let f = fx(MECH_CELL);
+    for (gc, want) in [(g, false), (on, true)] {
+        let cc = gc.quiet(true).conf_config(&f);
+        let (imp, spec) = (&f.implementation, &f.specification);
+        let o = crate::conformance::cfirst::run_with(&cc, imp, spec, false);
+        let s = o.counters.compact.as_ref().expect("conformance: the compact stats");
+        assert_eq!(s.memo_on, want, "conformance: memo_on");
+        if !want {
+            assert_eq!((s.memo_hits, s.memo_entries, s.memo_clears), (0, 0, 0));
+        }
+    }
+}
+
+/// E7a-6 (e): the sweep record. On A3 fifo k2q2 (sweeps on every miss), the
+/// stateless engine under `Current` and `Compact`, through the grid: the knob
+/// off (the default) leaves `sweep_sizes` and `sweep_ends` empty and the
+/// `sweep_sizes` column blank; on, `sweep_sizes` has one entry per sweep
+/// summing to `sweep_graphs` and `sweep_ends` one per sweep; the `sweep_ends`
+/// column's text and every scalar counter are equal across the knob. Fails
+/// before E7a (the vectors grew whatever the knob).
+#[test]
+fn e7a_e_the_sweep_record_behind_its_knob() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::grid::{row_of, run_grid, GridEnd, GridRaw};
+    let f = fx("apps/a3/fifo/spec/k2q2");
+    let mut bad = Vec::new();
+    for index in [IndexKind::Current, IndexKind::Compact] {
+        let run = |record: bool| {
+            let mut g = GridConfig::new(GridEngine::CompleteFirst).index(index).quiet(true);
+            g.sweep_record = record;
+            match run_grid(&f, &g, None) {
+                GridEnd::Ok(r) => r,
+                other => panic!("conformance: {other:?}"),
+            }
+        };
+        let (on, off) = (run(true), run(false));
+        let (ra, rb) = (row_of(&on), row_of(&off));
+        let (GridRaw::CompleteFirst(a), GridRaw::CompleteFirst(b)) = (&on.raw, &off.raw) else {
+            panic!("conformance: complete-first outcomes")
+        };
+        let (ca, cb) = (&a.counters, &b.counters);
+        let what = format!("{index:?}");
+        if ca.sweeps == 0
+            || ca.sweep_sizes.len() != ca.sweeps
+            || ca.sweep_sizes.iter().sum::<usize>() != ca.sweep_graphs
+            || a.sweep_ends.len() != ca.sweeps
+        {
+            bad.push(format!("{what} on: {} sizes, {} ends, {} sweeps", ca.sweep_sizes.len(),
+                a.sweep_ends.len(), ca.sweeps));
+        }
+        if !cb.sweep_sizes.is_empty() || !b.sweep_ends.is_empty() {
+            bad.push(format!("{what} off: vectors kept"));
+        }
+        let scalars = |c: &crate::conformance::CFirstCounters| {
+            (c.sweeps, c.sweeps_successful, c.sweeps_failing, c.sweeps_aborted, c.sweep_graphs,
+             c.sweep_graphs_max, c.cache_hits, c.admissions, c.reports)
+        };
+        if scalars(ca) != scalars(cb) {
+            bad.push(format!("{what}: the scalars differ"));
+        }
+        if e6_col(&rb, "sweep_sizes") != "" || e6_col(&ra, "sweep_sizes").is_empty() {
+            bad.push(format!("{what}: the sweep_sizes column"));
+        }
+        if e6_col(&ra, "sweep_ends") != e6_col(&rb, "sweep_ends") {
+            bad.push(format!("{what}: the sweep_ends column"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E7a-6 (e): {bad:#?}");
 }

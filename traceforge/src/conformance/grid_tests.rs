@@ -83,7 +83,12 @@ fn ok(end: GridEnd) -> GridResult {
 }
 
 fn run(f: &Fixture, c: &GridConfig) -> GridResult {
-    ok(run_grid(f, c, None))
+    // `MIN-ENGINES` E6 (the tester, gate 3): every report kept (the list is read).
+    let mut c = c.clone();
+    c.all_reports = true;
+    // `MIN-ENGINES` E7a (the tester, gate 3): the sweep sizes are read.
+    c.sweep_record = true;
+    ok(run_grid(f, &c, None))
 }
 
 fn serialized(s: &ReplaySnapshot) -> bool {

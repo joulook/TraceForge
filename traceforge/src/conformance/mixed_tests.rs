@@ -120,7 +120,10 @@ fn cc(e: Eng, config: Config, visible: &[String], s: Selector, skip: bool) -> Co
         Eng::CFirst => b.engine(Engine::CompleteFirst),
         Eng::Gated(m, p) => b.engine(Engine::Gated).gated_mode(m).gate_policy(p),
     };
-    b.build()
+    // `MIN-ENGINES` E6 (the tester, gate 3): the report list is these tests'
+    // subject, so every report is kept.
+    b.all_reports(true)
+        .build()
         .expect("conformance: the test configuration is in scope")
 }
 
@@ -278,7 +281,10 @@ fn ok(end: GridEnd) -> GridResult {
 }
 
 fn grun(f: &Fixture, c: &GridConfig) -> GridResult {
-    ok(run_grid(f, c, None))
+    // `MIN-ENGINES` E6 (the tester, gate 3): every report kept (the list is read).
+    let mut c = c.clone();
+    c.all_reports = true;
+    ok(run_grid(f, &c, None))
 }
 
 /// One report of a grid run, engine-independently (Part 6's X3 mapping).

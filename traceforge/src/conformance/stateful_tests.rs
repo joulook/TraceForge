@@ -82,14 +82,23 @@ fn built(b: ConfBuilder) -> ConfConfig {
         .expect("conformance: the test configuration is in scope")
 }
 
+/// `MIN-ENGINES` E6 (the tester, gate 3): both entry points keep every report
+/// — these tests read the list (keys, the counter against the list,
+/// artefacts).
+fn all(cc: &ConfConfig) -> ConfConfig {
+    let mut cc = cc.clone();
+    cc.all_reports = true;
+    cc
+}
+
 /// The engine-only entry point (criterion 12).
 fn rw(cc: &ConfConfig, imp: &Prog, spec: &Prog, keep: bool) -> StatefulOutcome {
-    run_with(cc, imp, spec, keep)
+    run_with(&all(cc), imp, spec, keep)
 }
 
 /// The public path (`conformance::run`, dispatching on the engine).
 fn run(cc: ConfConfig, imp: &Prog, spec: &Prog) -> Result<ConfVerdict, ConfError> {
-    crate::conformance::run(cc, Arc::clone(imp), Arc::clone(spec))
+    crate::conformance::run(all(&cc), Arc::clone(imp), Arc::clone(spec))
 }
 
 fn class(v: &Result<ConfVerdict, ConfError>) -> String {
@@ -270,8 +279,17 @@ const T6_EACH_UNCOVERED: &str = "Every graph in this list is an uncovered comple
      specification graph has its signature or no order stored under its signature is contained \
      in its own (lem:sig).";
 
-const T6_EXACTLY: &str = "The list is exactly the set of such graphs (thm:stateful): both \
-     enumerations reached the end of their state spaces.";
+/// `MIN-ENGINES` E6 (the tester's re-pin at gate 3): the "exactly" sentence is
+/// of the completion count N, kept or not — "There are exactly {N} " and this
+/// tail ([`t6_exactly`]); before E6 it read "The list is exactly the set of
+/// such graphs …". The tail alone stands for the sentence's absence.
+const T6_EXACTLY: &str = "such graphs (thm:stateful): both enumerations reached the end of \
+     their state spaces.";
+
+/// The "exactly" sentence for `n` completion reports (`MIN-ENGINES` E6).
+fn t6_exactly(n: usize) -> String {
+    format!("There are exactly {n} {T6_EXACTLY}")
+}
 
 const T6_CONFORMS_LINE: &str = "conformance: silence. Every complete graph of the \
      implementation is covered by one of the specification (thm:stateful), and both \
@@ -2220,8 +2238,9 @@ fn c14b_stateful_reported_rendering_unbounded() {
     let s = format!("{}", r.unwrap());
     let expected_head = format!(
         "conformance: run seed 7 (reproduce with the same `Config` plus `.with_seed(7)`)\n\
-         conformance: 2 candidate violation(s).\n{T6_EACH_UNCOVERED}\n{T6_EXACTLY}\n\
-         {RESIDUAL}\n{ONLY_SILENCE}\n"
+         conformance: 2 candidate violation(s).\n{T6_EACH_UNCOVERED}\n{}\n\
+         {RESIDUAL}\n{ONLY_SILENCE}\n",
+        t6_exactly(2)
     );
     assert_eq!(head(&s), expected_head, "conformance: the head, verbatim");
     for gone in [

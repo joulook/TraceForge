@@ -100,18 +100,29 @@ fn built(b: ConfBuilder) -> ConfConfig {
         .expect("conformance: the test configuration is in scope")
 }
 
+/// `MIN-ENGINES` E6 (the tester, gate 3): the three entry points keep every
+/// report — these tests read the list (keys, identities, artefacts).
+/// `MIN-ENGINES` E7a (the tester, gate 3): and the sweep record — they read
+/// `sweep_sizes` and `sweep_ends` (identities, pins).
+fn all(cc: &ConfConfig) -> ConfConfig {
+    let mut cc = cc.clone();
+    cc.all_reports = true;
+    cc.sweep_record = true;
+    cc
+}
+
 /// The engine-only entry point (criterion 11).
 fn rw(cc: &ConfConfig, imp: &Prog, spec: &Prog, keep: bool) -> CFirstOutcome {
-    run_with(cc, imp, spec, keep)
+    run_with(&all(cc), imp, spec, keep)
 }
 
 fn srw(cc: &ConfConfig, imp: &Prog, spec: &Prog) -> StatefulOutcome {
-    stateful_run_with(cc, imp, spec, true)
+    stateful_run_with(&all(cc), imp, spec, true)
 }
 
 /// The public path (`conformance::run`, dispatching on the engine).
 fn run(cc: ConfConfig, imp: &Prog, spec: &Prog) -> Result<ConfVerdict, ConfError> {
-    crate::conformance::run(cc, Arc::clone(imp), Arc::clone(spec))
+    crate::conformance::run(all(&cc), Arc::clone(imp), Arc::clone(spec))
 }
 
 fn class(v: &Result<ConfVerdict, ConfError>) -> String {
@@ -391,9 +402,18 @@ const C7_EACH_UNCOVERED: &str = "Every complete graph in this list is an uncover
      unpruned sweep of the specification found no graph with its signature whose order is \
      contained in its own (lem:sig).";
 
-const C7_EXACTLY: &str = "The list is exactly the set of such graphs (thm:cfirst): the outer \
-     exploration reached the end of its state space, no early-error cut fired, and every \
-     failing sweep reached the end of the specification's.";
+/// `MIN-ENGINES` E6 (the tester's re-pin at gate 3): the "exactly" sentence is
+/// of the completion count N, kept or not — "There are exactly {N} " and this
+/// tail ([`c7_exactly`]); before E6 it read "The list is exactly the set of
+/// such graphs …". The tail alone stands for the sentence's absence.
+const C7_EXACTLY: &str = "such graphs (thm:cfirst): the outer exploration reached the end of \
+     its state space, no early-error cut fired, and every failing sweep reached the end of the \
+     specification's.";
+
+/// The "exactly" sentence for `n` completion reports (`MIN-ENGINES` E6).
+fn c7_exactly(n: usize) -> String {
+    format!("There are exactly {n} {C7_EXACTLY}")
+}
 
 const C7_CUT_LINE: &str = "Reports raised by the early-error cut are prefixes of the \
      implementation: every completion of every extension of each is uncovered (the \
@@ -1755,7 +1775,7 @@ fn c06_the_oracle_regression_cut_off_and_on() {
     assert_completion_artefacts(&r, &o, "oracle/off");
     let s = rendering(&r);
     assert!(
-        s.contains(C7_EXACTLY) && !s.contains(C7_CUT_LINE),
+        s.contains(&c7_exactly(1)) && !s.contains(C7_CUT_LINE),
         "conformance: {s}"
     );
 
@@ -2638,8 +2658,9 @@ fn c14_reported_rendering_unbounded() {
     let s = rendering(&r);
     let expected_head = format!(
         "conformance: run seed 7 (reproduce with the same `Config` plus `.with_seed(7)`)\n\
-         conformance: 2 candidate violation(s).\n{C7_EACH_UNCOVERED}\n{C7_EXACTLY}\n\
-         {RESIDUAL}\n{ONLY_SILENCE}\n"
+         conformance: 2 candidate violation(s).\n{C7_EACH_UNCOVERED}\n{}\n\
+         {RESIDUAL}\n{ONLY_SILENCE}\n",
+        c7_exactly(2)
     );
     assert_eq!(head(&s), expected_head, "conformance: the head, verbatim");
     for gone in [
@@ -3027,8 +3048,14 @@ fn c14_verify_dispatches_to_complete_first() {
         move || imp(),
         move || spec(),
     );
-    assert_eq!(class(&r), "reported:2");
+    // `MIN-ENGINES` E6 (the tester's re-pin at gate 3): `verify` runs the
+    // default (`all_reports` off): two candidates counted, the first kept.
+    assert_eq!(class(&r), "reported:1");
     let o = outcome(&r);
+    assert_eq!(o.report_count(), 2);
     assert_eq!(o.engine(), Engine::CompleteFirst);
-    assert_eq!(counters_of(&r).sweep_sizes, vec![2, 2]);
+    // `MIN-ENGINES` E7a (the tester's re-pin at gate 3): the default keeps no
+    // sweep record; the two sweeps and their four graphs are the scalars.
+    let c = counters_of(&r);
+    assert_eq!((c.sweep_sizes.clone(), c.sweeps, c.sweep_graphs), (vec![], 2, 4));
 }

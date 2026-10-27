@@ -604,6 +604,8 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     let parsed = GridConfig {
         witness_cache,
         quiet,
+        // `MIN-ENGINES` E6: not in the label (off is the default).
+        all_reports: false,
         index,
         antichain,
         probe_memo,

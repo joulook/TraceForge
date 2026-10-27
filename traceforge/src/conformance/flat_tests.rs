@@ -127,11 +127,15 @@ fn builder(
     s: Selector,
     cover: CompletionCover,
 ) -> ConfBuilder {
+    // `MIN-ENGINES` E6 (the tester, gate 3): the key sets read every report.
     let b = ConfBuilder::new()
         .config(config)
         .visible_threads(visible.to_vec())
         .selector(s)
-        .completion_cover(cover);
+        .completion_cover(cover)
+        .all_reports(true)
+        // `MIN-ENGINES` E7a (the tester, gate 3): the sweep sizes are read.
+        .sweep_record(true);
     match e {
         Eng::Enum => b.engine(Engine::Enumerator),
         Eng::Stateful => b.engine(Engine::Stateful),
@@ -1156,8 +1160,9 @@ fn c02_the_pinned_reported_rendering() {
         "Every complete graph in this list is an uncovered complete graph of the implementation: \
          at its completion no cached witness covered it, and `FlatCover` found no covering graph \
          (thm:flat).",
-        "The list is exactly the set of such graphs (thm:cfirst): the outer exploration reached \
-         the end of its state space, no early-error cut fired, and `FlatCover` is exact for this \
+        // `MIN-ENGINES` E6 (the tester's re-pin at gate 3): of the count, N = 1.
+        "There are exactly 1 such graphs (thm:cfirst): the outer exploration reached the end \
+         of its state space, no early-error cut fired, and `FlatCover` is exact for this \
          communication-flat specification (thm:flat, cor:mixedflat).",
         "  certifies (CompleteCoverage): no graph of the specification covers the reported \
          complete graph: no cached witness did, and `FlatCover` found no covering graph of this \

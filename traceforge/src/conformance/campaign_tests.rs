@@ -2214,7 +2214,8 @@ fn c03_apps_series_fixtures_are_exactly_the_points_beyond_the_loops() {
 }
 
 /// RFC 1321 MD5 (no crate in the tree has one).
-fn md5_hex(data: &[u8]) -> String {
+/// `MIN-ENGINES` E7a: visible to `compact_tests`' E7 record (its uncovered digest).
+pub(super) fn md5_hex(data: &[u8]) -> String {
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
@@ -2318,10 +2319,14 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // md5 `b4daad38…`, F2's column included); `E1_HUNKS` undo it to `e81c8b53…`.
     // MIN-ENGINES E3 (2026-10-26, tester re-pin, gate 3): to `5b2e85ba…` (grid.rs
     // md5 `e21c504d…`); `E3_HUNKS` undo it to `24d93d46…`.
+    // MIN-ENGINES E6 (2026-10-27, tester re-pin, gate 3): to `b8abd789…` (grid.rs
+    // md5 `739ecfd1…`); `E6_HUNKS` undo it to `5b2e85ba…`.
+    // MIN-ENGINES E7a (2026-10-27, tester re-pin, gate 3): to `ec716542…`
+    // (grid.rs md5 `64247d19…`); `E7A_HUNKS` undo it to `b8abd789…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "5b2e85ba800fdb29d072c057e6e9fe97",
+        "ec7165429ad20358fe76ed34c7e6632d",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2560,7 +2565,231 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
             ),
         ),
     ];
+    // MIN-ENGINES E6 (2026-10-27, tester re-pin): the lead's eight `grid.rs`
+    // hunks (`diff -U1` against grid.rs `e21c504d…`: the `all_reports` field,
+    // its default and its `conf_config` line; `Debug for GridRaw`'s two arms;
+    // the three `reports` columns from the counters), all inside the prefix;
+    // undoing them gives back the E3 prefix, byte for byte.
+    const E6_HUNKS: [(&str, &str); 8] = [
+        (
+            concat!(
+                "    pub(super) quiet: bool,\n",
+                "    /// `MIN-ENGINES` E6: keep every report's graph, snapshot and dump (not in\n",
+                "    /// the label: off is the default and no campaign row turns it on).\n",
+                "    pub(super) all_reports: bool,\n",
+                "    /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and\n"
+            ),
+            concat!(
+                "    pub(super) quiet: bool,\n",
+                "    /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and\n"
+            ),
+        ),
+        (
+            concat!(
+                "            quiet: false,\n",
+                "            all_reports: false,\n",
+                "            index: IndexKind::Current,\n"
+            ),
+            concat!(
+                "            quiet: false,\n",
+                "            index: IndexKind::Current,\n"
+            ),
+        ),
+        (
+            concat!(
+                "            .quiet_sweeps(self.quiet)\n",
+                "            .all_reports(self.all_reports)\n",
+                "            .index(self.index)\n"
+            ),
+            concat!(
+                "            .quiet_sweeps(self.quiet)\n",
+                "            .index(self.index)\n"
+            ),
+        ),
+        (
+            concat!(
+                "                .debug_struct(\"Stateful\")\n",
+                "                .field(\"reports\", &o.counters.reports)\n",
+                "                .field(\"impl_end\", &o.impl_end)\n"
+            ),
+            concat!(
+                "                .debug_struct(\"Stateful\")\n",
+                "                .field(\"reports\", &o.reports.len())\n",
+                "                .field(\"impl_end\", &o.impl_end)\n"
+            ),
+        ),
+        (
+            concat!(
+                "                .debug_struct(\"CompleteFirst\")\n",
+                "                .field(\"reports\", &o.counters.reports)\n",
+                "                .field(\"cut_reports\", &o.cut_reports.len())\n",
+                "                .field(\"impl_end\", &o.impl_end)\n"
+            ),
+            concat!(
+                "                .debug_struct(\"CompleteFirst\")\n",
+                "                .field(\"reports\", &o.reports.len())\n",
+                "                .field(\"impl_end\", &o.impl_end)\n"
+            ),
+        ),
+        (
+            concat!(
+                "        GridRaw::Stateful(o) => {\n",
+                "            // `MIN-ENGINES` E6: the count, kept or not.\n",
+                "            push_d(&mut row, \"reports\", o.counters.reports);\n",
+                "            push(&mut row, \"impl_end\", o.impl_end);\n"
+            ),
+            concat!(
+                "        GridRaw::Stateful(o) => {\n",
+                "            push_d(&mut row, \"reports\", o.reports.len());\n",
+                "            push(&mut row, \"impl_end\", o.impl_end);\n"
+            ),
+        ),
+        (
+            concat!(
+                "        GridRaw::CompleteFirst(o) => {\n",
+                "            // `MIN-ENGINES` E6: the completion count, kept or not.\n",
+                "            push_d(&mut row, \"reports\", o.counters.reports);\n",
+                "            push_d(&mut row, \"cut_reports_list\", o.cut_reports.len());\n"
+            ),
+            concat!(
+                "        GridRaw::CompleteFirst(o) => {\n",
+                "            push_d(&mut row, \"reports\", o.reports.len());\n",
+                "            push_d(&mut row, \"cut_reports_list\", o.cut_reports.len());\n"
+            ),
+        ),
+        (
+            concat!(
+                "                let o = verdict.outcome();\n",
+                "                push_d(&mut row, \"reports\", o.report_count());\n",
+                "                push_d(&mut row, \"exhaustions\", o.exhaustions.len());\n"
+            ),
+            concat!(
+                "                let o = verdict.outcome();\n",
+                "                push_d(&mut row, \"reports\", o.reports.len());\n",
+                "                push_d(&mut row, \"exhaustions\", o.exhaustions.len());\n"
+            ),
+        ),
+    ];
+    // MIN-ENGINES E7a (2026-10-27, tester re-pin): the lead's six `grid.rs`
+    // hunks (`diff -U1` against grid.rs `739ecfd1…`: the `sweep_record` field,
+    // its default and its `conf_config` line; `sweep_split_counts`; the
+    // complete-first row's `sweep_ends` and `sweep_sizes`), all inside the
+    // prefix; undoing them gives back the E6 prefix, byte for byte.
+    const E7A_HUNKS: [(&str, &str); 6] = [
+        (
+            concat!(
+                "    pub(super) all_reports: bool,\n",
+                "    /// `MIN-ENGINES` E7a: the complete-first per-sweep record (not in the\n",
+                "    /// label: off is the default and no campaign row turns it on).\n",
+                "    pub(super) sweep_record: bool,\n",
+                "    /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and\n"
+            ),
+            concat!(
+                "    pub(super) all_reports: bool,\n",
+                "    /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and\n"
+            ),
+        ),
+        (
+            concat!(
+                "            all_reports: false,\n",
+                "            sweep_record: false,\n",
+                "            index: IndexKind::Current,\n",
+                "            antichain: true,\n",
+                "            // `MIN-ENGINES` E7a: the probe memo off by default.\n",
+                "            probe_memo: false,\n",
+                "            impl_distinct: false,\n"
+            ),
+            concat!(
+                "            all_reports: false,\n",
+                "            index: IndexKind::Current,\n",
+                "            antichain: true,\n",
+                "            probe_memo: true,\n",
+                "            impl_distinct: false,\n"
+            ),
+        ),
+        (
+            concat!(
+                "            .all_reports(self.all_reports)\n",
+                "            .sweep_record(self.sweep_record)\n",
+                "            .index(self.index)\n"
+            ),
+            concat!(
+                "            .all_reports(self.all_reports)\n",
+                "            .index(self.index)\n"
+            ),
+        ),
+        (
+            concat!(
+                "\n",
+                "/// `MIN-ENGINES` E7a: the complete-first row's `sweep_ends` text from the scalar",
+                "\n",
+                "/// counters — the same text `sweep_split` gives for the recorded vector (the\n",
+                "/// completion sweeps run without a limit, so none is budgeted), whatever the\n",
+                "/// `sweep_record` knob.\n",
+                "fn sweep_split_counts(c: &crate::conformance::report::CFirstCounters) -> String {",
+                "\n",
+                "    format!(\n",
+                "        \"witness={} exhausted={} aborted={} budgeted=0\",\n",
+                "        c.sweeps_successful, c.sweeps_failing, c.sweeps_aborted\n",
+                "    )\n",
+                "}\n",
+                "\n",
+                "fn sweep_split(ends: &[SweepEnd]) -> String {\n"
+            ),
+            concat!(
+                "\n",
+                "fn sweep_split(ends: &[SweepEnd]) -> String {\n"
+            ),
+        ),
+        (
+            concat!(
+                "            push_d(&mut row, \"witness_cache_len\", o.witnesses.len());\n",
+                "            // `MIN-ENGINES` E7a: from the scalars, so the text is the same\n",
+                "            // whatever the `sweep_record` knob.\n",
+                "            push_d(&mut row, \"sweep_ends\", sweep_split_counts(&o.counters));\n",
+                "            push(\n"
+            ),
+            concat!(
+                "            push_d(&mut row, \"witness_cache_len\", o.witnesses.len());\n",
+                "            push_d(&mut row, \"sweep_ends\", sweep_split(&o.sweep_ends));\n",
+                "            push(\n"
+            ),
+        ),
+        (
+            concat!(
+                "            push_d(&mut row, \"sweeps_aborted\", c.sweeps_aborted);\n",
+                "            // `MIN-ENGINES` E7a: blank unless the per-sweep record is on.\n",
+                "            if r.config.sweep_record {\n",
+                "                push(&mut row, \"sweep_sizes\", &c.sweep_sizes);\n",
+                "            } else {\n",
+                "                push_d(&mut row, \"sweep_sizes\", \"\");\n",
+                "            }\n",
+                "            push_d(&mut row, \"sweep_graphs\", c.sweep_graphs);\n"
+            ),
+            concat!(
+                "            push_d(&mut row, \"sweeps_aborted\", c.sweeps_aborted);\n",
+                "            push(&mut row, \"sweep_sizes\", &c.sweep_sizes);\n",
+                "            push_d(&mut row, \"sweep_graphs\", c.sweep_graphs);\n"
+            ),
+        ),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in E7A_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "b8abd7893c9ef4fcd78665bfb4ae49a6",
+        "conformance: the prefix without E7a's hunks = the E6 prefix"
+    );
+    for (new, old) in E6_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "5b2e85ba800fdb29d072c057e6e9fe97",
+        "conformance: the prefix without E6's hunks = the E3 prefix"
+    );
     for (new, old) in E3_HUNKS {
         t = undo(t, new, old);
     }
@@ -2863,11 +3092,11 @@ fn c04_rq2b_identities_on_a_known_spec_count() {
     let spec_n: usize = cell(&stateful, "spec_graphs").parse().unwrap();
     assert_eq!(spec_n, 6);
     // Complete-first, exhaustive.
-    let cf = match run_row_in_process(
-        &f,
-        &x1_config(GridEngine::CompleteFirst, Selector::Ltr),
-        false,
-    ) {
+    // `MIN-ENGINES` E7a (the tester's re-pin at gate 3): the sweep sizes are
+    // read: the sweep record on.
+    let mut record = x1_config(GridEngine::CompleteFirst, Selector::Ltr);
+    record.sweep_record = true;
+    let cf = match run_row_in_process(&f, &record, false) {
         GridEnd::Ok(r) => row_of(&r),
         _ => panic!("conformance: complete-first run"),
     };

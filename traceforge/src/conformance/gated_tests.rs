@@ -136,15 +136,31 @@ fn sb(config: Config, visible: &[String]) -> ConfConfig {
 }
 
 fn crw(cc: &ConfConfig, imp: &Prog, spec: &Prog) -> CFirstOutcome {
-    cfirst_run_with(cc, imp, spec, true)
+    // `MIN-ENGINES` E6 (the tester, gate 3): the comparators' key sets read
+    // every report (the gated engine is not E6's and keeps its own).
+    let mut cc = cc.clone();
+    cc.all_reports = true;
+    // `MIN-ENGINES` E7a (the tester, gate 3): and the sweep record (c01
+    // compares the sweep sizes and ends with the gated engine's).
+    cc.sweep_record = true;
+    cfirst_run_with(&cc, imp, spec, true)
 }
 
 fn srw(cc: &ConfConfig, imp: &Prog, spec: &Prog) -> StatefulOutcome {
-    stateful_run_with(cc, imp, spec, true)
+    // `MIN-ENGINES` E6 (the tester, gate 3): as `crw`.
+    let mut cc = cc.clone();
+    cc.all_reports = true;
+    stateful_run_with(&cc, imp, spec, true)
 }
 
 /// The public path (`conformance::run`, dispatching on the engine).
+/// `MIN-ENGINES` E6 (the tester, gate 3): every report kept — the verdict
+/// classes compared here count the list (the gated engine keeps its own).
 fn run(cc: ConfConfig, imp: &Prog, spec: &Prog) -> Result<ConfVerdict, ConfError> {
+    let mut cc = cc;
+    cc.all_reports = true;
+    // `MIN-ENGINES` E7a (the tester, gate 3): and the sweep record.
+    cc.sweep_record = true;
     crate::conformance::run(cc, Arc::clone(imp), Arc::clone(spec))
 }
 

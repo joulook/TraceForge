@@ -191,6 +191,8 @@ pub(crate) fn run(
     };
 
     Ok(ConfVerdict::of(ConfOutcome {
+        // `MIN-ENGINES` E6: every completion report counted, kept or not.
+        report_count: out.counters.reports,
         reports,
         exhaustions: Vec::new(),
         notes,
@@ -369,6 +371,7 @@ pub(crate) fn run_with(
         let visible = visible.clone();
         let config = cc.config.clone();
         let stop_at_first_report = cc.stop_at_first_report;
+        let all_reports = cc.all_reports;
         Box::new(move |g: &ExecutionGraph, must_state: &MustState| {
             // `COMPACT-INDEX` §5.1 item 4(a): under `Compact` the compact
             // summary is the only one built; under `Current` today's.
@@ -480,10 +483,14 @@ pub(crate) fn run_with(
                 return SinkVerdict::Continue;
             }
             st.counters.reports += 1;
-            // T3: the snapshot is taken here, with the live state, so it is
-            // `Serialized` like the enumerator's completion reports.
-            let snapshot = replay_snapshot(g, must_state, &config, None);
-            st.reports.push((g.clone(), snapshot));
+            // `MIN-ENGINES` E6: the first report keeps its graph clone and its
+            // snapshot (T3: taken here, with the live state, so it is
+            // `Serialized` like the enumerator's completion reports); the rest
+            // are counted and, with `all_reports` off, kept no further.
+            if all_reports || st.reports.is_empty() {
+                let snapshot = replay_snapshot(g, must_state, &config, None);
+                st.reports.push((g.clone(), snapshot));
+            }
             if stop_at_first_report {
                 SinkVerdict::Stop
             } else {

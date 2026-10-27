@@ -116,7 +116,9 @@ fn n(r: &Rec, c: &str) -> u64 {
 
 /// The raw complete-first outcome under a `GridConfig` (report keys).
 fn cfirst_raw(f: &Fixture, cfg: &GridConfig) -> cfirst::CFirstOutcome {
-    let cc = cfg.conf_config(f);
+    let mut cc = cfg.conf_config(f);
+    // `MIN-ENGINES` E6 (the tester, gate 3): the key sets read every report.
+    cc.all_reports = true;
     cfirst::run_with(&cc, &f.implementation, &f.specification, false)
 }
 

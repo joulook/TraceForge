@@ -317,6 +317,9 @@ pub(crate) fn run(
             r
         })
         .collect();
+    // `MIN-ENGINES` E6: the public count is the completion reports (counted,
+    // kept or not) plus the cut reports (the context's, all kept).
+    let cut_count = out.cut_reports.len();
     reports.extend(out.cut_reports.into_iter().map(|r| {
         build_report_for(
             Engine::CompleteFirst,
@@ -348,6 +351,7 @@ pub(crate) fn run(
     };
 
     Ok(ConfVerdict::of(ConfOutcome {
+        report_count: out.counters.reports + cut_count,
         reports,
         exhaustions: Vec::new(),
         notes,
@@ -426,6 +430,7 @@ pub(crate) fn run_with(
         let config = cc.config.clone();
         let specification = Arc::clone(specification);
         let stop_at_first_report = cc.stop_at_first_report;
+        let all_reports = cc.all_reports;
         // `P5-CFCFG` F1–F3: the capacity (the admission assertion is void
         // under `Zero`), the quiet flag for the sweeps, the outer start for
         // the first-report wall.
@@ -531,8 +536,12 @@ pub(crate) fn run_with(
                     None => {
                         st.counters.reports += 1;
                         note_first_report(&mut st.counters, started);
-                        let snapshot = replay_snapshot(g, must_state, &config, None);
-                        st.reports.push((g.clone(), snapshot));
+                        // `MIN-ENGINES` E6: the first report keeps its graph
+                        // clone and snapshot; the rest are counted.
+                        if all_reports || st.reports.is_empty() {
+                            let snapshot = replay_snapshot(g, must_state, &config, None);
+                            st.reports.push((g.clone(), snapshot));
+                        }
                         if stop_at_first_report {
                             SinkVerdict::Stop
                         } else {
@@ -626,8 +635,11 @@ pub(crate) fn run_with(
                     st.sweep_ends.push(SweepEnd::Exhausted);
                     st.counters.reports += 1;
                     note_first_report(&mut st.counters, started);
-                    let snapshot = replay_snapshot(g, must_state, &config, None);
-                    st.reports.push((g.clone(), snapshot));
+                    // `MIN-ENGINES` E6: as at the flat-cover miss above.
+                    if all_reports || st.reports.is_empty() {
+                        let snapshot = replay_snapshot(g, must_state, &config, None);
+                        st.reports.push((g.clone(), snapshot));
+                    }
                     if stop_at_first_report {
                         SinkVerdict::Stop
                     } else {

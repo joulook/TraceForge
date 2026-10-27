@@ -288,6 +288,10 @@ pub struct ConfConfig {
     /// complete-first engines' implementation runs (off: their records say
     /// "not counted" and the public counter reads 0).
     pub(crate) paper_events: bool,
+    /// `MIN-ENGINES` E6: keep every report's graph clone, replay snapshot and
+    /// printed graph in the stateful and complete-first engines (off: the
+    /// first report's only; the rest are counted).
+    pub(crate) all_reports: bool,
     /// `COMPACT-INDEX` §5 (frozen C1): which index the stateful and
     /// complete-first engines use. `Current` is today's code path byte for
     /// byte; `Compact` is the bucket index of `compact.rs`.
@@ -417,6 +421,7 @@ pub struct ConfBuilder {
     witness_cache: Capacity,
     quiet_sweeps: bool,
     paper_events: bool,
+    all_reports: bool,
     index: IndexKind,
     antichain: bool,
     probe_memo: bool,
@@ -461,6 +466,8 @@ impl ConfBuilder {
             quiet_sweeps: false,
             // `MIN-ENGINES` E3: the paper-events walk off in the two engines.
             paper_events: false,
+            // `MIN-ENGINES` E6: the first report kept, the rest counted.
+            all_reports: false,
             // `COMPACT-INDEX` §5 (frozen C1, §4, §5): today's index; the
             // antichain and the probe memo on wherever `Compact` reads them.
             index: IndexKind::Current,
@@ -528,6 +535,18 @@ impl ConfBuilder {
     /// `L` regardless.
     pub fn paper_events(mut self, on: bool) -> Self {
         self.paper_events = on;
+        self
+    }
+
+    /// `MIN-ENGINES` E6: keep every candidate violation's graph clone, replay
+    /// snapshot and printed graph. Default `false`: the stateful and
+    /// complete-first engines keep the first completion report's and count
+    /// the rest (`ConfOutcome::report_count`; the rendering says how many
+    /// were not kept). Read by [`Engine::Stateful`] and
+    /// [`Engine::CompleteFirst`]; the enumerator and the gated checker keep
+    /// every report regardless.
+    pub fn all_reports(mut self, on: bool) -> Self {
+        self.all_reports = on;
         self
     }
 
@@ -733,6 +752,7 @@ impl ConfBuilder {
             witness_cache: self.witness_cache,
             quiet_sweeps: self.quiet_sweeps,
             paper_events: self.paper_events,
+            all_reports: self.all_reports,
             index: self.index,
             antichain: self.antichain,
             probe_memo: self.probe_memo,

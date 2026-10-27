@@ -1286,8 +1286,11 @@ fn c02_verdict_rows_carry_the_run_with_counters() {
                     // complete-first host leaves `L` blank on every route
                     // (`ConfConfig::paper_events` off): compared (equal), and
                     // required blank rather than filled.
-                    let blank_l =
-                        *c == "max_paper_events" && cfg.engine == GridEngine::CompleteFirst;
+                    // `MIN-ENGINES` E7a (the tester's re-pin at gate 3): and
+                    // `sweep_sizes`, blank on every route with the sweep record
+                    // off (the default; E7a-1).
+                    let blank_l = (*c == "max_paper_events" || *c == "sweep_sizes")
+                        && cfg.engine == GridEngine::CompleteFirst;
                     if blank_l && !(raw[*c].is_empty() && fl[*c].is_empty()) {
                         bad.push(format!("{what}: {c} filled with the knob off"));
                     }
@@ -1691,8 +1694,15 @@ fn measures(f: &Rec, s: &Rec) -> Result<Measures, String> {
             sweeps as i64 - calls as i64,
             g(f, hits)? as i64 - g(s, hits)? as i64,
         ),
+        // `MIN-ENGINES` E7a (the tester's re-pin at gate 3): a complete-first
+        // row at the default has `sweep_sizes` blank (no sweep record); the
+        // sweep graphs are then its scalar `sweep_graphs`.
         sweep_graphs: (
-            list_sum(s, sizes).ok_or_else(|| format!("no {sizes}"))?,
+            match list_sum(s, sizes) {
+                Some(n) => n,
+                None if graphs.is_some() && s[sizes].is_empty() => g(s, "sweep_graphs")?,
+                None => return Err(format!("no {sizes}")),
+            },
             graphs.map(|c| g(s, c)).transpose()?,
         ),
         flat_units: [
@@ -2049,7 +2059,12 @@ fn c03_report_key_sets_equal_in_process() {
     for name in names {
         let f = fixture(name);
         for s in SELECTORS {
-            let cf = |cover| flat_cfg(false, s, false).cover(cover).conf_config(f);
+            // `MIN-ENGINES` E6 (the tester, gate 3): the key sets read every report.
+            let cf = |cover| {
+                let mut cc = flat_cfg(false, s, false).cover(cover).conf_config(f);
+                cc.all_reports = true;
+                cc
+            };
             let (a, b) = (
                 cfirst::run_with(
                     &cf(CompletionCover::Flat),
@@ -2435,10 +2450,17 @@ fn c05_the_derived_cells_through_the_runners_child() {
             } else {
                 ("sweeps", "sweep_sizes")
             };
+            // `MIN-ENGINES` E7a (the tester's re-pin at gate 3): the store's
+            // complete-first rows run the default (no sweep record):
+            // `sweep_sizes` blank, the sum from the scalar `sweep_graphs`, the
+            // sizes' multiset compared where recorded (the gated rows').
+            let recorded = !s[sizes_col].is_empty();
             let sizes = sorted_sizes(s, sizes_col);
+            let sigma = if recorded { list_sum(s, sizes_col) } else { num(s, "sweep_graphs") };
             if num(s, sw) != Some(c.sweeps)
-                || list_sum(s, sizes_col) != Some(c.sigma)
-                || (c.sizes.is_some() && sizes != c.sizes)
+                || sigma != Some(c.sigma)
+                || (recorded && c.sizes.is_some() && sizes != c.sizes)
+                || (!recorded && gated)
             {
                 bad.push(format!("{what}: sweep {:?} {:?}", s[sw], s[sizes_col]));
             }

@@ -274,6 +274,8 @@ pub(crate) fn run(
     };
 
     Ok(ConfVerdict::of(ConfOutcome {
+        // `MIN-ENGINES` E6: this engine keeps every report (the literal compiles).
+        report_count: reports.len(),
         reports,
         exhaustions: Vec::new(),
         notes,

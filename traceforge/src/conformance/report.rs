@@ -87,8 +87,8 @@ pub(crate) const STATEFUL_EACH_UNCOVERED: &str =
 /// `P4-STATEFUL` T6: `thm:stateful`'s "exactly", printed only when both
 /// enumerations completed (`end == StateSpaceExhausted`).
 pub(crate) const STATEFUL_EXACTLY_THE_SET: &str =
-    "The list is exactly the set of such graphs (thm:stateful): both enumerations reached \
-     the end of their state spaces.";
+    "such graphs (thm:stateful): both enumerations reached the end of their state \
+     spaces.";
 
 /// `P4-CFIRST` C7: true of every complete-first completion report, on every
 /// run — it is `alg:cfirst`'s `Covered`, which needs only an exhaustive
@@ -103,9 +103,9 @@ pub(crate) const CFIRST_EACH_UNCOVERED: &str =
 /// completed and no early-error cut fired (A27: with a cut the engine decides,
 /// it does not enumerate).
 pub(crate) const CFIRST_EXACTLY_THE_SET: &str =
-    "The list is exactly the set of such graphs (thm:cfirst): the outer exploration \
-     reached the end of its state space, no early-error cut fired, and every failing \
-     sweep reached the end of the specification's.";
+    "such graphs (thm:cfirst): the outer exploration reached the end of its state \
+     space, no early-error cut fired, and every failing sweep reached the end of the \
+     specification's.";
 
 /// `P4-GATED` G6: true of every exhaustive-mode gated report, on every run.
 pub(crate) const GATED_EACH_UNCOVERED: &str =
@@ -137,9 +137,9 @@ pub(crate) const CFIRST_EACH_UNCOVERED_FLAT: &str =
      found no covering graph (thm:flat).";
 
 pub(crate) const CFIRST_EXACTLY_THE_SET_FLAT: &str =
-    "The list is exactly the set of such graphs (thm:cfirst): the outer exploration \
-     reached the end of its state space, no early-error cut fired, and `FlatCover` is \
-     exact for this communication-flat specification (thm:flat, cor:mixedflat).";
+    "such graphs (thm:cfirst): the outer exploration reached the end of its state \
+     space, no early-error cut fired, and `FlatCover` is exact for this \
+     communication-flat specification (thm:flat, cor:mixedflat).";
 
 pub(crate) const GATED_EACH_UNCOVERED_FLAT: &str =
     "Every graph in this list is an uncovered complete graph of the implementation: it \
@@ -871,6 +871,11 @@ pub struct FlatEligibility {
 /// Everything one conformance run produced.
 #[derive(Clone)]
 pub struct ConfOutcome {
+    /// `MIN-ENGINES` E6: every candidate violation counted — the completion
+    /// reports, kept or not, plus (complete-first) the cut reports; equals
+    /// `reports.len()` unless the stateful or complete-first engine ran with
+    /// `ConfBuilder::all_reports` off and reported more than once.
+    pub(crate) report_count: usize,
     pub(crate) reports: Vec<ConfReport>,
     pub(crate) exhaustions: Vec<ConfExhaustion>,
     pub(crate) notes: Vec<ConfNote>,
@@ -1085,6 +1090,11 @@ impl ConfOutcome {
     pub fn reports(&self) -> &[ConfReport] {
         &self.reports
     }
+    /// `MIN-ENGINES` E6: every candidate violation counted, kept or not
+    /// (`reports()` holds the kept ones).
+    pub fn report_count(&self) -> usize {
+        self.report_count
+    }
     pub fn exhaustions(&self) -> &[ConfExhaustion] {
         &self.exhaustions
     }
@@ -1102,9 +1112,9 @@ impl ConfOutcome {
     /// thing that makes [`ConfVerdict::Conforms`] constructible.**
     pub fn not_a_certificate(&self) -> Vec<NotACertificate> {
         let mut out = Vec::new();
-        if !self.reports.is_empty() {
+        if self.report_count > 0 {
             out.push(NotACertificate::Reported {
-                count: self.reports.len(),
+                count: self.report_count,
             });
         }
         if !self.exhaustions.is_empty() {
@@ -1269,7 +1279,8 @@ pub struct GatedCounters {
     pub witnesses: usize,
     /// Admissions `W` refused as already held — asserted zero by the engine.
     pub witness_duplicates: usize,
-    /// Every report, of either kind.
+    /// Every completion report, kept or not (`MIN-ENGINES` E6; the cut reports
+    /// are the context's, counted in `cut_reports`).
     pub reports: usize,
     pub precheck_ran: bool,
     pub precheck_wall_time_ms: u128,
@@ -1451,7 +1462,7 @@ impl fmt::Debug for ConfVerdict {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfVerdict::Conforms(_) => write!(f, "ConfVerdict::Conforms"),
-            ConfVerdict::Reported(o) => write!(f, "ConfVerdict::Reported({})", o.reports.len()),
+            ConfVerdict::Reported(o) => write!(f, "ConfVerdict::Reported({})", o.report_count),
             ConfVerdict::Inconclusive(o) => {
                 write!(f, "ConfVerdict::Inconclusive({:?})", o.not_a_certificate())
             }
@@ -2016,9 +2027,20 @@ impl fmt::Display for ConfVerdict {
                 writeln!(
                     f,
                     "conformance: {} {}(s).",
-                    o.reports.len(),
+                    o.report_count,
                     CANDIDATE_VIOLATION
                 )?;
+                // `MIN-ENGINES` E6: the candidates not kept are said, not hidden.
+                let omitted = o.report_count.saturating_sub(o.reports.len());
+                if omitted > 0 {
+                    writeln!(
+                        f,
+                        "The list holds {} of them; {omitted} further {}(s) counted, not kept \
+                         (ConfBuilder::all_reports).",
+                        o.reports.len(),
+                        CANDIDATE_VIOLATION
+                    )?;
+                }
                 match o.engine {
                     Engine::Enumerator => {
                         writeln!(f, "{SETTLED_CLAIM}")?;
@@ -2030,7 +2052,10 @@ impl fmt::Display for ConfVerdict {
                     Engine::Stateful => {
                         writeln!(f, "{STATEFUL_EACH_UNCOVERED}")?;
                         if o.end == SearchEnd::StateSpaceExhausted {
-                            writeln!(f, "{STATEFUL_EXACTLY_THE_SET}")?;
+                            // `MIN-ENGINES` E6: the theorem's count, of the
+                            // completion reports counted, kept or not.
+                            let n = o.stateful_counters.as_ref().map_or(0, |c| c.reports);
+                            writeln!(f, "There are exactly {n} {STATEFUL_EXACTLY_THE_SET}")?;
                         }
                     }
                     // `P4-CFIRST` C7: the always-true sentence (scoped to
@@ -2045,10 +2070,13 @@ impl fmt::Display for ConfVerdict {
                             writeln!(f, "{CFIRST_EACH_UNCOVERED}")?;
                         }
                         if o.end == SearchEnd::StateSpaceExhausted && !cut_fired {
+                            // `MIN-ENGINES` E6: the theorem's count, of the
+                            // completion reports counted, kept or not.
+                            let n = o.cfirst_counters.as_ref().map_or(0, |c| c.reports);
                             if o.flat_counters.is_some() {
-                                writeln!(f, "{CFIRST_EXACTLY_THE_SET_FLAT}")?;
+                                writeln!(f, "There are exactly {n} {CFIRST_EXACTLY_THE_SET_FLAT}")?;
                             } else {
-                                writeln!(f, "{CFIRST_EXACTLY_THE_SET}")?;
+                                writeln!(f, "There are exactly {n} {CFIRST_EXACTLY_THE_SET}")?;
                             }
                         }
                         if cut_fired {
@@ -2422,6 +2450,26 @@ pub(crate) fn status_text(s: crate::conformance::morphism::Status) -> &'static s
 // Construction helpers used by `mod.rs`. No rendering here.
 // ---------------------------------------------------------------------------
 
+// `MIN-ENGINES` E6-6 (c), test builds only: how many snapshots this thread
+// took — the tester's evidence that a later report, with `all_reports` off,
+// computes none.
+#[cfg(test)]
+thread_local! {
+    static REPLAY_SNAPSHOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `MIN-ENGINES` E6-6 (c), test builds only: the thread's snapshot count.
+#[cfg(test)]
+pub(crate) fn replay_snapshots_for_test() -> usize {
+    REPLAY_SNAPSHOTS.with(|c| c.get())
+}
+
+/// `MIN-ENGINES` E6-6 (c), test builds only: reset the count.
+#[cfg(test)]
+pub(crate) fn reset_replay_snapshots_for_test() {
+    REPLAY_SNAPSHOTS.with(|c| c.set(0));
+}
+
 /// §7.1's serialized half, built **at capture time and off the live `Must`**.
 ///
 /// See [`ReplaySnapshot`] for why `store_replay_information`'s conformance
@@ -2440,6 +2488,8 @@ pub(crate) fn replay_snapshot(
     config: &crate::Config,
     pos: Option<crate::event::Event>,
 ) -> ReplaySnapshot {
+    #[cfg(test)]
+    REPLAY_SNAPSHOTS.with(|c| c.set(c.get() + 1));
     let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let sorted = graph.top_sort(pos);
         let info = crate::replay::ReplayInformation::create(sorted, state.clone(), config.clone());
