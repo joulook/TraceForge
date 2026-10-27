@@ -570,13 +570,14 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     } else if p.len() == 14 {
         // `SVERIFY-P` I2b-7: `index=set`; the knobs it does not print are not
         // read under `Set` and take `GridConfig::new`'s values, as under
-        // `Current` below.
+        // `Current` below (`MIN-ENGINES` E7a: the memo's default is off, so
+        // `pmemo` reads `false` here — gate 3's F-1).
         if p[13] != "index=set" {
             return None;
         }
-        (IndexKind::Set, true, true)
+        (IndexKind::Set, true, false)
     } else {
-        (IndexKind::Current, true, true)
+        (IndexKind::Current, true, false)
     };
     let engine = parse_engine(p[0])?;
     let precheck = flag(p[7], "precheck")?;
@@ -606,6 +607,7 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         quiet,
         // `MIN-ENGINES` E6: not in the label (off is the default).
         all_reports: false,
+        sweep_record: false,
         index,
         antichain,
         probe_memo,
@@ -3631,7 +3633,13 @@ fn verdict_counter_fill(end: &GridEnd, mut inner: Row) -> Row {
         );
         push(&mut inner, "sweeps_failing", c.sweeps_failing.to_string());
         push(&mut inner, "sweeps_aborted", c.sweeps_aborted.to_string());
-        push(&mut inner, "sweep_sizes", format!("{:?}", c.sweep_sizes));
+        // `MIN-ENGINES` E7a: blank unless the row's configuration records the
+        // sweeps, as `row_of` leaves it on the `run_with` route (gate 3's F-2).
+        if r.config.sweep_record {
+            push(&mut inner, "sweep_sizes", format!("{:?}", c.sweep_sizes));
+        } else {
+            push(&mut inner, "sweep_sizes", String::new());
+        }
         push(&mut inner, "sweep_graphs", c.sweep_graphs.to_string());
         push(
             &mut inner,

@@ -1794,11 +1794,11 @@ fn my_unescape(s: &str) -> String {
 /// and by `parse_csv_line`. Every value is quoted; no line breaks.
 #[test]
 fn c05_rfc4180_round_trip() {
-    let cf = match run_row_in_process(
-        &naive_fixture(3, 2),
-        &GridConfig::new(GridEngine::CompleteFirst),
-        false,
-    ) {
+    // `MIN-ENGINES` E7a (the tester's re-pin at gate 3): the sweep sizes are
+    // this test's subject: the sweep record on.
+    let mut record = GridConfig::new(GridEngine::CompleteFirst);
+    record.sweep_record = true;
+    let cf = match run_row_in_process(&naive_fixture(3, 2), &record, false) {
         GridEnd::Ok(r) => row_of(&r),
         other => panic!("conformance: {other:?}"),
     };

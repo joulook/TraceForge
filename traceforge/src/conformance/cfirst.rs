@@ -95,6 +95,11 @@ pub(crate) enum SweepEnd {
 pub(crate) enum SweepTest {
     Covered(Summary),
     Cone { wobs: Wobs, ord: VisOrder },
+    /// `MIN-ENGINES` E7a: the compact path — the query's compact summary,
+    /// moved into the sweep (a `Message` is `Send`, not `Sync`, so the
+    /// scoped sweep thread cannot borrow it) and handed back in `Swept`;
+    /// each sweep graph is tested by its own compact summary.
+    Compact(CompactSummary),
 }
 
 impl SweepTest {
@@ -105,8 +110,19 @@ impl SweepTest {
                 let _ = m_wobs;
                 cone_from(wobs, ord, m, visible)
             }
+            SweepTest::Compact(_) => {
+                unreachable!("conformance: the compact sweep test is answered by `covers_compact`")
+            }
         }
     }
+}
+
+/// `MIN-ENGINES` E7a: the compact sweep test — the relation the compact and set
+/// indexes answer `covers` with (`lem:sig` in counts, T2): the hash, then the
+/// full signature, then the specification's counts pointwise at most the
+/// query's.
+fn covers_compact(spec: &CompactSummary, query: &CompactSummary) -> bool {
+    spec.hash == query.hash && spec.sig == query.sig && spec.ord.le(&query.ord)
 }
 
 /// C3's decision table, shared with the gated checker (`P4-GATED` G4):
@@ -123,7 +139,10 @@ pub(crate) fn classify(swept: &Swept, limited: bool) -> SweepEnd {
     {
         return SweepEnd::Aborted;
     }
-    match (swept.witness.is_some(), swept.run.end, swept.budgeted) {
+    // `MIN-ENGINES` E7a: a stored witness is a graph (the pair-set and cone
+    // tests) or a compact summary (the compact test).
+    let stored = swept.witness.is_some() || swept.witness_summary.is_some();
+    match (stored, swept.run.end, swept.budgeted) {
         (true, SearchEnd::StoppedAtFirstReport, false) => SweepEnd::Witness,
         (false, SearchEnd::StateSpaceExhausted, false) => SweepEnd::Exhausted,
         (false, SearchEnd::StoppedAtFirstReport, true) if limited => SweepEnd::Budgeted,
@@ -155,6 +174,8 @@ pub(crate) struct CFirstOutcome {
     /// One `Vec` per sweep, in sweep order, each in completion order; empty
     /// unless asked for.
     pub(crate) kept_spec_graphs: Vec<Vec<ExecutionGraph>>,
+    /// Every sweep's end in sweep order — empty unless `ConfConfig::sweep_record`
+    /// (`MIN-ENGINES` E7a; the row's `sweep_ends` text comes from the scalars).
     pub(crate) sweep_ends: Vec<SweepEnd>,
     /// A sweep aborted the run (C4).
     pub(crate) aborted: bool,
@@ -203,8 +224,16 @@ struct SinkState {
 /// What one sweep hands back across its thread.
 pub(crate) struct Swept {
     pub(crate) run: Enumerated,
-    /// The covering graph, if the sink stopped on one.
+    /// The covering graph, if the sink stopped on one (the pair-set and cone
+    /// tests; the compact test keeps the summary instead, below).
     pub(crate) witness: Option<ExecutionGraph>,
+    /// `MIN-ENGINES` E7a: the covering graph's compact summary, if the compact
+    /// test stopped on one — the sweep's own, kept (no graph clone, no second
+    /// summary).
+    pub(crate) witness_summary: Option<CompactSummary>,
+    /// `MIN-ENGINES` E7a: the query's compact summary handed back from a
+    /// `SweepTest::Compact` sweep (the admission's memo entry).
+    pub(crate) query: Option<CompactSummary>,
     /// Complete Spec graphs tested.
     pub(crate) tested: usize,
     pub(crate) kept: Vec<ExecutionGraph>,
@@ -431,6 +460,7 @@ pub(crate) fn run_with(
         let specification = Arc::clone(specification);
         let stop_at_first_report = cc.stop_at_first_report;
         let all_reports = cc.all_reports;
+        let sweep_record = cc.sweep_record;
         // `P5-CFCFG` F1–F3: the capacity (the admission assertion is void
         // under `Zero`), the quiet flag for the sweeps, the outer start for
         // the first-report wall.
@@ -444,7 +474,8 @@ pub(crate) fn run_with(
             // summary is built first and the `Summary` (for the sweep's test,
             // which is unchanged) only on a miss; under `Current` today's.
             let compact_on = state.borrow().compact.is_some();
-            let cs = compact_on.then(|| CompactSummary::at_completion(g, &visible, "implementation"));
+            let mut cs =
+                compact_on.then(|| CompactSummary::at_completion(g, &visible, "implementation"));
             let mut lazy: Option<Summary> =
                 (!compact_on).then(|| summarise(g, &visible, "implementation"));
             {
@@ -493,8 +524,16 @@ pub(crate) fn run_with(
             if hit {
                 return SinkVerdict::Continue;
             }
-            let summary = lazy.get_or_insert_with(|| summarise(g, &visible, "implementation"));
+            // `MIN-ENGINES` E7a: under `Compact` the query's compact summary is
+            // the sweep's test — no pair-set summary of the query; the Flat
+            // adapter runs under `Current` only (Flat + `Compact` is refused).
+            let summary: Option<&Summary> = if cs.is_some() {
+                None
+            } else {
+                Some(lazy.get_or_insert_with(|| summarise(g, &visible, "implementation")))
+            };
             if let Some(fctx) = flat_ctx.as_ref() {
+                let summary = summary.expect("conformance: the Flat adapter runs under Current");
                 // `P4-FLAT` F4: the adapter — `FlatCover` in place of the
                 // completion sweep, on its own thread; a witness is admitted
                 // through `flat::admit`, which re-enters the cache's one mutating
@@ -557,7 +596,14 @@ pub(crate) fn run_with(
                 &config,
                 &visible,
                 &specification,
-                SweepTest::Covered(summary.clone()),
+                match cs.take() {
+                    Some(cs) => SweepTest::Compact(cs),
+                    None => SweepTest::Covered(
+                        summary
+                            .expect("conformance: a pair-set sweep needs the query's summary")
+                            .clone(),
+                    ),
+                },
                 None,
                 keep_graphs,
                 ConfMode::CFirstSweep,
@@ -565,7 +611,10 @@ pub(crate) fn run_with(
             );
             let mut st = state.borrow_mut();
             st.counters.sweeps += 1;
-            st.counters.sweep_sizes.push(swept.tested);
+            // `MIN-ENGINES` E7a: the per-sweep vectors only with the record on.
+            if sweep_record {
+                st.counters.sweep_sizes.push(swept.tested);
+            }
             st.counters.sweep_graphs += swept.tested;
             st.counters.sweep_graphs_max = st.counters.sweep_graphs_max.max(swept.tested);
             st.sweep_time += sweep_started.elapsed();
@@ -576,30 +625,37 @@ pub(crate) fn run_with(
             }
             if end == SweepEnd::Aborted {
                 st.counters.sweeps_aborted += 1;
-                st.sweep_ends.push(SweepEnd::Aborted);
+                if sweep_record {
+                    st.sweep_ends.push(SweepEnd::Aborted);
+                }
                 st.spec_errors = spec_errors_of(&swept.run);
                 st.aborted = true;
                 return SinkVerdict::Stop;
             }
-            match (swept.witness, end) {
-                (Some(m), SweepEnd::Witness) => {
+            match (swept.witness, swept.witness_summary, end) {
+                (witness, witness_summary, SweepEnd::Witness) => {
                     // ln:cfound — the stopping witness joins W. The graph is
                     // the sweep's completion-gate capture, one thread later,
                     // which is what `assume_finished_at_gate` asks for.
-                    let inserted = if cs.is_some() {
+                    let inserted = if let Some(ws) = witness_summary {
                         // `COMPACT-INDEX` frozen §4.3, §5: the witness's
                         // compact summary joins the index; the probed
                         // implementation summary joins the memo.
-                        let ws = CompactSummary::at_completion(&m, &visible, "specification");
+                        // `MIN-ENGINES` E7a: the sweep's own summary of the
+                        // witness, no third summary and no graph clone.
                         st.compact
                             .as_mut()
                             .expect("conformance: the compact cache is set")
                             .admit(
                                 &ws,
-                                cs.as_ref()
+                                swept
+                                    .query
+                                    .as_ref()
                                     .expect("conformance: a compact probe preceded the sweep"),
                             )
                     } else {
+                        let m = witness
+                            .expect("conformance: a pair-set sweep stores its witness graph");
                         let exec = CompleteExecution::assume_finished_at_gate(&m);
                         st.witnesses.admit_from_sweep(exec).unwrap_or_else(|e| {
                             panic!("conformance: the specification program is not a valid input: {e}")
@@ -619,7 +675,7 @@ pub(crate) fn run_with(
                             inserted,
                             "conformance: the complete-first engine admitted a witness W currently \
                              holds{}; the cache probe should have hit",
-                            if cs.is_some() { " or dominates" } else { "" }
+                            if compact_on { " or dominates" } else { "" }
                         );
                     }
                     st.counters.sweeps_successful += 1;
@@ -627,12 +683,16 @@ pub(crate) fn run_with(
                         .compact
                         .as_ref()
                         .map_or(st.witnesses.len(), CompactCache::len);
-                    st.sweep_ends.push(SweepEnd::Witness);
+                    if sweep_record {
+                        st.sweep_ends.push(SweepEnd::Witness);
+                    }
                     SinkVerdict::Continue
                 }
-                (None, SweepEnd::Exhausted) => {
+                (None, None, SweepEnd::Exhausted) => {
                     st.counters.sweeps_failing += 1;
-                    st.sweep_ends.push(SweepEnd::Exhausted);
+                    if sweep_record {
+                        st.sweep_ends.push(SweepEnd::Exhausted);
+                    }
                     st.counters.reports += 1;
                     note_first_report(&mut st.counters, started);
                     // `MIN-ENGINES` E6: as at the flat-cover miss above.
@@ -646,9 +706,9 @@ pub(crate) fn run_with(
                         SinkVerdict::Continue
                     }
                 }
-                (stored, end) => unreachable!(
+                (witness, witness_summary, end) => unreachable!(
                     "conformance: `classify` returned {end:?} with{} a stored witness",
-                    if stored.is_some() { "" } else { "out" }
+                    if witness.is_some() || witness_summary.is_some() { "" } else { "out" }
                 ),
             }
         }) as CompletionSink
@@ -827,12 +887,25 @@ pub(crate) fn sweep_with(
             ))
             .stack_size(32 * 1024 * 1024)
             .spawn_scoped(s, move || {
+                // `MIN-ENGINES` E7a: the compact test's query lives in a cell the
+                // sink reads and the sweep hands back; its pass keeps the sweep
+                // graph's compact summary, not the graph.
+                let (pair_test, compact_query) = match test {
+                    SweepTest::Compact(cs) => (None, Some(cs)),
+                    other => (Some(other), None),
+                };
+                let query: Rc<RefCell<Option<CompactSummary>>> =
+                    Rc::new(RefCell::new(compact_query));
+                let found_summary: Rc<RefCell<Option<CompactSummary>>> =
+                    Rc::new(RefCell::new(None));
                 let found: Rc<RefCell<Option<ExecutionGraph>>> = Rc::new(RefCell::new(None));
                 let tested = Rc::new(RefCell::new(0usize));
                 let budgeted = Rc::new(RefCell::new(false));
                 let kept: Rc<RefCell<Vec<ExecutionGraph>>> = Rc::new(RefCell::new(Vec::new()));
                 let sink = {
                     let found = Rc::clone(&found);
+                    let query = Rc::clone(&query);
+                    let found_summary = Rc::clone(&found_summary);
                     let tested = Rc::clone(&tested);
                     let budgeted = Rc::clone(&budgeted);
                     let kept = Rc::clone(&kept);
@@ -847,6 +920,21 @@ pub(crate) fn sweep_with(
                         if keep_graphs {
                             kept.borrow_mut().push(m.clone());
                         }
+                        // `MIN-ENGINES` E7a: on the compact path one compact
+                        // summary of the sweep graph (one `wobs`), tested by
+                        // `covers_compact`; on a pass the summary is kept — no
+                        // pair-set summary, no graph clone.
+                        if let Some(cs) = query.borrow().as_ref() {
+                            let spec = CompactSummary::at_completion(m, &visible, "specification");
+                            if covers_compact(&spec, cs) {
+                                *found_summary.borrow_mut() = Some(spec);
+                                return SinkVerdict::Stop;
+                            }
+                            return SinkVerdict::Continue;
+                        }
+                        let test = pair_test
+                            .as_ref()
+                            .expect("conformance: a sweep without a compact query tests pair-sets");
                         let m_wobs = wobs(m, &visible).unwrap_or_else(|e| {
                             panic!(
                                 "conformance: the specification program is not a valid input: {e}"
@@ -875,12 +963,16 @@ pub(crate) fn sweep_with(
                     &specification,
                 );
                 let witness = found.borrow_mut().take();
+                let witness_summary = found_summary.borrow_mut().take();
+                let query = query.borrow_mut().take();
                 let tested = *tested.borrow();
                 let budgeted = *budgeted.borrow();
                 let kept = std::mem::take(&mut *kept.borrow_mut());
                 Swept {
                     run,
                     witness,
+                    witness_summary,
+                    query,
                     tested,
                     kept,
                     budgeted,

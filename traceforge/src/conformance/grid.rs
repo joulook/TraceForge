@@ -1356,6 +1356,9 @@ pub(super) struct GridConfig {
     /// `MIN-ENGINES` E6: keep every report's graph, snapshot and dump (not in
     /// the label: off is the default and no campaign row turns it on).
     pub(super) all_reports: bool,
+    /// `MIN-ENGINES` E7a: the complete-first per-sweep record (not in the
+    /// label: off is the default and no campaign row turns it on).
+    pub(super) sweep_record: bool,
     /// `COMPACT-INDEX` §5 (frozen §8): the index kind of the stateful and
     /// complete-first engines (`index=compact` in the label when `Compact`;
     /// the label is today's byte for byte under `Current`).
@@ -1392,9 +1395,11 @@ impl GridConfig {
             witness_cache: Capacity::Unbounded,
             quiet: false,
             all_reports: false,
+            sweep_record: false,
             index: IndexKind::Current,
             antichain: true,
-            probe_memo: true,
+            // `MIN-ENGINES` E7a: the probe memo off by default.
+            probe_memo: false,
             impl_distinct: false,
             bucket: BucketKind::Scan,
         }
@@ -1523,6 +1528,7 @@ impl GridConfig {
             .witness_cache(self.witness_cache)
             .quiet_sweeps(self.quiet)
             .all_reports(self.all_reports)
+            .sweep_record(self.sweep_record)
             .index(self.index)
             .antichain(self.antichain)
             .probe_memo(self.probe_memo)
@@ -2134,6 +2140,17 @@ fn compact_columns(row: &mut Row, cs: Option<&crate::conformance::compact::Compa
     push_d(row, "memo_clears", cs.memo_clears);
 }
 
+/// `MIN-ENGINES` E7a: the complete-first row's `sweep_ends` text from the scalar
+/// counters — the same text `sweep_split` gives for the recorded vector (the
+/// completion sweeps run without a limit, so none is budgeted), whatever the
+/// `sweep_record` knob.
+fn sweep_split_counts(c: &crate::conformance::report::CFirstCounters) -> String {
+    format!(
+        "witness={} exhausted={} aborted={} budgeted=0",
+        c.sweeps_successful, c.sweeps_failing, c.sweeps_aborted
+    )
+}
+
 fn sweep_split(ends: &[SweepEnd]) -> String {
     let n = |e: SweepEnd| ends.iter().filter(|x| **x == e).count();
     format!(
@@ -2306,7 +2323,9 @@ pub(super) fn row_of(r: &GridResult) -> Row {
                 o.kept_spec_graphs.iter().map(Vec::len).sum::<usize>(),
             );
             push_d(&mut row, "witness_cache_len", o.witnesses.len());
-            push_d(&mut row, "sweep_ends", sweep_split(&o.sweep_ends));
+            // `MIN-ENGINES` E7a: from the scalars, so the text is the same
+            // whatever the `sweep_record` knob.
+            push_d(&mut row, "sweep_ends", sweep_split_counts(&o.counters));
             push(
                 &mut row,
                 "paper_events_at_first_report(grid)",
@@ -2321,7 +2340,12 @@ pub(super) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "sweeps_successful", c.sweeps_successful);
             push_d(&mut row, "sweeps_failing", c.sweeps_failing);
             push_d(&mut row, "sweeps_aborted", c.sweeps_aborted);
-            push(&mut row, "sweep_sizes", &c.sweep_sizes);
+            // `MIN-ENGINES` E7a: blank unless the per-sweep record is on.
+            if r.config.sweep_record {
+                push(&mut row, "sweep_sizes", &c.sweep_sizes);
+            } else {
+                push_d(&mut row, "sweep_sizes", "");
+            }
             push_d(&mut row, "sweep_graphs", c.sweep_graphs);
             push_d(&mut row, "sweep_graphs_max", c.sweep_graphs_max);
             push_d(&mut row, "witnesses", c.witnesses);

@@ -292,6 +292,10 @@ pub struct ConfConfig {
     /// printed graph in the stateful and complete-first engines (off: the
     /// first report's only; the rest are counted).
     pub(crate) all_reports: bool,
+    /// `MIN-ENGINES` E7a: record every sweep's size and end in the
+    /// complete-first engine's per-sweep vectors (off: the scalar sweep
+    /// counters only).
+    pub(crate) sweep_record: bool,
     /// `COMPACT-INDEX` §5 (frozen C1): which index the stateful and
     /// complete-first engines use. `Current` is today's code path byte for
     /// byte; `Compact` is the bucket index of `compact.rs`.
@@ -422,6 +426,7 @@ pub struct ConfBuilder {
     quiet_sweeps: bool,
     paper_events: bool,
     all_reports: bool,
+    sweep_record: bool,
     index: IndexKind,
     antichain: bool,
     probe_memo: bool,
@@ -468,11 +473,14 @@ impl ConfBuilder {
             paper_events: false,
             // `MIN-ENGINES` E6: the first report kept, the rest counted.
             all_reports: false,
+            // `MIN-ENGINES` E7a: the per-sweep record off.
+            sweep_record: false,
             // `COMPACT-INDEX` §5 (frozen C1, §4, §5): today's index; the
             // antichain and the probe memo on wherever `Compact` reads them.
             index: IndexKind::Current,
             antichain: true,
-            probe_memo: true,
+            // `MIN-ENGINES` E7a: the probe memo off by default (`true` before).
+            probe_memo: false,
             // `COMPACT-INDEX` phase 2 D6: off unless the step-0 counter is
             // asked for, so a run's peak is the algorithm's.
             impl_distinct: false,
@@ -550,6 +558,16 @@ impl ConfBuilder {
         self
     }
 
+    /// `MIN-ENGINES` E7a: record every sweep's size and end in the
+    /// complete-first engine's `sweep_sizes` and `sweep_ends` vectors.
+    /// Default `false`: the scalar sweep counters are kept, the vectors stay
+    /// empty (the `sweep_sizes` column blank; the `sweep_ends` column computed
+    /// from the counters). Read by [`Engine::CompleteFirst`] only.
+    pub fn sweep_record(mut self, on: bool) -> Self {
+        self.sweep_record = on;
+        self
+    }
+
     /// `COMPACT-INDEX` §5 (frozen C1): the index behind `I` and `W`
     /// ([`IndexKind`]). Default `Current`. Read by [`Engine::Stateful`] and
     /// [`Engine::CompleteFirst`]; `Compact` with `completion_cover(Flat)` is
@@ -570,8 +588,8 @@ impl ConfBuilder {
     }
 
     /// `COMPACT-INDEX` §5.1 item 4(b): the complete-first probe memo.
-    /// Default `true`. Read under `IndexKind::Compact` by
-    /// [`Engine::CompleteFirst`] only.
+    /// Default `false` (`MIN-ENGINES` E7a; `true` before). Read under
+    /// `IndexKind::Compact` by [`Engine::CompleteFirst`] only.
     pub fn probe_memo(mut self, on: bool) -> Self {
         self.probe_memo = on;
         self
@@ -753,6 +771,7 @@ impl ConfBuilder {
             quiet_sweeps: self.quiet_sweeps,
             paper_events: self.paper_events,
             all_reports: self.all_reports,
+            sweep_record: self.sweep_record,
             index: self.index,
             antichain: self.antichain,
             probe_memo: self.probe_memo,

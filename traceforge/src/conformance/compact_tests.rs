@@ -3283,7 +3283,7 @@ fn e1_record() {
         );
     }
     if parts.contains("e7c") || parts.contains("e7d") {
-        use crate::conformance::grid::{row_of, run_grid, GridEnd, GridRaw};
+        use crate::conformance::grid::{row_of, GridEnd, GridRaw};
         let compact = crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel)
             .index(crate::conformance::config::IndexKind::Compact);
         for (part, record) in [("e7c", true), ("e7d", false)] {
@@ -3295,7 +3295,9 @@ fn e1_record() {
             let mut g = compact.clone();
             g.sweep_record = record;
             g.all_reports = true;
-            let r = match run_grid(&f, &g, None) {
+            // The runner's own path with `keep_graphs` off (`run_grid` keeps
+            // every graph: gigabytes on the heavy fixtures, gate 3's probe).
+            let r = match crate::conformance::eval::run_row_in_process(&f, &g, false) {
                 GridEnd::Ok(r) => r,
                 other => panic!("conformance: {name} {part}: {other:?}"),
             };

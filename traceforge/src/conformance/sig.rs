@@ -356,12 +356,33 @@ pub(crate) struct Summary {
     pub(crate) ord: VisOrder,
 }
 
+// `MIN-ENGINES` E7a-6 (a), test builds only: how many pair-set summaries this
+// thread built — the tester's evidence that the compact path builds none.
+#[cfg(test)]
+thread_local! {
+    static SUMMARIES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// `MIN-ENGINES` E7a-6 (a), test builds only: the thread's pair-set summaries.
+#[cfg(test)]
+pub(crate) fn summaries_built_for_test() -> usize {
+    SUMMARIES_BUILT.with(|c| c.get())
+}
+
+/// `MIN-ENGINES` E7a-6 (a), test builds only: reset the count.
+#[cfg(test)]
+pub(crate) fn reset_summaries_built_for_test() {
+    SUMMARIES_BUILT.with(|c| c.set(0));
+}
+
 impl Summary {
     pub(crate) fn of(
         exec: CompleteExecution<'_>,
         wobs: Wobs,
         visible: &[String],
     ) -> Result<Self, ObsError> {
+        #[cfg(test)]
+        SUMMARIES_BUILT.with(|c| c.set(c.get() + 1));
         // `MIN-ENGINES` E4: the statuses (the §8 refusal first, as before) and
         // the order borrow the rows; the signature then takes them.
         let statuses = statuses(exec, &wobs, visible)?;
