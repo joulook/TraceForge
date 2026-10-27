@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::conformance::canon::CanonicalGraph;
 use crate::conformance::cert::Certificate;
 use crate::conformance::cfirst::{run_with as cfirst_run_with, CFirstOutcome, SweepEnd};
-use crate::conformance::config::ConfConfig;
+use crate::conformance::config::{ConfConfig, IndexKind};
 use crate::conformance::ctx::{
     CompletionSink, ConfMode, Diagnostic, Gate, GateAt, GateSink, GateVerdict, SinkVerdict,
 };
@@ -143,6 +143,10 @@ fn crw(cc: &ConfConfig, imp: &Prog, spec: &Prog) -> CFirstOutcome {
     // `MIN-ENGINES` E7a (the tester, gate 3): and the sweep record (c01
     // compares the sweep sizes and ends with the gated engine's).
     cc.sweep_record = true;
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the comparator runs
+    // `Current` — the gated engine's own `W` is a `WitnessCache`, and c01
+    // compares the two engines' cache counters (`cache_tests`).
+    cc.index = IndexKind::Current;
     cfirst_run_with(&cc, imp, spec, true)
 }
 

@@ -626,9 +626,12 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         early_error_cut: flag(p[9], "cut")?,
         completion_cover: parse_cover(p[10].strip_prefix("cover=")?)?,
     };
-    // `SVERIFY-P` I2b-7: `index=set` is the stateful engine's key only (the
-    // complete-first engine is refused with it; the others do not read it).
-    if parsed.index == IndexKind::Set && parsed.engine != GridEngine::Stateful {
+    // `SVERIFY-P` I2b-7, `MIN-ENGINES` E7b: `index=set` is the key of the two
+    // engines that read the index (the others do not), never with Flat (F1).
+    if parsed.index == IndexKind::Set
+        && (!matches!(parsed.engine, GridEngine::Stateful | GridEngine::CompleteFirst)
+            || parsed.completion_cover == CompletionCover::Flat)
+    {
         return None;
     }
     // `P5-CFCFG` F4 (gate 4 n1): only `label()`'s own spelling parses — the
@@ -3848,6 +3851,11 @@ pub(super) enum PartnerClass {
 pub(super) fn x5_partner(row: &RowSpec) -> (String, PartnerClass) {
     let mut c = row.config.clone();
     c.completion_cover = CompletionCover::Sweep;
+    // `MIN-ENGINES` E7b (the owner's ruling, ISSUE-min-engines §13 (a)): the Flat
+    // row runs `Current` (F1); its Sweep partner takes the Sweep row's own
+    // default index, so it is X5's sweep row and the X1/X2 row (`Set` for the
+    // complete-first host, `Current` for the gated one).
+    c.index = GridConfig::new(c.engine).index;
     if c.engine == GridEngine::Gated {
         let key = key_of(
             &row.fixture,
@@ -3985,7 +3993,11 @@ pub(super) fn x5_spec() -> Spec {
         }
     }
     fn flat(s: Selector, stop: bool) -> GridConfig {
-        sweep(s, stop).precheck(true).cover(CompletionCover::Flat)
+        // `MIN-ENGINES` E7b (F1): the Flat row runs `Current` explicitly.
+        sweep(s, stop)
+            .precheck(true)
+            .cover(CompletionCover::Flat)
+            .index(IndexKind::Current)
     }
     x5_rows("X5", sweep, flat, true)
 }

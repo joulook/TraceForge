@@ -761,8 +761,12 @@ fn t1_on(f: &Fixture, tally: &mut T1Tally) -> Vec<String> {
         // `MIN-ENGINES` E6: T1 compares the report sequences: every report kept.
         stateful::run_with(&e6_all(cc), &f.implementation, &f.specification, false)
     };
+    // `MIN-ENGINES` E7b (the tester, gate 3): `T1_OTHER=set` compares `Current`
+    // with the set index (the stateless engine's newly admitted cache).
     let other = if std::env::var("T1_SELF").is_ok() {
         IndexKind::Current
+    } else if std::env::var("T1_OTHER").is_ok_and(|v| v == "set") {
+        IndexKind::Set
     } else {
         IndexKind::Compact
     };
@@ -2210,15 +2214,17 @@ fn m13_d7_orders_held_subtracts_antichain_removals() {
 
 /// m14 (P2-derived §3.2; P2-frozen §3 D6, §5): the `impl_distinct` knob.
 /// Off (the default): no distinct set, the column blank (`None`) on both
-/// engines and both index kinds, and the label unchanged. On:
+/// engines and every index kind, and the label unchanged. On:
 /// `/distinct=on` closes the label and parses back; the stateful engine
-/// counts under both kinds and complete-first under `Compact` only, each
-/// equal to step 0 on the cell (A2 pb k2q2: 6).
+/// counts under every kind and complete-first under `Compact` and `Set`,
+/// each equal to step 0 on the cell (A2 pb k2q2: 6). `MIN-ENGINES` E7b gate
+/// 4 round 01 M1 (the tester's re-pin): the domain takes `Set`, which
+/// complete-first now reads.
 #[test]
 fn m14_d6_the_distinct_knob() {
     use crate::conformance::config::IndexKind;
     let f = fx(MECH_CELL);
-    for k in [IndexKind::Current, IndexKind::Compact] {
+    for k in [IndexKind::Current, IndexKind::Compact, IndexKind::Set] {
         for on in [false, true] {
             let g = GridConfig::new(GridEngine::Stateful)
                 .index(k)
@@ -2257,7 +2263,7 @@ fn m14_d6_the_distinct_knob() {
                 .compact
                 .as_ref()
                 .and_then(|s| s.impl_distinct_summaries);
-            let want = (on && k == IndexKind::Compact).then_some(6);
+            let want = (on && k != IndexKind::Current).then_some(6);
             assert_eq!(got, want, "conformance: complete-first {k:?} {on}");
         }
     }
@@ -2404,8 +2410,10 @@ fn m16_p3_an_alias_is_found_by_the_second_pass() {
 }
 
 /// m17 (P7, P2-frozen §7): `/distinct=on` prints only where the knob has
-/// effect — Stateful under both kinds, CompleteFirst under Compact — and
-/// every printed label parses back to itself.
+/// effect — Stateful under every kind, CompleteFirst under Compact and Set —
+/// and every printed label parses back to itself. `MIN-ENGINES` E7b gate 4
+/// round 01 M1 (the tester's re-pin): the domain takes `Set`; the enumerator
+/// with `index=set` is no key (s15), so there only the suffix is checked.
 #[test]
 fn m17_p7_the_distinct_suffix_only_where_it_acts() {
     use crate::conformance::config::IndexKind;
@@ -2414,18 +2422,26 @@ fn m17_p7_the_distinct_suffix_only_where_it_acts() {
         GridEngine::CompleteFirst,
         GridEngine::Enumerator,
     ] {
-        for k in [IndexKind::Current, IndexKind::Compact] {
+        for k in [IndexKind::Current, IndexKind::Compact, IndexKind::Set] {
             for on in [false, true] {
                 let g = GridConfig::new(e).index(k).impl_distinct(on);
                 let label = g.label();
                 let acts = on
                     && (e == GridEngine::Stateful
-                        || (e == GridEngine::CompleteFirst && k == IndexKind::Compact));
+                        || (e == GridEngine::CompleteFirst && k != IndexKind::Current));
                 assert_eq!(
                     label.ends_with("/distinct=on"),
                     acts,
                     "conformance: {e:?} {k:?} {on}: {label}"
                 );
+                if e == GridEngine::Enumerator && k == IndexKind::Set {
+                    assert_eq!(
+                        crate::conformance::eval::parse_label(&label),
+                        None,
+                        "conformance: {label} is no key"
+                    );
+                    continue;
+                }
                 let back = crate::conformance::eval::parse_label(&label)
                     .unwrap_or_else(|| panic!("conformance: {label} does not parse"));
                 assert_eq!(back.label(), label, "conformance: {label} round-trips");
@@ -2699,6 +2715,7 @@ fn m20_fifo_eviction_and_readmission_reach_the_structures() {
 /// the label — under Compact only, never for the scan, before `/distinct=on`
 /// — round-trips through `parse_label`; and `COMPACT2` is 24 + 14 rows as
 /// PHASE2 §6 says, every row rep 0, timed, default tier, knob off.
+/// `MIN-ENGINES` E7b gate 4 round 01 M1 (the tester's re-pin): `Set` too.
 #[test]
 fn m21_the_bucket_label_and_the_compact2_spec() {
     use crate::conformance::config::IndexKind;
@@ -2706,7 +2723,7 @@ fn m21_the_bucket_label_and_the_compact2_spec() {
         compact2_ablation_configs, compact2_spec, compact_configs, parse_label, RunKind,
     };
     for e in [GridEngine::Stateful, GridEngine::CompleteFirst] {
-        for k in [IndexKind::Current, IndexKind::Compact] {
+        for k in [IndexKind::Current, IndexKind::Compact, IndexKind::Set] {
             for b in [
                 BucketKind::Scan,
                 BucketKind::Inverted(0),
@@ -3102,6 +3119,8 @@ fn e1_fixture(name: &str) -> Fixture {
 /// parts print theirs: `e7c` (`Compact`, the sweep record on, the memo at its
 /// new default, off) and `e7d` (`Compact` at E7a's defaults, through the grid,
 /// with an `E7R` line of its row's knob columns) — all outside the `E1` filter.
+/// `MIN-ENGINES` E7b: and `e7s`, the stateless engine at its new default
+/// (`Set`), the sweep record on, its E7 record outside the filter.
 /// `MIN-ENGINES` E6: every engine part above keeps every report (`all_reports`
 /// on, today's lists); two more parts run the default (off): `e6s` (stateful
 /// under `Set`) and `e6c` (stateless), each an `E6T`/`E6C` line outside the
@@ -3322,6 +3341,24 @@ fn e1_record() {
                 col("memo_clears")
             );
         }
+    }
+    // `MIN-ENGINES` E7b (the tester, gate 3): `e7s` — the stateless engine at
+    // its new default (`Set`), the sweep record on and every report kept; its
+    // E7 record is compared with the `Current` part's, field for field.
+    if parts.contains("e7s") {
+        use crate::conformance::grid::{GridEnd, GridRaw};
+        let mut g = crate::conformance::eval::x1_config(GridEngine::CompleteFirst, sel);
+        assert_eq!(g.index, crate::conformance::config::IndexKind::Set, "conformance: the default");
+        g.sweep_record = true;
+        g.all_reports = true;
+        let r = match crate::conformance::eval::run_row_in_process(&f, &g, false) {
+            GridEnd::Ok(r) => r,
+            other => panic!("conformance: {name} e7s: {other:?}"),
+        };
+        let GridRaw::CompleteFirst(o) = &r.raw else {
+            panic!("conformance: {name} e7s: not a complete-first outcome")
+        };
+        note!("E7\t{name}\t{sel:?}\te7s\t{}", e7_record(o, &line_of));
     }
     if parts.contains("plain") {
         let sides = [("specification", &f.specification), ("implementation", &f.implementation)];
@@ -3928,9 +3965,16 @@ fn s6_the_set_index_source() {
         code.contains("    orders: indexmap::IndexMap<OrdCounts, u64>,"),
         "conformance: I2b-1: one map per slot"
     );
-    for gone in ["HashSet<OrdCounts>", "Vec<Entry>", "held:", "remove("] {
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): `remove(` is gone from
+    // the list — the stateless cache's eviction removes through
+    // `SetIndex::remove`, by `shift_remove`, which keeps the scan's order.
+    for gone in ["HashSet<OrdCounts>", "Vec<Entry>", "held:"] {
         assert!(!code.contains(gone), "conformance: I2b-1: the set index's code has {gone}");
     }
+    assert!(
+        code.contains(".shift_remove_index(") && !code.contains("swap_remove"),
+        "conformance: E7b-1: the order kept"
+    );
     let at = |s: &str| code.find(s).unwrap_or_else(|| panic!("conformance: no {s}"));
     let insert = &code[at("pub(crate) fn insert(")..at("pub(crate) fn covers(")];
     for bad in [".cmp(", "le_counted", ".le("] {
@@ -4262,7 +4306,9 @@ fn i2b_knob(f: &Fixture, distinct: bool) -> (Vec<String>, String) {
         ("set", base.clone().index(IndexKind::Set), "set"),
         ("compact-anti-off", base.clone().index(IndexKind::Compact).antichain(false), "compact"),
         ("compact-default", base.clone().index(IndexKind::Compact), "compact"),
-        ("current", base.clone(), "current"),
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): `Current` named —
+        // the default is `Set` now.
+        ("current", base.clone().index(IndexKind::Current), "current"),
     ];
     let mut bad = Vec::new();
     let mut runs = Vec::new();
@@ -4432,69 +4478,95 @@ fn s13_the_set_construction_reads_no_knob() {
     assert!(block.contains("    pub(crate) fn new() -> Self {\n"), "conformance: no argument");
 }
 
-/// s14 (I2b-7, the two refusal sites): the public `verify` with the
-/// complete-first engine and `Set` returns the `KnobConflict` and runs
-/// neither program; the grid's `conf_config` panics with its message, and
-/// `run_grid` ends `Panicked` with it, before any engine starts. The gated
-/// and enumerator engines read no index: under `Set` they run as under
-/// `Compact`.
+/// s14 (I2b-7's two refusal sites; `MIN-ENGINES` E7b-5 (c), the tester's
+/// re-pin at gate 3): E7b admits the stateless engine with `Set` — the public
+/// `verify` runs both programs and returns its verdict, the grid's
+/// `conf_config` builds the configuration, `run_grid` ends `Ok` with the set
+/// cache present — and refuses `Set` with `completion_cover(Flat)` (the
+/// owner's ruling F1): the public `verify` returns `KnobConflict { knob:
+/// "index(Set)", conflicts_with: "completion_cover(Flat): use index(Current)" }`
+/// and runs neither program; the grid's `conf_config` panics with its message,
+/// which names `index(Current)`. The gated and enumerator engines read no
+/// index: under `Set` they run as under `Compact`.
 #[test]
-fn s14_complete_first_with_set_is_refused_at_both_sites() {
+fn s14_complete_first_with_set_is_admitted_and_flat_set_refused() {
     use crate::conformance::config::IndexKind;
     use crate::conformance::grid::{run_grid, GridEnd, GridRaw};
-    use crate::conformance::{ConfBuilder, ConfError, Engine};
+    use crate::conformance::{CompletionCover, ConfBuilder, ConfError, Engine};
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     let f = fx("apps/a3/fifo/spec/k2q2");
-    let calls = std::sync::Arc::new(AtomicUsize::new(0));
-    let (ci, cs) = (std::sync::Arc::clone(&calls), std::sync::Arc::clone(&calls));
-    let (imp, spec) = (f.implementation.clone(), f.specification.clone());
-    let cc = ConfBuilder::new()
-        .config(f.config.clone())
-        .visible_threads(f.visible.clone())
-        .engine(Engine::CompleteFirst)
-        .index(IndexKind::Set)
-        .build()
-        .expect("conformance: the builder takes the pair; `run` refuses it");
-    let r = crate::conformance::verify(
-        cc,
-        move || {
-            ci.fetch_add(1, SeqCst);
-            imp()
-        },
-        move || {
-            cs.fetch_add(1, SeqCst);
-            spec()
-        },
+    let verify = |flat: bool| {
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let (ci, cs) = (std::sync::Arc::clone(&calls), std::sync::Arc::clone(&calls));
+        let (imp, spec) = (f.implementation.clone(), f.specification.clone());
+        let mut b = ConfBuilder::new()
+            .config(f.config.clone())
+            .visible_threads(f.visible.clone())
+            .engine(Engine::CompleteFirst);
+        if flat {
+            b = b.completion_cover(CompletionCover::Flat);
+        }
+        let cc = b.index(IndexKind::Set).build().expect("conformance: the builder takes it");
+        let r = crate::conformance::verify(
+            cc,
+            move || {
+                ci.fetch_add(1, SeqCst);
+                imp()
+            },
+            move || {
+                cs.fetch_add(1, SeqCst);
+                spec()
+            },
+        );
+        (r, calls.load(SeqCst))
+    };
+    let (r, calls) = verify(false);
+    assert!(
+        matches!(r, Ok(ref v) if v.outcome().cfirst_counters().is_some()) && calls > 0,
+        "conformance: CompleteFirst × Set at the public site: {r:?}, {calls} calls"
     );
+    let (r, calls) = verify(true);
     assert!(
         matches!(
             r,
             Err(ConfError::KnobConflict {
                 knob: "index(Set)",
-                conflicts_with: "engine(CompleteFirst)"
+                conflicts_with: "completion_cover(Flat): use index(Current)"
             })
-        ),
-        "conformance: the public site: {r:?}"
+        ) && calls == 0,
+        "conformance: Flat × Set at the public site: {r:?}, {calls} calls"
     );
-    assert_eq!(calls.load(SeqCst), 0, "conformance: neither program ran");
-    let msg = "conformance: index(Set) with engine(CompleteFirst) is not a configuration \
-               (SVERIFY-P I2b)";
     let g = GridConfig::new(GridEngine::CompleteFirst).index(IndexKind::Set);
-    let p = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| g.conf_config(&f))) {
-        Ok(_) => panic!("conformance: the grid site did not refuse"),
-        Err(p) => p,
+    let cc = g.conf_config(&f);
+    assert_eq!(cc.index, IndexKind::Set, "conformance: the grid site builds it");
+    match run_grid(&f, &g, None) {
+        GridEnd::Ok(r) => match r.raw {
+            GridRaw::CompleteFirst(o) => assert!(
+                o.set_cache.is_some() && o.compact_cache.is_none(),
+                "conformance: the set cache"
+            ),
+            other => panic!("conformance: {other:?}"),
+        },
+        other => panic!("conformance: run_grid: {other:?}"),
+    }
+    let msg = "conformance: index(Set) with completion_cover(Flat) is not a configuration; set \
+               index(Current) (MIN-ENGINES E7b)";
+    let flat = GridConfig::new(GridEngine::CompleteFirst)
+        .precheck(true)
+        .cover(CompletionCover::Flat)
+        .index(IndexKind::Set);
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| flat.conf_config(&f)));
+    std::panic::set_hook(prev);
+    let got = match p {
+        Ok(_) => panic!("conformance: the grid site did not refuse Flat × Set"),
+        Err(p) => p
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| p.downcast_ref::<String>().cloned()),
     };
-    let got = p
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| p.downcast_ref::<String>().cloned());
     assert_eq!(got.as_deref(), Some(msg), "conformance: the grid site's message");
-    let end = run_grid(&f, &g, None);
-    let shown = format!("{end:?}");
-    assert!(
-        matches!(end, GridEnd::Panicked { .. }) && shown.contains(msg),
-        "conformance: run_grid: {shown}"
-    );
     for e in [GridEngine::Gated, GridEngine::Enumerator] {
         let run = |k: IndexKind| match run_grid(&f, &GridConfig::new(e).index(k), None) {
             GridEnd::Ok(r) => match r.raw {
@@ -4520,6 +4592,9 @@ fn s14_complete_first_with_set_is_refused_at_both_sites() {
 /// configuration with other knob values has the same key and parses to the
 /// defaults), and with `distinct=on`; it is refused on every engine but the
 /// stateful one, with a bucket suffix, and in the sixteen-field form.
+/// `MIN-ENGINES` E7b (the tester's re-pin at gate 3): and the stateless
+/// engine's — its default key, parsing back to `GridConfig::new` — but never
+/// with `cover=Flat` (F1).
 #[test]
 fn s15_the_set_key() {
     use crate::conformance::config::IndexKind;
@@ -4534,8 +4609,17 @@ fn s15_the_set_key() {
     assert_eq!(parse_label(&other.label()), Some(set.clone()));
     let d = set.clone().impl_distinct(true);
     assert_eq!(parse_label(&d.label()), Some(d.clone()));
+    let cf = GridConfig::new(GridEngine::CompleteFirst);
+    assert_eq!(parse_label(&cf.label()), Some(cf.clone()), "conformance: CompleteFirst, Set");
+    let flat = cf.clone().precheck(true).cover(crate::conformance::CompletionCover::Flat);
+    let flat_set = flat.clone().index(IndexKind::Set).label();
+    assert!(
+        flat_set.ends_with("cover=Flat/w=inf/quiet=false/index=set"),
+        "conformance: {flat_set}"
+    );
+    assert_eq!(parse_label(&flat_set), None, "conformance: Flat with index=set");
+    assert_eq!(parse_label(&flat.label()), Some(flat.clone()), "conformance: Flat, Current");
     for e in [
-        GridEngine::CompleteFirst,
         GridEngine::Gated,
         GridEngine::Enumerator,
         GridEngine::Verify,
@@ -6141,7 +6225,7 @@ fn e6_col(row: &crate::conformance::grid::Row, k: &str) -> String {
 /// `reports` and `counter_reports` columns equal (`reports` from the counter);
 /// complete-first's first-report columns present iff N ≥ 1 on both, and
 /// `paper_events_at_first_report(grid)` equal. Complete-first × `Set` is
-/// still refused (I2b; admitting it is E7's). Then the public route, both
+/// built (`MIN-ENGINES` E7b admits it; refused before). Then the public route, both
 /// engines under `Current`: `report_count` N on both; `reports()` N on, min(N,
 /// 1) off; the first `ConfReport`'s dump, tag, gate, events and (normalised)
 /// snapshot equal. Fails before E6: the off list is N long.
@@ -6225,17 +6309,11 @@ fn e6_b_the_knob_off_against_on() {
                 }
             }
         }
-        // Complete-first × `Set` stays refused (I2b).
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): complete-first ×
+        // `Set` is admitted (refused since I2b; E7b-5 (c) is s14).
         let set = x1_config(GridEngine::CompleteFirst, Selector::Ltr).index(IndexKind::Set);
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            set.conf_config(&f)
-        }))
-        .is_err();
-        std::panic::set_hook(prev);
-        if !refused {
-            bad.push(format!("{name}: complete-first × Set was admitted"));
+        if set.conf_config(&f).index != IndexKind::Set {
+            bad.push(format!("{name}: complete-first × Set not built"));
         }
         // The public route.
         for engine in [GridEngine::Stateful, GridEngine::CompleteFirst] {
@@ -6767,4 +6845,204 @@ fn e7a_e_the_sweep_record_behind_its_knob() {
         }
     }
     assert!(bad.is_empty(), "conformance: E7a-6 (e): {bad:#?}");
+}
+
+// =========================================================================
+// MIN-ENGINES E7b (the tester, gate 3; criteria/MIN-ENGINES-E7B.md rev 1.1,
+// E7b-5 (a)–(e); derived §E7 (c)): `Set` for the stateless cache, the
+// default of both engines, the keys
+// =========================================================================
+
+/// The five occupancy fields E7b-5 (a) compares at every step.
+fn e7b_occ(s: &crate::conformance::compact::CompactStats) -> [usize; 5] {
+    [s.entries, s.buckets, s.signatures, s.summary_bytes, s.sig_bytes_est]
+}
+
+/// E7b-5 (a): `SetCache` against `CompactCache` (antichain off, memo off) on
+/// the same admissions and probes. One `SigHash` bucket with two unequal
+/// signatures (`MECH_CELL`'s and a forged one), synthetic orders of its
+/// length:
+/// - under `Bounded(1)` every admission evicts the one held order, so the
+///   bucket empties and fills again at each step, slots are refilled after
+///   being emptied, and the first order comes back (a re-admission);
+/// - under `Bounded(2)` and `Unbounded`, a longer run; under `Zero` nothing.
+/// At every step: `admit`'s answer, `len`, the three tallies and `entries`,
+/// `buckets`, `signatures`, `summary_bytes`, `sig_bytes_est` equal; then each
+/// probe's `Hit`/`Miss` equal. The historical fields by their definitions:
+/// `admitted` = admissions, `signatures_seen` = 2, `bucket_max` ≤ the
+/// capacity. Fails before E7b (no `SetCache`).
+#[test]
+fn e7b_a_the_set_cache_against_the_compact_cache() {
+    use crate::conformance::compact::{Probe, SetCache};
+    let base = real_summary(MECH_CELL);
+    let other = e4_into_bucket(&base, "2pc/leader/conf/n2");
+    assert!(base.hash == other.hash && base.sig != other.sig, "conformance: one bucket, two sigs");
+    let l = base.ord.len();
+    assert!(l >= 3, "conformance: room for three unit orders");
+    let ords: Vec<Vec<u8>> = (0..3).map(|i| unit(l, i)).collect();
+    let mk = |s: &CompactSummary, v: &[u8]| syn(s, v);
+    // The admission sequence: (signature, order index), the first order again
+    // at the end (a re-admission under `Bounded(n)`).
+    let seq: Vec<CompactSummary> = vec![
+        mk(&base, &ords[0]),
+        mk(&other, &ords[0]),
+        mk(&base, &ords[1]),
+        mk(&other, &ords[1]),
+        mk(&base, &ords[2]),
+        mk(&base, &ords[0]),
+    ];
+    let ones = vec![1u8; l];
+    let queries = [mk(&base, &ones), mk(&other, &ones), mk(&base, &ords[1]), mk(&other, &ords[2])];
+    let mut bad = Vec::new();
+    for cap in [Capacity::Bounded(1), Capacity::Bounded(2), Capacity::Unbounded, Capacity::Zero] {
+        let mut set = SetCache::new(cap);
+        let mut cmp = CompactCache::new(cap, false, false);
+        let mut readmitted = 0usize;
+        for (i, w) in seq.iter().enumerate() {
+            let what = format!("{cap:?} step {i}");
+            let (a, b) = (set.admit(w, w), cmp.admit(w, w));
+            let (ss, cs) = (set.stats(), cmp.stats());
+            let tallies = |x: (usize, usize, usize, usize)| x;
+            let (ts, tc) = (
+                tallies((set.len(), set.admissions(), set.evictions(), set.readmissions())),
+                tallies((cmp.len(), cmp.admissions(), cmp.evictions(), cmp.readmissions())),
+            );
+            if a != b || ts != tc || e7b_occ(&ss) != e7b_occ(&cs) {
+                bad.push(format!("{what}: admit {a}/{b} tallies {ts:?}/{tc:?} occupancy {:?}/{:?}",
+                    e7b_occ(&ss), e7b_occ(&cs)));
+            }
+            readmitted = ts.3;
+            for (j, q) in queries.iter().enumerate() {
+                let (ps, pc) = (set.probe(q).0, cmp.probe(q).0);
+                let hit = |p: Probe| matches!(p, Probe::Hit | Probe::MemoHit);
+                if hit(ps) != hit(pc) || matches!(ps, Probe::MemoHit) {
+                    bad.push(format!("{what} query {j}: {ps:?} / {pc:?}"));
+                }
+            }
+            if ss.admitted != set.admissions()
+                || ss.signatures_seen > 2
+                || matches!(cap, Capacity::Bounded(n) if ss.bucket_max > n)
+            {
+                bad.push(format!("{what}: historical {} {} {}", ss.admitted, ss.signatures_seen,
+                    ss.bucket_max));
+            }
+        }
+        match cap {
+            Capacity::Bounded(1) => {
+                if readmitted == 0 || set.evictions() != seq.len() - 1 {
+                    bad.push(format!("{cap:?}: {readmitted} re-admissions, {} evictions",
+                        set.evictions()));
+                }
+            }
+            Capacity::Zero => {
+                if set.len() != 0 || set.admissions() != 0 {
+                    bad.push("Zero admitted".to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E7b-5 (a): {bad:#?}");
+}
+
+/// E7b-5 (b) and (d): the per-engine defaults and the keys.
+/// `ConfBuilder::new()` builds `index` `Set`; `GridConfig::new(engine)` is
+/// `Set` for the stateful and stateless engines and `Current` for the
+/// enumerator and the gated engine; each default key round-trips through
+/// `parse_label`; the two engines' default keys are the fourteen-field
+/// `…/w=inf/quiet=false/index=set`, the others' the eleven-field form; and
+/// the old eleven- and thirteen-field keys of the two engines still parse,
+/// as `Current`, and round-trip. Fails before E7b (the default was
+/// `Current`).
+#[test]
+fn e7b_b_the_defaults_and_the_keys() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::parse_label;
+    let cc = crate::conformance::ConfBuilder::new().build().expect("conformance: in scope");
+    assert_eq!(cc.index, IndexKind::Set, "conformance: the builder's default");
+    let mut bad = Vec::new();
+    for (e, want) in [
+        (GridEngine::Stateful, IndexKind::Set),
+        (GridEngine::CompleteFirst, IndexKind::Set),
+        (GridEngine::Enumerator, IndexKind::Current),
+        (GridEngine::Gated, IndexKind::Current),
+    ] {
+        let g = GridConfig::new(e);
+        let key = g.label();
+        let fields = key.split('/').count();
+        let want_fields = if want == IndexKind::Set { 14 } else { 11 };
+        if g.index != want || parse_label(&key) != Some(g.clone()) || fields != want_fields {
+            bad.push(format!("{e:?}: {:?} {key} ({fields} fields)", g.index));
+        }
+        if want == IndexKind::Set && !key.ends_with("/w=inf/quiet=false/index=set") {
+            bad.push(format!("{e:?}: {key}"));
+        }
+        if want == IndexKind::Set {
+            // E7b-5 (d): the old keys — eleven fields, and thirteen.
+            for old in [
+                g.clone().index(IndexKind::Current),
+                g.clone().index(IndexKind::Current).quiet(true),
+            ] {
+                let k = old.label();
+                match parse_label(&k) {
+                    Some(p) if p.index == IndexKind::Current && p.label() == k => {}
+                    other => bad.push(format!("{e:?}: old key {k}: {other:?}")),
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "conformance: E7b-5 (b)/(d): {bad:#?}");
+}
+
+/// E7b gate 4 round 01 M1 (Codex's required test; the tester's derivation):
+/// under `Set` the complete-first engine counts its step-0 distinct
+/// summaries (`impl_distinct`), so the knob is effective there and the key
+/// carries it. With `g(on) = GridConfig::new(CompleteFirst).impl_distinct(on)`
+/// (index `Set`, the default): the two labels differ; the on label is the
+/// off label followed by `/distinct=on`; each parses back to its own
+/// configuration and re-labels to itself. On `MECH_CELL` the cache
+/// statistics read `None` with the knob off and, with it on, the number of
+/// distinct `(Sig, OrdCounts)` among the implementation's complete graphs
+/// (computed here from the stateful engine's kept graphs: 6, m14's figure).
+/// Fails before the fix: the on label equals the off label and parses back
+/// with the knob off.
+#[test]
+fn e7b_g4_m1_the_distinct_knob_under_set_is_in_the_key() {
+    use crate::conformance::config::IndexKind;
+    use crate::conformance::eval::parse_label;
+    let f = fx(MECH_CELL);
+    let (_, imp) = kept_summaries(&f);
+    let mut distinct: Vec<&CompactSummary> = Vec::new();
+    for s in &imp {
+        if !distinct.iter().any(|d| d.sig == s.sig && d.ord == s.ord) {
+            distinct.push(s);
+        }
+    }
+    assert_eq!(distinct.len(), 6, "conformance: the step-0 count on the cell");
+    let g = |on: bool| GridConfig::new(GridEngine::CompleteFirst).impl_distinct(on);
+    let (off, on) = (g(false), g(true));
+    assert_eq!((off.index, on.index), (IndexKind::Set, IndexKind::Set));
+    let (lo, ln) = (off.label(), on.label());
+    assert_ne!(lo, ln, "conformance: two configurations, two keys");
+    assert!(!lo.contains("distinct"), "conformance: {lo}");
+    assert_eq!(ln, format!("{lo}/distinct=on"), "conformance: the suffix");
+    for (c, l) in [(&off, &lo), (&on, &ln)] {
+        let back = parse_label(l).unwrap_or_else(|| panic!("conformance: {l} does not parse"));
+        assert_eq!(&back, c, "conformance: {l} parses back to its configuration");
+        assert_eq!(&back.label(), l, "conformance: {l} round-trips");
+    }
+    for (c, want) in [(&off, None), (&on, Some(distinct.len()))] {
+        let o = crate::conformance::cfirst::run_with(
+            &c.conf_config(&f),
+            &f.implementation,
+            &f.specification,
+            false,
+        );
+        assert!(
+            o.set_cache.is_some() && o.compact_cache.is_none(),
+            "conformance: the set cache"
+        );
+        let got = o.counters.compact.as_ref().map(|s| s.impl_distinct_summaries);
+        assert_eq!(got, Some(want), "conformance: the cache statistics, knob {}", c.impl_distinct);
+    }
 }

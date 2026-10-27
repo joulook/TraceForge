@@ -51,7 +51,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::conformance::compact::{CompactCache, CompactSummary, OrdCounts, Probe};
+use crate::conformance::compact::{CompactCache, CompactSummary, OrdCounts, Probe, SetCache};
 use crate::conformance::config::{Capacity, CompletionCover, ConfConfig, Engine, IndexKind};
 use crate::conformance::flat;
 use crate::conformance::report::FlatCounters;
@@ -169,6 +169,8 @@ pub(crate) struct CFirstOutcome {
     /// `COMPACT-INDEX` §5.1 item 4(b): `W` on the bucket index, `Some` iff
     /// `index = Compact`.
     pub(crate) compact_cache: Option<CompactCache>,
+    /// `MIN-ENGINES` E7b: `W` on the set index, `Some` iff `index = Set`.
+    pub(crate) set_cache: Option<SetCache>,
     /// Every outer completion, in completion order; empty unless asked for.
     pub(crate) kept_impl_graphs: Vec<ExecutionGraph>,
     /// One `Vec` per sweep, in sweep order, each in completion order; empty
@@ -203,11 +205,14 @@ struct SinkState {
     /// `COMPACT-INDEX` §5.1 item 4(b): `Some` iff `index = Compact`; then
     /// `witnesses` above stays empty.
     compact: Option<CompactCache>,
+    /// `MIN-ENGINES` E7b: `Some` iff `index = Set`; then `witnesses` stays
+    /// empty.
+    set: Option<SetCache>,
     /// `COMPACT-INDEX` frozen §6: distinct implementation summaries by the
-    /// exact `(Sig, OrdCounts)` (phase 2 P1), `Compact` only.
+    /// exact `(Sig, OrdCounts)` (phase 2 P1), `Compact` or `Set` only.
     impl_seen: SigBuckets<std::collections::HashSet<OrdCounts>>,
-    /// Phase 2 D6: the distinct count, `Some` iff `index = Compact` and the
-    /// `impl_distinct` knob is on.
+    /// Phase 2 D6: the distinct count, `Some` iff `index` is `Compact` or
+    /// `Set` (`MIN-ENGINES` E7b) and the `impl_distinct` knob is on.
     impl_distinct: Option<usize>,
     counters: CFirstCounters,
     /// Summed as a `Duration` and converted once (truncating per sweep would
@@ -265,6 +270,15 @@ pub(crate) fn run(
         return Err(ConfError::KnobConflict {
             knob: "index(Compact)",
             conflicts_with: "completion_cover(Flat)",
+        });
+    }
+    // `MIN-ENGINES` E7b (the owner's ruling F1): the set cache cannot serve a
+    // `Flat` run either; the fix is `index(Current)`, the cache FlatCover
+    // admits into.
+    if flat && cc.index == IndexKind::Set {
+        return Err(ConfError::KnobConflict {
+            knob: "index(Set)",
+            conflicts_with: "completion_cover(Flat): use index(Current)",
         });
     }
     // `P4-FLAT` F5/D13: eligibility needs the precheck.
@@ -426,6 +440,12 @@ pub(crate) fn run_with(
         !(cc.index == IndexKind::Compact && cc.completion_cover == CompletionCover::Flat),
         "conformance: index(Compact) with completion_cover(Flat) is not a configuration (COMPACT-INDEX frozen §0)"
     );
+    // `MIN-ENGINES` E7b (F1): the grid path's twin of `run`'s refusal.
+    assert!(
+        !(cc.index == IndexKind::Set && cc.completion_cover == CompletionCover::Flat),
+        "conformance: index(Set) with completion_cover(Flat) is not a configuration; set \
+         index(Current) (MIN-ENGINES E7b)"
+    );
     let visible = cc.visible.clone();
 
     let state = Rc::new(RefCell::new(SinkState {
@@ -436,8 +456,12 @@ pub(crate) fn run_with(
             .then(|| {
                 CompactCache::with_bucket(cc.witness_cache, cc.antichain, cc.probe_memo, cc.bucket)
             }),
+        // `MIN-ENGINES` E7b: the set cache (no memo, no antichain).
+        set: (cc.index == IndexKind::Set).then(|| SetCache::new(cc.witness_cache)),
         impl_seen: SigBuckets::new(),
-        impl_distinct: (cc.index == IndexKind::Compact && cc.impl_distinct).then_some(0),
+        // `MIN-ENGINES` E7b: the step-0 count under `Set` too.
+        impl_distinct: (matches!(cc.index, IndexKind::Compact | IndexKind::Set) && cc.impl_distinct)
+            .then_some(0),
         counters: CFirstCounters::default(),
         sweep_time: std::time::Duration::ZERO,
         reports: Vec::new(),
@@ -473,7 +497,11 @@ pub(crate) fn run_with(
             // `COMPACT-INDEX` §5.1 item 4(b): under `Compact` the compact
             // summary is built first and the `Summary` (for the sweep's test,
             // which is unchanged) only on a miss; under `Current` today's.
-            let compact_on = state.borrow().compact.is_some();
+            // `MIN-ENGINES` E7b: the compact path under `Compact` or `Set`.
+            let compact_on = {
+                let st = state.borrow();
+                st.compact.is_some() || st.set.is_some()
+            };
             let mut cs =
                 compact_on.then(|| CompactSummary::at_completion(g, &visible, "implementation"));
             let mut lazy: Option<Summary> =
@@ -498,8 +526,15 @@ pub(crate) fn run_with(
                     // `COMPACT-INDEX` frozen §5, §4.2: the memo, then the
                     // bucket query; `cache_tests` is read off the index at
                     // the end of the run.
-                    let cache = st.compact.as_mut().expect("conformance: the compact cache is set");
-                    let (outcome, _) = cache.probe(s);
+                    let (outcome, _) = match st.compact.as_mut() {
+                        Some(cache) => cache.probe(s),
+                        // `MIN-ENGINES` E7b: the set cache's probe.
+                        None => st
+                            .set
+                            .as_mut()
+                            .expect("conformance: the compact or the set cache is set")
+                            .probe(s),
+                    };
                     if st.impl_distinct.is_some()
                         && st
                             .impl_seen
@@ -643,16 +678,19 @@ pub(crate) fn run_with(
                         // implementation summary joins the memo.
                         // `MIN-ENGINES` E7a: the sweep's own summary of the
                         // witness, no third summary and no graph clone.
-                        st.compact
-                            .as_mut()
-                            .expect("conformance: the compact cache is set")
-                            .admit(
-                                &ws,
-                                swept
-                                    .query
-                                    .as_ref()
-                                    .expect("conformance: a compact probe preceded the sweep"),
-                            )
+                        let probed = swept
+                            .query
+                            .as_ref()
+                            .expect("conformance: a compact probe preceded the sweep");
+                        match st.compact.as_mut() {
+                            Some(cache) => cache.admit(&ws, probed),
+                            // `MIN-ENGINES` E7b: the set cache's admission.
+                            None => st
+                                .set
+                                .as_mut()
+                                .expect("conformance: the compact or the set cache is set")
+                                .admit(&ws, probed),
+                        }
                     } else {
                         let m = witness
                             .expect("conformance: a pair-set sweep stores its witness graph");
@@ -679,10 +717,11 @@ pub(crate) fn run_with(
                         );
                     }
                     st.counters.sweeps_successful += 1;
-                    st.counters.witnesses = st
-                        .compact
-                        .as_ref()
-                        .map_or(st.witnesses.len(), CompactCache::len);
+                    st.counters.witnesses = match (st.compact.as_ref(), st.set.as_ref()) {
+                        (Some(cache), _) => cache.len(),
+                        (None, Some(cache)) => cache.len(),
+                        (None, None) => st.witnesses.len(),
+                    };
                     if sweep_record {
                         st.sweep_ends.push(SweepEnd::Witness);
                     }
@@ -749,6 +788,17 @@ pub(crate) fn run_with(
         st.counters.witnesses = cache.len();
         st.counters.compact = Some(stats);
     }
+    if let Some(cache) = st.set.as_ref() {
+        // `MIN-ENGINES` E7b: the set cache's tallies, as the compact cache's.
+        st.counters.admissions = cache.admissions();
+        st.counters.evictions = cache.evictions();
+        st.counters.readmissions = cache.readmissions();
+        let mut stats = cache.stats();
+        stats.impl_distinct_summaries = st.impl_distinct;
+        st.counters.cache_tests = stats.containment_tests;
+        st.counters.witnesses = cache.len();
+        st.counters.compact = Some(stats);
+    }
 
     CFirstOutcome {
         reports: st.reports,
@@ -756,6 +806,7 @@ pub(crate) fn run_with(
         counters: st.counters,
         witnesses: st.witnesses,
         compact_cache: st.compact,
+        set_cache: st.set,
         kept_impl_graphs: st.kept_impl,
         kept_spec_graphs: st.kept_spec,
         sweep_ends: st.sweep_ends,
@@ -776,6 +827,7 @@ impl Default for SinkState {
         Self {
             witnesses: WitnessCache::new(Vec::new()),
             compact: None,
+            set: None,
             impl_seen: SigBuckets::new(),
             impl_distinct: None,
             counters: CFirstCounters::default(),

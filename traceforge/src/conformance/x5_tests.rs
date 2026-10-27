@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::conformance::cfirst;
-use crate::conformance::config::{CompletionCover, GatePolicy, GatedMode};
+use crate::conformance::config::{CompletionCover, GatePolicy, GatedMode, IndexKind};
 use crate::conformance::eval::{
     all_fixtures, builtin_specs, eval_row_of, experiments_of, header, profile_name, read_rows,
     record_of, run_row_in_process, x1_config, x2_config, x5_partner, Driver, FrozenLists,
@@ -662,7 +662,9 @@ fn c01_shared_keys_carry_the_same_twin_key() {
 /// C1 (round 03 m1, m2; E-X5-3; T4): `x5_partner` is the sole partner API —
 /// its class equals the class derived per point kind, its key is the Flat
 /// label with `cover = Sweep` (and `precheck = false` in the complete-first
-/// host only), and **the partner key is a key of its named spec** (X1, X1V, X2,
+/// host only; `MIN-ENGINES` E7b, ISSUE-min-engines §13 (a): the Flat row runs `Current`, its
+/// partner the Sweep row's default index, `Set` in the complete-first host and `Current` in the
+/// gated one), and **the partner key is a key of its named spec** (X1, X1V, X2,
 /// or the host's own) and of the host. With the list empty: X5's partners X1
 /// 72, X1V 18, X2 108, own 96; X5G's own 186. No own partner is a key of X1,
 /// X1V or X2. X2's complete-first configuration is X1's with `stop`.
@@ -677,8 +679,14 @@ fn c01_every_partner_is_a_key_of_its_named_spec() {
             if class != want {
                 bad.push(format!("{}: class {class:?}, derived {want:?}", r.fixture));
             }
+            if r.config.index != IndexKind::Current {
+                bad.push(format!("{}: Flat index {:?}", r.fixture, r.config.index));
+            }
             let mut pc = r.config.clone();
             pc.completion_cover = CompletionCover::Sweep;
+            // `MIN-ENGINES` E7b (ISSUE-min-engines §13 (a); the tester's re-pin
+            // at gate 3): the partner runs the Sweep row's default index.
+            pc.index = if gated { IndexKind::Current } else { IndexKind::Set };
             if !gated {
                 pc.precheck = false;
             }
@@ -1433,7 +1441,8 @@ fn is_gated_key(key: &str) -> bool {
 }
 
 /// A Flat row's partner key, from the key alone (F1; E-X5-3): `cover=Sweep`,
-/// and `precheck=false` in the complete-first host.
+/// and `precheck=false` in the complete-first host; there, since `MIN-ENGINES`
+/// E7b (ISSUE-min-engines §13 (a)), also the `Set` index fields.
 fn partner_key(flat_key: &str) -> String {
     let mut p = key_parts(flat_key);
     let mut label = p[1].replace("cover=Flat", "cover=Sweep");
@@ -1444,6 +1453,15 @@ fn partner_key(flat_key: &str) -> String {
         let mut f: Vec<String> = label.split('/').map(str::to_owned).collect();
         f[1] = "Plain".to_owned();
         label = f.join("/");
+        // `MIN-ENGINES` E7b (ISSUE-min-engines §13 (a); the tester's re-pin at
+        // gate 3): the Flat row runs `Current`; its partner the complete-first
+        // default `Set`, whose label prints the capacity, `quiet` and
+        // `index=set`.
+        match label.split('/').count() {
+            11 => label.push_str("/w=inf/quiet=false/index=set"),
+            13 => label.push_str("/index=set"),
+            n => panic!("conformance: a complete-first Flat label of {n} fields: {label}"),
+        }
     }
     p[1] = label;
     p.join("|")

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::conformance::config::{CompletionCover, GatePolicy, GatedMode};
+use crate::conformance::config::{CompletionCover, GatePolicy, GatedMode, IndexKind};
 use crate::conformance::eval::key_of;
 use crate::conformance::eval::{
     builtin_specs, contract_fixtures, contract_specs, csv_line, experiments_of, exports_of,
@@ -2323,10 +2323,18 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // md5 `739ecfd1…`); `E6_HUNKS` undo it to `5b2e85ba…`.
     // MIN-ENGINES E7a (2026-10-27, tester re-pin, gate 3): to `ec716542…`
     // (grid.rs md5 `64247d19…`); `E7A_HUNKS` undo it to `b8abd789…`.
+    // MIN-ENGINES E7b (2026-10-27, tester re-pin, gate 3): to `4fe09771…`
+    // (grid.rs md5 `fd294af9…`); `E7B_HUNKS` undo it to `ec716542…`.
+    // MIN-ENGINES E7b gate 4 round 01 M1 (2026-10-27, tester re-pin): to
+    // `32c67c7e…` (grid.rs md5 `0ddccba0…`); `E7B_G4_HUNKS` undo it to
+    // `4fe09771…`.
+    // MIN-ENGINES E7b gate 4 round 02 m1 (2026-10-27, tester re-pin): to
+    // `92d0c443…` (grid.rs md5 `4ff398e4…`); `E7B_G4R2_HUNKS` undo it to
+    // `32c67c7e…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "ec7165429ad20358fe76ed34c7e6632d",
+        "92d0c443ef1b84bfa7e8ca931a31171f",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2773,7 +2781,162 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
             ),
         ),
     ];
+    // MIN-ENGINES E7b (2026-10-27, tester re-pin): the lead's three `grid.rs`
+    // hunks (`diff -U1` against grid.rs `64247d19…`: `GridConfig::new`'s
+    // per-engine index, `cover(Flat)`'s `Current`, and `conf_config`'s Flat ×
+    // `Set` assertion), all inside the prefix; undoing them gives back the E7a
+    // prefix, byte for byte.
+    const E7B_HUNKS: [(&str, &str); 3] = [
+        (
+            concat!(
+                "            sweep_record: false,\n",
+                "            // `MIN-ENGINES` E7b: `Set` for the two engines that read the index,",
+                "\n",
+                "            // `Current` for the rest, whose keys print no index field.\n",
+                "            index: if matches!(engine, GridEngine::Stateful | GridEngine::Complet",
+                "eFirst) {\n",
+                "                IndexKind::Set\n",
+                "            } else {\n",
+                "                IndexKind::Current\n",
+                "            },\n",
+                "            antichain: true,\n"
+            ),
+            concat!(
+                "            sweep_record: false,\n",
+                "            index: IndexKind::Current,\n",
+                "            antichain: true,\n"
+            ),
+        ),
+        (
+            concat!(
+                "        self.completion_cover = c;\n",
+                "        // `MIN-ENGINES` E7b (the owner's ruling F1): a Flat row runs the\n",
+                "        // `Current` witness cache, set explicitly here.\n",
+                "        if c == CompletionCover::Flat {\n",
+                "            self.index = IndexKind::Current;\n",
+                "        }\n",
+                "        self\n"
+            ),
+            concat!(
+                "        self.completion_cover = c;\n",
+                "        self\n"
+            ),
+        ),
+        (
+            concat!(
+                "        };\n",
+                "        // `MIN-ENGINES` E7b: the complete-first engine reads `Set`; Flat + `Set`",
+                "\n",
+                "        // is refused here (this path does not pass `cfirst::run`'s refusal),\n",
+                "        // before any engine starts — the fix is `index(Current)` (F1).\n",
+                "        assert!(\n",
+                "            !(self.completion_cover == CompletionCover::Flat && self.index == Ind",
+                "exKind::Set),\n",
+                "            \"conformance: index(Set) with completion_cover(Flat) is not a config",
+                "uration; set \\\n",
+                "             index(Current) (MIN-ENGINES E7b)\"\n",
+                "        );\n"
+            ),
+            concat!(
+                "        };\n",
+                "        // `SVERIFY-P` I2b-7: the set index is the stateful engine's; the\n",
+                "        // complete-first engine would run `Current` under `Set` (it reads\n",
+                "        // `Compact` only), and this path does not pass `conformance::run`'s\n",
+                "        // refusal, so the pair is refused here, before any engine starts.\n",
+                "        assert!(\n",
+                "            !(engine == Engine::CompleteFirst && self.index == IndexKind::Set),\n",
+                "            \"conformance: index(Set) with engine(CompleteFirst) is not a configu",
+                "ration \\\n",
+                "             (SVERIFY-P I2b)\"\n",
+                "        );\n"
+            ),
+        ),
+    ];
+    // MIN-ENGINES E7b gate 4 round 01 M1 (2026-10-27, tester re-pin): the
+    // lead's two `grid.rs` hunks (`diff -U1` against grid.rs `fd294af9…`: the
+    // `impl_distinct` field doc, and `distinct_effective` with the
+    // complete-first engine under `Compact` or `Set`), both inside the prefix;
+    // undoing them gives back the E7b gate-3 prefix, byte for byte.
+    const E7B_G4_HUNKS: [(&str, &str); 2] = [
+        (
+            concat!(
+                "    pub(super) probe_memo: bool,\n",
+                "    /// `COMPACT-INDEX` phase 2 D6 (`distinct=on`; printed only when on and\n",
+                "    /// effective: the stateful engine, and the complete-first engine under\n",
+                "    /// `Compact` or `Set` (`MIN-ENGINES` E7b)).\n",
+                "    pub(super) impl_distinct: bool,\n"
+            ),
+            concat!(
+                "    pub(super) probe_memo: bool,\n",
+                "    /// `COMPACT-INDEX` phase 2 D6 (`distinct=on`; printed only when on).\n",
+                "    pub(super) impl_distinct: bool,\n"
+            ),
+        ),
+        (
+            concat!(
+                "        };\n",
+                "        // Phase 2 D6, `MIN-ENGINES` E7b: the knob acts in the stateful engine\n",
+                "        // under every index, and in the complete-first engine under `Compact`\n",
+                "        // and `Set` (its step-0 set, `cfirst.rs`); only there is it printed.\n",
+                "        let distinct_effective = self.engine == GridEngine::Stateful\n",
+                "            || (self.engine == GridEngine::CompleteFirst\n",
+                "                && matches!(self.index, IndexKind::Compact | IndexKind::Set));\n",
+                "        if self.impl_distinct && distinct_effective {\n"
+            ),
+            concat!(
+                "        };\n",
+                "        let distinct_effective = self.engine == GridEngine::Stateful\n",
+                "            || (self.engine == GridEngine::CompleteFirst && self.index == IndexKi",
+                "nd::Compact);\n",
+                "        if self.impl_distinct && distinct_effective {\n"
+            ),
+        ),
+    ];
+    // MIN-ENGINES E7b gate 4 round 02 m1 (2026-10-27, tester re-pin): the
+    // lead's one `grid.rs` hunk (`diff -U1` against grid.rs `0ddccba0…`: the
+    // label's Phase 2 D6/P7 comment, which `COMPACT_P2_HUNKS` pins in its old
+    // words), inside the prefix; undoing it gives back the round-01 prefix.
+    const E7B_G4R2_HUNKS: [(&str, &str); 1] = [
+        (
+            concat!(
+                "        // every key with it off is the slice's key; P7: and only where it has\n",
+                "        // effect (the stateful engine, every index; complete-first under\n",
+                "        // `Compact` or `Set`, `MIN-ENGINES` E7b).\n",
+                "        let base = if self.index == IndexKind::Compact {\n"
+            ),
+            concat!(
+                "        // every key with it off is the slice's key; P7: and only where it has\n",
+                "        // effect (the stateful engine, either index; complete-first under\n",
+                "        // `Compact`).\n",
+                "        let base = if self.index == IndexKind::Compact {\n"
+            ),
+        ),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in E7B_G4R2_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "32c67c7e93f2e751c9744cf454206f8f",
+        "conformance: the prefix without round 02's hunk = the round-01 prefix"
+    );
+    for (new, old) in E7B_G4_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "4fe097718365bdccb66aa12c20804834",
+        "conformance: the prefix without E7b gate 4's hunks = the E7b gate-3 prefix"
+    );
+    for (new, old) in E7B_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "ec7165429ad20358fe76ed34c7e6632d",
+        "conformance: the prefix without E7b's hunks = the E7a prefix"
+    );
     for (new, old) in E7A_HUNKS {
         t = undo(t, new, old);
     }
@@ -4597,7 +4760,9 @@ fn c04_exports_and_determinism_through_the_child() {
 /// of every builtin spec is a key of some builtin spec (the dangling check
 /// stays on for X5/X5G). The X5/X5G sweep partner (`P5-X5` F1, criterion 1) is
 /// checked independently of `x5_partner`: each `A_flat` row's label with
-/// `cover = Sweep` (and `precheck = false` in the complete-first host) is a key
+/// `cover = Sweep` (and `precheck = false` in the complete-first host; since
+/// `MIN-ENGINES` E7b, ISSUE-min-engines §13 (a), the index the Sweep row's
+/// default: `Set` there, `Current` in the gated host; the Flat row `Current`) is a key
 /// the spec itself lists, held by X1 (24 conforming §6 points × 3 reps), X1V
 /// (the six `ex:naive/k{2,3,4}` `Ltr` points × 3; one key also X0's), X2 (the
 /// 108 stop pairs) or no other spec (X5: 32 violating §6 points × 3; X5G:
@@ -4672,8 +4837,16 @@ fn r01_every_twin_key_is_a_key_of_some_spec() {
             }
             flat += 1;
             assert!(r.config.precheck, "conformance: {name}: A_flat precheck");
+            assert_eq!(
+                r.config.index,
+                IndexKind::Current,
+                "conformance: {name}: A_flat index"
+            );
             let mut c = r.config.clone();
             c.completion_cover = CompletionCover::Sweep;
+            // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the partner
+            // runs the Sweep row's default index.
+            c.index = if name == "X5" { IndexKind::Set } else { IndexKind::Current };
             if name == "X5" {
                 c.precheck = false;
             }

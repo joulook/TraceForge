@@ -1204,6 +1204,117 @@ impl CompactCache {
 /// admission number the value, in one `IndexMap` that keeps admission order
 /// for the scan and answers the duplicate check and the exact-hit probe by
 /// hash, with no `cmp`.
+/// `MIN-ENGINES` E7b: the stateless engine's witness cache on the set index
+/// (I2): `CompactCache`'s capacity rules and tallies — FIFO eviction under
+/// `Bounded(n)` with re-admission detection by `(sig_id, ord)` — with no memo
+/// and no antichain (neither is read under `Set`). A probe answers as the set
+/// index's `covers`; an admission evicts first, then inserts. After a missed
+/// probe no held order is `≤` the probed summary, and the witness's order is
+/// `≤` it, so the witness's order is not held: the insertion stores.
+#[derive(Clone, Debug)]
+pub(crate) struct SetCache {
+    index: SetIndex,
+    capacity: Capacity,
+    fifo: VecDeque<(SigHash, SigId, u64)>,
+    evicted: HashSet<MemoKey>,
+    admissions: usize,
+    evictions: usize,
+    readmissions: usize,
+}
+
+impl SetCache {
+    pub(crate) fn new(capacity: Capacity) -> Self {
+        Self {
+            index: SetIndex::new(),
+            capacity,
+            fifo: VecDeque::new(),
+            evicted: HashSet::new(),
+            admissions: 0,
+            evictions: 0,
+            readmissions: 0,
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> Capacity {
+        self.capacity
+    }
+
+    pub(crate) fn index(&self) -> &SetIndex {
+        &self.index
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub(crate) fn admissions(&self) -> usize {
+        self.admissions
+    }
+
+    pub(crate) fn evictions(&self) -> usize {
+        self.evictions
+    }
+
+    pub(crate) fn readmissions(&self) -> usize {
+        self.readmissions
+    }
+
+    /// The set index's counters in the compact record (I2b-7's mapping; the
+    /// memo fields off).
+    pub(crate) fn stats(&self) -> CompactStats {
+        self.index.stats().as_compact_stats()
+    }
+
+    /// A probe: `Hit` iff the set index holds an order `≤` the summary's in its
+    /// signature's slot; never `MemoHit` (no memo).
+    pub(crate) fn probe(&mut self, s: &CompactSummary) -> (Probe, Option<SigId>) {
+        match self.index.covers(s) {
+            (id, Covers::Found(_)) => (Probe::Hit, id),
+            (id, Covers::NoBucket | Covers::NoSig | Covers::NotFound) => (Probe::Miss, id),
+        }
+    }
+
+    /// An admission (`CompactCache::admit`'s rules): refused under `Zero`;
+    /// under `Bounded(n)` the oldest orders evicted first; then the witness's
+    /// order stored, a re-admission counted when it was evicted before.
+    pub(crate) fn admit(&mut self, witness: &CompactSummary, probed: &CompactSummary) -> bool {
+        debug_assert!(
+            witness.sig == probed.sig,
+            "conformance: a sweep's witness has the probed summary's signature"
+        );
+        if matches!(self.capacity, Capacity::Zero | Capacity::Bounded(0)) {
+            return false;
+        }
+        if let Capacity::Bounded(n) = self.capacity {
+            while self.index.len() >= n {
+                let Some((hash, sig_id, seq)) = self.fifo.pop_front() else {
+                    break;
+                };
+                if let Some(ord) = self.index.remove(hash, sig_id, seq) {
+                    self.evicted.insert((sig_id, ord));
+                    self.evictions += 1;
+                }
+            }
+        }
+        let (sig_id, seq) = match self.index.insert(witness) {
+            (id, Inserted::Stored(seq)) => (id, seq),
+            (_, Inserted::Duplicate | Inserted::DroppedNew) => return false,
+        };
+        self.admissions += 1;
+        if matches!(self.capacity, Capacity::Bounded(_)) {
+            if self.evicted.contains(&(sig_id, witness.ord.clone())) {
+                self.readmissions += 1;
+            }
+            self.fifo.push_back((witness.hash, sig_id, seq));
+        }
+        true
+    }
+}
+
 #[derive(Clone, Debug)]
 struct SetSlot {
     sig_id: SigId,
@@ -1219,6 +1330,9 @@ struct SetSlot {
 #[derive(Clone, Debug, Default)]
 struct SetBucket {
     slots: Vec<SetSlot>,
+    /// `MIN-ENGINES` E7b: the slots holding at least one order (a slot emptied
+    /// by the stateless cache's eviction stays, P1, but is not occupied).
+    occupied: usize,
     hint: std::cell::RefCell<HashMap<u64, Vec<usize>>>,
 }
 
@@ -1311,13 +1425,14 @@ pub struct SetStats {
 
 impl SetStats {
     /// The counters in the reference's record (I2b-6), for the stateful
-    /// engine's `counters.compact` so that the store's columns are filled
-    /// under `IndexKind::Set`: the thirteen shared fields carried over
-    /// (`bucket_max` is `slot_max`), `insert_tests` 0 (no `cmp` at insertion),
-    /// the antichain, inverted, trie and memo fields off or `None`,
-    /// `impl_distinct_summaries` `None` (the engine sets it as under
-    /// `Compact`). `exact_hits` has no counterpart there and is read from the
-    /// engine's `set_index`.
+    /// engine's `counters.compact` and, through `SetCache::stats`
+    /// (`MIN-ENGINES` E7b), the complete-first engine's, so that the store's
+    /// columns are filled under `IndexKind::Set`: the thirteen shared fields
+    /// carried over (`bucket_max` is `slot_max`), `insert_tests` 0 (no `cmp`
+    /// at insertion), the antichain, inverted, trie and memo fields off or
+    /// `None`, `impl_distinct_summaries` `None` (each engine sets it as under
+    /// `Compact`). `exact_hits` has no counterpart there; it stays in
+    /// `SetStats`.
     pub(crate) fn as_compact_stats(&self) -> CompactStats {
         CompactStats {
             antichain_effective: false,
@@ -1355,8 +1470,10 @@ impl SetStats {
 /// a slot held once in an `IndexMap<OrdCounts, u64>` (I2b-1) that answers an
 /// exact duplicate and the exact-hit probe by hash with no `cmp` — and the
 /// admission-ordered scan of [`CompactIndex`]'s query, through `&self`. No
-/// antichain, no removal, no capacity: the held set is the set of distinct
-/// summaries inserted. On one insertion sequence it equals
+/// antichain and no capacity policy of its own; `remove` (`MIN-ENGINES` E7b)
+/// is the stateless cache's FIFO eviction, which drops an order and keeps its
+/// slot. The held set is the set of distinct summaries inserted and not
+/// removed. On one insertion sequence it equals
 /// `CompactIndex::with_bucket(false, BucketKind::Scan)` in every insertion
 /// outcome, id and seq, in every query's verdict class, and in every counter
 /// but `insert_tests`, `containment_tests` and `coordinates_compared`: the
@@ -1426,6 +1543,30 @@ impl SetIndex {
         self.stats.entries == 0
     }
 
+    /// `MIN-ENGINES` E7b: remove the order admitted as `seq` from `sig_id`'s slot
+    /// — the stateless cache's FIFO eviction. `shift_remove` keeps the slot's
+    /// admission order (the scan's); the slot itself stays (P1); the
+    /// occupancy counters move as `CompactIndex::remove`'s. `None` if no such
+    /// order is held.
+    pub(crate) fn remove(&mut self, hash: SigHash, sig_id: SigId, seq: u64) -> Option<OrdCounts> {
+        let bucket = self.buckets.get_mut(&hash)?;
+        let si = bucket.slots.iter().position(|s| s.sig_id == sig_id)?;
+        let slot = &mut bucket.slots[si];
+        let i = slot.orders.values().position(|&q| q == seq)?;
+        let (ord, _) = slot.orders.shift_remove_index(i)?;
+        self.stats.entries -= 1;
+        self.stats.summary_bytes -= ord.payload_bytes();
+        if slot.orders.is_empty() {
+            self.stats.signatures -= 1;
+            self.stats.sig_bytes_est -= slot.sig_est;
+            bucket.occupied -= 1;
+            if bucket.occupied == 0 {
+                self.stats.buckets -= 1;
+            }
+        }
+        Some(ord)
+    }
+
     /// An insertion's resolution: the signature's slot, created (bucket and
     /// slot, with a fresh checked id) when absent — `slot_for_insert`'s rule.
     fn slot_for_insert(&mut self, s: &CompactSummary) -> usize {
@@ -1463,7 +1604,6 @@ impl SetIndex {
             .buckets
             .get_mut(&s.hash)
             .expect("conformance: a resolved bucket exists");
-        let first_in_bucket = bucket.slots.len() == 1;
         let slot = &mut bucket.slots[si];
         let sig_id = slot.sig_id;
         if slot.orders.contains_key(&s.ord) {
@@ -1481,14 +1621,16 @@ impl SetIndex {
         stats.summary_bytes += s.ord.payload_bytes();
         stats.slot_max = stats.slot_max.max(slot.orders.len());
         if was_empty {
-            // A slot is created by the insertion that then stores (its set
-            // is empty), so this is the slot's creation: the occupancy
-            // counters as `CompactIndex::occupancy`'s.
+            // The slot becomes occupied (created now, or emptied by an
+            // eviction and filled again): the occupancy counters as
+            // `CompactIndex::occupancy`'s (`MIN-ENGINES` E7b: by the bucket's
+            // occupied slots, not its slot count).
             stats.signatures += 1;
             stats.sig_bytes_est += slot.sig_est;
-            if first_in_bucket {
+            if bucket.occupied == 0 {
                 stats.buckets += 1;
             }
+            bucket.occupied += 1;
         }
         (sig_id, Inserted::Stored(seq))
     }
@@ -1500,8 +1642,10 @@ impl SetIndex {
     /// coordinate read (the hash and the equality compare are not counted),
     /// `exact_hits` + 1. Otherwise the first held order `≤` the query
     /// in admission order answers (D4's exit), exactly `CompactIndex::covers`
-    /// under `BucketKind::Scan`. A slot with no orders does not exist here
-    /// (nothing is removed), so `(Some(_), NoSig)` is unreachable.
+    /// under `BucketKind::Scan`. A slot is never removed (P1), so
+    /// `(Some(_), NoSig)` is unreachable; but `remove` (the stateless cache's
+    /// eviction, `MIN-ENGINES` E7b) may leave a slot with no held order, and
+    /// such a slot answers `(Some(id), NotFound)`.
     pub(crate) fn covers(&self, s: &CompactSummary) -> (Option<SigId>, Covers) {
         let Some(bucket) = self.buckets.get(&s.hash) else {
             return (None, Covers::NoBucket);
@@ -1510,11 +1654,9 @@ impl SetIndex {
         let Some(si) = bucket.find(&s.sig, r, &self.sig_tests, &self.sig_aliases) else {
             return (None, Covers::NoSig);
         };
+        // `MIN-ENGINES` E7b: a slot emptied by the stateless cache's eviction
+        // answers `NotFound` (no held order), as `CompactIndex`'s does.
         let slot = &bucket.slots[si];
-        debug_assert!(
-            !slot.orders.is_empty(),
-            "conformance: a set-index slot holds at least one order"
-        );
         if let Some(&seq) = slot.orders.get(&s.ord) {
             self.exact_hits.set(self.exact_hits.get() + 1);
             return (Some(slot.sig_id), Covers::Found(seq));

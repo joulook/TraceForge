@@ -766,16 +766,9 @@ fn run(
         });
     }
 
-    // `SVERIFY-P` I2b-7: the set index is the stateful engine's; the
-    // complete-first engine reads `Compact` only and would run `Current`
-    // under `Set`, so the pair is refused here, on every public path, before
-    // any engine starts (the grid driver refuses it in `conf_config`).
-    if cc.engine == Engine::CompleteFirst && cc.index == config::IndexKind::Set {
-        return Err(ConfError::KnobConflict {
-            knob: "index(Set)",
-            conflicts_with: "engine(CompleteFirst)",
-        });
-    }
+    // `MIN-ENGINES` E7b: the complete-first engine reads `Set` (its set
+    // cache); the refusal `SVERIFY-P` I2b-7 placed here is lifted. Flat + `Set`
+    // is refused in `cfirst::run`, beside Flat + `Compact`.
 
     // `P4-STATEFUL` T4/T6: the stateful engine is its own §5.4 check and has
     // no inner search, diagnostics or triage; it leaves here.

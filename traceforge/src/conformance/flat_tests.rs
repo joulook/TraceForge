@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::conformance::cfirst::{self, CFirstOutcome};
-use crate::conformance::config::{CompletionCover, ConfConfig, GatePolicy, GatedMode};
+use crate::conformance::config::{CompletionCover, ConfConfig, GatePolicy, GatedMode, IndexKind};
 use crate::conformance::flat;
 use crate::conformance::gated::{self, GatedOutcome};
 use crate::conformance::grid::{
@@ -136,6 +136,9 @@ fn builder(
         .all_reports(true)
         // `MIN-ENGINES` E7a (the tester, gate 3): the sweep sizes are read.
         .sweep_record(true);
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3; the owner's ruling F1):
+    // a Flat configuration names `index(Current)` (Flat × `Set` is refused).
+    let b = if cover == CompletionCover::Flat { b.index(IndexKind::Current) } else { b };
     match e {
         Eng::Enum => b.engine(Engine::Enumerator),
         Eng::Stateful => b.engine(Engine::Stateful),

@@ -971,8 +971,11 @@ fn cf_rows(max: usize, profile: &str) -> Vec<serde_json::Value> {
         for s in 2..=max {
             for fam in FAMILIES {
                 for p in ApptabPair::ALL.iter().filter(|p| p.family() == fam) {
+                    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the
+                    // CFCFG rows' derived key is the `Set` default's.
+                    let label = format!("{}/index=set", cf_label(w));
                     out.push(serde_json::json!({
-                        "key": format!("{}|{}|0|default|timed|{profile}", p.name(s), cf_label(w)),
+                        "key": format!("{}|{label}|0|default|timed|{profile}", p.name(s)),
                         "benchmark": fam,
                         "pair": p.label(),
                         "variant": p.variant(),

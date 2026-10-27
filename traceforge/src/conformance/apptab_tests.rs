@@ -1023,9 +1023,12 @@ fn c06_the_schedule_parser() {
     let k = base["rows"][i]["key"].as_str().unwrap();
     // `MIN-ENGINES` E1 (2026-10-26, tester re-pin at gate 3): the stateful key
     // prints `Plain`, the enumerator's names its selector (`Ltr`).
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the stateful key's
+    // `Set` suffix goes too — the enumerator's key does not print the index.
     let ek = k
         .replace("Stateful/Plain/", "Enumerator/Ltr/")
-        .replace("memo=false/Default", "memo=true/Unlimited");
+        .replace("memo=false/Default", "memo=true/Unlimited")
+        .replace("/w=inf/quiet=false/index=set", "");
     v["rows"][i]["key"] = serde_json::json!(ek);
     v["rows"][i]["engine"] = serde_json::json!("Enumerator");
     v["rows"][i]["series"] = serde_json::json!(series_of(

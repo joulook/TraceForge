@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::conformance::canon::CanonicalGraph;
-use crate::conformance::config::ConfConfig;
+use crate::conformance::config::{ConfConfig, IndexKind};
 use crate::conformance::ctx::Diagnostic;
 use crate::conformance::morphism::{matches, statuses, statuses_agree, CompleteExecution};
 use crate::conformance::obs::wobs;
@@ -211,8 +211,11 @@ fn assert_identities(o: &StatefulOutcome, what: &str) {
         c.lookups_signature_miss + c.lookups_failed_after_tests,
         "conformance: {what}: reports = sig_miss + failed: {c:?}"
     );
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): under `Set` (the
+    // default) an exact hit answers a tested lookup with no `≤` test (I2b-3).
+    let exact = o.set_index.as_ref().map_or(0, |s| s.stats().exact_hits);
     assert!(
-        c.containment_tests >= c.lookups_containment_tested,
+        c.containment_tests + exact >= c.lookups_containment_tested,
         "conformance: {what}: tests >= tested: {c:?}"
     );
     assert_eq!(
@@ -224,16 +227,18 @@ fn assert_identities(o: &StatefulOutcome, what: &str) {
         c.lookups, c.impl_graphs,
         "conformance: {what}: one lookup per Impl completion"
     );
+    // `MIN-ENGINES` E7b: the slots and buckets of the configured index — the
+    // set index's under `Set` (the default), `SigBuckets`' under `Current`.
+    let (slots, buckets) = match (&o.set_index, &o.compact_index) {
+        (Some(s), _) => (s.stats().signatures, s.stats().buckets),
+        (None, Some(ci)) => (ci.stats().signatures, ci.stats().buckets),
+        (None, None) => (o.index.len(), o.index.key_buckets()),
+    };
     assert_eq!(
-        c.signatures,
-        o.index.len(),
-        "conformance: {what}: signatures = SigBuckets::len"
+        c.signatures, slots,
+        "conformance: {what}: signatures = the index's slots"
     );
-    assert_eq!(
-        c.sig_key_buckets,
-        o.index.key_buckets(),
-        "conformance: {what}: key buckets"
-    );
+    assert_eq!(c.sig_key_buckets, buckets, "conformance: {what}: key buckets");
     assert!(
         c.sig_key_buckets <= c.signatures && c.signatures <= c.orders_held,
         "conformance: {what}: buckets <= slots <= orders: {c:?}"
@@ -1021,7 +1026,9 @@ fn c01_c08_identities_on_every_fixture() {
     ));
     let mut runs = 0;
     for p in fixtures {
-        let cc = built(sb(p.config.clone(), &p.visible));
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): this test reads the
+        // `Current` index's slots (`SigBuckets`): named here.
+        let cc = built(sb(p.config.clone(), &p.visible).index(IndexKind::Current));
         let o = rw(&cc, &p.imp, &p.spec, true);
         assert!(
             o.spec_errors.is_empty(),
@@ -1528,7 +1535,9 @@ fn c03_an_invisible_block_assert_surviving_a_revisit() {
     assert_block_survives_the_revisit(&o.kept_impl_graphs, "Impl side", Revisit::Forward);
     assert_counts(
         &o.counters,
-        [2, 2, 1, 2, 2, 2, 0, 2, 2, 0, 2, 0],
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): `tests` 2 → 0 at the
+        // default `Set`, where both lookups are exact hits (no `≤` test, I2b-3).
+        [2, 2, 1, 2, 2, 2, 0, 2, 2, 0, 0, 0],
         "Impl side",
     );
     assert!(
@@ -1662,7 +1671,9 @@ fn c04_thm_stateful_against_the_phase_3_morphism() {
 fn c05_ex_naive_k_2_to_5() {
     for (k, fact) in [(2usize, 2usize), (3, 6), (4, 24), (5, 120)] {
         let v = naive_visible(k);
-        let cc = built(sb(cfg(ConsType::Bag), &v));
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): this test's subject is
+    // the `Current` index (its slots or its containment tests): named here.
+        let cc = built(sb(cfg(ConsType::Bag), &v).index(IndexKind::Current));
         let o = rw(&cc, &naive(k, 0), &naive(k, 1), true);
         let what = format!("ex:naive k={k}");
         assert_counts(
@@ -1866,7 +1877,9 @@ fn c07_several_spec_graphs_one_signature() {
     .collect();
     assert!(q_a < q_b, "conformance: BTreeSet order");
     for (a_first, ord, tests) in [(true, &q_a, 1usize), (false, &q_b, 2usize)] {
-        let cc = built(sb(cfg(ConsType::Bag), &v));
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): this test's subject is
+        // the `Current` index (its slots or its containment tests): named here.
+        let cc = built(sb(cfg(ConsType::Bag), &v).index(IndexKind::Current));
         let o = rw(&cc, &c7_impl(a_first), &c7_spec(), true);
         let what = format!("criterion 7, a_first={a_first}");
         assert_counts(&o.counters, [2, 1, 1, 1, 2, 1, 0, 1, 1, 0, tests, 0], &what);
@@ -1893,7 +1906,9 @@ fn c07_one_spec_graph_one_test() {
         ("ex:cone", ex_cone_spec(), vis(&["a", "c"])),
         ("relay", relay_spec(), vis(&["a", "c"])),
     ] {
-        let cc = built(sb(cfg(ConsType::Bag), &v));
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): this test's subject is
+        // the `Current` index (its slots or its containment tests): named here.
+        let cc = built(sb(cfg(ConsType::Bag), &v).index(IndexKind::Current));
         let o = rw(&cc, &p, &p, false);
         assert_counts(&o.counters, [1, 1, 1, 1, 1, 1, 0, 1, 1, 0, 1, 0], what);
     }
@@ -1905,7 +1920,9 @@ fn c07_one_spec_graph_one_test() {
 #[test]
 fn c08_key_buckets_and_signatures_differ_in_general() {
     let v = vis(&["a", "b", "c"]);
-    let cc = built(sb(cfg(ConsType::Bag), &v));
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): this test's subject is
+    // the `Current` index (its slots or its containment tests): named here.
+    let cc = built(sb(cfg(ConsType::Bag), &v).index(IndexKind::Current));
     let o = rw(
         &cc,
         &two_senders(1i32, 2i32),
@@ -1940,7 +1957,9 @@ fn c08_key_buckets_and_signatures_differ_in_general() {
 #[test]
 fn c08_orders_held_is_after_dedup() {
     let v = vis(&["v"]);
-    let cc = built(sb(cfg(ConsType::Bag), &v));
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): this test's subject is
+    // the `Current` index (its slots or its containment tests): named here.
+    let cc = built(sb(cfg(ConsType::Bag), &v).index(IndexKind::Current));
     let p = inv_assert_on_revisit(false);
     let o = rw(&cc, &p, &p, false);
     assert_counts(
@@ -1959,7 +1978,9 @@ fn c08_orders_held_is_after_dedup() {
 #[test]
 fn c10_a9_nan_reports_and_inflates_the_index() {
     let v = vis(&["a", "c"]);
-    let cc = built(sb(cfg(ConsType::Bag), &v));
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): this test's subject is
+    // the `Current` index (its slots or its containment tests): named here.
+    let cc = built(sb(cfg(ConsType::Bag), &v).index(IndexKind::Current));
     let o = rw(&cc, &direct_of(f64::NAN), &direct_of(f64::NAN), false);
     assert_counts(
         &o.counters,
@@ -1967,7 +1988,7 @@ fn c10_a9_nan_reports_and_inflates_the_index() {
         "NaN direct",
     );
     let vb = vis(&["a", "b", "c"]);
-    let ccb = built(sb(cfg(ConsType::Bag), &vb));
+    let ccb = built(sb(cfg(ConsType::Bag), &vb).index(IndexKind::Current));
     let o = rw(
         &ccb,
         &two_senders(f64::NAN, f64::NAN),
@@ -2053,15 +2074,13 @@ fn c12_the_entry_point_fields() {
         compact_index,
         set_index,
     } = rw(&cc, &naive(2, 0), &naive(2, 1), false);
-    // COMPACT-INDEX: `None` under the default `IndexKind::Current`.
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the default index is
+    // `Set` — the set index present, the compact index and `SigBuckets`
+    // empty (both were the default `Current`'s before).
     let compact_index: Option<crate::conformance::compact::CompactIndex> = compact_index;
-    assert!(
-        compact_index.is_none(),
-        "conformance: no compact index under Current"
-    );
-    // SVERIFY-P I2b-7: `None` under the default `IndexKind::Current`.
+    assert!(compact_index.is_none(), "conformance: no compact index at the default");
     let set_index: Option<crate::conformance::compact::SetIndex> = set_index;
-    assert!(set_index.is_none(), "conformance: no set index under Current");
+    assert!(set_index.is_some(), "conformance: the set index at the default");
     let reports: Vec<(ExecutionGraph, ReplaySnapshot)> = reports;
     let counters: StatefulCounters = counters;
     let index: SigBuckets<BTreeSet<VisOrder>> = index;
@@ -2073,7 +2092,7 @@ fn c12_the_entry_point_fields() {
     let (executions, max_paper_events): (usize, Option<usize>) = (executions, max_paper_events);
     assert_eq!(reports.len(), 2);
     assert_eq!(counters.reports, 2);
-    assert_eq!(index.len(), 1);
+    assert_eq!(index.len(), 0, "conformance: `SigBuckets` unused under `Set`");
     assert!(
         kept_impl_graphs.is_empty() && kept_spec_graphs.is_empty(),
         "conformance: kept without keep_graphs"
@@ -2484,7 +2503,9 @@ fn c03_an_invisible_block_assert_surviving_a_backward_revisit() {
     assert_block_survives_the_revisit(&o.kept_impl_graphs, "Impl side", Revisit::Backward);
     assert_counts(
         &o.counters,
-        [2, 2, 1, 2, 2, 2, 0, 2, 2, 0, 2, 0],
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): `tests` 2 → 0 at the
+        // default `Set`, where both lookups are exact hits (no `≤` test, I2b-3).
+        [2, 2, 1, 2, 2, 2, 0, 2, 2, 0, 0, 0],
         "Impl side",
     );
     assert!(

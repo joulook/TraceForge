@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::conformance::canon::CanonicalGraph;
 use crate::conformance::cfirst::{run_with, CFirstOutcome, SweepEnd};
-use crate::conformance::config::ConfConfig;
+use crate::conformance::config::{ConfConfig, IndexKind};
 use crate::conformance::ctx::{Diagnostic, DiagnosticReason, Report, ReportKind};
 use crate::conformance::morphism::{matches, statuses, statuses_agree, CompleteExecution, Status};
 use crate::conformance::obs::{wobs, Obs};
@@ -252,11 +252,16 @@ fn assert_identities(o: &CFirstOutcome, visible: &[String], kept: bool, what: &s
         "conformance: {what}: witnesses + dups = successful"
     );
     assert_eq!(c.witness_duplicates, 0, "conformance: {what}: duplicates");
-    assert_eq!(
-        c.witnesses,
-        o.witnesses.len(),
-        "conformance: {what}: W.len()"
-    );
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): `W` is the configured
+    // index's cache — the set cache under `Set` (the default), the compact
+    // cache under `Compact`, `WitnessCache` under `Current`.
+    let held = o
+        .set_cache
+        .as_ref()
+        .map(|s| s.len())
+        .or_else(|| o.compact_cache.as_ref().map(|c| c.len()))
+        .unwrap_or_else(|| o.witnesses.len());
+    assert_eq!(c.witnesses, held, "conformance: {what}: W.len()");
     assert_eq!(
         c.reports, c.sweeps_failing,
         "conformance: {what}: reports = failing"
@@ -264,8 +269,11 @@ fn assert_identities(o: &CFirstOutcome, visible: &[String], kept: bool, what: &s
     assert_eq!(c.reports, o.reports.len(), "conformance: {what}: list");
     assert_eq!(c.cut_reports, 0, "conformance: {what}: cut off");
     assert!(o.cut_reports.is_empty(), "conformance: {what}: cut off");
+    // `MIN-ENGINES` E7b: under `Set` an exact hit answers with no `≤` test
+    // (I2b-3), so the hits are bounded by the tests plus the exact hits.
+    let exact = o.set_cache.as_ref().map_or(0, |s| s.index().stats().exact_hits);
     assert!(
-        c.cache_tests >= c.cache_hits && c.cache_tests <= c.cache_probes * c.witnesses,
+        c.cache_tests + exact >= c.cache_hits && c.cache_tests <= c.cache_probes * c.witnesses,
         "conformance: {what}: cache_tests bounds: {c:?}"
     );
     assert_eq!(o.sweep_ends.len(), c.sweeps, "conformance: {what}: ends");
@@ -1139,7 +1147,9 @@ fn c01_the_outer_run_is_musts_uncut_exploration_of_impl() {
         // `MIN-ENGINES` E3 (the tester's re-pin at gate 3): `L` is compared with
         // `ConfConfig::paper_events` on in both engines (the cut and the stop
         // off: both runs exhaustive).
-        let cc = built(cb(p.config.clone(), v).paper_events(true));
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the identities
+        // re-simulate `W`'s admission order from its graphs: `Current` named.
+        let cc = built(cb(p.config.clone(), v).paper_events(true).index(IndexKind::Current));
         let o = rw(&cc, &p.imp, &p.spec, true);
         assert_identities(&o, v, true, &p.name);
         let s = srw(&built(sb(p.config.clone(), v).paper_events(true)), &p.imp, &p.spec);
@@ -1392,7 +1402,9 @@ fn is_first_completion(s: &Summary) -> bool {
 #[test]
 fn c03_ex_nogate_no_pruning() {
     let v = vis(&["a", "b", "c"]);
-    let cc = built(cb(cfg(ConsType::Bag), &v));
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the identities
+    // re-simulate `W`'s admission order from its graphs: `Current` named.
+    let cc = built(cb(cfg(ConsType::Bag), &v).index(IndexKind::Current));
     let o = rw(&cc, &nogate(), &nogate(), true);
     assert_identities(&o, &v, true, "ex:nogate");
     assert_counts(
@@ -1461,7 +1473,10 @@ fn c03_ex_nogate_no_pruning() {
 #[test]
 fn c04_w_positive_fixture_is_a_provable_hit() {
     let v = vis(&["a", "b", "c"]);
-    let cc = built(cb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(true));
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the identities
+    // re-simulate `W`'s admission order from its graphs: `Current` named.
+    let b = cb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(true);
+    let cc = built(b.index(IndexKind::Current));
     let o = rw(&cc, &c4_impl(), &c4_spec_positive(), true);
     assert_identities(&o, &v, true, "c4 positive");
     assert_counts(
@@ -1482,7 +1497,10 @@ fn c04_w_positive_fixture_is_a_provable_hit() {
 #[test]
 fn c04_w_negative_fixture_misses() {
     let v = vis(&["a", "b", "c"]);
-    let cc = built(cb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(true));
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the identities
+    // re-simulate `W`'s admission order from its graphs: `Current` named.
+    let b = cb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(true);
+    let cc = built(b.index(IndexKind::Current));
     let o = rw(&cc, &c4_impl(), &c4_spec_negative(), true);
     assert_identities(&o, &v, true, "c4 negative");
     let c = &o.counters;
@@ -2309,7 +2327,10 @@ fn c08_first_report_mode() {
 fn c09_the_cost_dial_on_ex_naive_against_itself() {
     for (k, fact) in [(2usize, 2usize), (3, 6)] {
         let v = naive_visible(k);
-        let cc = built(cb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(true));
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the identities
+        // re-simulate `W`'s admission order from its graphs: `Current` named.
+        let b = cb(cfg(ConsType::Bag), &v).skip_spec_errfree_check(true);
+    let cc = built(b.index(IndexKind::Current));
         let o = rw(&cc, &naive(k, 0), &naive(k, 0), true);
         let what = format!("cost dial k={k}");
         assert_identities(&o, &v, true, &what);
@@ -2388,12 +2409,16 @@ fn c11_the_entry_point_fields() {
         executions,
         max_paper_events,
         compact_cache,
+        set_cache,
     } = rw(&cc, &naive(2, 0), &naive(2, 1), false);
-    // COMPACT-INDEX: `None` under the default `IndexKind::Current`.
+    // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the default index is
+    // `Set` — the set cache present, the compact cache absent (it was `None`
+    // under the former default `Current`).
     let compact_cache: Option<crate::conformance::compact::CompactCache> = compact_cache;
+    let set_cache: Option<crate::conformance::compact::SetCache> = set_cache;
     assert!(
-        compact_cache.is_none(),
-        "conformance: no compact cache under Current"
+        compact_cache.is_none() && set_cache.is_some(),
+        "conformance: the set cache at the default"
     );
     let reports: Vec<(ExecutionGraph, ReplaySnapshot)> = reports;
     let cut_reports: Vec<Report> = cut_reports;
@@ -2909,7 +2934,10 @@ fn c07_an_abort_at_the_nth_completion() {
         let spec = forward_to_checker(Some(2));
         let o = rw(&cc, &imp, &spec, true);
         let what = format!("bad=2 cut={cut}");
-        assert_counts(&o.counters, [2, 2, 0, 1, 2, 1, 0, 1, 3, 1, 0, 0, 0], &what);
+        // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): `cache_tests` 1 → 0
+        // at the default `Set`, where the second probe's signature miss tests
+        // no order (`Current` tested its one witness).
+        assert_counts(&o.counters, [2, 2, 0, 0, 2, 1, 0, 1, 3, 1, 0, 0, 0], &what);
         assert_eq!(o.counters.sweep_sizes, vec![1, 2], "conformance: {what}");
         assert_eq!(o.sweep_ends, vec![SweepEnd::Witness, SweepEnd::Aborted]);
         assert_eq!(

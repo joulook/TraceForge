@@ -307,7 +307,8 @@ pub struct ConfConfig {
     /// (`Compact` and complete-first only).
     pub(crate) probe_memo: bool,
     /// `COMPACT-INDEX` phase 2 D6: keep the distinct-implementation-summary
-    /// set and export `impl_distinct_summaries` (both index kinds).
+    /// set and export `impl_distinct_summaries` (the stateful engine under
+    /// every index kind; the complete-first engine under `Compact` or `Set`).
     pub(crate) impl_distinct: bool,
     /// `COMPACT-INDEX` phase 2 item 7: the structure answering a signature
     /// slot's queries (`Compact` only).
@@ -477,7 +478,9 @@ impl ConfBuilder {
             sweep_record: false,
             // `COMPACT-INDEX` §5 (frozen C1, §4, §5): today's index; the
             // antichain and the probe memo on wherever `Compact` reads them.
-            index: IndexKind::Current,
+            // `MIN-ENGINES` E7b: `Set` the default structure of the stateful and
+            // complete-first engines (the other engines do not read it).
+            index: IndexKind::Set,
             antichain: true,
             // `MIN-ENGINES` E7a: the probe memo off by default (`true` before).
             probe_memo: false,
@@ -597,8 +600,9 @@ impl ConfBuilder {
 
     /// `COMPACT-INDEX` phase 2 D6: keep the set of distinct implementation
     /// summaries and export `impl_distinct_summaries` (the step-0 counter).
-    /// Default `false`. Read by [`Engine::Stateful`] under both index kinds
-    /// and by [`Engine::CompleteFirst`] under `IndexKind::Compact`.
+    /// Default `false`. Read by [`Engine::Stateful`] under every index kind
+    /// (`Current`, `Compact`, `Set`) and by [`Engine::CompleteFirst`] under
+    /// `IndexKind::Compact` or `IndexKind::Set` (`MIN-ENGINES` E7b).
     pub fn impl_distinct(mut self, on: bool) -> Self {
         self.impl_distinct = on;
         self

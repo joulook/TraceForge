@@ -1367,7 +1367,9 @@ pub(super) struct GridConfig {
     pub(super) antichain: bool,
     /// `COMPACT-INDEX` §5.1 item 4(b) (`pmemo=<bool>`; printed under `Compact`).
     pub(super) probe_memo: bool,
-    /// `COMPACT-INDEX` phase 2 D6 (`distinct=on`; printed only when on).
+    /// `COMPACT-INDEX` phase 2 D6 (`distinct=on`; printed only when on and
+    /// effective: the stateful engine, and the complete-first engine under
+    /// `Compact` or `Set` (`MIN-ENGINES` E7b)).
     pub(super) impl_distinct: bool,
     /// `COMPACT-INDEX` phase 2 item 7 (`bucket=inverted:<t>` or
     /// `bucket=trie`, printed under `Compact`; nothing for the scan).
@@ -1396,7 +1398,13 @@ impl GridConfig {
             quiet: false,
             all_reports: false,
             sweep_record: false,
-            index: IndexKind::Current,
+            // `MIN-ENGINES` E7b: `Set` for the two engines that read the index,
+            // `Current` for the rest, whose keys print no index field.
+            index: if matches!(engine, GridEngine::Stateful | GridEngine::CompleteFirst) {
+                IndexKind::Set
+            } else {
+                IndexKind::Current
+            },
             antichain: true,
             // `MIN-ENGINES` E7a: the probe memo off by default.
             probe_memo: false,
@@ -1449,6 +1457,11 @@ impl GridConfig {
 
     pub(super) fn cover(mut self, c: CompletionCover) -> Self {
         self.completion_cover = c;
+        // `MIN-ENGINES` E7b (the owner's ruling F1): a Flat row runs the
+        // `Current` witness cache, set explicitly here.
+        if c == CompletionCover::Flat {
+            self.index = IndexKind::Current;
+        }
         self
     }
 
@@ -1503,14 +1516,13 @@ impl GridConfig {
                 panic!("conformance: `Explore` has no conformance configuration (P5-XBASE F1)")
             }
         };
-        // `SVERIFY-P` I2b-7: the set index is the stateful engine's; the
-        // complete-first engine would run `Current` under `Set` (it reads
-        // `Compact` only), and this path does not pass `conformance::run`'s
-        // refusal, so the pair is refused here, before any engine starts.
+        // `MIN-ENGINES` E7b: the complete-first engine reads `Set`; Flat + `Set`
+        // is refused here (this path does not pass `cfirst::run`'s refusal),
+        // before any engine starts — the fix is `index(Current)` (F1).
         assert!(
-            !(engine == Engine::CompleteFirst && self.index == IndexKind::Set),
-            "conformance: index(Set) with engine(CompleteFirst) is not a configuration \
-             (SVERIFY-P I2b)"
+            !(self.completion_cover == CompletionCover::Flat && self.index == IndexKind::Set),
+            "conformance: index(Set) with completion_cover(Flat) is not a configuration; set \
+             index(Current) (MIN-ENGINES E7b)"
         );
         let b = ConfBuilder::new()
             .config(fixture.config.clone())
@@ -1593,8 +1605,8 @@ impl GridConfig {
         // followed by the three knobs; under `Current` nothing changes.
         // Phase 2 D6: `/distinct=on` appended only when the knob is on, so
         // every key with it off is the slice's key; P7: and only where it has
-        // effect (the stateful engine, either index; complete-first under
-        // `Compact`).
+        // effect (the stateful engine, every index; complete-first under
+        // `Compact` or `Set`, `MIN-ENGINES` E7b).
         let base = if self.index == IndexKind::Compact {
             format!(
                 "{eleven}/{}/quiet={}/index=compact/anti={}/pmemo={}",
@@ -1625,8 +1637,12 @@ impl GridConfig {
             (IndexKind::Compact, BucketKind::Trie) => format!("{base}/bucket=trie"),
             _ => base,
         };
+        // Phase 2 D6, `MIN-ENGINES` E7b: the knob acts in the stateful engine
+        // under every index, and in the complete-first engine under `Compact`
+        // and `Set` (its step-0 set, `cfirst.rs`); only there is it printed.
         let distinct_effective = self.engine == GridEngine::Stateful
-            || (self.engine == GridEngine::CompleteFirst && self.index == IndexKind::Compact);
+            || (self.engine == GridEngine::CompleteFirst
+                && matches!(self.index, IndexKind::Compact | IndexKind::Set));
         if self.impl_distinct && distinct_effective {
             format!("{base}/distinct=on")
         } else {
