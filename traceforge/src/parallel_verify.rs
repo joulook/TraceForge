@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -14,6 +14,94 @@ use crate::revisit::RevisitEnum;
 use crate::runtime::execution::Execution;
 use crate::runtime::thread::continuation::{ContinuationPool, CONTINUATION_POOL};
 use crate::{Config, Stats};
+
+/// `SVERIFY-P` I3-3: what the partitioned stateful checker attaches to this
+/// runner — `on_must`, once per exploring `Must` (the root, and each cached
+/// per-thread `Must` at its creation; `reset_for_reuse` keeps what it set,
+/// and a cached `Must` is never hooked again), `on_task_end`, once per
+/// task (empty and panicked tasks included, after the task's `catch_unwind`
+/// and before the empty-task drop) and once for the root at its teardown,
+/// and the stop token `cancel` (criteria rev 2.3). The hooks are `Fn` and
+/// shareable, so one `Arc` serves every worker; what they build runs on the
+/// worker's own thread.
+#[derive(Clone)]
+pub(crate) struct PartitionHooks {
+    pub(crate) on_must: Arc<dyn Fn(&mut Must) + Send + Sync>,
+    pub(crate) on_task_end: Arc<dyn Fn(&mut Must) + Send + Sync>,
+    pub(crate) cancel: Arc<CancelToken>,
+}
+
+impl Default for PartitionHooks {
+    fn default() -> Self {
+        Self {
+            on_must: Arc::new(|_| {}),
+            on_task_end: Arc::new(|_| {}),
+            cancel: Arc::new(CancelToken::new()),
+        }
+    }
+}
+
+/// `SVERIFY-P` I3-3: the stop token. `cancel` sets the flag under the
+/// admission lock and returns the spawns admitted so far; every spawn of the
+/// runner is admitted through `admit` under the same lock, so **no spawn is
+/// admitted after `cancel` returns** and the value `cancel` returns equals
+/// `total_spawned` at the runner's return — the lock is the stop's
+/// linearization point. A spawn admitted before the cancel may still start
+/// after it and reads the flag at its loop's head. The warmup and the two
+/// loop heads read `is_cancelled`. The legacy entry passes a token nobody
+/// cancels.
+pub(crate) struct CancelToken {
+    flag: AtomicBool,
+    /// The admitted spawns, guarded by the lock that linearizes the stop.
+    admission: Mutex<u64>,
+}
+
+impl CancelToken {
+    pub(crate) fn new() -> Self {
+        Self {
+            flag: AtomicBool::new(false),
+            admission: Mutex::new(0),
+        }
+    }
+
+    /// Set the flag; the spawns admitted before this call.
+    pub(crate) fn cancel(&self) -> u64 {
+        let admitted = self
+            .admission
+            .lock()
+            .expect("partitioned runner: the admission lock");
+        self.flag.store(true, Ordering::SeqCst);
+        *admitted
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Admit one spawn: `None` once cancelled, else `f` run under the lock.
+    pub(crate) fn admit<R>(&self, f: impl FnOnce() -> R) -> Option<R> {
+        let mut admitted = self
+            .admission
+            .lock()
+            .expect("partitioned runner: the admission lock");
+        if self.flag.load(Ordering::SeqCst) {
+            return None;
+        }
+        *admitted += 1;
+        Some(f())
+    }
+}
+
+/// `SVERIFY-P` I3-3: the hooked runner's result — Must's own `Stats` summed
+/// over the workers, and the number of tasks the runner spawned (the root not
+/// counted), so a caller can pin its flushes to `tasks_spawned + 1`.
+pub(crate) struct PartitionedRun {
+    pub(crate) stats: Stats,
+    pub(crate) tasks_spawned: usize,
+    /// The workers that reported a non-empty `Stats` (the root included), a
+    /// diagnostic: tasks with no execution are not in it.
+    pub(crate) workers_reported: usize,
+}
 
 /// Frozen thread index mapping passed from parent to child workers.
 /// Ensures that `named_nondet` computes the same thread indices as in
@@ -62,6 +150,22 @@ pub fn verify_partitioned_rayon<F>(conf: Config, f: F) -> Stats
 where
     F: Fn() + Send + Sync + 'static,
 {
+    verify_partitioned_rayon_with(conf, f, PartitionHooks::default()).stats
+}
+
+/// `SVERIFY-P` I3-3: `verify_partitioned_rayon` with the checker's hooks; the
+/// plain entry is this with no-op hooks. One change for both (Codex B1 on
+/// I3's criteria): a panic in the root's warmup or loop — caught by the scope
+/// below, printed — is re-raised after cleanup as a task's always was, instead
+/// of returning the stats as if the run had completed.
+pub(crate) fn verify_partitioned_rayon_with<F>(
+    conf: Config,
+    f: F,
+    hooks: PartitionHooks,
+) -> PartitionedRun
+where
+    F: Fn() + Send + Sync + 'static,
+{
     let f = Arc::new(f);
     let start_time = Instant::now();
 
@@ -93,18 +197,26 @@ where
     // spawned tasks complete before the scope exits.
     // Wrap with catch_unwind so that a panic from any rayon task does not
     // prevent the final summary from being printed.
+    let mut queue_metrics: Option<Arc<RayonQueueMetrics>> = None;
     let scope_result = catch_unwind(AssertUnwindSafe(|| {
         pool.scope(|s| {
-            explore_workers_revisit_queue_rayon(
+            queue_metrics = Some(explore_workers_revisit_queue_rayon(
                 s,
                 conf.clone(),
                 f.clone(),
                 actual_pool_size,
                 results.clone(),
                 first_panic.clone(),
-            );
+                hooks.clone(),
+            ));
         });
     }));
+    // `SVERIFY-P` I3-3: the spawn count is read here, after the scope
+    // returned — every spawned task has finished, so no task spawns after
+    // this read (the root's own return came while tasks still spawned).
+    let tasks_spawned = queue_metrics
+        .as_ref()
+        .map_or(0, |m| m.total_spawned.load(Ordering::Relaxed));
 
     if let Err(ref e) = scope_result {
         // Extract a human-readable panic message from the payload
@@ -149,8 +261,18 @@ where
     if let Some(payload) = first_panic.lock().unwrap().take() {
         std::panic::resume_unwind(payload);
     }
+    // `SVERIFY-P` I3-3 (Codex B1): the root's own panic, caught by the scope
+    // above, is re-raised too — a task's payload first when both exist (it was
+    // captured inside the scope), else the scope's. No stats on either.
+    if let Err(payload) = scope_result {
+        std::panic::resume_unwind(payload);
+    }
 
-    total_stats
+    PartitionedRun {
+        stats: total_stats,
+        tasks_spawned,
+        workers_reported: worker_results.len(),
+    }
 }
 
 // =============================================================================
@@ -181,7 +303,9 @@ fn explore_workers_revisit_queue_rayon<'scope, F>(
     num_workers: usize,
     results: Arc<Mutex<Vec<(String, Stats)>>>,
     first_panic: Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>>,
-) where
+    hooks: PartitionHooks,
+) -> Arc<RayonQueueMetrics>
+where
     F: Fn() + Send + Sync + 'static,
 {
     let warmup = conf.warmup;
@@ -196,13 +320,19 @@ fn explore_workers_revisit_queue_rayon<'scope, F>(
     // --- Phase 1: Root exploration to seed work items ---
 
     let must = Rc::new(RefCell::new(Must::new((*conf).clone(), false)));
+    // `SVERIFY-P` I3-3: the root's hook, before its first execution and
+    // before the warmup's `max_iterations` write below.
+    (hooks.on_must)(&mut must.borrow_mut());
     Must::set_current(Some(must.clone()));
 
     // Run the warmup executions. This populates the execution graph
     // and generates backward revisits (saved states) that become work items.
     let root_pool = ContinuationPool::new();
     must.borrow_mut().config.max_iterations = Some(warmup as u64);
-    explore_with_pool(&must, &f, &root_pool);
+    // `SVERIFY-P` I3-3: the token, read before the warmup.
+    if !hooks.cancel.is_cancelled() {
+        explore_with_pool(&must, &f, &root_pool);
+    }
 
     // Freeze the thread index mapping so all tasks use consistent indices.
     // This must happen after the first exploration which builds the mapping.
@@ -252,7 +382,7 @@ fn explore_workers_revisit_queue_rayon<'scope, F>(
     println!("RevisitQueueRayon per-worker stats:");
 
     spawn_batched_tasks(
-        scope, items, &conf, &f, &metrics, &results, &first_panic, interval, batch_size,
+        scope, items, &conf, &f, &metrics, &results, &first_panic, interval, batch_size, &hooks,
     );
 
     // --- Phase 3: Root continues exploring locally ---
@@ -261,6 +391,10 @@ fn explore_workers_revisit_queue_rayon<'scope, F>(
 
     let root_start = Instant::now();
     loop {
+        // `SVERIFY-P` I3-3: the token, read before every chunk of the root.
+        if hooks.cancel.is_cancelled() {
+            break;
+        }
         if must.borrow().current_rqueue_empty() {
             break;
         }
@@ -281,11 +415,14 @@ fn explore_workers_revisit_queue_rayon<'scope, F>(
         let surplus = filter_nonempty_work_items(saved);
         spawn_batched_tasks(
             scope, surplus, &conf, &f, &metrics, &results, &first_panic, interval, batch_size,
+            &hooks,
         );
     }
 
     // Free root pool stacks now that root is done exploring
     root_pool.drain_and_free();
+    // `SVERIFY-P` I3-3: the root's flush.
+    (hooks.on_task_end)(&mut must.borrow_mut());
 
     // Record root worker stats
     let root_stats = must.borrow().stats();
@@ -302,6 +439,7 @@ fn explore_workers_revisit_queue_rayon<'scope, F>(
         .lock()
         .unwrap()
         .push(("rayon-root".to_string(), root_stats));
+    metrics
 }
 
 // Thread-local cached Must instance for rayon tasks.
@@ -348,6 +486,7 @@ fn rayon_queue_task<'scope, F>(
     interval: usize,
     batch_size: usize,
     task_id: usize,
+    hooks: &PartitionHooks,
 ) where
     F: Fn() + Send + Sync + 'static,
 {
@@ -355,7 +494,11 @@ fn rayon_queue_task<'scope, F>(
 
     let must = RAYON_CACHED_MUST.with(|cached| {
         cached.borrow_mut().take().unwrap_or_else(|| {
-            Rc::new(RefCell::new(Must::new((**conf).clone(), false)))
+            let fresh = Rc::new(RefCell::new(Must::new((**conf).clone(), false)));
+            // `SVERIFY-P` I3-3: hooked once, at creation; a cached `Must`
+            // keeps what the hook set across the tasks it serves.
+            (hooks.on_must)(&mut fresh.borrow_mut());
+            fresh
         })
     });
     // Clear accumulated state from previous task on this thread
@@ -383,6 +526,10 @@ fn rayon_queue_task<'scope, F>(
     // prevent the final summary from being printed).
     let explore_result = catch_unwind(AssertUnwindSafe(|| {
         loop {
+            // `SVERIFY-P` I3-3: the token, read before every chunk of a task.
+            if hooks.cancel.is_cancelled() {
+                break;
+            }
             // try_revisit() picks the next revisit from the current state's queue.
             // If the current queue is empty, it pops from the saved state stack.
             // Returns false when all revisits are exhausted.
@@ -418,6 +565,7 @@ fn rayon_queue_task<'scope, F>(
 
             spawn_batched_tasks(
                 scope, surplus_items, conf, f, metrics, results, first_panic, interval, batch_size,
+                hooks,
             );
 
             // If current state has no more revisits, the next try_revisit()
@@ -450,6 +598,11 @@ fn rayon_queue_task<'scope, F>(
     }
 
     // --- Teardown: record stats and return Must + pool to caches ---
+
+    // `SVERIFY-P` I3-3: the task's flush — after the task's `catch_unwind`
+    // (a panicked task flushes too; the re-raise keeps its set out of any
+    // verdict) and before the empty-task drop below.
+    (hooks.on_task_end)(&mut must.borrow_mut());
 
     let worker_stats = must.borrow().stats();
     let total_execs = worker_stats.execs + worker_stats.block;
@@ -484,6 +637,7 @@ fn spawn_batched_tasks<'scope, F>(
     first_panic: &Arc<Mutex<Option<Box<dyn std::any::Any + Send>>>>,
     interval: usize,
     batch_size: usize,
+    hooks: &PartitionHooks,
 ) where
     F: Fn() + Send + Sync + 'static,
 {
@@ -498,12 +652,21 @@ fn spawn_batched_tasks<'scope, F>(
         let results = results.clone();
         let metrics = metrics.clone();
         let first_panic = first_panic.clone();
-        let child_id = metrics.total_spawned.fetch_add(1, Ordering::Relaxed);
+        let hooks = hooks.clone();
+        // `SVERIFY-P` I3-3: every spawn is admitted under the token's lock —
+        // the one `total_spawned` increment runs inside it, so none follows a
+        // cancel; the remaining batches are dropped.
+        let Some(child_id) = hooks
+            .cancel
+            .admit(|| metrics.total_spawned.fetch_add(1, Ordering::Relaxed))
+        else {
+            return;
+        };
 
         scope.spawn(move |s| {
             rayon_queue_task(
                 s, batch, &conf, &f, &metrics, &results, &first_panic, interval, batch_size,
-                child_id,
+                child_id, &hooks,
             );
         });
     }

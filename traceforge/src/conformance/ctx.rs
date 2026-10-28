@@ -71,6 +71,12 @@ pub(crate) enum ConfMode {
     /// no-prune behaviour, a production engine label, and a completion sink
     /// (T3) instead of a `Vec` of every graph.
     Enumerate,
+    /// `SVERIFY-P` I3-2: `Enumerate`'s twin for the partitioned stateful
+    /// checker's worker contexts — the same behaviour under its own label and
+    /// the second scope predicate (`Must::enable_conformance_partitioned`):
+    /// plain-scheduled (`MIN-ENGINES` E1–E3 apply), no prune, a completion
+    /// sink.
+    EnumeratePartitioned,
     /// `P4-CFIRST` C1: the complete-first checker's outer run — `Enumerate`'s
     /// behaviour under its own label, and the only mode that may carry the
     /// early-error cut (C5).
@@ -96,6 +102,7 @@ impl ConfMode {
             ConfMode::Triage => "triage",
             ConfMode::Collect => "oracle",
             ConfMode::Enumerate => "stateful",
+            ConfMode::EnumeratePartitioned => "sverify-p",
             ConfMode::CFirstOuter => "complete-first",
             ConfMode::CFirstSweep => "complete-first sweep",
             ConfMode::GatedOuter => "gated",
@@ -109,6 +116,7 @@ impl ConfMode {
         matches!(
             self,
             ConfMode::Enumerate
+                | ConfMode::EnumeratePartitioned
                 | ConfMode::CFirstOuter
                 | ConfMode::CFirstSweep
                 | ConfMode::GatedOuter
@@ -117,15 +125,19 @@ impl ConfMode {
     }
 
     /// `MIN-ENGINES` E1-1: the modes that schedule by plain Must (the config's
-    /// `SchedulePolicy`, never the selector) — the stateful engine's two runs
-    /// and the stateless engine's outer run and sweeps. Named explicitly:
+    /// `SchedulePolicy`, never the selector) — the stateful engine's two runs,
+    /// its partitioned twin's worker runs (`SVERIFY-P` I3-2) and the stateless
+    /// engine's outer run and sweeps. Named explicitly:
     /// `Outer`, `Precheck`, `Triage`, `Collect`, `GatedOuter` and `GatedSweep`
     /// keep the selector (`MIN-ENGINES.md` §5: the gated engine unchanged), as
     /// does a probe (`Must::uses_selector`).
     pub(crate) fn plain_scheduling(self) -> bool {
         matches!(
             self,
-            ConfMode::Enumerate | ConfMode::CFirstOuter | ConfMode::CFirstSweep
+            ConfMode::Enumerate
+                | ConfMode::EnumeratePartitioned
+                | ConfMode::CFirstOuter
+                | ConfMode::CFirstSweep
         )
     }
 }

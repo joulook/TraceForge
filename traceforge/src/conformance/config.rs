@@ -65,6 +65,17 @@ pub enum Engine {
     /// `max_iterations` bounds the outer run only. Sweeps are isolated as
     /// under `CompleteFirst`.
     Gated,
+    /// SVerify-P (`SVERIFY-P` I3): SVerify on the minimal core, both sides
+    /// explored with the partitioned parallel Must; per-worker summary sets
+    /// merged by move into one index, frozen and queried in parallel at each
+    /// implementation completion. Reads `threads`, `flush_entries`,
+    /// `stop_at_first_report`, `impl_distinct` and `paper_events`; refuses
+    /// `max_iterations` and `parallel`; ignores `index`, `antichain`,
+    /// `probe_memo`, `bucket`, `witness_cache`, `completion_cover`,
+    /// `gated_mode`, `gate_policy`, `early_error_cut`, `all_reports`,
+    /// `triage`, `search_budget`, `inner_order`, `memo` and
+    /// `skip_spec_errfree_check` (its specification phase is the §5.4 check).
+    SverifyP,
 }
 
 /// `P4-GATED` G5: the gated checker's reporting contract.
@@ -313,6 +324,13 @@ pub struct ConfConfig {
     /// `COMPACT-INDEX` phase 2 item 7: the structure answering a signature
     /// slot's queries (`Compact` only).
     pub(crate) bucket: BucketKind,
+    /// `SVERIFY-P` I3-1: the worker count of [`Engine::SverifyP`]'s partitioned
+    /// runs (read by that engine only; `0` refused there).
+    pub(crate) threads: usize,
+    /// `SVERIFY-P` I3-1: the orders a worker's set holds before it is moved
+    /// into the merged index (read by [`Engine::SverifyP`] only; `0` refused
+    /// there).
+    pub(crate) flush_entries: usize,
 }
 
 /// `COMPACT-INDEX` phase 2 items 4, 5, 7 (P2-frozen §6): the structure that
@@ -433,6 +451,8 @@ pub struct ConfBuilder {
     probe_memo: bool,
     impl_distinct: bool,
     bucket: BucketKind,
+    threads: usize,
+    flush_entries: usize,
 }
 
 impl Default for ConfBuilder {
@@ -492,7 +512,27 @@ impl ConfBuilder {
             // `P4-ENUMERATOR` criterion 4: memo off until D7 is decided.
             memo: false,
             engine: Engine::Enumerator,
+            // `SVERIFY-P` I3-1: one worker, and 4096 orders per flush, unless
+            // asked.
+            threads: 1,
+            flush_entries: 4096,
         }
+    }
+
+    /// `SVERIFY-P` I3-1: the worker count of [`Engine::SverifyP`]'s
+    /// partitioned runs — read by that engine only, which refuses `0`.
+    /// Default `1`.
+    pub fn threads(mut self, t: usize) -> Self {
+        self.threads = t;
+        self
+    }
+
+    /// `SVERIFY-P` I3-1: the orders a worker's set holds before it is moved
+    /// into the merged index — read by [`Engine::SverifyP`] only, which
+    /// refuses `0`. Default `4096`.
+    pub fn flush_entries(mut self, f: usize) -> Self {
+        self.flush_entries = f;
+        self
     }
 
     /// `P4-STATEFUL` T6: which checker runs. See [`Engine`] for what each
@@ -781,6 +821,8 @@ impl ConfBuilder {
             probe_memo: self.probe_memo,
             impl_distinct: self.impl_distinct,
             bucket: self.bucket,
+            threads: self.threads,
+            flush_entries: self.flush_entries,
         })
     }
 }

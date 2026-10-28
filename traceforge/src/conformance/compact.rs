@@ -1321,6 +1321,10 @@ struct SetSlot {
     sig: Sig,
     sig_est: usize,
     orders: indexmap::IndexMap<OrdCounts, u64>,
+    /// `SVERIFY-P` I3-6: the multiplicity of each held order, index-aligned
+    /// with `orders` (an insertion appends; `remove` shifts both); `None` on
+    /// a set that does not count (`new`), which then pays nothing for it.
+    counts: Option<Vec<u32>>,
 }
 
 /// One shape's bucket in the set index: its slots in creation order and the
@@ -1486,11 +1490,19 @@ impl SetStats {
 /// `IndexMap` bucket of 48 B per order plus its counts and the index table
 /// (criteria I2b-8). `Send`, not `Sync` (`Sig` holds `Box<dyn Message>`; the
 /// `Cell`s and `RefCell`s add nothing to that).
+///
+/// `SVERIFY-P` I3 adds, in this region only: a counting set
+/// (`with_multiplicities`), the merge by move (`absorb_by_move`), the freeze
+/// by move into a [`SigTable`] and an [`OrderStore`] (`freeze`), and
+/// `entries_counted`. `insert` and `covers` are unchanged in what they do;
+/// `covers` shares its body with the store's (`covers_in`).
 #[derive(Clone, Debug)]
 pub(crate) struct SetIndex {
     buckets: HashMap<SigHash, SetBucket>,
     next_seq: u64,
     next_sig_id: SigId,
+    /// `SVERIFY-P` I3-6: whether the slots carry multiplicities.
+    count: bool,
     /// The insertion-side counters.
     stats: SetStats,
     /// The counters a query advances, through `&self` (I2-3); `stats()`
@@ -1514,6 +1526,7 @@ impl SetIndex {
             buckets: HashMap::new(),
             next_seq: 0,
             next_sig_id: 0,
+            count: false,
             stats: SetStats::default(),
             sig_tests: std::cell::Cell::new(0),
             sig_aliases: std::cell::Cell::new(0),
@@ -1521,6 +1534,21 @@ impl SetIndex {
             coordinates_compared: std::cell::Cell::new(0),
             exact_hits: std::cell::Cell::new(0),
         }
+    }
+
+    /// `SVERIFY-P` I3-6: a set that counts multiplicities — a duplicate
+    /// advances the held order's count instead of being merely refused
+    /// (`duplicates` still counts it); `entries_counted` yields the counts;
+    /// `absorb_by_move` sums them.
+    pub(crate) fn with_multiplicities() -> Self {
+        let mut s = Self::new();
+        s.count = true;
+        s
+    }
+
+    /// `SVERIFY-P` I3-6: whether this set counts multiplicities.
+    pub(crate) fn counts_multiplicities(&self) -> bool {
+        self.count
     }
 
     /// The counters, the query-side `Cell`s folded in.
@@ -1543,6 +1571,16 @@ impl SetIndex {
         self.stats.entries == 0
     }
 
+    /// `SVERIFY-P` I3-4 (f), test builds only: Σ over the slots of the orders
+    /// map's capacity — what a worker set keeps after a flush took its maps.
+    #[cfg(test)]
+    pub(crate) fn orders_capacity_for_test(&self) -> usize {
+        self.buckets
+            .values()
+            .flat_map(|b| b.slots.iter().map(|s| s.orders.capacity()))
+            .sum()
+    }
+
     /// `MIN-ENGINES` E7b: remove the order admitted as `seq` from `sig_id`'s slot
     /// — the stateless cache's FIFO eviction. `shift_remove` keeps the slot's
     /// admission order (the scan's); the slot itself stays (P1); the
@@ -1554,6 +1592,9 @@ impl SetIndex {
         let slot = &mut bucket.slots[si];
         let i = slot.orders.values().position(|&q| q == seq)?;
         let (ord, _) = slot.orders.shift_remove_index(i)?;
+        if let Some(counts) = slot.counts.as_mut() {
+            counts.remove(i);
+        }
         self.stats.entries -= 1;
         self.stats.summary_bytes -= ord.payload_bytes();
         if slot.orders.is_empty() {
@@ -1575,15 +1616,39 @@ impl SetIndex {
         if let Some(i) = bucket.find(&s.sig, r, &self.sig_tests, &self.sig_aliases) {
             return i;
         }
+        self.new_slot(s.hash, s.sig.clone(), s.sig_est, r)
+    }
+
+    /// `SVERIFY-P` I3-4: `slot_for_insert` for a flushed slot's own signature,
+    /// which is moved into the slot created when absent (no clone) and
+    /// dropped when the slot exists.
+    fn slot_for_owned(&mut self, hash: SigHash, sig: Sig, sig_est: usize) -> usize {
+        let r = render_hash(&sig);
+        let bucket = self.buckets.entry(hash).or_default();
+        if let Some(i) = bucket.find(&sig, r, &self.sig_tests, &self.sig_aliases) {
+            return i;
+        }
+        self.new_slot(hash, sig, sig_est, r)
+    }
+
+    /// The slot's creation, shared by the two resolutions: a fresh checked
+    /// id, the hint entry when `r` is `Some`, `signatures_seen` + 1.
+    fn new_slot(&mut self, hash: SigHash, sig: Sig, sig_est: usize, r: Option<u64>) -> usize {
         let sig_id = self.next_sig_id;
         self.next_sig_id = sig_id
             .checked_add(1)
             .expect("conformance: more than u32::MAX signatures (SigId overflow)");
+        let count = self.count;
+        let bucket = self
+            .buckets
+            .get_mut(&hash)
+            .expect("conformance: a resolved bucket exists");
         bucket.slots.push(SetSlot {
             sig_id,
-            sig: s.sig.clone(),
-            sig_est: s.sig_est,
+            sig,
+            sig_est,
             orders: indexmap::IndexMap::new(),
+            counts: count.then(Vec::new),
         });
         let i = bucket.slots.len() - 1;
         if let Some(r) = r {
@@ -1599,15 +1664,35 @@ impl SetIndex {
     /// `DroppedNew` is never returned (no antichain).
     pub(crate) fn insert(&mut self, s: &CompactSummary) -> (SigId, Inserted) {
         let si = self.slot_for_insert(s);
+        self.store(s.hash, si, std::borrow::Cow::Borrowed(&s.ord), 1)
+    }
+
+    /// The store step shared by `insert` and `absorb_by_move` (`SVERIFY-P`
+    /// I3-4): the duplicate check by the slot's map (a counting set advances
+    /// the held order's multiplicity by `count`), else the order stored once
+    /// — cloned from a borrowed order, moved from an owned one — with the
+    /// next checked admission number and its multiplicity `count`.
+    fn store(
+        &mut self,
+        hash: SigHash,
+        si: usize,
+        ord: std::borrow::Cow<'_, OrdCounts>,
+        count: u32,
+    ) -> (SigId, Inserted) {
         let stats = &mut self.stats;
         let bucket = self
             .buckets
-            .get_mut(&s.hash)
+            .get_mut(&hash)
             .expect("conformance: a resolved bucket exists");
         let slot = &mut bucket.slots[si];
         let sig_id = slot.sig_id;
-        if slot.orders.contains_key(&s.ord) {
+        if let Some(i) = slot.orders.get_index_of(ord.as_ref()) {
             stats.duplicates += 1;
+            if let Some(counts) = slot.counts.as_mut() {
+                counts[i] = counts[i]
+                    .checked_add(count)
+                    .expect("conformance: more than u32::MAX occurrences of one summary");
+            }
             return (sig_id, Inserted::Duplicate);
         }
         let seq = self.next_seq;
@@ -1615,10 +1700,14 @@ impl SetIndex {
             .checked_add(1)
             .expect("conformance: more than u64::MAX insertions (seq overflow)");
         let was_empty = slot.orders.is_empty();
-        slot.orders.insert(s.ord.clone(), seq);
+        let ord = ord.into_owned();
+        stats.summary_bytes += ord.payload_bytes();
+        slot.orders.insert(ord, seq);
+        if let Some(counts) = slot.counts.as_mut() {
+            counts.push(count);
+        }
         stats.admitted += 1;
         stats.entries += 1;
-        stats.summary_bytes += s.ord.payload_bytes();
         stats.slot_max = stats.slot_max.max(slot.orders.len());
         if was_empty {
             // The slot becomes occupied (created now, or emptied by an
@@ -1635,6 +1724,38 @@ impl SetIndex {
         (sig_id, Inserted::Stored(seq))
     }
 
+    /// `SVERIFY-P` I3-4, the merge by move: every held order of `other`
+    /// stored into `self` — `other`'s buckets in ascending hash, its slots in
+    /// creation order, its orders in admission order — each slot resolved
+    /// **once** by `Sig ==` (its signature moved in when the slot is new),
+    /// each order **moved** in (no `OrdCounts` clone: the heap buffer keeps
+    /// its address) with a fresh checked `seq` in this order; an order `self`
+    /// already holds is a duplicate (counted; a counting `self` adds
+    /// `other`'s multiplicity to it). `other`'s query counters are its own
+    /// work and are not folded in; the occupancy counters follow from the
+    /// stores.
+    pub(crate) fn absorb_by_move(&mut self, other: SetIndex) {
+        let mut buckets: Vec<(SigHash, SetBucket)> = other.buckets.into_iter().collect();
+        buckets.sort_unstable_by_key(|(h, _)| *h);
+        for (hash, bucket) in buckets {
+            for slot in bucket.slots {
+                let SetSlot {
+                    sig,
+                    sig_est,
+                    orders,
+                    counts,
+                    ..
+                } = slot;
+                let si = self.slot_for_owned(hash, sig, sig_est);
+                let mut counts = counts.map(Vec::into_iter);
+                for (ord, _seq) in orders {
+                    let count = counts.as_mut().and_then(Iterator::next).unwrap_or(1);
+                    self.store(hash, si, std::borrow::Cow::Owned(ord), count);
+                }
+            }
+        }
+    }
+
     /// The read-only query (I2-3, I2b-3): the signature's id, `None` when it
     /// has no slot (the query creates none, P1), with the outcome. The
     /// exact-hit probe first: if the slot holds the query's order itself, it
@@ -1645,7 +1766,8 @@ impl SetIndex {
     /// under `BucketKind::Scan`. A slot is never removed (P1), so
     /// `(Some(_), NoSig)` is unreachable; but `remove` (the stateless cache's
     /// eviction, `MIN-ENGINES` E7b) may leave a slot with no held order, and
-    /// such a slot answers `(Some(id), NotFound)`.
+    /// such a slot answers `(Some(id), NotFound)`. The slot's probe and scan
+    /// are `covers_in`, shared with [`OrderStore::covers`] (`SVERIFY-P` I3-5).
     pub(crate) fn covers(&self, s: &CompactSummary) -> (Option<SigId>, Covers) {
         let Some(bucket) = self.buckets.get(&s.hash) else {
             return (None, Covers::NoBucket);
@@ -1654,23 +1776,15 @@ impl SetIndex {
         let Some(si) = bucket.find(&s.sig, r, &self.sig_tests, &self.sig_aliases) else {
             return (None, Covers::NoSig);
         };
-        // `MIN-ENGINES` E7b: a slot emptied by the stateless cache's eviction
-        // answers `NotFound` (no held order), as `CompactIndex`'s does.
         let slot = &bucket.slots[si];
-        if let Some(&seq) = slot.orders.get(&s.ord) {
-            self.exact_hits.set(self.exact_hits.get() + 1);
-            return (Some(slot.sig_id), Covers::Found(seq));
-        }
-        let mut coords = self.coordinates_compared.get();
-        for (held, &seq) in &slot.orders {
-            self.containment_tests.set(self.containment_tests.get() + 1);
-            if held.le_counted(&s.ord, &mut coords) {
-                self.coordinates_compared.set(coords);
-                return (Some(slot.sig_id), Covers::Found(seq));
-            }
-        }
-        self.coordinates_compared.set(coords);
-        (Some(slot.sig_id), Covers::NotFound)
+        let mut q = QueryCounts::default();
+        let c = covers_in(&slot.orders, &s.ord, &mut q);
+        self.exact_hits.set(self.exact_hits.get() + q.exact_hits);
+        self.containment_tests
+            .set(self.containment_tests.get() + q.containment_tests);
+        self.coordinates_compared
+            .set(self.coordinates_compared.get() + q.coordinates_compared);
+        (Some(slot.sig_id), c)
     }
 
     /// Every held order with its signature's id, the slot's representative
@@ -1688,5 +1802,185 @@ impl SetIndex {
                     .map(move |(ord, &seq)| (slot.sig_id, &slot.sig, seq, ord))
             })
         })
+    }
+
+    /// `SVERIFY-P` I3-6: `entries` with the bucket's hash first and each
+    /// order's multiplicity last (the count of a counting set, `1` on a set
+    /// that does not count), in `entries`' order.
+    pub(crate) fn entries_counted(
+        &self,
+    ) -> impl Iterator<Item = (SigHash, SigId, &Sig, u64, &OrdCounts, u32)> + '_ {
+        let mut hashes: Vec<&SigHash> = self.buckets.keys().collect();
+        hashes.sort_unstable();
+        hashes.into_iter().flat_map(move |h| {
+            self.buckets[h].slots.iter().flat_map(move |slot| {
+                slot.orders.iter().enumerate().map(move |(i, (ord, &seq))| {
+                    let count = slot.counts.as_ref().map_or(1, |c| c[i]);
+                    (*h, slot.sig_id, &slot.sig, seq, ord, count)
+                })
+            })
+        })
+    }
+
+    /// `SVERIFY-P` I3-5, the freeze by move: the index split into the
+    /// signature table (per slot its hash, id and `Sig`, in creation order
+    /// within the bucket) and the order store (per `SigId` the slot's map,
+    /// `shrink_to_fit` so that the entries vector's unused capacity is
+    /// returned — the map's headers move, the orders' heap buffers do not).
+    /// The query counters and the hints are dropped; `stats()` before the
+    /// freeze is the index's record. A set that counts multiplicities loses
+    /// them here (the store answers queries; it does not count).
+    pub(crate) fn freeze(self) -> (SigTable, OrderStore) {
+        let n = self.next_sig_id as usize;
+        let mut orders: Vec<indexmap::IndexMap<OrdCounts, u64>> =
+            (0..n).map(|_| indexmap::IndexMap::new()).collect();
+        let mut table: HashMap<SigHash, Vec<(SigId, Sig)>> =
+            HashMap::with_capacity(self.buckets.len());
+        for (hash, bucket) in self.buckets {
+            let mut slots = Vec::with_capacity(bucket.slots.len());
+            for slot in bucket.slots {
+                let SetSlot {
+                    sig_id,
+                    sig,
+                    orders: mut held,
+                    ..
+                } = slot;
+                held.shrink_to_fit();
+                orders[sig_id as usize] = held;
+                slots.push((sig_id, sig));
+            }
+            table.insert(hash, slots);
+        }
+        (SigTable { buckets: table }, OrderStore { orders })
+    }
+}
+
+/// `SVERIFY-P` I3-5: the exact-hit probe, then the admission-ordered scan
+/// — the one body of `SetIndex::covers` and `OrderStore::covers`. The
+/// counts are added to `q`.
+fn covers_in(
+    orders: &indexmap::IndexMap<OrdCounts, u64>,
+    ord: &OrdCounts,
+    q: &mut QueryCounts,
+) -> Covers {
+    if let Some(&seq) = orders.get(ord) {
+        q.exact_hits += 1;
+        return Covers::Found(seq);
+    }
+    for (held, &seq) in orders {
+        q.containment_tests += 1;
+        if held.le_counted(ord, &mut q.coordinates_compared) {
+            return Covers::Found(seq);
+        }
+    }
+    Covers::NotFound
+}
+
+/// `SVERIFY-P` I3-5: one query's counts, returned by value by
+/// [`OrderStore::covers`] (no `Cell`: the store is shared read-only).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct QueryCounts {
+    pub(crate) exact_hits: usize,
+    pub(crate) containment_tests: usize,
+    pub(crate) coordinates_compared: usize,
+}
+
+/// `SVERIFY-P` I3-5: a signature's resolution in a [`SigTable`] — the
+/// three cases [`Covers`] distinguishes before any order is probed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SigLookup {
+    /// No bucket for the shape.
+    NoBucket,
+    /// The shape's bucket exists, but no slot has this signature.
+    NoSig,
+    /// The signature's id.
+    Found(SigId),
+}
+
+/// `SVERIFY-P` I3-5: the frozen index's signatures — per shape bucket its
+/// slots' `(SigId, Sig)` in creation order. `Clone`, and `Send` but not
+/// `Sync` (a `Sig` holds `Box<dyn Message>`), so each querying worker owns a
+/// clone. Resolution is the creation-order scan by `Sig ==` (`render_hash`
+/// is `None` since `MIN-ENGINES` E4, so the set index's hints were always
+/// empty and the scan was its only pass).
+#[derive(Clone, Debug)]
+pub(crate) struct SigTable {
+    buckets: HashMap<SigHash, Vec<(SigId, Sig)>>,
+}
+
+impl SigTable {
+    /// The signature's id, with the `Sig ==` comparisons made added to
+    /// `tests` (the set index's `sig_tests`).
+    pub(crate) fn resolve(&self, hash: SigHash, sig: &Sig, tests: &mut usize) -> SigLookup {
+        let Some(slots) = self.buckets.get(&hash) else {
+            return SigLookup::NoBucket;
+        };
+        for (id, held) in slots {
+            *tests += 1;
+            if held == sig {
+                return SigLookup::Found(*id);
+            }
+        }
+        SigLookup::NoSig
+    }
+
+    /// Slots (signatures) in the table.
+    pub(crate) fn signatures(&self) -> usize {
+        self.buckets.values().map(Vec::len).sum()
+    }
+
+    /// Every slot: buckets in ascending `SigHash`, slots in creation order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (SigHash, SigId, &Sig)> + '_ {
+        let mut hashes: Vec<&SigHash> = self.buckets.keys().collect();
+        hashes.sort_unstable();
+        hashes.into_iter().flat_map(move |h| {
+            self.buckets[h].iter().map(move |(id, sig)| (*h, *id, sig))
+        })
+    }
+}
+
+/// `SVERIFY-P` I3-5: the frozen index's orders — per `SigId` the slot's
+/// `IndexMap<OrdCounts, u64>` in admission order, plain data, `Sync`, shared
+/// read-only through an `Arc`. `covers` answers exactly as
+/// `SetIndex::covers` answers on the slot (the same body), with the counts
+/// returned by value.
+#[derive(Debug)]
+pub(crate) struct OrderStore {
+    orders: Vec<indexmap::IndexMap<OrdCounts, u64>>,
+}
+
+impl OrderStore {
+    /// The read-only query on `id`'s slot: the exact-hit probe, then the
+    /// first held order `≤` the query in admission order. `NoBucket` and
+    /// `NoSig` are the table's answers, never this one's; a slot with no
+    /// order answers `NotFound`.
+    pub(crate) fn covers(&self, id: SigId, ord: &OrdCounts) -> (Covers, QueryCounts) {
+        let mut q = QueryCounts::default();
+        let c = covers_in(&self.orders[id as usize], ord, &mut q);
+        (c, q)
+    }
+
+    /// Held orders.
+    pub(crate) fn len(&self) -> usize {
+        self.orders.iter().map(indexmap::IndexMap::len).sum()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every held order with its signature's id and admission number: slots
+    /// by ascending `SigId`, orders in admission order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (SigId, u64, &OrdCounts)> + '_ {
+        self.orders.iter().enumerate().flat_map(|(id, m)| {
+            m.iter().map(move |(ord, &seq)| (id as SigId, seq, ord))
+        })
+    }
+
+    /// `SVERIFY-P` I3-5 (f), test builds only: per slot `(len, capacity)` of
+    /// its map, by `SigId`.
+    #[cfg(test)]
+    pub(crate) fn capacities_for_test(&self) -> Vec<(usize, usize)> {
+        self.orders.iter().map(|m| (m.len(), m.capacity())).collect()
     }
 }

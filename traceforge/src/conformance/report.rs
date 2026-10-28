@@ -78,6 +78,17 @@ pub(crate) const BUDGET_KNOB: &str = "ConfBuilder::search_budget";
 
 /// `P4-STATEFUL` T6: true of every stateful report, on every run — it is
 /// `alg:stateful`'s lookup (`I[sig(G)]`), which needs only a complete index.
+/// `SVERIFY-P` I3-7.
+pub(crate) const SVERIFYP_EACH_UNCOVERED: &str =
+    "Each uncovered summary is a distinct complete implementation graph summary (signature and \
+     order counts) that no specification graph covers (lem:sig), with the number of \
+     implementation executions that produced it; no graph is attached (a witness graph is \
+     SVERIFY-P I5's rerun, never fabricated).";
+pub(crate) const SVERIFYP_EXACTLY_THE_SET: &str =
+    "distinct uncovered summaries: both partitioned enumerations ran to the end of their state \
+     spaces (every task's queue exhausted, no panic), so they are exactly the set of distinct \
+     uncovered implementation summaries, with their multiplicities";
+
 pub(crate) const STATEFUL_EACH_UNCOVERED: &str =
     "Every graph in this list is an uncovered complete graph of the implementation: each \
      was looked up in an index of every specification graph, and either no specification \
@@ -868,6 +879,182 @@ pub struct FlatEligibility {
     pub first_invisible: Option<(String, String)>,
 }
 
+/// `SVERIFY-P` I3-7: one uncovered implementation summary of the partitioned
+/// stateful checker — the signature's rendering, the order's counts and how
+/// many implementation executions produced it. No graph (I5's rerun would
+/// recover one; none is fabricated).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UncoveredSummary {
+    pub(crate) signature: String,
+    pub(crate) counts: String,
+    pub(crate) multiplicity: usize,
+}
+
+impl UncoveredSummary {
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
+    pub fn counts(&self) -> &str {
+        &self.counts
+    }
+
+    pub fn multiplicity(&self) -> usize {
+        self.multiplicity
+    }
+}
+
+/// `SVERIFY-P` I3-8: the partitioned stateful checker's counters — the
+/// parameters echoed; per phase the tasks (spawned + the root), the flushes,
+/// the completions (Must's own `Stats` summed over the tasks, and the sinks'
+/// `graphs`), the wall and the merge lock's held and wait times; the merged
+/// specification index's occupancy and the conservation identities' terms
+/// (Σ flush `entries` + Σ worker `duplicates` = graphs; merged `entries` +
+/// merge `duplicates` = Σ flush `entries`); the per-completion lookup classes
+/// of the implementation phase (as the sequential engine's); the first report
+/// (`MIN-ENGINES` E9); the stop path; the uncovered summaries, distinct and
+/// by multiplicity.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SverifyPCounters {
+    pub threads: usize,
+    pub flush_entries: usize,
+    pub iterations_until_split: usize,
+    pub spec_tasks: usize,
+    pub impl_tasks: usize,
+    pub spec_tasks_nonempty: usize,
+    pub impl_tasks_nonempty: usize,
+    pub spec_flushes: usize,
+    pub impl_flushes: usize,
+    pub spec_complete: usize,
+    pub spec_blocked: usize,
+    pub impl_complete: usize,
+    pub impl_blocked: usize,
+    pub spec_graphs: usize,
+    pub impl_graphs: usize,
+    pub spec_wall_time_ms: u128,
+    pub freeze_wall_time_ms: u128,
+    pub impl_wall_time_ms: u128,
+    pub spec_merge_lock_held_ms: u128,
+    pub spec_merge_lock_wait_ms: u128,
+    pub impl_merge_lock_held_ms: u128,
+    pub impl_merge_lock_wait_ms: u128,
+    pub signatures: usize,
+    pub buckets: usize,
+    pub orders_held: usize,
+    /// Σ over the specification flushes of the flushed set's `entries`.
+    pub spec_flush_entries: usize,
+    pub spec_worker_duplicates: usize,
+    pub spec_merge_duplicates: usize,
+    /// `Some` iff `impl_distinct` is on: the distinct implementation
+    /// summaries, counted in a merged set of their own.
+    pub impl_distinct_summaries: Option<usize>,
+    pub impl_seen_flush_entries: usize,
+    pub impl_seen_worker_duplicates: usize,
+    /// The implementation phase's queries, one per completion.
+    pub lookups: usize,
+    pub lookups_signature_miss: usize,
+    pub lookups_containment_tested: usize,
+    pub lookups_succeeded: usize,
+    pub lookups_failed_after_tests: usize,
+    /// `Sig ==` comparisons made by the workers' signature tables.
+    pub sig_tests: usize,
+    pub exact_hits: usize,
+    pub containment_tests: usize,
+    pub coordinates_compared: usize,
+    /// The uncovered completions (= `uncovered_multiplicity`).
+    pub reports: usize,
+    pub uncovered_distinct: usize,
+    pub uncovered_multiplicity: usize,
+    /// The uncovered set's conservation terms, as the specification's.
+    pub uncovered_flush_entries: usize,
+    pub uncovered_worker_duplicates: usize,
+    pub uncovered_merge_duplicates: usize,
+    /// `MIN-ENGINES` E9: since the implementation phase started; `Some` iff
+    /// the run has a report.
+    pub wall_ms_at_first_report: Option<u128>,
+    pub vmhwm_kb_at_first_report: Option<u64>,
+    /// `Some` iff `paper_events` is on: the maximum over the workers.
+    pub max_paper_events: Option<usize>,
+    /// The stop path (`stop_at_first_report`): whether the token was
+    /// cancelled, the uncovered set's size at the end of a stopped run, and
+    /// the spawns admitted when the cancel took effect.
+    pub stopped_early: bool,
+    pub uncovered_at_stop: usize,
+    pub spawned_at_stop: u64,
+    /// The merged specification index's counters before the freeze.
+    pub spec_set: crate::conformance::compact::SetStats,
+    /// The merged uncovered set's counters.
+    pub uncovered_set: crate::conformance::compact::SetStats,
+    /// The merged distinct-implementation set's counters (`impl_distinct`).
+    pub impl_set: Option<crate::conformance::compact::SetStats>,
+    /// The uncovered summaries, in the merged uncovered set's order.
+    pub uncovered: Vec<UncoveredSummary>,
+}
+
+impl fmt::Display for SverifyPCounters {
+    /// Every field, one per line, `name: value` (`SVERIFY-P` I3-7: a snapshot
+    /// of the field names pins the record's shape); the uncovered summaries
+    /// by their count only — the verdict lists them.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "threads: {}", self.threads)?;
+        writeln!(f, "flush_entries: {}", self.flush_entries)?;
+        writeln!(f, "iterations_until_split: {}", self.iterations_until_split)?;
+        writeln!(f, "spec_tasks: {}", self.spec_tasks)?;
+        writeln!(f, "impl_tasks: {}", self.impl_tasks)?;
+        writeln!(f, "spec_tasks_nonempty: {}", self.spec_tasks_nonempty)?;
+        writeln!(f, "impl_tasks_nonempty: {}", self.impl_tasks_nonempty)?;
+        writeln!(f, "spec_flushes: {}", self.spec_flushes)?;
+        writeln!(f, "impl_flushes: {}", self.impl_flushes)?;
+        writeln!(f, "spec_complete: {}", self.spec_complete)?;
+        writeln!(f, "spec_blocked: {}", self.spec_blocked)?;
+        writeln!(f, "impl_complete: {}", self.impl_complete)?;
+        writeln!(f, "impl_blocked: {}", self.impl_blocked)?;
+        writeln!(f, "spec_graphs: {}", self.spec_graphs)?;
+        writeln!(f, "impl_graphs: {}", self.impl_graphs)?;
+        writeln!(f, "spec_wall_time_ms: {}", self.spec_wall_time_ms)?;
+        writeln!(f, "freeze_wall_time_ms: {}", self.freeze_wall_time_ms)?;
+        writeln!(f, "impl_wall_time_ms: {}", self.impl_wall_time_ms)?;
+        writeln!(f, "spec_merge_lock_held_ms: {}", self.spec_merge_lock_held_ms)?;
+        writeln!(f, "spec_merge_lock_wait_ms: {}", self.spec_merge_lock_wait_ms)?;
+        writeln!(f, "impl_merge_lock_held_ms: {}", self.impl_merge_lock_held_ms)?;
+        writeln!(f, "impl_merge_lock_wait_ms: {}", self.impl_merge_lock_wait_ms)?;
+        writeln!(f, "signatures: {}", self.signatures)?;
+        writeln!(f, "buckets: {}", self.buckets)?;
+        writeln!(f, "orders_held: {}", self.orders_held)?;
+        writeln!(f, "spec_flush_entries: {}", self.spec_flush_entries)?;
+        writeln!(f, "spec_worker_duplicates: {}", self.spec_worker_duplicates)?;
+        writeln!(f, "spec_merge_duplicates: {}", self.spec_merge_duplicates)?;
+        writeln!(f, "impl_distinct_summaries: {:?}", self.impl_distinct_summaries)?;
+        writeln!(f, "impl_seen_flush_entries: {}", self.impl_seen_flush_entries)?;
+        writeln!(f, "impl_seen_worker_duplicates: {}", self.impl_seen_worker_duplicates)?;
+        writeln!(f, "lookups: {}", self.lookups)?;
+        writeln!(f, "lookups_signature_miss: {}", self.lookups_signature_miss)?;
+        writeln!(f, "lookups_containment_tested: {}", self.lookups_containment_tested)?;
+        writeln!(f, "lookups_succeeded: {}", self.lookups_succeeded)?;
+        writeln!(f, "lookups_failed_after_tests: {}", self.lookups_failed_after_tests)?;
+        writeln!(f, "sig_tests: {}", self.sig_tests)?;
+        writeln!(f, "exact_hits: {}", self.exact_hits)?;
+        writeln!(f, "containment_tests: {}", self.containment_tests)?;
+        writeln!(f, "coordinates_compared: {}", self.coordinates_compared)?;
+        writeln!(f, "reports: {}", self.reports)?;
+        writeln!(f, "uncovered_distinct: {}", self.uncovered_distinct)?;
+        writeln!(f, "uncovered_multiplicity: {}", self.uncovered_multiplicity)?;
+        writeln!(f, "uncovered_flush_entries: {}", self.uncovered_flush_entries)?;
+        writeln!(f, "uncovered_worker_duplicates: {}", self.uncovered_worker_duplicates)?;
+        writeln!(f, "uncovered_merge_duplicates: {}", self.uncovered_merge_duplicates)?;
+        writeln!(f, "wall_ms_at_first_report: {:?}", self.wall_ms_at_first_report)?;
+        writeln!(f, "vmhwm_kb_at_first_report: {:?}", self.vmhwm_kb_at_first_report)?;
+        writeln!(f, "max_paper_events: {:?}", self.max_paper_events)?;
+        writeln!(f, "stopped_early: {}", self.stopped_early)?;
+        writeln!(f, "uncovered_at_stop: {}", self.uncovered_at_stop)?;
+        writeln!(f, "spawned_at_stop: {}", self.spawned_at_stop)?;
+        writeln!(f, "spec_set: {:?}", self.spec_set)?;
+        writeln!(f, "uncovered_set: {:?}", self.uncovered_set)?;
+        writeln!(f, "impl_set: {:?}", self.impl_set)?;
+        writeln!(f, "uncovered: {} summaries", self.uncovered.len())
+    }
+}
+
 /// Everything one conformance run produced.
 #[derive(Clone)]
 pub struct ConfOutcome {
@@ -1038,6 +1225,12 @@ pub struct ConfCounters {
     /// (`MIN-ENGINES` E3: 0 here, `None` in `CFirstCounters`). A receive that
     /// blocks is no event and is not counted.
     pub invisible_ops_of_visible_threads: usize,
+    /// `SVERIFY-P` I3-7/I3-8: the partitioned stateful checker's record —
+    /// `Some` iff `engine = SverifyP`. It lives here, not in `ConfOutcome`,
+    /// so that the sequential engines' `ConfOutcome` literals do not change
+    /// (I3-11): every engine builds `ConfCounters` with
+    /// `..ConfCounters::default()`.
+    pub sverify_p: Option<SverifyPCounters>,
 }
 
 /// One `Cover` call's counters (`P4-ENUMERATOR` criterion 13).
@@ -1062,6 +1255,21 @@ pub struct CoverCounters {
 }
 
 impl ConfOutcome {
+    /// `SVERIFY-P` I3-7: the partitioned stateful checker's uncovered
+    /// implementation summaries; empty on every other engine. A non-empty
+    /// list makes the verdict `Reported`, through `report_count`.
+    pub fn uncovered_summaries(&self) -> &[UncoveredSummary] {
+        self.counters
+            .sverify_p
+            .as_ref()
+            .map_or(&[], |c| c.uncovered.as_slice())
+    }
+
+    /// `SVERIFY-P` I3-8: `Some` iff `engine = SverifyP`.
+    pub fn sverify_p_counters(&self) -> Option<&SverifyPCounters> {
+        self.counters.sverify_p.as_ref()
+    }
+
     /// **The random seed this run used** (F61).
     ///
     /// `nondet()` draws its first value from this seed, and that draw sets the
@@ -1443,7 +1651,9 @@ impl ConfVerdict {
     /// The single construction point. Three facts, checked here and nowhere
     /// else.
     pub(crate) fn of(outcome: ConfOutcome) -> Self {
-        if !outcome.reports.is_empty() {
+        // `SVERIFY-P` I3-7: the partitioned checker reports through
+        // `report_count` alone (uncovered summaries carry no graph).
+        if outcome.report_count > 0 || !outcome.reports.is_empty() {
             return ConfVerdict::Reported(outcome);
         }
         if outcome.not_a_certificate().is_empty() {
@@ -2023,6 +2233,14 @@ impl fmt::Display for ConfVerdict {
                          a sweep (thm:gated) \u{2014} and the outer exploration reached the \
                          end of its state space."
                     )?,
+                    // `SVERIFY-P` I3-7, line (1).
+                    Engine::SverifyP => writeln!(
+                        f,
+                        "conformance: silence. Every complete graph summary of the \
+                         implementation is covered by one of the specification (thm:stateful, \
+                         the partitioned form), and both partitioned enumerations ran to the \
+                         end of their state spaces."
+                    )?,
                 }
                 render_flat(f, c.outcome())?;
                 writeln!(f, "{ONLY_SILENCE_IS_A_VERDICT}")?;
@@ -2043,7 +2261,9 @@ impl fmt::Display for ConfVerdict {
                 )?;
                 // `MIN-ENGINES` E6: the candidates not kept are said, not hidden.
                 let omitted = o.report_count.saturating_sub(o.reports.len());
-                if omitted > 0 {
+                // `SVERIFY-P` I3-7: that engine keeps summaries, not graphs;
+                // its own arm below says so.
+                if omitted > 0 && o.engine != Engine::SverifyP {
                     writeln!(
                         f,
                         "The list holds {} of them; {omitted} further {}(s) counted, not kept \
@@ -2112,6 +2332,22 @@ impl fmt::Display for ConfVerdict {
                             }
                         }
                     }
+                    // `SVERIFY-P` I3-7: the always-true sentence, then the
+                    // "exactly" only when both phases completed.
+                    Engine::SverifyP => {
+                        writeln!(f, "{SVERIFYP_EACH_UNCOVERED}")?;
+                        let (d, m) = o.counters.sverify_p.as_ref().map_or((0, 0), |c| {
+                            (c.uncovered_distinct, c.uncovered_multiplicity)
+                        });
+                        writeln!(
+                            f,
+                            "{m} uncovered implementation execution(s), {d} distinct summar{}.",
+                            if d == 1 { "y" } else { "ies" }
+                        )?;
+                        if o.end == SearchEnd::StateSpaceExhausted {
+                            writeln!(f, "There are exactly {d} {SVERIFYP_EXACTLY_THE_SET}.")?;
+                        }
+                    }
                 }
                 render_flat(f, o)?;
                 writeln!(f, "{RESIDUAL_SOURCES}")?;
@@ -2122,6 +2358,14 @@ impl fmt::Display for ConfVerdict {
                     write!(f, "{r}")?;
                 }
                 render_exhaustions(f, o)?;
+                // `SVERIFY-P` I3-7: the uncovered summaries, listed like
+                // reports.
+                for (i, u) in o.uncovered_summaries().iter().enumerate() {
+                    writeln!(f, "\n#{i} uncovered summary")?;
+                    writeln!(f, "  produced by {} implementation execution(s)", u.multiplicity)?;
+                    writeln!(f, "  signature: {}", u.signature)?;
+                    writeln!(f, "  order counts: {}", u.counts)?;
+                }
                 render_notes(f, o)?;
                 render_caveats(f, o)
             }

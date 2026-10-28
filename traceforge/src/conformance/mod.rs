@@ -267,6 +267,7 @@ pub(crate) mod search;
 pub(crate) mod selector;
 pub(crate) mod sig;
 pub(crate) mod stateful;
+pub(crate) mod sverify_p;
 pub(crate) mod triage;
 pub(crate) mod witness;
 
@@ -411,6 +412,61 @@ pub(crate) fn assert_config_in_scope(config: &crate::Config, engine: &str) {
     );
 }
 
+/// `SVERIFY-P` I3-2: the second scope predicate, for the partitioned stateful
+/// checker's worker `Must`s (`Must::enable_conformance_partitioned`). Every
+/// check of `assert_config_in_scope`, with one difference: the partitioned
+/// mode is **required** (it is the checker's own run mode) and the
+/// shared-queue mode still refused. The partitioned mode's `backward_revisit`
+/// ships the graph to a task that explores it to completion, where the
+/// completion sink sees it (`SVERIFY-P` I1); so the exclusion's reason (a
+/// post-apply gate never firing for a shipped revisit) does not apply to a
+/// sink-only mode.
+pub(crate) fn assert_config_in_scope_partitioned(config: &crate::Config, engine: &str) {
+    use crate::channel::cons_to_model;
+    use crate::{CommunicationModel, ExplorationMode, SchedulePolicy};
+
+    assert_ne!(
+        cons_to_model(config.cons_type),
+        CommunicationModel::TotalOrder,
+        "{engine}: conformance is scoped to asyn/p2p/cd (conf-plan.md §1/§9); \
+         mailbox is out of scope. Checked on the *model*, so the deprecated \
+         `MO` spelling is caught as well as `Mailbox`."
+    );
+    assert_eq!(
+        config.schedule_policy,
+        SchedulePolicy::LTR,
+        "{engine}: conformance requires the LTR schedule policy (conf-plan.md §9)"
+    );
+    assert_eq!(
+        config.mode,
+        ExplorationMode::Verification,
+        "{engine}: conformance does not run in estimation mode (conf-plan.md §9)"
+    );
+    assert_eq!(
+        config.lossy_budget, 0,
+        "{engine}: conformance excludes lossy sends (conf-plan.md §9)"
+    );
+    assert!(
+        !config.parallel,
+        "{engine}: the shared-queue parallel mode is excluded (conf-plan.md §9); \
+         the partitioned checker's mode is its own"
+    );
+    assert!(
+        config.partitioned_parallelization,
+        "{engine}: the partitioned checker's worker runs in the partitioned mode"
+    );
+    assert!(
+        config.predetermined_choices.is_empty() && config.predetermined_global_choices.is_empty(),
+        "{engine}: conformance excludes predetermined choices (conf-plan.md §9); \
+         a predetermined choice is a decision the search never sees"
+    );
+    #[cfg(feature = "symbolic")]
+    assert!(
+        !config.symbolic,
+        "{engine}: conformance excludes symbolic execution (conf-plan.md §9)"
+    );
+}
+
 #[cfg(test)]
 pub(crate) mod adversarial;
 #[cfg(test)]
@@ -472,6 +528,9 @@ mod xbase_tests;
 /// COMPACT-INDEX's tests (tester). **Test-only.**
 #[cfg(test)]
 mod compact_tests;
+/// SVERIFY-P I3's tests (tester). **Test-only.**
+#[cfg(test)]
+mod sverify_p_tests;
 /// P5-SYNTH's tests (tester). **Test-only.**
 #[cfg(test)]
 mod synth_tests;
@@ -774,6 +833,11 @@ fn run(
     // no inner search, diagnostics or triage; it leaves here.
     if cc.engine == Engine::Stateful {
         return stateful::run(cc, implementation, specification);
+    }
+    // `SVERIFY-P` I3-1: the partitioned stateful checker, likewise its own
+    // check (its specification phase is the §5.4 check); it leaves here.
+    if cc.engine == Engine::SverifyP {
+        return sverify_p::run(cc, implementation, specification);
     }
     // `P4-CFIRST` C4/C7: its own (unbounded) precheck, no inner search,
     // diagnostics or triage; it leaves here.

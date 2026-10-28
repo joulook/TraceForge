@@ -325,6 +325,27 @@ impl Must {
         self.conf = Some(Box::new(ctx));
     }
 
+    /// `SVERIFY-P` I3-2: `enable_conformance` for the partitioned stateful
+    /// checker's contexts (`ConfMode::EnumeratePartitioned` only): the same
+    /// body under the second scope predicate, which admits this `Must`'s
+    /// `partitioned_parallelization` and refuses everything the first refuses.
+    pub(crate) fn enable_conformance_partitioned(
+        &mut self,
+        ctx: crate::conformance::ctx::ConfCtx,
+    ) {
+        assert_eq!(
+            ctx.mode(),
+            crate::conformance::ctx::ConfMode::EnumeratePartitioned,
+            "conformance: enable_conformance_partitioned takes the partitioned checker's mode only"
+        );
+        crate::conformance::assert_config_in_scope_partitioned(
+            &self.config,
+            ctx.mode().engine_label(),
+        );
+        self.config.keep_going_after_error = true;
+        self.conf = Some(Box::new(ctx));
+    }
+
     /// Take the current graph out of this `Must`, leaving it empty.
     pub(crate) fn take_graph(&mut self) -> ExecutionGraph {
         std::mem::take(&mut self.current.graph)

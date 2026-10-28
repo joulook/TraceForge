@@ -28,7 +28,7 @@ macro_rules! note {
 
 /// The 132 catalogued fixtures, copied from `apps_tests.rs`'s `PILOT` (whose
 /// constant is private to that module), in its order.
-const PILOT_NAMES: [&str; 132] = [
+pub(super) const PILOT_NAMES: [&str; 132] = [
     "apps/a1/correct/spec/n2r1",
     "apps/a1/correct/spec/n3r1",
     "apps/a1/correct/spec/n4r1",
@@ -164,7 +164,7 @@ const PILOT_NAMES: [&str; 132] = [
 ];
 
 /// The five size-2 cells of the slice (§5.3); three are not in `PILOT`.
-const SIZE2_CELLS: [&str; 5] = [
+pub(super) const SIZE2_CELLS: [&str; 5] = [
     "apps/a1/correct/spec/n2r2",
     "apps/a2/pb/spec/k2q2",
     "apps/a3/fifo/spec/k2q2",
@@ -439,7 +439,7 @@ fn oracle_trace_dump() {
 }
 
 /// The ten cells of the slice (§5.3).
-const SLICE_CELLS: [&str; 10] = [
+pub(super) const SLICE_CELLS: [&str; 10] = [
     "apps/a1/correct/spec/n2r2",
     "apps/a1/correct/spec/n3r3",
     "apps/a2/pb/spec/k2q2",
@@ -4003,10 +4003,15 @@ fn s5_the_iteration_order_is_deterministic() {
 /// code (comment lines dropped): one `IndexMap<OrdCounts, u64>` per slot and
 /// no second copy (no `HashSet<OrdCounts>`, no `Vec<Entry>`, no `held:`);
 /// nothing ever removed from a map (the scan and `entries()` rely on its
-/// insertion order); `insert` decides by `contains_key`, stores one clone and
-/// reaches no `cmp`/`le`; `covers` probes before the scan and advances
-/// `exact_hits` at one site; no explicit `Debug` formatting other than
-/// through `render_hash`; both ids checked; every panic message prefixed.
+/// insertion order); `insert` decides by the slot's map and stores one copy
+/// and reaches no `cmp`/`le` — since `SVERIFY-P` I3-4 (the tester's re-pin at
+/// I3 gate 3) through the `store` step it shares with `absorb_by_move`: the
+/// check is `get_index_of`, the copy `Cow::into_owned` (a clone of
+/// `insert`'s borrowed order, `absorb_by_move`'s owned order moved); `covers`
+/// probes before the scan — since I3-5 in `covers_in`, shared with the frozen
+/// `OrderStore` — and advances `exact_hits` at one site; no explicit `Debug`
+/// formatting other than through `render_hash`; both ids checked; every panic
+/// message prefixed.
 #[test]
 fn s6_the_set_index_source() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance/compact.rs");
@@ -4034,15 +4039,29 @@ fn s6_the_set_index_source() {
     for bad in [".cmp(", "le_counted", ".le("] {
         assert!(!insert.contains(bad), "conformance: I2-8: `insert` contains {bad}");
     }
+    let store = &code[at("fn store(")..at("pub(crate) fn absorb_by_move(")];
+    let absorb = &code[at("pub(crate) fn absorb_by_move(")..at("pub(crate) fn covers(")];
     assert!(
-        insert.contains("slot.orders.contains_key(&s.ord)")
-            && insert.contains("slot.orders.insert(s.ord.clone(), seq)"),
+        insert.contains("self.store(s.hash, si, std::borrow::Cow::Borrowed(&s.ord), 1)")
+            && store.contains("slot.orders.get_index_of(ord.as_ref())")
+            && store.contains("let ord = ord.into_owned();")
+            && store.contains("slot.orders.insert(ord, seq)")
+            && absorb.contains("self.store(hash, si, std::borrow::Cow::Owned(ord), count)")
+            && !store.contains(".clone()")
+            && !absorb.contains(".clone()"),
         "conformance: I2b-2: the duplicate check and the one stored copy"
     );
     let covers = &code[at("pub(crate) fn covers(")..at("pub(crate) fn entries(")];
-    let probe = covers.find("slot.orders.get(&s.ord)").expect("conformance: I2b-3: the probe");
-    let scan = covers.find("le_counted").expect("conformance: I2b-3: the scan");
+    assert!(
+        covers.contains("covers_in(&slot.orders, &s.ord, &mut q)"),
+        "conformance: I2b-3: `covers` answers by `covers_in`"
+    );
+    let shared = &code[at("fn covers_in(")..];
+    let shared = &shared[..shared.find("\n}\n").expect("conformance: covers_in's end")];
+    let probe = shared.find("orders.get(ord)").expect("conformance: I2b-3: the probe");
+    let scan = shared.find("le_counted").expect("conformance: I2b-3: the scan");
     assert!(probe < scan, "conformance: I2b-3: the probe precedes the scan");
+    assert_eq!(shared.matches("q.exact_hits += 1").count(), 1, "conformance: I2b-3: one site");
     assert_eq!(code.matches("self.exact_hits.set(").count(), 1, "conformance: I2b-3: one site");
     // No printing macro is listed: `compact.rs` is not test-only, so s5's
     // `c1_no_user_facing_emission_outside_the_rendering_module` scans it,
@@ -4962,7 +4981,9 @@ fn e1_the_selector_branch_is_never_taken_by_the_plain_modes() {
 
 /// MIN-ENGINES E1-1 (derived §E1 item 12, the source half): `uses_selector` is
 /// the predicate over `ConfMode::plain_scheduling`, which names `Enumerate`,
-/// `CFirstOuter` and `CFirstSweep` and no other mode; the scheduling step's
+/// `CFirstOuter` and `CFirstSweep` and, since `SVERIFY-P` I3-2 (the tester's
+/// re-pin at I3 gate 3), the twin `EnumeratePartitioned`, and no other mode;
+/// the scheduling step's
 /// plain branch is the `SchedulePolicy` match with the LTR arm
 /// `runnable.iter().find(..)` — no candidate vector, no origination vector —
 /// and `unblock_ready`'s plain return is `blocked.first()`.
@@ -4983,8 +5004,13 @@ fn e1_the_plain_path_builds_no_candidate_vector() {
         .find("pub(crate) fn plain_scheduling(self) -> bool {")
         .expect("conformance: plain_scheduling");
     let body = &ctx[at..at + ctx[at..].find("\n    }\n").expect("conformance: its end")];
-    assert_eq!(body.matches("ConfMode::").count(), 3, "conformance: {body}");
-    for m in ["ConfMode::Enumerate", "ConfMode::CFirstOuter", "ConfMode::CFirstSweep"] {
+    assert_eq!(body.matches("ConfMode::").count(), 4, "conformance: {body}");
+    for m in [
+        "ConfMode::Enumerate\n",
+        "ConfMode::EnumeratePartitioned",
+        "ConfMode::CFirstOuter",
+        "ConfMode::CFirstSweep",
+    ] {
         assert!(body.contains(m), "conformance: {m} in {body}");
     }
     let start = must
@@ -5460,7 +5486,7 @@ fn e1_the_selector_column_is_the_keys_field() {
 /// sink counting calls in the enumerating modes), on the test thread: the
 /// context's counters, its F49/F42 tallies, plain Must's split, the sink's
 /// calls, and the test-only take and clone counts over the run.
-fn e2_entry_counts(
+pub(super) fn e2_entry_counts(
     f: &Fixture,
     p: &crate::conformance::grid::Prog,
     mode: crate::conformance::ctx::ConfMode,
