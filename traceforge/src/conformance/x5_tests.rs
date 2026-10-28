@@ -1247,8 +1247,10 @@ fn c02_verdict_rows_carry_the_run_with_counters() {
     // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, 202 columns.
     // COMPACT-INDEX phase 2 re-pin (2026-10-19): schema 5, 208 columns;
     // fix round P3 (`sig_aliases`): 209.
-    assert_eq!(SCHEMA_VERSION, 5, "conformance: the schema version");
-    assert_eq!(header().len(), 209, "conformance: the header's width");
+    // SVERIFY-P I4 re-pin (2026-10-28, gate 3, ruling 8): schema 6, the forty columns
+    // after `memo_clears` (249).
+    assert_eq!(SCHEMA_VERSION, 6, "conformance: the schema version");
+    assert_eq!(header().len(), 249, "conformance: the header's width");
     for c in CFIRST_COUNTER_COLUMNS
         .iter()
         .chain(GATED_COUNTER_COLUMNS.iter())

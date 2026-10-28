@@ -331,6 +331,12 @@ pub struct ConfConfig {
     /// into the merged index (read by [`Engine::SverifyP`] only; `0` refused
     /// there).
     pub(crate) flush_entries: usize,
+    /// `SVERIFY-P` I4-3: the per-phase `VmHWM` resets in [`Engine::SverifyP`]
+    /// (a write of `5` to `/proc/self/clear_refs` before each phase, the
+    /// readings kept so the first-report memory and the process peak are
+    /// what they are without resets). Off by default: on in the driver's
+    /// per-row child processes only, never in the test suite.
+    pub(crate) phase_peaks: bool,
 }
 
 /// `COMPACT-INDEX` phase 2 items 4, 5, 7 (P2-frozen §6): the structure that
@@ -453,6 +459,7 @@ pub struct ConfBuilder {
     bucket: BucketKind,
     threads: usize,
     flush_entries: usize,
+    phase_peaks: bool,
 }
 
 impl Default for ConfBuilder {
@@ -516,7 +523,17 @@ impl ConfBuilder {
             // asked.
             threads: 1,
             flush_entries: 4096,
+            // `SVERIFY-P` I4-3: no reset unless asked.
+            phase_peaks: false,
         }
+    }
+
+    /// `SVERIFY-P` I4-3: the per-phase `VmHWM` resets of [`Engine::SverifyP`]
+    /// — read by that engine only. Default off; the driver's per-row child
+    /// turns it on. See `ConfConfig::phase_peaks`.
+    pub fn phase_peaks(mut self, on: bool) -> Self {
+        self.phase_peaks = on;
+        self
     }
 
     /// `SVERIFY-P` I3-1: the worker count of [`Engine::SverifyP`]'s
@@ -823,6 +840,7 @@ impl ConfBuilder {
             bucket: self.bucket,
             threads: self.threads,
             flush_entries: self.flush_entries,
+            phase_peaks: self.phase_peaks,
         })
     }
 }

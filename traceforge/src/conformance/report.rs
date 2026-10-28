@@ -981,6 +981,18 @@ pub struct SverifyPCounters {
     pub stopped_early: bool,
     pub uncovered_at_stop: usize,
     pub spawned_at_stop: u64,
+    /// `SVERIFY-P` I4-3: with `phase_peaks` on, `VmHWM` after each phase, the
+    /// mark reset before it ("peak during the phase"); `None` with the knob
+    /// off or when a reset failed (`phase_peaks` false: one process peak).
+    pub spec_vmhwm_kb: Option<u64>,
+    pub freeze_vmhwm_kb: Option<u64>,
+    pub impl_vmhwm_kb: Option<u64>,
+    /// The process's peak: the maximum of every reading taken (R2) — the raw
+    /// `VmHWM` at the end without resets.
+    pub vmhwm_kb_max: Option<u64>,
+    /// Whether the three phase figures are per-phase peaks (the resets all
+    /// succeeded) — else they are blank and `vmhwm_kb_max` is the one peak.
+    pub phase_peaks: bool,
     /// The merged specification index's counters before the freeze.
     pub spec_set: crate::conformance::compact::SetStats,
     /// The merged uncovered set's counters.
@@ -1048,6 +1060,11 @@ impl fmt::Display for SverifyPCounters {
         writeln!(f, "stopped_early: {}", self.stopped_early)?;
         writeln!(f, "uncovered_at_stop: {}", self.uncovered_at_stop)?;
         writeln!(f, "spawned_at_stop: {}", self.spawned_at_stop)?;
+        writeln!(f, "spec_vmhwm_kb: {:?}", self.spec_vmhwm_kb)?;
+        writeln!(f, "freeze_vmhwm_kb: {:?}", self.freeze_vmhwm_kb)?;
+        writeln!(f, "impl_vmhwm_kb: {:?}", self.impl_vmhwm_kb)?;
+        writeln!(f, "vmhwm_kb_max: {:?}", self.vmhwm_kb_max)?;
+        writeln!(f, "phase_peaks: {}", self.phase_peaks)?;
         writeln!(f, "spec_set: {:?}", self.spec_set)?;
         writeln!(f, "uncovered_set: {:?}", self.uncovered_set)?;
         writeln!(f, "impl_set: {:?}", self.impl_set)?;

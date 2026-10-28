@@ -33,7 +33,10 @@
 //! first-writer-wins and the runner's chunk caps write `MaxIterations`).
 //!
 //! `threads`, `flush_entries` and the runner's `iterations_until_split` are
-//! parameters; nothing here reads the machine.
+//! parameters; nothing here reads the machine. With `phase_peaks` on (I4-3,
+//! the driver's per-row children), `VmHWM` is reset before each phase and
+//! read after it, every reading kept, so the first-report memory and the
+//! process peak are what they are without resets.
 
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
@@ -290,6 +293,45 @@ struct PhaseResult {
     stopped: bool,
 }
 
+/// `VmHWM` from `/proc/self/status`, in kB (`None` where unreadable) — the
+/// stateless engine's reader is private to `cfirst.rs`, which I3/I4 do not
+/// change.
+fn vm_hwm_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `SVERIFY-P` I4-3: reset the process's `VmHWM` to its current RSS (a write
+/// of `5` to `/proc/self/clear_refs`; `VmPeak` untouched). `false` where the
+/// write fails (another kernel, a sandbox): R5. Shared with the baseline arm.
+pub(crate) fn reset_vm_hwm() -> bool {
+    #[cfg(test)]
+    {
+        if RESET_FAILS.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+    }
+    std::fs::write("/proc/self/clear_refs", b"5\n").is_ok()
+}
+
+/// I4-3 R5, test builds only: make every reset report failure, so the
+/// fallback (the three phase columns blank, `phase_peaks` false, the process
+/// peak kept) is testable on a kernel where the write succeeds.
+#[cfg(test)]
+static RESET_FAILS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// I4-3 R5, test builds only: force (or stop forcing) reset failures.
+#[cfg(test)]
+pub(crate) fn set_reset_fails_for_test(on: bool) {
+    RESET_FAILS.store(on, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The maximum of the readings taken, `None` if none was.
+fn hwm_max<const N: usize>(readings: [Option<u64>; N]) -> Option<u64> {
+    readings.into_iter().flatten().max()
+}
+
 fn fresh_set(counting: bool) -> SetIndex {
     if counting {
         SetIndex::with_multiplicities()
@@ -348,8 +390,11 @@ fn phase(
     side: &'static str,
     shared: Arc<Shared>,
     cancel: Arc<CancelToken>,
+    started: Instant,
 ) -> PhaseResult {
-    let started = Instant::now();
+    // `SVERIFY-P` I4 (ruling 6): the phase's wall runs from the caller's
+    // instant — the one the first-report clock starts from — so the two
+    // clocks are one.
     // The engine's own copy of the configuration carries the runner's knobs;
     // the public `ConfConfig` never does (the builder refuses the flag).
     let mut config: Config = cc.config.clone();
@@ -646,6 +691,13 @@ pub(crate) fn run_with(
     crate::conformance::assert_config_in_scope(&cc.config, "sverify-p");
 
     // -- the specification phase (I3-4) ----------------------------------
+    // `SVERIFY-P` I4-3: with `phase_peaks` on, `VmHWM` is read and reset
+    // around each phase; every reading is kept (R2–R4). With it off nothing
+    // is written to `/proc/self/clear_refs`.
+    let peaks = cc.phase_peaks;
+    let hwm_before = peaks.then(vm_hwm_kb).flatten();
+    let mut resets_ok = !peaks || reset_vm_hwm();
+    let spec_started = Instant::now();
     let spec_shared = Arc::new(Shared {
         merged: Mutex::new(SetIndex::new()),
         seen: None,
@@ -658,7 +710,9 @@ pub(crate) fn run_with(
         "specification",
         spec_shared,
         Arc::new(CancelToken::new()),
+        spec_started,
     );
+    let spec_hwm = peaks.then(vm_hwm_kb).flatten();
     let spec_errors = spec_errors_of(spec.errors, &spec.diagnostics);
     let spec_set: SetStats = spec.merged.stats();
     let mut counters = SverifyPCounters {
@@ -682,6 +736,7 @@ pub(crate) fn run_with(
         spec_merge_duplicates: spec_set.duplicates,
         impl_distinct_summaries: cc.impl_distinct.then_some(0),
         spec_set,
+        spec_vmhwm_kb: spec_hwm,
         ..SverifyPCounters::default()
     };
     // One flush per task end, plus the flushes at F (gate 3, D1).
@@ -690,6 +745,13 @@ pub(crate) fn run_with(
         "conformance: sverify-p flushes at least once per task"
     );
     if !spec_errors.is_empty() {
+        counters.phase_peaks = peaks && resets_ok;
+        counters.vmhwm_kb_max = hwm_max([hwm_before, spec_hwm, vm_hwm_kb()]);
+        if !counters.phase_peaks {
+            // I4-3 R5 on this return too (gate 4, M1): a failed reset leaves
+            // the phase columns blank; the process peak above stays.
+            counters.spec_vmhwm_kb = None;
+        }
         return SverifyPOutcome {
             counters,
             uncovered: Vec::new(),
@@ -703,9 +765,12 @@ pub(crate) fn run_with(
     }
 
     // -- the freeze (I3-5) -------------------------------------------------
+    resets_ok = resets_ok && (!peaks || reset_vm_hwm());
     let freeze_started = Instant::now();
     let (table, store) = spec.merged.freeze();
     counters.freeze_wall_time_ms = freeze_started.elapsed().as_millis();
+    let freeze_hwm = peaks.then(vm_hwm_kb).flatten();
+    counters.freeze_vmhwm_kb = freeze_hwm;
     #[cfg(test)]
     {
         let mut r = ADDRESS_RECORD
@@ -715,7 +780,9 @@ pub(crate) fn run_with(
     }
 
     // -- the implementation phase (I3-6) -----------------------------------
+    resets_ok = resets_ok && (!peaks || reset_vm_hwm());
     let cancel = Arc::new(CancelToken::new());
+    let impl_started = Instant::now();
     let impl_shared = Arc::new(Shared {
         merged: Mutex::new(SetIndex::with_multiplicities()),
         seen: cc
@@ -726,12 +793,20 @@ pub(crate) fn run_with(
             table: Mutex::new(table),
             store: Arc::new(store),
             first: Mutex::new(FirstReport::default()),
-            impl_started: Instant::now(),
+            impl_started,
             stop_at_first_report: cc.stop_at_first_report,
             cancel: Arc::clone(&cancel),
         }),
     });
-    let imp = phase(cc, implementation, "implementation", impl_shared, cancel);
+    let imp = phase(
+        cc,
+        implementation,
+        "implementation",
+        impl_shared,
+        cancel,
+        impl_started,
+    );
+    let impl_hwm = peaks.then(vm_hwm_kb).flatten();
     let t = &imp.tally;
     counters.impl_tasks = imp.tasks;
     counters.impl_tasks_nonempty = imp.tasks_nonempty;
@@ -766,7 +841,27 @@ pub(crate) fn run_with(
         counters.impl_set = Some(st);
     }
     counters.wall_ms_at_first_report = imp.first.wall_ms;
-    counters.vmhwm_kb_at_first_report = imp.first.vmhwm_kb;
+    // I4-3 R3: on a reset run the report's reading covers the implementation
+    // phase only; the readings before it complete the process's peak.
+    counters.vmhwm_kb_at_first_report = if peaks {
+        imp.first
+            .vmhwm_kb
+            .map(|h| hwm_max([Some(h), hwm_before, spec_hwm, freeze_hwm]).unwrap_or(h))
+    } else {
+        imp.first.vmhwm_kb
+    };
+    counters.impl_vmhwm_kb = impl_hwm;
+    counters.phase_peaks = peaks && resets_ok;
+    if !counters.phase_peaks {
+        // I4-3 R5: a failed reset (another kernel, a sandbox): the three
+        // phase columns blank, the one process peak said so.
+        counters.spec_vmhwm_kb = None;
+        counters.freeze_vmhwm_kb = None;
+        counters.impl_vmhwm_kb = None;
+    }
+    // I4-3 R2: the process's peak — every reading's maximum, the last one
+    // taken now (without resets it is the raw `VmHWM`).
+    counters.vmhwm_kb_max = hwm_max([hwm_before, spec_hwm, freeze_hwm, impl_hwm, vm_hwm_kb()]);
     counters.max_paper_events = cc.paper_events.then_some(imp.max_paper);
     counters.stopped_early = imp.stopped;
     counters.uncovered_at_stop = if imp.stopped {

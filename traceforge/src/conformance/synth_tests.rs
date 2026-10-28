@@ -361,7 +361,12 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 serialized: serialized(s),
             })
             .collect(),
-        GridRaw::Verdict(_) | GridRaw::Explore(_) => Vec::new(),
+        // `SVERIFY-P` I4: neither the partitioned checker (uncovered summaries,
+        // no report graphs) nor its baseline has a report list.
+        GridRaw::Verdict(_)
+        | GridRaw::Explore(_)
+        | GridRaw::SverifyP(_)
+        | GridRaw::ExploreP(_) => Vec::new(),
     }
 }
 
@@ -403,6 +408,22 @@ fn st(r: &GridResult) -> St {
             end: o.impl_end,
             failure: (o.aborted || !o.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", o.aborted, o.spec_errors)),
+        },
+        // `SVERIFY-P` I4: the partitioned checker's status from its raw outcome
+        // (reports = the uncovered completions); its baseline has none, as
+        // `Explore`.
+        GridRaw::SverifyP(r) => St {
+            reports: r.outcome.counters.uncovered_multiplicity,
+            exhaustions: 0,
+            end: r.outcome.impl_end,
+            failure: (!r.outcome.spec_errors.is_empty())
+                .then(|| format!("{:?}", r.outcome.spec_errors)),
+        },
+        GridRaw::ExploreP(_) => St {
+            reports: 0,
+            exhaustions: 0,
+            end: SearchEnd::Unknown,
+            failure: Some("an ExploreP (plain Must, partitioned) run has no conformance status".to_owned()),
         },
         // P5-XBASE: a plain Must run (no Spec) has no conformance status.
         GridRaw::Explore(_) => St {

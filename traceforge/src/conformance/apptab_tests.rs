@@ -2252,8 +2252,10 @@ fn c12_the_pins_that_must_not_move() {
     // columns after `flat_wall_time_ms` (202).
     // COMPACT-INDEX phase 2 re-pin (2026-10-19): schema 5, 208 columns;
     // fix round P3 (`sig_aliases`): 209.
-    assert_eq!(SCHEMA_VERSION, 5, "conformance: schema");
-    assert_eq!(header().len(), 209, "conformance: header");
+    // SVERIFY-P I4 re-pin (2026-10-28, gate 3, ruling 8): schema 6, the forty columns
+    // after `memo_clears` (249).
+    assert_eq!(SCHEMA_VERSION, 6, "conformance: schema");
+    assert_eq!(header().len(), 249, "conformance: header");
     assert_eq!(
         LABEL_PIN,
         GridConfig::new(GridEngine::Enumerator).label(),

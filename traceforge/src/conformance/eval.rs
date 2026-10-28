@@ -74,7 +74,13 @@ use crate::conformance::{verify, verify_conformance_with_opts};
 /// (`inverted_used`, `inverted_words`, `trie_nodes_visited`), which only a
 /// row with `bucket` other than the scan fills; the label at the defaults is
 /// unchanged.
-pub(super) const SCHEMA_VERSION: u32 = 5;
+/// `SVERIFY-P` I4-2: schema 6 appends the forty columns of the parallel
+/// stateful engine's record after `memo_clears` (the three phase peaks and
+/// `vmhwm_kb_max`, `phase_peaks`, `vm_peak_kb`, the per-side counts, tasks,
+/// flushes and lock timers, the conservation terms, `exact_hits`, the
+/// uncovered counts and the stop fields); the label at the defaults is
+/// unchanged (`LABEL_PIN`); a schema-5 store is refused as any other.
+pub(super) const SCHEMA_VERSION: u32 = 6;
 
 /// `GridConfig::new(GridEngine::Enumerator).label()` at this schema version.
 pub(super) const LABEL_PIN: &str =
@@ -300,6 +306,47 @@ pub(super) const ROW_OF_COLUMNS: &[&str] = &[
     "memo_on",
     "memo_entries",
     "memo_clears",
+    // `SVERIFY-P` I4-2 (schema 6): the parallel stateful engine's record.
+    "threads",
+    "flush_entries",
+    "iterations_until_split",
+    "warmup",
+    "state_batch_size",
+    "freeze_wall_time_ms",
+    "spec_vmhwm_kb",
+    "freeze_vmhwm_kb",
+    "impl_vmhwm_kb",
+    "vmhwm_kb_max",
+    "phase_peaks",
+    "vm_peak_kb",
+    "spec_complete",
+    "spec_blocked",
+    "impl_complete",
+    "impl_blocked",
+    "spec_tasks",
+    "impl_tasks",
+    "spec_tasks_nonempty",
+    "impl_tasks_nonempty",
+    "spec_flushes",
+    "impl_flushes",
+    "spec_merge_lock_held_ms",
+    "spec_merge_lock_wait_ms",
+    "impl_merge_lock_held_ms",
+    "impl_merge_lock_wait_ms",
+    "spec_flush_entries",
+    "spec_worker_duplicates",
+    "spec_merge_duplicates",
+    "impl_seen_flush_entries",
+    "impl_seen_worker_duplicates",
+    "exact_hits",
+    "uncovered_distinct",
+    "uncovered_multiplicity",
+    "uncovered_flush_entries",
+    "uncovered_worker_duplicates",
+    "uncovered_merge_duplicates",
+    "stopped_early",
+    "uncovered_at_stop",
+    "spawned_at_stop",
 ];
 
 /// The declared header: the runner's columns, then every `row_of` column.
@@ -543,6 +590,37 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         }
         None => BucketKind::Scan,
     };
+    // `SVERIFY-P` I4-1: the two partitioned engines' trailing fields, taken
+    // off before the counts below — `flush=<F>` (`SverifyP`, off-default
+    // only), then `threads=<t>`; `ExploreP` is the eleven-field form plus
+    // `threads=`. The round trip at the end refuses a non-canonical spelling
+    // (`threads=04`, `flush=4096`) as it refuses every other.
+    let partitioned = matches!(p.first().copied(), Some("SverifyP") | Some("ExploreP"));
+    let (threads, flush_entries) = if partitioned {
+        let flush = match p.last().copied().and_then(|f| f.strip_prefix("flush=")) {
+            Some(f) if p[0] == "SverifyP" => {
+                let v: usize = f.parse().ok()?;
+                // I4-1: `flush=0` is no configuration (the engine refuses it);
+                // `flush=4096`, the default printed, fails the round trip.
+                if v == 0 {
+                    return None;
+                }
+                p.pop();
+                v
+            }
+            Some(_) => return None,
+            None => 4096,
+        };
+        let t: usize = p.last().copied()?.strip_prefix("threads=")?.parse().ok()?;
+        // I4-1: `threads=0` is no configuration (gate 3, L1).
+        if t == 0 {
+            return None;
+        }
+        p.pop();
+        (t, flush)
+    } else {
+        (1, 4096)
+    };
     // `P5-CFCFG` F4: eleven fields (the campaign's form: the unbounded cache,
     // sweeps not quiet) or thirteen (`w=…`, `quiet=…`); `COMPACT-INDEX`
     // frozen §8: sixteen (`index=compact`, `anti=…`, `pmemo=…`); `SVERIFY-P`
@@ -590,6 +668,8 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     // name).
     let plain_engine = match engine {
         GridEngine::Stateful => true,
+        // `SVERIFY-P` I4-1: the twin mode is plain-scheduled (I3-2).
+        GridEngine::SverifyP => true,
         GridEngine::CompleteFirst => !precheck,
         _ => false,
     };
@@ -625,13 +705,24 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         instrumented: flag(p[8], "instr")?,
         early_error_cut: flag(p[9], "cut")?,
         completion_cover: parse_cover(p[10].strip_prefix("cover=")?)?,
+        threads,
+        flush_entries,
+        // `SVERIFY-P` I4-3: a measurement mode, never in a key.
+        phase_peaks: false,
     };
-    // `SVERIFY-P` I2b-7, `MIN-ENGINES` E7b: `index=set` is the key of the two
+    // `SVERIFY-P` I2b-7, `MIN-ENGINES` E7b: `index=set` is the key of the
     // engines that read the index (the others do not), never with Flat (F1).
+    // `SVERIFY-P` I4-1: SVerify-P has no other index, so its key is the
+    // `index=set` form and no other.
     if parsed.index == IndexKind::Set
-        && (!matches!(parsed.engine, GridEngine::Stateful | GridEngine::CompleteFirst)
-            || parsed.completion_cover == CompletionCover::Flat)
+        && (!matches!(
+            parsed.engine,
+            GridEngine::Stateful | GridEngine::CompleteFirst | GridEngine::SverifyP
+        ) || parsed.completion_cover == CompletionCover::Flat)
     {
+        return None;
+    }
+    if parsed.engine == GridEngine::SverifyP && parsed.index != IndexKind::Set {
         return None;
     }
     // `P5-CFCFG` F4 (gate 4 n1): only `label()`'s own spelling parses — the
@@ -658,6 +749,8 @@ pub(super) fn parse_engine(s: &str) -> Option<GridEngine> {
         "Gated" => GridEngine::Gated,
         "Verify" => GridEngine::Verify,
         "Explore" => GridEngine::Explore,
+        "SverifyP" => GridEngine::SverifyP,
+        "ExploreP" => GridEngine::ExploreP,
         _ => return None,
     })
 }
@@ -955,6 +1048,20 @@ fn call_with(fixture: &Fixture, config: &GridConfig, keep_graphs: bool) -> GridR
                 .expect("conformance: flushing the xbase split line");
             GridRaw::Explore(s)
         }
+        // `SVERIFY-P` I4: as `call`'s arms.
+        GridEngine::SverifyP => {
+            let cc = config.conf_config(fixture);
+            let outcome = crate::conformance::sverify_p::run_with(&cc, &imp, &spec);
+            GridRaw::SverifyP(Box::new(crate::conformance::grid::SverifyPRun {
+                outcome,
+                vm_peak_kb: crate::conformance::grid::vm_peak_kb(),
+                warmup: fixture.config.warmup,
+                state_batch_size: fixture.config.state_batch_size,
+            }))
+        }
+        GridEngine::ExploreP => GridRaw::ExploreP(Box::new(
+            crate::conformance::grid::explore_partitioned(fixture, config),
+        )),
     }
 }
 
@@ -1017,7 +1124,11 @@ pub(super) fn run_row_in_process(
             let started = Instant::now();
             let outcome = catch_unwind(AssertUnwindSafe(|| call_with(&f, &c, keep_graphs)));
             let wall = started.elapsed();
-            let after = vm_hwm_kb();
+            // `SVERIFY-P` I4-3 R4: the engine's peak folded in on a reset run.
+            let after = match &outcome {
+                Ok(raw) => crate::conformance::grid::after_reading(raw, vm_hwm_kb()),
+                Err(_) => vm_hwm_kb(),
+            };
             let _ = tx.send((outcome, wall, before, after));
         })
         .expect("conformance: could not spawn the eval run thread");
@@ -1759,6 +1870,12 @@ fn eval_row() {
         );
     }
     let commit = std::env::var("EVAL_COMMIT").unwrap_or_default();
+    // `SVERIFY-P` I4-3 R1: the per-phase resets run in the driver's child
+    // only — here, never in a test process.
+    let mut spec = spec;
+    if matches!(spec.config.engine, GridEngine::SverifyP | GridEngine::ExploreP) {
+        spec.config.phase_peaks = true;
+    }
     let row = child_row(&spec, &commit).unwrap_or_else(|e| panic!("conformance: {}", e.text()));
     let line = format!("{SENTINEL}{}\n", csv_line(&record_of(&row)));
     let mut out = std::io::stdout().lock();
@@ -3540,7 +3657,11 @@ fn export_first_report(end: &GridEnd, visible: &[String], dir: &Path) -> Result<
                 .collect::<Vec<_>>());
             j
         }),
-        GridRaw::Verdict(_) | GridRaw::Explore(_) => None,
+        // `SVERIFY-P` I4: SVerify-P keeps no graph (I3-7); the baseline has none.
+        GridRaw::Verdict(_)
+        | GridRaw::Explore(_)
+        | GridRaw::SverifyP(_)
+        | GridRaw::ExploreP(_) => None,
     };
     if let Some(v) = v {
         fs::create_dir_all(dir).map_err(|e| Refusal::Io(e.to_string()))?;

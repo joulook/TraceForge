@@ -2333,10 +2333,12 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // `32c67c7e…`.
     // MIN-ENGINES E9 (2026-10-27, tester re-pin, gate 3): to `23713aaa…`
     // (grid.rs md5 `21fdc1cd…`); `E9_HUNKS` undo it to `92d0c443…`.
+    // SVERIFY-P I4 (2026-10-28, tester re-pin, gate 3): to `c8f7a859…` (grid.rs
+    // md5 `7368b91d…`); `I4_HUNKS` undo it to `23713aaa…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "23713aaac056630ab1428baf94107ea7",
+        "c8f7a8599eb09de47c372d3b7bdcd192",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2914,6 +2916,509 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
             ),
         ),
     ];
+    // SVERIFY-P I4 (2026-10-28, tester re-pin, gate 3): the lead's twenty hunks
+    // inside the prefix (`difflib` against grid.rs `21fdc1cd…`, each widened by
+    // context until its new text is unique, undone in order); undoing them gives
+    // back the E9 prefix, byte for byte.
+    const I4_HUNKS: [(&str, &str); 20] = [
+        (
+            r##"    Explore,
+    /// `SVERIFY-P` I4: SVerify-P, `sverify_p::run_with(&cc, impl, spec)`, the
+    /// raw outcome; the label carries `threads=<t>` and an off-default
+    /// `flush=<F>` after `index=set`.
+    SverifyP,
+    /// `SVERIFY-P` I4-4: the baseline — Must alone in the partitioned mode on
+    /// the specification, then on the implementation, under SVerify-P's phase
+    /// `Config` with the same `threads` (`explore_partitioned`); the label is
+    /// the eleven-field form plus `threads=<t>`.
+    ExploreP,
+}
+"##,
+            r##"    Explore,
+}
+"##,
+        ),
+        (
+            r##"    pub(super) bucket: BucketKind,
+    /// `SVERIFY-P` I4-1: the worker count of the two partitioned engines
+    /// (`threads=<t>`, printed on the `SverifyP` and `ExploreP` labels only;
+    /// `1` and unprinted elsewhere).
+    pub(super) threads: usize,
+    /// `SVERIFY-P` I4-1: SVerify-P's flush size (`flush=<F>` on the
+    /// `SverifyP` label when not 4096; `4096` and unprinted elsewhere).
+    pub(super) flush_entries: usize,
+    /// `SVERIFY-P` I4-3: the per-phase `VmHWM` resets of the two partitioned
+    /// engines — a measurement mode, not an identity (no label field): on in
+    /// the driver's per-row children only (R1), off in every in-process run.
+    pub(super) phase_peaks: bool,
+}
+"##,
+            r##"    pub(super) bucket: BucketKind,
+}
+"##,
+        ),
+        (
+            r##"            // `Current` for the rest, whose keys print no index field.
+            index: if matches!(
+                engine,
+                GridEngine::Stateful | GridEngine::CompleteFirst | GridEngine::SverifyP
+            ) {
+                IndexKind::Set
+"##,
+            r##"            // `Current` for the rest, whose keys print no index field.
+            index: if matches!(engine, GridEngine::Stateful | GridEngine::CompleteFirst) {
+                IndexKind::Set
+"##,
+        ),
+        (
+            r##"            bucket: BucketKind::Scan,
+            // `SVERIFY-P` I4-1: one worker, 4096 orders per flush, no reset.
+            threads: 1,
+            flush_entries: 4096,
+            phase_peaks: false,
+        }
+"##,
+            r##"            bucket: BucketKind::Scan,
+        }
+"##,
+        ),
+        (
+            r##"        }
+    }
+
+    /// `SVERIFY-P` I4-1: the worker count (`SverifyP` and `ExploreP`).
+    pub(super) fn threads(mut self, t: usize) -> Self {
+        self.threads = t;
+        self
+    }
+
+    /// `SVERIFY-P` I4-1: SVerify-P's flush size.
+    pub(super) fn flush_entries(mut self, f: usize) -> Self {
+        self.flush_entries = f;
+        self
+    }
+
+    /// `SVERIFY-P` I4-3: the per-phase resets (the driver's child only).
+    pub(super) fn phase_peaks(mut self, on: bool) -> Self {
+        self.phase_peaks = on;
+        self
+    }
+"##,
+            r##"        }
+    }
+"##,
+        ),
+        (
+            r##"            GridEngine::Gated => Engine::Gated,
+            GridEngine::SverifyP => Engine::SverifyP,
+            // `P5-XBASE` F1: never reached — the `Explore` arms of `call` and
+"##,
+            r##"            GridEngine::Gated => Engine::Gated,
+            // `P5-XBASE` F1: never reached — the `Explore` arms of `call` and
+"##,
+        ),
+        (
+            r##"                panic!("conformance: `Explore` has no conformance configuration (P5-XBASE F1)")
+            }
+            // `SVERIFY-P` I4-4: likewise — the baseline runs Must alone.
+            GridEngine::ExploreP => {
+                panic!("conformance: `ExploreP` has no conformance configuration (SVERIFY-P I4-4)")
+            }
+"##,
+            r##"                panic!("conformance: `Explore` has no conformance configuration (P5-XBASE F1)")
+            }
+"##,
+        ),
+        (
+            r##"            .bucket(self.bucket)
+            .threads(self.threads)
+            .flush_entries(self.flush_entries)
+            .phase_peaks(self.phase_peaks)
+            .skip_spec_errfree_check(!self.precheck)
+"##,
+            r##"            .bucket(self.bucket)
+            .skip_spec_errfree_check(!self.precheck)
+"##,
+        ),
+        (
+            r##"            (None, GridEngine::Stateful) => "Plain".to_owned(),
+            // `SVERIFY-P` I4-1: the twin mode is plain-scheduled (I3-2).
+            (None, GridEngine::SverifyP) => "Plain".to_owned(),
+            (None, GridEngine::CompleteFirst) if !self.precheck => "Plain".to_owned(),
+"##,
+            r##"            (None, GridEngine::Stateful) => "Plain".to_owned(),
+            (None, GridEngine::CompleteFirst) if !self.precheck => "Plain".to_owned(),
+"##,
+        ),
+        (
+            r##"                GridEngine::Stateful => true,
+                GridEngine::SverifyP => true,
+                GridEngine::CompleteFirst => !self.precheck,
+"##,
+            r##"                GridEngine::Stateful => true,
+                GridEngine::CompleteFirst => !self.precheck,
+"##,
+        ),
+        (
+            r##"        // and `Set` (its step-0 set, `cfirst.rs`); only there is it printed.
+        // `SVERIFY-P` I4-1: the two partitioned engines' fields, appended —
+        // `threads=<t>` always (the rows of V-S's curve must not share a key),
+        // `flush=<F>` only off its default; no `explore=` (ruling D3, one
+        // value adds no identity). Every other engine's label is untouched.
+        let base = match self.engine {
+            GridEngine::SverifyP if self.flush_entries != 4096 => {
+                format!("{base}/threads={}/flush={}", self.threads, self.flush_entries)
+            }
+            GridEngine::SverifyP | GridEngine::ExploreP => {
+                format!("{base}/threads={}", self.threads)
+            }
+            _ => base,
+        };
+        // `SVERIFY-P` I4: the knob acts in SVerify-P as in the stateful engine.
+        let distinct_effective = self.engine == GridEngine::Stateful
+"##,
+            r##"        // and `Set` (its step-0 set, `cfirst.rs`); only there is it printed.
+        let distinct_effective = self.engine == GridEngine::Stateful
+"##,
+        ),
+        (
+            r##"        let distinct_effective = self.engine == GridEngine::Stateful
+            || self.engine == GridEngine::SverifyP
+            || (self.engine == GridEngine::CompleteFirst
+"##,
+            r##"        let distinct_effective = self.engine == GridEngine::Stateful
+            || (self.engine == GridEngine::CompleteFirst
+"##,
+        ),
+        (
+            r##"    Explore(crate::Stats),
+    /// `SVERIFY-P` I4: SVerify-P's raw outcome, with `VmPeak` at its end and
+    /// the run's `Config` parameters.
+    SverifyP(Box<SverifyPRun>),
+    /// `SVERIFY-P` I4-4: the baseline's two partitioned explorations.
+    ExploreP(Box<ExplorePRun>),
+}
+
+/// `SVERIFY-P` I4: one SVerify-P run as the row sees it.
+pub(super) struct SverifyPRun {
+    pub(super) outcome: crate::conformance::sverify_p::SverifyPOutcome,
+    /// `VmPeak` (the address space's high-water mark) at the row's end,
+    /// I2b-8 (c)'s figure.
+    pub(super) vm_peak_kb: Option<u64>,
+    pub(super) warmup: usize,
+    pub(super) state_batch_size: usize,
+}
+
+/// `SVERIFY-P` I4-4: the baseline's raw outcome — Must alone in the
+/// partitioned mode on each side, under SVerify-P's phase `Config`, with the
+/// per-phase readings of I4-3 when the knob is on.
+pub(super) struct ExplorePRun {
+    pub(super) spec: crate::parallel_verify::PartitionedRun,
+    pub(super) imp: crate::parallel_verify::PartitionedRun,
+    pub(super) spec_wall_ms: u128,
+    pub(super) impl_wall_ms: u128,
+    pub(super) spec_vmhwm_kb: Option<u64>,
+    pub(super) impl_vmhwm_kb: Option<u64>,
+    pub(super) vmhwm_kb_max: Option<u64>,
+    pub(super) phase_peaks: bool,
+    pub(super) vm_peak_kb: Option<u64>,
+    pub(super) threads: usize,
+    pub(super) warmup: usize,
+    pub(super) iterations_until_split: usize,
+    pub(super) state_batch_size: usize,
+}
+"##,
+            r##"    Explore(crate::Stats),
+}
+"##,
+        ),
+        (
+            r##"                .field("block", &s.block)
+                .finish(),
+            GridRaw::SverifyP(r) => f
+                .debug_struct("SverifyP")
+                .field("reports", &r.outcome.counters.reports)
+                .field("impl_end", &r.outcome.impl_end)
+                .field("spec_end", &r.outcome.spec_end)
+                .field("spec_errors", &r.outcome.spec_errors.len())
+                .finish(),
+            GridRaw::ExploreP(r) => f
+                .debug_struct("ExploreP")
+                .field("spec_execs", &r.spec.stats.execs)
+                .field("spec_block", &r.spec.stats.block)
+                .field("impl_execs", &r.imp.stats.execs)
+                .field("impl_block", &r.imp.stats.block)
+                .finish(),
+"##,
+            r##"                .field("block", &s.block)
+                .finish(),
+"##,
+        ),
+        (
+            r##"    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `SVERIFY-P` I4-4: `VmPeak` from `/proc/self/status`, in kB — the address
+/// space's high-water mark, what `ulimit -v` bounds (I2b-8 (c)).
+pub(super) fn vm_peak_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmPeak:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `SVERIFY-P` I4-3 R4: the run thread's `after` reading on a reset run is
+/// the maximum of what it read and the engine's `vmhwm_kb_max`, so
+/// `vm_hwm_kb_after`, `rss_child_hwm_kb` and the post-hoc censor keep the
+/// process's peak; every other engine's reading is returned as is.
+pub(super) fn after_reading(raw: &GridRaw, after: Option<u64>) -> Option<u64> {
+    let engine_max = match raw {
+        GridRaw::SverifyP(r) => r.outcome.counters.vmhwm_kb_max,
+        GridRaw::ExploreP(r) => r.vmhwm_kb_max,
+        _ => None,
+    };
+    [after, engine_max].into_iter().flatten().max()
+}
+
+/// `SVERIFY-P` I4-4: the baseline — `verify_partitioned_rayon_with` with
+/// default hooks (a token nobody cancels) on the specification, then on the
+/// implementation, each under SVerify-P's phase `Config` exactly (the
+/// fixture's with `keep_going_after_error`, the partitioned mode at
+/// `threads`, the fixture's `warmup`, `iterations_until_split` and
+/// `state_batch_size`); with the knob on, `VmHWM` reset before each side and
+/// read after it, every reading kept (R2, R5), as the engine does.
+pub(super) fn explore_partitioned(fixture: &Fixture, config: &GridConfig) -> ExplorePRun {
+    use crate::conformance::sverify_p::reset_vm_hwm;
+    use crate::parallel_verify::{verify_partitioned_rayon_with, PartitionHooks};
+    let mut cfg = fixture.config.clone();
+    cfg.keep_going_after_error = true;
+    cfg.partitioned_parallelization = true;
+    cfg.partitioned_num_threads = Some(config.threads);
+    let peaks = config.phase_peaks;
+    let read = || if peaks { vm_hwm_kb() } else { None };
+    let before = read();
+    let mut ok = !peaks || reset_vm_hwm();
+    let spec = fixture.specification.clone();
+    let t0 = Instant::now();
+    let spec_run =
+        verify_partitioned_rayon_with(cfg.clone(), move || spec(), PartitionHooks::default());
+    let spec_wall_ms = t0.elapsed().as_millis();
+    let spec_hwm = read();
+    ok = ok && (!peaks || reset_vm_hwm());
+    let imp = fixture.implementation.clone();
+    let t1 = Instant::now();
+    let impl_run =
+        verify_partitioned_rayon_with(cfg.clone(), move || imp(), PartitionHooks::default());
+    let impl_wall_ms = t1.elapsed().as_millis();
+    let impl_hwm = read();
+    let phase_peaks = peaks && ok;
+    let vmhwm_kb_max = [before, spec_hwm, impl_hwm, vm_hwm_kb()]
+        .into_iter()
+        .flatten()
+        .max();
+    ExplorePRun {
+        spec: spec_run,
+        imp: impl_run,
+        spec_wall_ms,
+        impl_wall_ms,
+        spec_vmhwm_kb: if phase_peaks { spec_hwm } else { None },
+        impl_vmhwm_kb: if phase_peaks { impl_hwm } else { None },
+        vmhwm_kb_max,
+        phase_peaks,
+        vm_peak_kb: vm_peak_kb(),
+        threads: config.threads,
+        warmup: cfg.warmup,
+        iterations_until_split: cfg.iterations_until_split,
+        state_batch_size: cfg.state_batch_size,
+    }
+}
+"##,
+            r##"    line.split_whitespace().nth(1)?.parse().ok()
+}
+"##,
+        ),
+        (
+            r##"        }
+        // `SVERIFY-P` I4: the raw outcome, `VmPeak` read at the run's end.
+        GridEngine::SverifyP => {
+            let cc = config.conf_config(fixture);
+            let outcome = crate::conformance::sverify_p::run_with(&cc, &imp, &spec);
+            GridRaw::SverifyP(Box::new(SverifyPRun {
+                outcome,
+                vm_peak_kb: vm_peak_kb(),
+                warmup: fixture.config.warmup,
+                state_batch_size: fixture.config.state_batch_size,
+            }))
+        }
+        GridEngine::ExploreP => GridRaw::ExploreP(Box::new(explore_partitioned(fixture, config))),
+    }
+"##,
+            r##"        }
+    }
+"##,
+        ),
+        (
+            r##"            let wall = started.elapsed();
+            // `SVERIFY-P` I4-3 R4: the engine's peak folded in on a reset run.
+            let after = match &outcome {
+                Ok(raw) => after_reading(raw, vm_hwm_kb()),
+                Err(_) => vm_hwm_kb(),
+            };
+            // A receiver that has given up (a cap) is gone; nothing to do.
+"##,
+            r##"            let wall = started.elapsed();
+            let after = vm_hwm_kb();
+            // A receiver that has given up (a cap) is gone; nothing to do.
+"##,
+        ),
+        (
+            r##"            compact_columns(&mut row, c.compact.as_ref());
+            // `SVERIFY-P` I4-2: the exact-hit probe's count, comparable with
+            // the sverify-p row's (I2-4: invariant under the insertion order).
+            push_opt(&mut row, "exact_hits", o.set_index.as_ref().map(|s| s.stats().exact_hits));
+        }
+"##,
+            r##"            compact_columns(&mut row, c.compact.as_ref());
+        }
+"##,
+        ),
+        (
+            r##"        }
+        GridRaw::SverifyP(r) => sverify_p_columns(&mut row, r),
+        GridRaw::ExploreP(r) => explore_p_columns(&mut row, r),
+    }
+"##,
+            r##"        }
+    }
+"##,
+        ),
+        (
+            r##"    row
+}
+
+/// `SVERIFY-P` I4-2, I4-6: the sverify-p row — the verdict by `run`'s rule
+/// on the raw outcome, the stateful row's columns under their meanings
+/// (`duplicates` = worker + merge; `sig_tests` = the merge's resolutions +
+/// the queries'; `containment_tests` and `coordinates_compared` the
+/// queries'), then the engine's record flattened whole.
+fn sverify_p_columns(row: &mut Row, r: &SverifyPRun) {
+    let o = &r.outcome;
+    let c = &o.counters;
+    let class = if !o.spec_errors.is_empty() {
+        "Err"
+    } else if c.uncovered_multiplicity > 0 {
+        "Reported"
+    } else {
+        "Conforms"
+    };
+    push_d(row, "verdict", class);
+    push_d(row, "reports", c.reports);
+    push(row, "impl_end", o.impl_end);
+    push(row, "spec_end", o.spec_end);
+    push_d(row, "spec_errors", o.spec_errors.len());
+    push_d(row, "impl_notes", o.impl_notes.len());
+    push_d(row, "executions", o.executions);
+    push_opt(row, "max_paper_events", o.max_paper_events);
+    push_d(row, "spec_graphs", c.spec_graphs);
+    push_d(row, "impl_graphs", c.impl_graphs);
+    push_d(row, "signatures", c.signatures);
+    push_d(row, "orders_held", c.orders_held);
+    push_d(row, "lookups", c.lookups);
+    push_d(row, "lookups_signature_miss", c.lookups_signature_miss);
+    push_d(row, "lookups_containment_tested", c.lookups_containment_tested);
+    push_d(row, "lookups_succeeded", c.lookups_succeeded);
+    push_d(row, "lookups_failed_after_tests", c.lookups_failed_after_tests);
+    push_d(row, "containment_tests", c.containment_tests);
+    push_d(row, "counter_reports", c.reports);
+    push_d(row, "spec_wall_time_ms", c.spec_wall_time_ms);
+    push_d(row, "impl_wall_time_ms", c.impl_wall_time_ms);
+    push_opt(row, "wall_ms_at_first_report", c.wall_ms_at_first_report);
+    push_opt(row, "vmhwm_kb_at_first_report", c.vmhwm_kb_at_first_report);
+    push_opt(row, "impl_distinct_summaries", c.impl_distinct_summaries);
+    push_d(row, "index_kind", "set");
+    let mut cs = c.spec_set.as_compact_stats();
+    cs.duplicates = c.spec_worker_duplicates + c.spec_merge_duplicates;
+    cs.sig_tests = c.spec_set.sig_tests + c.sig_tests;
+    cs.containment_tests = c.containment_tests;
+    cs.coordinates_compared = c.coordinates_compared;
+    cs.impl_distinct_summaries = c.impl_distinct_summaries;
+    compact_columns(row, Some(&cs));
+    push_d(row, "threads", c.threads);
+    push_d(row, "flush_entries", c.flush_entries);
+    push_d(row, "iterations_until_split", c.iterations_until_split);
+    push_d(row, "warmup", r.warmup);
+    push_d(row, "state_batch_size", r.state_batch_size);
+    push_d(row, "freeze_wall_time_ms", c.freeze_wall_time_ms);
+    push_opt(row, "spec_vmhwm_kb", c.spec_vmhwm_kb);
+    push_opt(row, "freeze_vmhwm_kb", c.freeze_vmhwm_kb);
+    push_opt(row, "impl_vmhwm_kb", c.impl_vmhwm_kb);
+    push_opt(row, "vmhwm_kb_max", c.vmhwm_kb_max);
+    push_d(row, "phase_peaks", if c.phase_peaks { "per-phase" } else { "process" });
+    push_opt(row, "vm_peak_kb", r.vm_peak_kb);
+    push_d(row, "spec_complete", c.spec_complete);
+    push_d(row, "spec_blocked", c.spec_blocked);
+    push_d(row, "impl_complete", c.impl_complete);
+    push_d(row, "impl_blocked", c.impl_blocked);
+    push_d(row, "spec_tasks", c.spec_tasks);
+    push_d(row, "impl_tasks", c.impl_tasks);
+    push_d(row, "spec_tasks_nonempty", c.spec_tasks_nonempty);
+    push_d(row, "impl_tasks_nonempty", c.impl_tasks_nonempty);
+    push_d(row, "spec_flushes", c.spec_flushes);
+    push_d(row, "impl_flushes", c.impl_flushes);
+    push_d(row, "spec_merge_lock_held_ms", c.spec_merge_lock_held_ms);
+    push_d(row, "spec_merge_lock_wait_ms", c.spec_merge_lock_wait_ms);
+    push_d(row, "impl_merge_lock_held_ms", c.impl_merge_lock_held_ms);
+    push_d(row, "impl_merge_lock_wait_ms", c.impl_merge_lock_wait_ms);
+    push_d(row, "spec_flush_entries", c.spec_flush_entries);
+    push_d(row, "spec_worker_duplicates", c.spec_worker_duplicates);
+    push_d(row, "spec_merge_duplicates", c.spec_merge_duplicates);
+    push_d(row, "impl_seen_flush_entries", c.impl_seen_flush_entries);
+    push_d(row, "impl_seen_worker_duplicates", c.impl_seen_worker_duplicates);
+    push_d(row, "exact_hits", c.exact_hits);
+    push_d(row, "uncovered_distinct", c.uncovered_distinct);
+    push_d(row, "uncovered_multiplicity", c.uncovered_multiplicity);
+    push_d(row, "uncovered_flush_entries", c.uncovered_flush_entries);
+    push_d(row, "uncovered_worker_duplicates", c.uncovered_worker_duplicates);
+    push_d(row, "uncovered_merge_duplicates", c.uncovered_merge_duplicates);
+    push_d(row, "stopped_early", c.stopped_early);
+    push_d(row, "uncovered_at_stop", c.uncovered_at_stop);
+    push_d(row, "spawned_at_stop", c.spawned_at_stop);
+}
+
+/// `SVERIFY-P` I4-4: the baseline row — the per-side counts, walls, tasks and
+/// peaks under the sverify-p row's names; `executions` the implementation's
+/// `execs + block` (XBASE's convention).
+fn explore_p_columns(row: &mut Row, r: &ExplorePRun) {
+    let (sp, im) = (&r.spec.stats, &r.imp.stats);
+    push_d(row, "executions", im.execs + im.block);
+    push(row, "outer_graphs(execs+block)", Some(im.execs + im.block));
+    push_d(row, "spec_graphs", sp.execs + sp.block);
+    push_d(row, "impl_graphs", im.execs + im.block);
+    push_d(row, "spec_complete", sp.execs);
+    push_d(row, "spec_blocked", sp.block);
+    push_d(row, "impl_complete", im.execs);
+    push_d(row, "impl_blocked", im.block);
+    push_d(row, "spec_wall_time_ms", r.spec_wall_ms);
+    push_d(row, "impl_wall_time_ms", r.impl_wall_ms);
+    push_d(row, "spec_tasks", r.spec.tasks_spawned + 1);
+    push_d(row, "impl_tasks", r.imp.tasks_spawned + 1);
+    push_d(row, "spec_tasks_nonempty", r.spec.workers_reported);
+    push_d(row, "impl_tasks_nonempty", r.imp.workers_reported);
+    push_d(row, "threads", r.threads);
+    push_d(row, "iterations_until_split", r.iterations_until_split);
+    push_d(row, "warmup", r.warmup);
+    push_d(row, "state_batch_size", r.state_batch_size);
+    push_opt(row, "spec_vmhwm_kb", r.spec_vmhwm_kb);
+    push_opt(row, "impl_vmhwm_kb", r.impl_vmhwm_kb);
+    push_opt(row, "vmhwm_kb_max", r.vmhwm_kb_max);
+    push_d(row, "phase_peaks", if r.phase_peaks { "per-phase" } else { "process" });
+    push_opt(row, "vm_peak_kb", r.vm_peak_kb);
+}
+"##,
+            r##"    row
+}
+"##,
+        ),
+    ];
     // MIN-ENGINES E9 (2026-10-27, tester re-pin, gate 3): the lead's one
     // `grid.rs` hunk (`diff -U1` against grid.rs `4ff398e4…`: the stateful
     // row's two first-report columns), inside the prefix; undoing it gives
@@ -2937,6 +3442,14 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
         ),
     ];
     let mut t = prefix.clone();
+    for (new, old) in I4_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "23713aaac056630ab1428baf94107ea7",
+        "conformance: the prefix without I4's hunks = the E9 prefix"
+    );
     for (new, old) in E9_HUNKS {
         t = undo(t, new, old);
     }

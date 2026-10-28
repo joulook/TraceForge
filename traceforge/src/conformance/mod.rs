@@ -564,8 +564,6 @@ mod stateful_baseline;
 mod stateful_tests;
 #[cfg(test)]
 pub(crate) mod testing;
-#[cfg(test)]
-mod p0_launch;
 
 /// What a conformance run found, at the sink's level of detail.
 ///

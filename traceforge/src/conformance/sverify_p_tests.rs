@@ -1912,3 +1912,998 @@ fn i3_5_d_the_store_is_sync_the_table_is_not_and_no_unsafe() {
     }
     assert!(bad.is_empty(), "conformance: I3-5 (d): unsafe in the lead's files: {bad:#?}");
 }
+
+// =========================================================================
+// SVERIFY-P I4 (gate 3, the tester): the driver and the store row, and the baseline row,
+// against criteria rev 1.2 and `log/dev/SVERIFY-P.derived-i4.md` (10d5f6e9). Every in-process
+// test keeps `phase_peaks` off (R1); the reset runs only in `i4_3_a_…` (ignored, own process)
+// and in the driver's children.
+// =========================================================================
+
+use crate::conformance::eval::{
+    header, parse_key, parse_label, read_rows, Driver, Probes, RowSpec, RunKind, Spec, Tier,
+    LABEL_PIN,
+};
+use crate::conformance::grid::{run_grid, row_of, GridConfig, GridEnd, GridRaw, GridResult};
+
+/// One engine run through the grid's own path (`run_grid`, the run thread, the `VmHWM` reads).
+fn i4_run(f: &Fixture, c: &GridConfig) -> GridResult {
+    match run_grid(f, c, None) {
+        GridEnd::Ok(r) => r,
+        other => panic!("conformance: I4 run of {}: {other:?}", f.name),
+    }
+}
+
+/// A row as name → text.
+fn i4_cells(r: &GridResult) -> BTreeMap<String, String> {
+    row_of(r).into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+}
+
+fn i4_num(m: &BTreeMap<String, String>, k: &str) -> u128 {
+    let v = m.get(k).unwrap_or_else(|| panic!("conformance: no column {k}"));
+    v.parse()
+        .unwrap_or_else(|_| panic!("conformance: column {k} = {v:?} is not a number"))
+}
+
+/// A blank, `None`, a number or `Some(<number>)` (the `push` of an `Option`, as `vm_hwm_kb_after`).
+fn i4_opt(m: &BTreeMap<String, String>, k: &str) -> Option<u128> {
+    match m.get(k).map(String::as_str) {
+        None | Some("") | Some("None") => None,
+        Some(v) => {
+            let n = v.strip_prefix("Some(").and_then(|x| x.strip_suffix(')')).unwrap_or(v);
+            Some(n.parse().unwrap_or_else(|_| panic!("conformance: {k} = {v:?}")))
+        }
+    }
+}
+
+/// I4-6 (c)–(e) read off a sverify-p row's cells; `stop` relaxes the one equality a stopped run
+/// cannot keep (`lookups` ≤ `impl_graphs`).
+fn i4_identities(m: &BTreeMap<String, String>) -> Vec<String> {
+    let n = |k: &str| i4_num(m, k);
+    let mut bad = Vec::new();
+    fn eq(bad: &mut Vec<String>, what: &str, a: u128, b: u128) {
+        if a != b {
+            bad.push(format!("{what}: {a} vs {b}"));
+        }
+    }
+    eq(&mut bad, "spec complete + blocked", n("spec_complete") + n("spec_blocked"), n("spec_graphs"));
+    eq(&mut bad, "impl complete + blocked", n("impl_complete") + n("impl_blocked"), n("impl_graphs"));
+    eq(
+        &mut bad,
+        "flush entries + worker duplicates",
+        n("spec_flush_entries") + n("spec_worker_duplicates"),
+        n("spec_graphs"),
+    );
+    eq(&mut bad, "entries + merge duplicates", n("entries") + n("spec_merge_duplicates"), n("spec_flush_entries"));
+    eq(&mut bad, "duplicates", n("duplicates"), n("spec_graphs") - n("entries"));
+    eq(&mut bad, "entries = orders_held", n("entries"), n("orders_held"));
+    eq(
+        &mut bad,
+        "lookup classes",
+        n("lookups_signature_miss") + n("lookups_succeeded") + n("lookups_failed_after_tests"),
+        n("lookups"),
+    );
+    eq(
+        &mut bad,
+        "containment tested",
+        n("lookups_containment_tested"),
+        n("lookups_succeeded") + n("lookups_failed_after_tests"),
+    );
+    eq(
+        &mut bad,
+        "uncovered flush + worker duplicates",
+        n("uncovered_flush_entries") + n("uncovered_worker_duplicates"),
+        n("reports"),
+    );
+    eq(
+        &mut bad,
+        "uncovered distinct + merge duplicates",
+        n("uncovered_distinct") + n("uncovered_merge_duplicates"),
+        n("uncovered_flush_entries"),
+    );
+    eq(&mut bad, "reports = uncovered_multiplicity", n("reports"), n("uncovered_multiplicity"));
+    eq(&mut bad, "counter_reports", n("counter_reports"), n("reports"));
+    let stopped = m["stopped_early"] == "true";
+    if stopped {
+        if n("lookups") > n("impl_graphs") {
+            bad.push(format!("stopped: lookups {} > impl_graphs {}", n("lookups"), n("impl_graphs")));
+        }
+        if m["impl_end"] != "StoppedAtFirstReport" {
+            bad.push(format!("stopped_early with impl_end {}", m["impl_end"]));
+        }
+        eq(&mut bad, "spawned_at_stop", n("spawned_at_stop"), n("impl_tasks") - 1);
+    } else {
+        if m["spec_errors"] == "0" {
+            eq(&mut bad, "lookups = impl_graphs", n("lookups"), n("impl_graphs"));
+            if m["impl_end"] != "StateSpaceExhausted" {
+                bad.push(format!("impl_end {}", m["impl_end"]));
+            }
+        }
+        eq(&mut bad, "spawned_at_stop (not stopped)", n("spawned_at_stop"), 0);
+        eq(&mut bad, "uncovered_at_stop (not stopped)", n("uncovered_at_stop"), 0);
+    }
+    if m["spec_end"] != "StateSpaceExhausted" {
+        bad.push(format!("spec_end {}", m["spec_end"]));
+    }
+    if n("spec_flushes") < n("spec_tasks") || n("impl_flushes") < n("impl_tasks") {
+        bad.push("flushes < tasks".to_owned());
+    }
+    if i4_opt(m, "impl_distinct_summaries").is_some() {
+        eq(
+            &mut bad,
+            "seen flush + worker duplicates",
+            n("impl_seen_flush_entries") + n("impl_seen_worker_duplicates"),
+            n("impl_graphs"),
+        );
+    }
+    // (d) the first report: blank iff no report; the exact bound (ruling 6); the sum ≤ the wall
+    let w = i4_opt(m, "wall_ms_at_first_report");
+    let h = i4_opt(m, "vmhwm_kb_at_first_report");
+    if w.is_some() != (n("reports") > 0) || h.is_some() != (n("reports") > 0) {
+        bad.push(format!("first-report columns {w:?} {h:?} with {} reports", n("reports")));
+    }
+    if let Some(w) = w {
+        if w > n("impl_wall_time_ms") {
+            bad.push(format!("first report {w} ms > impl wall {} ms", n("impl_wall_time_ms")));
+        }
+        let sum = n("spec_wall_time_ms") + n("freeze_wall_time_ms") + w;
+        if sum > n("wall_ms") {
+            bad.push(format!("first-report sum {sum} ms > wall {} ms", n("wall_ms")));
+        }
+    }
+    let class = if m["spec_errors"] != "0" {
+        "Err"
+    } else if n("uncovered_multiplicity") > 0 {
+        "Reported"
+    } else {
+        "Conforms"
+    };
+    if m["verdict"] != class {
+        bad.push(format!("verdict {} by run's rule {class}", m["verdict"]));
+    }
+    bad
+}
+
+/// I4-1 (a), (b), (d): the two engines' labels round-trip, three thread counts give three keys,
+/// the non-canonical spellings are refused, and `conf_config` carries the knobs.
+#[test]
+fn i4_1_the_labels_round_trip_and_refuse_what_is_not_canonical() {
+    let mut bad = Vec::new();
+    let mut keys = BTreeSet::new();
+    for t in [1, 2, 4, 16] {
+        for fe in [7, 4096] {
+            for distinct in [false, true] {
+                for stop in [false, true] {
+                    let c = GridConfig::new(GridEngine::SverifyP)
+                        .threads(t)
+                        .flush_entries(fe)
+                        .impl_distinct(distinct)
+                        .stop(stop);
+                    let l = c.label();
+                    if parse_label(&l) != Some(c.clone()) {
+                        bad.push(format!("no round trip: {l}"));
+                    }
+                    keys.insert(l);
+                }
+            }
+        }
+        let e = GridConfig::new(GridEngine::ExploreP).threads(t);
+        if parse_label(&e.label()) != Some(e.clone()) {
+            bad.push(format!("no round trip: {}", e.label()));
+        }
+        keys.insert(e.label());
+    }
+    // 4 t × 2 F × 2 distinct × 2 stop, and 4 baselines: every label distinct
+    if keys.len() != 32 + 4 {
+        bad.push(format!("{} distinct keys of 36", keys.len()));
+    }
+    let base = "SverifyP/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set";
+    let ebase = "ExploreP/Ltr/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep";
+    for (got, want) in [
+        (GridConfig::new(GridEngine::SverifyP).threads(4).label(), format!("{base}/threads=4")),
+        (
+            GridConfig::new(GridEngine::SverifyP).threads(4).flush_entries(7).label(),
+            format!("{base}/threads=4/flush=7"),
+        ),
+        (
+            GridConfig::new(GridEngine::SverifyP).threads(1).impl_distinct(true).label(),
+            format!("{base}/threads=1/distinct=on"),
+        ),
+        (GridConfig::new(GridEngine::ExploreP).threads(16).label(), format!("{ebase}/threads=16")),
+    ] {
+        if got != want {
+            bad.push(format!("label {got} != {want}"));
+        }
+    }
+    let stateful = GridConfig::new(GridEngine::Stateful).label();
+    for l in [
+        format!("{base}/threads=0"),
+        format!("{base}/threads=04"),
+        format!("{base}/threads=+4"),
+        base.to_owned(),
+        format!("{base}/threads=4/flush=4096"),
+        format!("{base}/threads=4/flush=0"),
+        format!("{base}/threads=4/flush=07"),
+        format!("{base}/flush=7/threads=4"),
+        format!("{base}/threads=4/explore=sequential"),
+        format!("{}/threads=4", base.replace("/index=set", "/index=compact/anti=true/pmemo=false")),
+        format!("{}/threads=4", base.replace("/w=inf/quiet=false/index=set", "")),
+        format!("{stateful}/threads=4"),
+        format!("{ebase}/threads=0"),
+        format!("{ebase}/threads=4/flush=7"),
+        format!("{ebase}/w=inf/quiet=false/index=set/threads=4"),
+        ebase.to_owned(),
+    ] {
+        if let Some(c) = parse_label(&l) {
+            bad.push(format!("accepted: {l} as threads {} flush {}", c.threads, c.flush_entries));
+        }
+    }
+    let f = fx("apps/a1/correct/spec/n2r2");
+    let cc = GridConfig::new(GridEngine::SverifyP).threads(4).flush_entries(7).conf_config(&f);
+    if (cc.engine, cc.threads, cc.flush_entries, cc.phase_peaks) != (Engine::SverifyP, 4, 7, false) {
+        bad.push(format!(
+            "conf_config: {:?} {} {} {}",
+            cc.engine, cc.threads, cc.flush_entries, cc.phase_peaks
+        ));
+    }
+    assert_eq!(LABEL_PIN, GridConfig::new(GridEngine::Enumerator).label());
+    assert!(bad.is_empty(), "conformance: I4-1: {bad:#?}");
+}
+
+/// I4-1 (c): every key in every `rows*.csv` under `log/eval/` (the plan's stores) parses and
+/// reprints byte for byte, as before I4: `parse_label` takes its new branch only on a label whose
+/// engine field is `SverifyP` or `ExploreP`, and no store but I4's own holds one; on every other key
+/// the new fields are at their defaults.
+#[test]
+fn i4_1_c_every_stored_key_reprints() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plan/traceForge/log/eval");
+    let mut files = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap_or_else(|e| panic!("conformance: {}: {e}", d.display())) {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n != "runs") {
+                    stack.push(p);
+                }
+            } else if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.starts_with("rows") && n.ends_with(".csv")
+            }) {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    let mut bad = Vec::new();
+    let (mut parsed, mut refused, mut new_engines) = (0usize, 0usize, 0usize);
+    let mut per_store: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for p in &files {
+        let Ok(rows) = read_rows(p) else {
+            continue;
+        };
+        let name = p.strip_prefix(&root).unwrap().display().to_string();
+        for r in rows {
+            let Some(key) = r.get("key") else { continue };
+            let label = key.split('|').nth(1).unwrap_or("");
+            let entry = per_store.entry(name.clone()).or_default();
+            match parse_key(key) {
+                Some((_, c, ..)) => {
+                    parsed += 1;
+                    entry.0 += 1;
+                    if c.label() != label {
+                        bad.push(format!("{name}: {key} reprints as {}", c.label()));
+                    }
+                    let partitioned = matches!(c.engine, GridEngine::SverifyP | GridEngine::ExploreP);
+                    if partitioned {
+                        new_engines += 1;
+                        if !name.starts_with("sverify-p-i4/") {
+                            bad.push(format!("{name}: an I4 engine outside I4's store: {key}"));
+                        }
+                    } else if (c.threads, c.flush_entries, c.phase_peaks) != (1, 4096, false) {
+                        bad.push(format!("{name}: {key}: the new fields not at their defaults"));
+                    }
+                }
+                None => {
+                    refused += 1;
+                    entry.1 += 1;
+                    if label.starts_with("SverifyP/") || label.starts_with("ExploreP/") {
+                        bad.push(format!("{name}: an I4 key refused: {key}"));
+                    }
+                }
+            }
+        }
+    }
+    note!(
+        "P41C\tstores {}\tkeys parsed {parsed}\trefused (legacy formats) {refused}\tI4 engines {new_engines}",
+        files.len()
+    );
+    for (s, (a, b)) in &per_store {
+        note!("P41C\t{s}\tparsed {a}\trefused {b}");
+    }
+    assert!(files.len() >= 5 && parsed > 1000, "conformance: non-vacuity: {} files, {parsed} keys", files.len());
+    assert!(bad.is_empty(), "conformance: I4-1 (c): {bad:#?}");
+}
+
+/// I4-2 (a): every column either new arm pushes is declared (a missing name is dropped silently by
+/// the store's layout).
+#[test]
+fn i4_2_a_every_pushed_column_is_declared() {
+    let _g = serial();
+    let f = fx("apps/a3/never-grant/spec/k2q2");
+    let h: BTreeSet<&str> = header().into_iter().collect();
+    let mut bad = Vec::new();
+    for c in [
+        GridConfig::new(GridEngine::SverifyP).threads(2).impl_distinct(true),
+        GridConfig::new(GridEngine::ExploreP).threads(2),
+    ] {
+        let r = i4_run(&f, &c);
+        for (k, _) in row_of(&r) {
+            if !h.contains(k) {
+                bad.push(format!("{:?}: {k}", c.engine));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "conformance: I4-2 (a): {bad:#?}");
+}
+
+/// I4-2 (b): the row is the outcome, column by column, on the five size-2 cells at t = 1 and 4
+/// (the derivation's two tables), and the comparable columns equal the stateful row's on the same
+/// cell.
+#[test]
+fn i4_2_b_the_row_is_the_outcome_and_the_comparable_columns_the_stateful_rows() {
+    let _g = serial();
+    let mut bad = Vec::new();
+    for name in SIZE2_CELLS {
+        let f = fx(name);
+        let s = i4_cells(&i4_run(&f, &GridConfig::new(GridEngine::Stateful)));
+        for t in [1, 4] {
+            let r = i4_run(&f, &GridConfig::new(GridEngine::SverifyP).threads(t));
+            let m = i4_cells(&r);
+            let GridRaw::SverifyP(run) = &r.raw else { unreachable!() };
+            let (o, c) = (&run.outcome, &run.outcome.counters);
+            let ss = c.spec_set;
+            let tag = format!("{name} t{t}");
+            let mut want: Vec<(&str, String)> = vec![
+                ("reports", c.reports.to_string()),
+                ("spec_graphs", c.spec_graphs.to_string()),
+                ("impl_graphs", c.impl_graphs.to_string()),
+                ("orders_held", c.orders_held.to_string()),
+                ("signatures", c.signatures.to_string()),
+                ("lookups", c.lookups.to_string()),
+                ("lookups_signature_miss", c.lookups_signature_miss.to_string()),
+                ("lookups_succeeded", c.lookups_succeeded.to_string()),
+                ("lookups_failed_after_tests", c.lookups_failed_after_tests.to_string()),
+                ("lookups_containment_tested", c.lookups_containment_tested.to_string()),
+                ("executions", o.executions.to_string()),
+                ("entries", ss.entries.to_string()),
+                ("buckets", ss.buckets.to_string()),
+                ("bucket_max", ss.slot_max.to_string()),
+                ("admitted", ss.admitted.to_string()),
+                ("summary_bytes", ss.summary_bytes.to_string()),
+                ("sig_bytes_est", ss.sig_bytes_est.to_string()),
+                ("signatures_seen", ss.signatures_seen.to_string()),
+                ("sig_aliases", ss.sig_aliases.to_string()),
+                ("duplicates", (c.spec_worker_duplicates + c.spec_merge_duplicates).to_string()),
+                ("sig_tests", (ss.sig_tests + c.sig_tests).to_string()),
+                ("containment_tests", c.containment_tests.to_string()),
+                ("coordinates_compared", c.coordinates_compared.to_string()),
+                ("exact_hits", c.exact_hits.to_string()),
+                ("index_kind", "set".to_owned()),
+                ("threads", t.to_string()),
+                ("flush_entries", "4096".to_owned()),
+                ("iterations_until_split", f.config.iterations_until_split.to_string()),
+                ("warmup", f.config.warmup.to_string()),
+                ("state_batch_size", f.config.state_batch_size.to_string()),
+                ("freeze_wall_time_ms", c.freeze_wall_time_ms.to_string()),
+                ("spec_complete", c.spec_complete.to_string()),
+                ("spec_blocked", c.spec_blocked.to_string()),
+                ("impl_complete", c.impl_complete.to_string()),
+                ("impl_blocked", c.impl_blocked.to_string()),
+                ("spec_tasks", c.spec_tasks.to_string()),
+                ("impl_tasks", c.impl_tasks.to_string()),
+                ("spec_flushes", c.spec_flushes.to_string()),
+                ("impl_flushes", c.impl_flushes.to_string()),
+                ("spec_flush_entries", c.spec_flush_entries.to_string()),
+                ("spec_worker_duplicates", c.spec_worker_duplicates.to_string()),
+                ("spec_merge_duplicates", c.spec_merge_duplicates.to_string()),
+                ("uncovered_distinct", c.uncovered_distinct.to_string()),
+                ("uncovered_multiplicity", c.uncovered_multiplicity.to_string()),
+                ("stopped_early", "false".to_owned()),
+                ("spawned_at_stop", "0".to_owned()),
+                ("phase_peaks", "process".to_owned()),
+                ("spec_vmhwm_kb", String::new()),
+                ("freeze_vmhwm_kb", String::new()),
+                ("impl_vmhwm_kb", String::new()),
+                ("impl_distinct_summaries", String::new()),
+                ("verdict", "Conforms".to_owned()),
+                ("spec_end", format!("{:?}", o.spec_end)),
+                ("impl_end", format!("{:?}", o.impl_end)),
+            ];
+            want.push(("spec_wall_time_ms", c.spec_wall_time_ms.to_string()));
+            for (k, v) in want {
+                if m.get(k) != Some(&v) {
+                    bad.push(format!("{tag}: {k} = {:?}, the outcome {v:?}", m.get(k)));
+                }
+            }
+            if i4_opt(&m, "vm_peak_kb").is_none_or(|v| v == 0 || v > 10_000_000) {
+                bad.push(format!("{tag}: vm_peak_kb {:?}", m.get("vm_peak_kb")));
+            }
+            for k in [
+                "spec_graphs", "impl_graphs", "orders_held", "signatures", "lookups",
+                "lookups_signature_miss", "lookups_succeeded", "lookups_failed_after_tests",
+                "lookups_containment_tested", "reports", "counter_reports", "executions", "entries",
+                "buckets", "bucket_max", "admitted", "duplicates", "summary_bytes", "sig_bytes_est",
+                "signatures_seen", "sig_aliases", "exact_hits", "index_kind", "antichain_effective",
+                "insert_tests", "impl_distinct_summaries", "spec_end", "impl_end", "spec_errors",
+            ] {
+                if m.get(k) != s.get(k) {
+                    bad.push(format!("{tag}: {k} {:?}, the stateful row {:?}", m.get(k), s.get(k)));
+                }
+            }
+            bad.extend(i4_identities(&m).into_iter().map(|b| format!("{tag}: {b}")));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: I4-2 (b): {bad:#?}");
+}
+
+/// The two-thread specification-error program of I3 test 23, as a fixture.
+fn i4_spec_error_fixture() -> Fixture {
+    let mut f = fx("apps/a1/correct/spec/n2r2");
+    f.name = "i4:spec-error/bag".to_owned();
+    f.specification = prog(|| {
+        let _x = named("x", || {});
+        let _a = named("a", || crate::assert(false));
+    });
+    f.implementation = prog(|| {
+        let _x = named("x", || {});
+        let _a = named("a", || {});
+    });
+    f.visible = vec!["a".to_owned(), "x".to_owned()];
+    f.config = Config::builder().with_cons_type(ConsType::Bag).with_seed(0).build();
+    f
+}
+
+/// I4-6 (a)–(e): one row of each verdict class, the ends, the identities and the first-report
+/// columns, and the class equal to `sverify_p::run`'s (the public verdict) on the same
+/// configuration.
+#[test]
+fn i4_6_the_verdict_classes_the_ends_and_the_identities() {
+    let _g = serial();
+    let mut bad = Vec::new();
+    let cases = [
+        (fx("apps/a1/correct/spec/n2r2"), 4, false, "Conforms"),
+        (fx("apps/a3/never-grant/spec/k2q2"), 4, false, "Reported"),
+        (i4_spec_error_fixture(), 2, false, "Err"),
+        (fx("apps/a1/silent/spec/n2r3"), 4, true, "Reported"),
+    ];
+    for (f, t, stop, class) in cases {
+        let c = GridConfig::new(GridEngine::SverifyP).threads(t).stop(stop);
+        let m = i4_cells(&i4_run(&f, &c));
+        let tag = format!("{} t{t} stop {stop}", f.name);
+        if m["verdict"] != class {
+            bad.push(format!("{tag}: verdict {}", m["verdict"]));
+        }
+        let (i, s) = (Arc::clone(&f.implementation), Arc::clone(&f.specification));
+        let public = match crate::conformance::verify(c.conf_config(&f), move || i(), move || s()) {
+            Ok(ConfVerdict::Conforms(_)) => "Conforms",
+            Ok(ConfVerdict::Reported(_)) => "Reported",
+            Ok(ConfVerdict::Inconclusive(_)) => "Inconclusive",
+            Err(_) => "Err",
+        };
+        if public != class {
+            bad.push(format!("{tag}: the public verdict {public}"));
+        }
+        let want_end = match (class, stop) {
+            ("Err", _) => "Unknown",
+            (_, true) => "StoppedAtFirstReport",
+            _ => "StateSpaceExhausted",
+        };
+        if m["impl_end"] != want_end {
+            bad.push(format!("{tag}: impl_end {}", m["impl_end"]));
+        }
+        if class == "Reported" && !stop && m["reports"] != "8" {
+            bad.push(format!("{tag}: reports {} (the record's 8)", m["reports"]));
+        }
+        if stop && m["stopped_early"] != "true" {
+            bad.push(format!("{tag}: stopped_early {}", m["stopped_early"]));
+        }
+        if class != "Err" {
+            bad.extend(i4_identities(&m).into_iter().map(|b| format!("{tag}: {b}")));
+        } else if m["spec_errors"] == "0" {
+            bad.push(format!("{tag}: no specification error recorded"));
+        }
+        note!(
+            "P46\t{tag}\tverdict {}\treports {}\timpl_end {}\tW {:?}\timpl_wall {}\tspawned_at_stop {}",
+            m["verdict"],
+            m["reports"],
+            m["impl_end"],
+            m.get("wall_ms_at_first_report"),
+            m["impl_wall_time_ms"],
+            m["spawned_at_stop"]
+        );
+    }
+    assert!(bad.is_empty(), "conformance: I4-6: {bad:#?}");
+}
+
+/// I4-4 (a)–(d) on exhaustive pairs (`stop` off), the five size-2 cells at t = 1 and 4: the
+/// baseline's per-side complete/blocked/graphs and task counts equal the sverify-p row's;
+/// `vm_peak_kb` present and within the limit; the peaks off (R1).
+#[test]
+fn i4_4_the_baseline_equals_the_exhaustive_row_per_side() {
+    let _g = serial();
+    let mut bad = Vec::new();
+    for name in SIZE2_CELLS {
+        let f = fx(name);
+        for t in [1, 4] {
+            let p = i4_cells(&i4_run(&f, &GridConfig::new(GridEngine::SverifyP).threads(t)));
+            let b = i4_cells(&i4_run(&f, &GridConfig::new(GridEngine::ExploreP).threads(t)));
+            let tag = format!("{name} t{t}");
+            for k in [
+                "spec_complete", "spec_blocked", "impl_complete", "impl_blocked", "spec_graphs",
+                "impl_graphs", "spec_tasks", "impl_tasks", "threads", "warmup",
+                "iterations_until_split", "state_batch_size",
+            ] {
+                if p.get(k) != b.get(k) {
+                    bad.push(format!("{tag}: {k} {:?}, the baseline {:?}", p.get(k), b.get(k)));
+                }
+            }
+            if i4_opt(&b, "vm_peak_kb").is_none_or(|v| v == 0 || v > 10_000_000) {
+                bad.push(format!("{tag}: the baseline's vm_peak_kb {:?}", b.get("vm_peak_kb")));
+            }
+            if b["phase_peaks"] != "process" || !b["spec_vmhwm_kb"].is_empty() || !b["impl_vmhwm_kb"].is_empty() {
+                bad.push(format!("{tag}: the baseline reset in the suite"));
+            }
+            if b["executions"] != b["impl_graphs"] {
+                bad.push(format!("{tag}: executions {} vs impl_graphs {}", b["executions"], b["impl_graphs"]));
+            }
+            note!(
+                "P44\t{tag}\tspec {}/{}\timpl {}/{}\ttasks {}/{}",
+                b["spec_complete"],
+                b["spec_blocked"],
+                b["impl_complete"],
+                b["impl_blocked"],
+                b["spec_tasks"],
+                b["impl_tasks"]
+            );
+        }
+    }
+    assert!(bad.is_empty(), "conformance: I4-4: {bad:#?}");
+}
+
+/// The text of the item that starts at the line beginning `start` and ends at its closing brace
+/// (the first later line that is exactly `}`), comment lines dropped. Not the next column-0 line:
+/// rustfmt puts a multi-line signature's `) -> T {` at column 0.
+fn i4_item(src: &str, start: &str) -> Option<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let a = lines.iter().position(|l| l.starts_with(start))?;
+    let b = (a + 1..lines.len()).find(|&i| lines[i] == "}")?;
+    Some(
+        lines[a..=b]
+            .iter()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Every `phase(` call's text in `body`, from `phase(` to its matching `)`.
+fn i4_phase_calls(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = body[from..].find("phase(") {
+        let s = from + at;
+        let before = body[..s].chars().last();
+        from = s + "phase(".len();
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            continue;
+        }
+        let mut depth = 0i32;
+        for (i, ch) in body[s..].char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push(body[s..s + i + 1].to_owned());
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The F1 source shape (rev 1.2 I4-9) of an engine source: the failures, empty when the shape holds.
+fn i4_f1_shape(src: &str) -> Vec<String> {
+    let mut bad = Vec::new();
+    let Some(phase) = i4_item(src, "fn phase(") else {
+        return vec!["no `fn phase(` item".to_owned()];
+    };
+    // non-vacuity: the slice is the whole item, not its signature
+    if !phase.contains("-> PhaseResult {") || !phase.contains("verify_partitioned_rayon_with(") {
+        bad.push("the phase slice is not the whole item".to_owned());
+    }
+    let sig = &phase[..phase.find("-> PhaseResult {").unwrap_or(phase.len())];
+    if !sig.contains("started: Instant") {
+        bad.push("(i) `phase` declares no `started: Instant`".to_owned());
+    }
+    if phase.contains("Instant::now()") {
+        bad.push(format!("(ii) `phase` reads {} clock(s) of its own", phase.matches("Instant::now()").count()));
+    }
+    let Some(rw) = i4_item(src, "pub(crate) fn run_with(") else {
+        bad.push("no `run_with` item".to_owned());
+        return bad;
+    };
+    for b in ["let impl_started = Instant::now();", "let spec_started = Instant::now();"] {
+        if rw.matches(b).count() != 1 {
+            bad.push(format!("(iii) `run_with` binds `{b}` {} times", rw.matches(b).count()));
+        }
+    }
+    if rw.contains("impl_started: Instant::now()")
+        || !(rw.contains("impl_started,") || rw.contains("impl_started: impl_started,"))
+    {
+        bad.push("(iii) the `Frozen` literal does not take the `impl_started` binding".to_owned());
+    }
+    let calls = i4_phase_calls(&rw);
+    for (side, binding) in [("\"implementation\"", "impl_started"), ("\"specification\"", "spec_started")] {
+        match calls.iter().find(|c| c.contains(side)) {
+            Some(c) if c.contains(binding) => {}
+            Some(c) => bad.push(format!("(iii) the {side} call passes no `{binding}`: {c}")),
+            None => bad.push(format!("(iii) no {side} `phase(` call")),
+        }
+    }
+    bad
+}
+
+/// I4-9, the F1 pin (rev 1.2): the one-instant shape holds on this tree's engine.
+#[test]
+fn i4_9_f1_the_phase_clock_is_the_callers_instant() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance/sverify_p.rs"),
+    )
+    .unwrap();
+    let bad = i4_f1_shape(&src);
+    assert!(bad.is_empty(), "conformance: I4-9 F1: {bad:#?}");
+}
+
+/// I4-9, the pin's red evidence: the same check on another engine source (`I4_OLD_SVERIFY_P`, I3's
+/// f081e3ca) fails each of (i), (ii) and (iii). Ignored: the file is not part of the tree.
+#[test]
+#[ignore]
+fn i4_9_f1_the_shape_is_red_on_the_two_clock_engine() {
+    let Ok(path) = std::env::var("I4_OLD_SVERIFY_P") else {
+        return;
+    };
+    let bad = i4_f1_shape(&std::fs::read_to_string(path).unwrap());
+    note!("P49\t{bad:?}");
+    for item in ["(i)", "(ii)", "(iii)"] {
+        assert!(bad.iter().any(|b| b.starts_with(item)), "conformance: {item} not red: {bad:#?}");
+    }
+}
+
+/// I4-3 (a), and (b) on two runs with the knob on — ignored, its own process (R1): the reset
+/// drops `VmHWM` after a freed 64 MiB allocation; then a reporting sverify-p run and its baseline
+/// with `phase_peaks` on: each phase peak ≤ `vmhwm_kb_max`, the first-report memory ≥ the
+/// specification phase's peak (R3), the grid's `after` reading ≥ `vmhwm_kb_max` (R4).
+#[test]
+#[ignore]
+fn i4_3_a_the_reset_and_the_peaks() {
+    let Ok(_) = std::env::var("I4_RESET") else {
+        return;
+    };
+    let hwm = crate::conformance::grid::vm_hwm_kb;
+    let h0 = hwm().unwrap();
+    let mut v: Vec<u8> = vec![0; 64 << 20];
+    for i in (0..v.len()).step_by(4096) {
+        v[i] = 1;
+    }
+    let h1 = hwm().unwrap();
+    std::hint::black_box(&v);
+    drop(v);
+    let ok = sverify_p::reset_vm_hwm();
+    let h2 = hwm().unwrap();
+    note!("P43A\tVmHWM before {h0} kB, after touching 64 MiB {h1} kB, after free and reset {h2} kB, reset {ok}");
+    assert!(ok, "conformance: the reset failed");
+    assert!(h1 >= h0 + 60 * 1024, "conformance: non-vacuity: the allocation did not show");
+    assert!(h2 + 32 * 1024 < h1, "conformance: the reset did not drop VmHWM");
+    let mut bad = Vec::new();
+    for (name, engine) in [
+        ("apps/a3/never-grant/spec/k2q2", GridEngine::SverifyP),
+        ("apps/a4/hash/a4a/k3q3m3", GridEngine::SverifyP),
+        ("apps/a4/hash/a4a/k3q3m3", GridEngine::ExploreP),
+    ] {
+        let f = fx(name);
+        let r = i4_run(&f, &GridConfig::new(engine).threads(4).phase_peaks(true));
+        let m = i4_cells(&r);
+        let max = i4_opt(&m, "vmhwm_kb_max").unwrap_or(0);
+        let tag = format!("{name} {engine:?}");
+        if m["phase_peaks"] != "per-phase" {
+            bad.push(format!("{tag}: phase_peaks {}", m["phase_peaks"]));
+        }
+        let phases: &[&str] = if engine == GridEngine::SverifyP {
+            &["spec_vmhwm_kb", "freeze_vmhwm_kb", "impl_vmhwm_kb"]
+        } else {
+            &["spec_vmhwm_kb", "impl_vmhwm_kb"]
+        };
+        for k in phases {
+            match i4_opt(&m, k) {
+                Some(p) if p <= max => {}
+                other => bad.push(format!("{tag}: {k} {other:?} against max {max}")),
+            }
+        }
+        if i4_opt(&m, "vm_hwm_kb_after").is_none_or(|a| a < max) {
+            bad.push(format!("{tag}: vm_hwm_kb_after {:?} < max {max}", m.get("vm_hwm_kb_after")));
+        }
+        if let (Some(h), Some(s)) = (i4_opt(&m, "vmhwm_kb_at_first_report"), i4_opt(&m, "spec_vmhwm_kb")) {
+            if h < s {
+                bad.push(format!("{tag}: first-report memory {h} < the specification's peak {s}"));
+            }
+        }
+        note!(
+            "P43B\t{tag}\tspec {:?}\tfreeze {:?}\timpl {:?}\tmax {max}\tafter {:?}\tat first report {:?}\tvm_peak {:?}",
+            m.get("spec_vmhwm_kb"),
+            m.get("freeze_vmhwm_kb"),
+            m.get("impl_vmhwm_kb"),
+            m.get("vm_hwm_kb_after"),
+            m.get("vmhwm_kb_at_first_report"),
+            m.get("vm_peak_kb")
+        );
+    }
+    assert!(bad.is_empty(), "conformance: I4-3: {bad:#?}");
+}
+
+/// The 52 rows of I4-8 (b): the main matrix (eight fixtures × t ∈ {1, 4, 16} × {sverify-p,
+/// baseline}, `stop` off) and the four diagnostics (A3 never-grant k2q2 and A1 silent n2r3 at
+/// t = 4, `stop` off and on, sverify-p only).
+fn i4_store_rows() -> Vec<RowSpec> {
+    let row = |fixture: &str, config: GridConfig, variant: &str| RowSpec {
+        fixture: fixture.to_owned(),
+        config,
+        rep: 0,
+        tier: Tier::default_tier(),
+        run_kind: RunKind::Timed,
+        family: "sverify-p-i4".to_owned(),
+        knobs: String::new(),
+        k: [None; 4],
+        variant: variant.to_owned(),
+        twin_key: String::new(),
+        series: None,
+    };
+    let mut rows = Vec::new();
+    let main = SIZE2_CELLS
+        .iter()
+        .copied()
+        .chain(["apps/a3/fifo/spec/k3q3", "2pc/leader/conf/n4", "apps/a4/hash/a4a/k3q3m3"]);
+    for name in main {
+        for t in [1, 4, 16] {
+            rows.push(row(name, GridConfig::new(GridEngine::SverifyP).threads(t), "conforming"));
+            rows.push(row(name, GridConfig::new(GridEngine::ExploreP).threads(t), "baseline"));
+        }
+    }
+    for name in ["apps/a3/never-grant/spec/k2q2", "apps/a1/silent/spec/n2r3"] {
+        for stop in [false, true] {
+            rows.push(row(
+                name,
+                GridConfig::new(GridEngine::SverifyP).threads(4).stop(stop),
+                "violating",
+            ));
+        }
+    }
+    rows
+}
+
+/// I4-8 (b): the store, through the driver (one child process per row, the driver's own
+/// sampling, censoring and record) — ignored; `I4_STORE` the output directory. The git probe is
+/// replaced: the lead copy is not a repository; the commit column names the build instead.
+#[test]
+#[ignore]
+fn i4_8_b_the_store() {
+    let Ok(out) = std::env::var("I4_STORE") else {
+        return;
+    };
+    let rows = i4_store_rows();
+    assert_eq!(rows.len(), 52);
+    let spec = Spec {
+        name: "SVERIFY-P-I4".to_owned(),
+        rows,
+    };
+    let mut probes = Probes::real();
+    let commit = std::env::var("I4_COMMIT").unwrap_or_else(|_| "unknown".to_owned());
+    probes.git = Box::new(move || (commit.clone(), false));
+    let d = Driver {
+        spec: spec.clone(),
+        specs: vec![spec],
+        out_dir: std::path::PathBuf::from(out),
+        sample_period: std::time::Duration::from_millis(100),
+        probes,
+        allow_mixed: false,
+        only: std::env::var("EVAL_ONLY").ok(),
+    };
+    match d.run() {
+        Ok(s) => note!(
+            "P48\tran {}\tskipped present {}\tcensored {}\tstore {}",
+            s.ran,
+            s.skipped_present,
+            s.censored,
+            s.store.display()
+        ),
+        Err(e) => panic!("conformance: the driver refused: {}", e.text()),
+    }
+}
+
+/// I4-8 (b)'s checks on the store (`I4_STORE`) — ignored: every row ok and per-phase; the 24
+/// exhaustive pairs with I4-4 (a)–(d) and P0's three splits; every sverify-p row's identities
+/// (I4-6); the four diagnostics' first-report and stop fields; the peaks (I4-3 (b)).
+#[test]
+#[ignore]
+fn i4_8_b_the_store_checks() {
+    let Ok(out) = std::env::var("I4_STORE") else {
+        return;
+    };
+    let rows = read_rows(&std::path::Path::new(&out).join("rows.csv"))
+        .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let mut bad = Vec::new();
+    if rows.len() != 52 {
+        bad.push(format!("{} rows", rows.len()));
+    }
+    let by_key: BTreeMap<String, &BTreeMap<String, String>> =
+        rows.iter().map(|r| (r["key"].clone(), r)).collect();
+    for spec in i4_store_rows() {
+        let key = spec.key("release");
+        let Some(m) = by_key.get(&key) else {
+            bad.push(format!("missing {key}"));
+            continue;
+        };
+        let t = spec.config.threads;
+        let tag = format!("{} {:?} t{t} stop {}", spec.fixture, spec.config.engine, spec.config.stop_at_first_report);
+        if m["end_class"] != "ok" {
+            bad.push(format!("{tag}: end_class {}", m["end_class"]));
+            continue;
+        }
+        if m["phase_peaks"] != "per-phase" {
+            bad.push(format!("{tag}: phase_peaks {}", m["phase_peaks"]));
+        }
+        let max = i4_opt(m, "vmhwm_kb_max").unwrap_or(0);
+        let child = i4_opt(m, "rss_child_hwm_kb").unwrap_or(0);
+        let peaks: &[&str] = if spec.config.engine == GridEngine::SverifyP {
+            &["spec_vmhwm_kb", "freeze_vmhwm_kb", "impl_vmhwm_kb"]
+        } else {
+            &["spec_vmhwm_kb", "impl_vmhwm_kb"]
+        };
+        for k in peaks {
+            if i4_opt(m, k).is_none_or(|p| p > max) {
+                bad.push(format!("{tag}: {k} {:?} against max {max}", m.get(*k)));
+            }
+        }
+        if max > child {
+            bad.push(format!("{tag}: vmhwm_kb_max {max} > rss_child_hwm_kb {child}"));
+        }
+        if i4_opt(m, "vm_peak_kb").is_none_or(|v| v == 0 || v > 10_000_000) {
+            bad.push(format!("{tag}: vm_peak_kb {:?}", m.get("vm_peak_kb")));
+        }
+        if spec.config.engine == GridEngine::ExploreP {
+            continue;
+        }
+        bad.extend(i4_identities(m).into_iter().map(|b| format!("{tag}: {b}")));
+        if let (Some(h), Some(s)) = (i4_opt(m, "vmhwm_kb_at_first_report"), i4_opt(m, "spec_vmhwm_kb")) {
+            if h < s {
+                bad.push(format!("{tag}: first-report memory {h} < the specification's peak {s}"));
+            }
+        }
+        if spec.variant == "violating" {
+            note!(
+                "P48D\t{tag}\tverdict {}\treports {}\tuncovered {}\timpl_graphs {}\timpl_end {}\tW {} ms\tH {} kB\tsum {} ms\tstopped {}\tspawned_at_stop {}\timpl_tasks {}\tuncovered_at_stop {}",
+                m["verdict"], m["reports"], m["uncovered_distinct"], m["impl_graphs"], m["impl_end"],
+                m["wall_ms_at_first_report"], m["vmhwm_kb_at_first_report"],
+                i4_num(m, "spec_wall_time_ms") + i4_num(m, "freeze_wall_time_ms") + i4_opt(m, "wall_ms_at_first_report").unwrap_or(0),
+                m["stopped_early"], m["spawned_at_stop"], m["impl_tasks"], m["uncovered_at_stop"]
+            );
+            continue;
+        }
+        // an exhaustive main-matrix row: its pair
+        let pair = RowSpec {
+            config: GridConfig::new(GridEngine::ExploreP).threads(t),
+            variant: "baseline".to_owned(),
+            ..spec.clone()
+        };
+        let Some(b) = by_key.get(&pair.key("release")) else {
+            bad.push(format!("{tag}: no baseline"));
+            continue;
+        };
+        for k in [
+            "spec_complete", "spec_blocked", "impl_complete", "impl_blocked", "spec_graphs",
+            "impl_graphs", "spec_tasks", "impl_tasks",
+        ] {
+            if m.get(k) != b.get(k) {
+                bad.push(format!("{tag}: {k} {:?}, the baseline {:?}", m.get(k), b.get(k)));
+            }
+        }
+        let p0 = match spec.fixture.as_str() {
+            "apps/a3/fifo/spec/k3q3" => Some(("impl", 330_252, 0)),
+            "2pc/leader/conf/n4" => Some(("impl", 1_839_744, 0)),
+            "apps/a4/hash/a4a/k3q3m3" => Some(("spec", 0, 45_360)),
+            _ => None,
+        };
+        if let Some((side, c, bl)) = p0 {
+            let got = (i4_num(b, &format!("{side}_complete")), i4_num(b, &format!("{side}_blocked")));
+            if got != (c, bl) {
+                bad.push(format!("{tag}: the baseline's {side} {got:?}, P0's {:?}", (c, bl)));
+            }
+        }
+        if m["verdict"] != "Conforms" || m["reports"] != "0" {
+            bad.push(format!("{tag}: verdict {} reports {}", m["verdict"], m["reports"]));
+        }
+        note!(
+            "P48P\t{tag}\tspec {}/{} impl {}/{}\ttasks {}/{}\twall spec {} freeze {} impl {} | base {} {}\tpeaks spec {} freeze {} impl {} max {} | base {} {} {}\tvm_peak {} | {}\tchild {} | {}",
+            m["spec_complete"], m["spec_blocked"], m["impl_complete"], m["impl_blocked"],
+            m["spec_tasks"], m["impl_tasks"],
+            m["spec_wall_time_ms"], m["freeze_wall_time_ms"], m["impl_wall_time_ms"],
+            b["spec_wall_time_ms"], b["impl_wall_time_ms"],
+            m["spec_vmhwm_kb"], m["freeze_vmhwm_kb"], m["impl_vmhwm_kb"], m["vmhwm_kb_max"],
+            b["spec_vmhwm_kb"], b["impl_vmhwm_kb"], b["vmhwm_kb_max"],
+            m["vm_peak_kb"], b["vm_peak_kb"], m["rss_child_hwm_kb"], b["rss_child_hwm_kb"]
+        );
+    }
+    assert!(bad.is_empty(), "conformance: I4-8 (b): {bad:#?}");
+}
+
+/// I4 gate 4 round 01 M1 (I4-3 R5 on both returns of `run_with`): with `phase_peaks` on and every
+/// reset failing (the engine's seam `set_reset_fails_for_test`), the specification-error return and
+/// the normal return both leave `phase_peaks` false and the three phase columns blank, and keep the
+/// process peak (`vmhwm_kb_max` `Some`). Red on a2f124e5 (with the seam): its specification-error
+/// return set `phase_peaks` false but kept `spec_vmhwm_kb`. The knob is on in this test only; with
+/// the seam on nothing is written to `/proc/self/clear_refs` (R1). The seam is process-wide: the
+/// test holds `serial()` and turns it off on every exit.
+#[test]
+fn i4_3_r5_a_failed_reset_blanks_the_phase_columns_on_both_returns() {
+    let _g = serial();
+    struct SeamOff;
+    impl Drop for SeamOff {
+        fn drop(&mut self) {
+            sverify_p::set_reset_fails_for_test(false);
+        }
+    }
+    sverify_p::set_reset_fails_for_test(true);
+    let _off = SeamOff;
+    let mut bad = Vec::new();
+    for (f, error_return) in [(i4_spec_error_fixture(), true), (fx("apps/a2/pb/spec/k2q2"), false)] {
+        let cc = GridConfig::new(GridEngine::SverifyP).threads(2).phase_peaks(true).conf_config(&f);
+        assert!(cc.phase_peaks, "conformance: the knob reaches the engine");
+        let o = sverify_p::run_with(&cc, &f.implementation, &f.specification);
+        let c = &o.counters;
+        // non-vacuity: the two returns
+        let took = !o.spec_errors.is_empty();
+        if took != error_return {
+            bad.push(format!("{}: the specification-error return taken: {took}", f.name));
+        }
+        if c.phase_peaks
+            || c.spec_vmhwm_kb.is_some()
+            || c.freeze_vmhwm_kb.is_some()
+            || c.impl_vmhwm_kb.is_some()
+            || c.vmhwm_kb_max.is_none()
+        {
+            bad.push(format!(
+                "{}: phase_peaks {} spec {:?} freeze {:?} impl {:?} max {:?}",
+                f.name,
+                c.phase_peaks,
+                c.spec_vmhwm_kb,
+                c.freeze_vmhwm_kb,
+                c.impl_vmhwm_kb,
+                c.vmhwm_kb_max
+            ));
+        }
+        note!(
+            "P43R5\t{}\terror return {took}\tphase_peaks {}\tspec {:?}\tfreeze {:?}\timpl {:?}\tmax {:?}",
+            f.name,
+            c.phase_peaks,
+            c.spec_vmhwm_kb,
+            c.freeze_vmhwm_kb,
+            c.impl_vmhwm_kb,
+            c.vmhwm_kb_max
+        );
+    }
+    assert!(bad.is_empty(), "conformance: I4-3 R5: {bad:#?}");
+}

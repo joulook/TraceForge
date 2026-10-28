@@ -386,7 +386,12 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 },
             })
             .collect(),
-        GridRaw::Verdict(_) | GridRaw::Explore(_) => Vec::new(),
+        // `SVERIFY-P` I4: neither the partitioned checker (uncovered summaries,
+        // no report graphs) nor its baseline has a report list.
+        GridRaw::Verdict(_)
+        | GridRaw::Explore(_)
+        | GridRaw::SverifyP(_)
+        | GridRaw::ExploreP(_) => Vec::new(),
     }
 }
 
@@ -402,7 +407,10 @@ fn grid_counter(r: &GridResult) -> Option<usize> {
         GridRaw::CompleteFirst(o) => o.counters.invisible_ops_of_visible_threads,
         GridRaw::Gated(o) => Some(o.counters.invisible_ops_of_visible_threads),
         GridRaw::Verdict(v) => Some(invisible_ops(v)),
-        GridRaw::Explore(_) => {
+        // `SVERIFY-P` I4: both sides in the twin of `Enumerate`, where M8 is off
+        // (`SVERIFY-P` I1): not counted, as the stateful engine.
+        GridRaw::SverifyP(_) => None,
+        GridRaw::Explore(_) | GridRaw::ExploreP(_) => {
             unreachable!("conformance: Explore (plain Must) carries no conformance counters")
         }
     }
@@ -1485,7 +1493,8 @@ fn raw_notes(r: &GridResult) -> Vec<String> {
         GridRaw::Stateful(o) => &o.impl_notes,
         GridRaw::CompleteFirst(o) => &o.impl_notes,
         GridRaw::Gated(o) => &o.impl_notes,
-        GridRaw::Verdict(_) | GridRaw::Explore(_) => return Vec::new(),
+        GridRaw::SverifyP(r) => &r.outcome.impl_notes,
+        GridRaw::Verdict(_) | GridRaw::Explore(_) | GridRaw::ExploreP(_) => return Vec::new(),
     };
     ds.iter()
         .map(|d| format!("{:?}@{}", d.reason, d.thread))

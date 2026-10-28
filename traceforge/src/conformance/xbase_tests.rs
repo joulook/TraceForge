@@ -375,8 +375,10 @@ fn c04_the_header_and_the_stack() {
     // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, 202 columns.
     // COMPACT-INDEX phase 2 re-pin (2026-10-19): schema 5, 208 columns;
     // fix round P3 (`sig_aliases`): 209.
-    assert_eq!(SCHEMA_VERSION, 5, "conformance: schema");
-    assert_eq!(header().len(), 209, "conformance: header width");
+    // SVERIFY-P I4 re-pin (2026-10-28, gate 3, ruling 8): schema 6, the forty columns
+    // after `memo_clears` (249).
+    assert_eq!(SCHEMA_VERSION, 6, "conformance: schema");
+    assert_eq!(header().len(), 249, "conformance: header width");
     for name in [
         "apps/a4/hash/a4a/k2q2m2",
         "2pc/leader/conf/n2",
