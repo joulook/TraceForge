@@ -28,6 +28,7 @@ use std::fmt;
 
 use crate::conformance::config::{Engine, ScopeField, DEFAULT_SEARCH_BUDGET};
 use crate::conformance::ctx::{DiagnosticReason, Gate, ReportKind};
+use crate::conformance::interchange;
 use crate::exec_graph::ExecutionGraph;
 
 // ---------------------------------------------------------------------------
@@ -2997,5 +2998,94 @@ pub(crate) fn build_report_for(
         diagnostics,
         triage: None,
         by_flat_cover: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `J3`: the rendering of the summary interchange (`interchange.rs`) — its
+// errors, the decoded value and the join's report — here, in the one rendering
+// module (S5 criterion 1); the types and their logic stay in `interchange.rs`.
+// ---------------------------------------------------------------------------
+
+impl fmt::Display for interchange::EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            interchange::EncodeError::OutOfRange(v) => {
+                write!(f, "the integer {v} is outside signed 64 bits")
+            }
+        }
+    }
+}
+
+impl fmt::Display for interchange::ExportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use interchange::ExportError as E;
+        match self {
+            E::NotSet => write!(f, "the export runs under `index(Set)` only"),
+            E::Model(c) => write!(f, "the consistency model {c} has no format `model`"),
+            E::Unregistered { type_name } => {
+                write!(f, "a visible value of type `{type_name}` has no registered encoder")
+            }
+            E::Encode(e) => write!(f, "{e}"),
+            E::SpecErrors(n) => write!(f, "the program raised {n} assertion failure(s)"),
+            E::NotReflexive { reports } => {
+                write!(f, "the program checked against itself reported {reports} time(s)")
+            }
+            E::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// A decoded value renders as its canonical bytes (a `Message` needs `Display`
+/// under `print_vals_custom`).
+impl fmt::Display for interchange::DecVal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Display for interchange::JoinError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// One file's header line as `conf-join` prints it.
+fn render_file_head(h: &interchange::FileHead) -> String {
+    format!(
+        "tool={} program={} size={} model={} enumeration={}",
+        h.tool,
+        h.program,
+        h.size,
+        h.model,
+        h.enumeration.name()
+    )
+}
+
+impl interchange::JoinReport {
+    /// `conf-join`'s stdout (J3-3): the two header lines, the verdict with its
+    /// label, the uncovered count, then one `<class> <line>` per uncovered line.
+    pub fn render(&self) -> String {
+        use interchange::{Enumeration, Verdict};
+        use std::fmt::Write as _;
+        let verdict = match self.verdict {
+            Verdict::Conforms => "conforms",
+            Verdict::Violation => "violation",
+            Verdict::NoVerdict => "no verdict",
+        };
+        let label = match self.imp.enumeration {
+            Enumeration::Complete => "",
+            Enumeration::Sampled => " (sampled)",
+            Enumeration::Bounded | Enumeration::Aborted => " (partial)",
+        };
+        let mut out = String::new();
+        let _ = writeln!(out, "spec: {}", render_file_head(&self.spec));
+        let _ = writeln!(out, "impl: {}", render_file_head(&self.imp));
+        let _ = writeln!(out, "verdict: {verdict}{label}");
+        let _ = writeln!(out, "uncovered: {}", self.uncovered.len());
+        for (class, line) in &self.uncovered {
+            let _ = writeln!(out, "{} {line}", class.name());
+        }
+        out
     }
 }

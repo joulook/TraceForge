@@ -205,6 +205,16 @@ impl Sig {
         Self { words, statuses }
     }
 
+    /// `J3` (the reader of `interchange`): the signature from decoded words and
+    /// statuses, with no graph; the caller gives one word and one status per
+    /// declared name.
+    pub(crate) fn from_words(
+        statuses: BTreeMap<String, Status>,
+        words: BTreeMap<String, Vec<Obs>>,
+    ) -> Self {
+        Self { words, statuses }
+    }
+
     pub(crate) fn word(&self, name: &str) -> &[Obs] {
         self.words.get(name).map(Vec::as_slice).unwrap_or(&[])
     }

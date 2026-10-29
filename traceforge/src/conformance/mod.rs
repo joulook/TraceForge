@@ -258,6 +258,7 @@ pub(crate) mod ctx;
 pub(crate) mod diagnose;
 pub(crate) mod flat;
 pub(crate) mod gated;
+pub(crate) mod interchange;
 pub(crate) mod morphism;
 pub(crate) mod obs;
 pub(crate) mod precheck;
@@ -295,6 +296,10 @@ pub(crate) mod witness;
 // - **the report and its parts** — `ConfReport`, `ReportGate`, `ReportCause`,
 //   `Diagnostics`, `UnavailableKind`, `Obligation`, `VisTrace`, `TriageOutcome`,
 //   `ReplaySnapshot`, `ConfExhaustion`, `ConfNote`.
+// - **the join of two summary files** (`J3`) — `conf_join`, `JoinReport`,
+//   `JoinError`: the library half of the `conf-join` command, which as a binary
+//   reaches only `pub` items; the report renders itself and gives the exit
+//   code, and its parts stay crate-internal.
 //
 // What is **not** exported, deliberately: `Gate`, `ReportKind`, `Report`,
 // `ConfCtx`, `Search`, `Cover`, `Wobs`, `Obs`, `Status`, `Offer` and every
@@ -340,6 +345,7 @@ pub use report::{
     StatefulCounters, TriageFailure, TriageOutcome, UnavailableKind, VisTrace,
 };
 pub use selector::{InnerOrder, Selector};
+pub use interchange::{conf_join, JoinError, JoinReport};
 
 use std::sync::Arc;
 
@@ -541,6 +547,9 @@ mod campaign_tests;
 /// P5-X5's tests (tester). **Test-only.**
 #[cfg(test)]
 mod x5_tests;
+/// J3's tests (tester). **Test-only.**
+#[cfg(test)]
+mod interchange_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
 /// truth the differential harness measures the tool against, it is the naive
 /// exponential algorithm the paper's algorithm exists to avoid, and nothing

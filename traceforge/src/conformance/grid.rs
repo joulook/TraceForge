@@ -3571,6 +3571,58 @@ pub(super) enum Msg {
 #[derive(Clone, PartialEq, Debug)]
 pub(super) struct Grant(pub(super) usize, pub(super) usize);
 
+// `J3` (J3-1, ruling 1): the canonical encodings of A3's and A2's visible
+// message types, the only types that implement the encoder; the tags and the
+// field order are JMC's (`plan/jmc-must/log/runs/J4/`), fields in declaration
+// order (`Put { c, k, v }` is `[c, k, v]`).
+use crate::conformance::interchange::{EncVal, EncodeError, Encoders, SummaryEncode};
+
+impl SummaryEncode for Msg {
+    fn encode(&self) -> Result<EncVal, EncodeError> {
+        Ok(match self {
+            Msg::Acq(c) => EncVal::tagged("Acq", vec![EncVal::int(*c)?]),
+            Msg::Rel(c) => EncVal::tagged("Rel", vec![EncVal::int(*c)?]),
+        })
+    }
+}
+
+impl SummaryEncode for Grant {
+    fn encode(&self) -> Result<EncVal, EncodeError> {
+        Ok(EncVal::tagged("Grant", vec![EncVal::int(self.0)?, EncVal::int(self.1)?]))
+    }
+}
+
+impl SummaryEncode for Req {
+    fn encode(&self) -> Result<EncVal, EncodeError> {
+        Ok(match self {
+            Req::Put { c, k, v } => EncVal::tagged(
+                "Put",
+                vec![EncVal::int(*c)?, EncVal::int(*k)?, EncVal::int(*v)?],
+            ),
+            Req::Get { c, k } => EncVal::tagged("Get", vec![EncVal::int(*c)?, EncVal::int(*k)?]),
+        })
+    }
+}
+
+impl SummaryEncode for Rep {
+    fn encode(&self) -> Result<EncVal, EncodeError> {
+        Ok(match self {
+            Rep::Ack => EncVal::tagged("Ack", vec![]),
+            Rep::Val(v) => EncVal::tagged("Val", vec![EncVal::int(*v)?]),
+            Rep::None => EncVal::tagged("None", vec![]),
+        })
+    }
+}
+
+/// `J3`: the registry of the four (J3-1).
+pub(super) fn a3_a2_encoders() -> Encoders {
+    Encoders::new()
+        .register::<Msg>()
+        .register::<Grant>()
+        .register::<Req>()
+        .register::<Rep>()
+}
+
 fn a3_spawn_clients(
     q: usize,
     reply_rx: Vec<crate::channel::Receiver<Grant>>,

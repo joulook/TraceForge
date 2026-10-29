@@ -2292,9 +2292,77 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     );
     // Each block starts at the `// ====` line above its title.
     let block = |a: usize, b: usize| lines[a - 1..b - 1].concat();
+    // J3 (2026-10-29, tester re-pin, gate 3): the lead's one hunk inside the P5-APPS block —
+    // the encoder implementations of A3's and A2's message types and their registry (J3-1),
+    // after `Grant`; undoing it gives back the block (`543b5315…`) and the Q14 prefix
+    // (`4653dceb…`), byte for byte.
+    const J3_HUNKS: [(&str, &str); 1] = [(
+        concat!(
+            "\n",
+            "// `J3` (J3-1, ruling 1): the canonical encodings of A3's and A2's visible\n",
+            "// message types, the only types that implement the encoder; the tags and the\n",
+            "// field order are JMC's (`plan/jmc-must/log/runs/J4/`), fields in declaration\n",
+            "// order (`Put { c, k, v }` is `[c, k, v]`).\n",
+            "use crate::conformance::interchange::{EncVal, EncodeError, Encoders, SummaryEncode};\n",
+            "\n",
+            "impl SummaryEncode for Msg {\n",
+            "    fn encode(&self) -> Result<EncVal, EncodeError> {\n",
+            "        Ok(match self {\n",
+            "            Msg::Acq(c) => EncVal::tagged(\"Acq\", vec![EncVal::int(*c)?]),\n",
+            "            Msg::Rel(c) => EncVal::tagged(\"Rel\", vec![EncVal::int(*c)?]),\n",
+            "        })\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "impl SummaryEncode for Grant {\n",
+            "    fn encode(&self) -> Result<EncVal, EncodeError> {\n",
+            "        Ok(EncVal::tagged(\"Grant\", vec![EncVal::int(self.0)?, EncVal::int(self.1)?]))\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "impl SummaryEncode for Req {\n",
+            "    fn encode(&self) -> Result<EncVal, EncodeError> {\n",
+            "        Ok(match self {\n",
+            "            Req::Put { c, k, v } => EncVal::tagged(\n",
+            "                \"Put\",\n",
+            "                vec![EncVal::int(*c)?, EncVal::int(*k)?, EncVal::int(*v)?],\n",
+            "            ),\n",
+            "            Req::Get { c, k } => EncVal::tagged(\"Get\", vec![EncVal::int(*c)?, EncVal::int(*k)?]),\n",
+            "        })\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "impl SummaryEncode for Rep {\n",
+            "    fn encode(&self) -> Result<EncVal, EncodeError> {\n",
+            "        Ok(match self {\n",
+            "            Rep::Ack => EncVal::tagged(\"Ack\", vec![]),\n",
+            "            Rep::Val(v) => EncVal::tagged(\"Val\", vec![EncVal::int(*v)?]),\n",
+            "            Rep::None => EncVal::tagged(\"None\", vec![]),\n",
+            "        })\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "/// `J3`: the registry of the four (J3-1).\n",
+            "pub(super) fn a3_a2_encoders() -> Encoders {\n",
+            "    Encoders::new()\n",
+            "        .register::<Msg>()\n",
+            "        .register::<Grant>()\n",
+            "        .register::<Req>()\n",
+            "        .register::<Rep>()\n",
+            "}\n",
+            "\n"
+        ),
+        concat!(
+            "\n"
+        ),
+    )];
+    let apps_block = block(apps, synth);
+    assert_eq!(md5_hex(apps_block.as_bytes()), "b1a68c655834f17110c7c8ca4a4dc73f");
+    assert_eq!(apps_block.matches(J3_HUNKS[0].0).count(), 1, "conformance: the J3 hunk");
     assert_eq!(
-        md5_hex(block(apps, synth).as_bytes()),
-        "543b5315f824e994d3e86fff058db0cf"
+        md5_hex(apps_block.replace(J3_HUNKS[0].0, J3_HUNKS[0].1).as_bytes()),
+        "543b5315f824e994d3e86fff058db0cf",
+        "conformance: the P5-APPS block without J3's hunk"
     );
     assert_eq!(
         md5_hex(lines[synth - 1..camp - 2].concat().as_bytes()),
@@ -2341,10 +2409,12 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // `cac3b127…`, VC-0's split on the CFirstP row); `VC_HUNKS` undo it to `04bcdc02…`.
     // SVERIFY-P V-C Q14 (a) (2026-10-29, tester re-pin): to `4653dceb…` (grid.rs md5
     // `4b3aac66…`); `Q14_HUNKS` undo it to `6615e593…`.
+    // J3 (2026-10-29, tester re-pin, gate 3): to `df1a8cb6…` (grid.rs md5 `66a39607…`);
+    // `J3_HUNKS` undo it to `4653dceb…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "4653dceb140fcdfb15d3ad9c752125ac",
+        "df1a8cb6b4824b92fee5df7c24a8cfb7",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -3727,6 +3797,14 @@ fn explore_p_columns(row: &mut Row, r: &ExplorePRun) {
         ),
     )];
     let mut t = prefix.clone();
+    for (new, old) in J3_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "4653dceb140fcdfb15d3ad9c752125ac",
+        "conformance: the prefix without J3's hunk = the Q14 prefix"
+    );
     for (new, old) in Q14_HUNKS {
         t = undo(t, new, old);
     }
