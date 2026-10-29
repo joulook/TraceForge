@@ -2152,8 +2152,8 @@ fn i4_1_the_labels_round_trip_and_refuse_what_is_not_canonical() {
 
 /// I4-1 (c): every key in every `rows*.csv` under `log/eval/` (the plan's stores) parses and
 /// reprints byte for byte, as before I4: `parse_label` takes its new branch only on a label whose
-/// engine field is `SverifyP` or `ExploreP`, and no store but I4's own holds one; on every other key
-/// the new fields are at their defaults.
+/// engine field is `SverifyP` or `ExploreP`, and only the stores written since I4 (I4's, V-S's two)
+/// hold one; on every other key the new fields are at their defaults.
 #[test]
 fn i4_1_c_every_stored_key_reprints() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plan/traceForge/log/eval");
@@ -2196,8 +2196,11 @@ fn i4_1_c_every_stored_key_reprints() {
                     let partitioned = matches!(c.engine, GridEngine::SverifyP | GridEngine::ExploreP);
                     if partitioned {
                         new_engines += 1;
-                        if !name.starts_with("sverify-p-i4/") {
-                            bad.push(format!("{name}: an I4 engine outside I4's store: {key}"));
+                        // the stores written since I4 (I4's own; V-S's two, tester re-pin
+                        // at V-S gate 3): no earlier store holds an I4 engine's key
+                        let since_i4 = ["sverify-p-i4/", "sverify-p-vs/", "sverify-p-vs-curve/"];
+                        if !since_i4.iter().any(|d| name.starts_with(d)) {
+                            bad.push(format!("{name}: an I4 engine outside the stores since I4: {key}"));
                         }
                     } else if (c.threads, c.flush_entries, c.phase_peaks) != (1, 4096, false) {
                         bad.push(format!("{name}: {key}: the new fields not at their defaults"));
@@ -2906,4 +2909,613 @@ fn i4_3_r5_a_failed_reset_blanks_the_phase_columns_on_both_returns() {
         );
     }
     assert!(bad.is_empty(), "conformance: I4-3 R5: {bad:#?}");
+}
+
+// =========================================================================
+// SVERIFY-P V-S (gate 3, the tester): the parallel stateful engine against the sequential one on
+// the 144-fixture catalogue, and the speed-up curves — criteria `SVERIFY-P-VS.md` rev 1.2 and
+// `log/dev/SVERIFY-P.derived-vs.md` (efb90b18). The references are MIN-ENGINES §4's package
+// (`log/dev/MIN-ENGINES.validation/`, made on `c884d2e`), read by extracting its record tarballs into
+// `TMPDIR` through `tar`; nothing sequential is re-run (ruling 3).
+// =========================================================================
+
+/// The catalogue's twelve fixtures beyond the pilot (§4's C1), the four `e1:*` last.
+const VS_EXTRA: [&str; 12] = [
+    "2pc/leader/conf/n2",
+    "2pc/leader/conf/n3",
+    "apps/a1/correct/spec/n3r3",
+    "apps/a2/pb/spec/k2q2",
+    "apps/a2/pb/spec/k3q3",
+    "apps/a3/fifo/spec/k3q3",
+    "apps/a4/hash/a4a/k2q2m2",
+    "apps/a4/hash/a4a/k3q3m3",
+    "e1:chain/bag",
+    "e1:nested4/self",
+    "e1:race-bad/bag",
+    "e1:race/bag",
+];
+
+/// The 144 catalogue fixtures: the pilot, then the twelve.
+fn vs_catalogue() -> Vec<&'static str> {
+    PILOT_NAMES.iter().copied().chain(VS_EXTRA).collect()
+}
+
+/// One fixture's record from the package.
+#[derive(Clone, Debug, Default)]
+struct VsRecord {
+    verdict: String,
+    reports: u128,
+    spec_graphs: u128,
+    impl_graphs: u128,
+    /// (side, execs, block), plain Must (`E1P`).
+    spec_split: (u128, u128),
+    impl_split: (u128, u128),
+    /// The distinct `(Sig, counts)` per side (`E1E`).
+    spec_distinct: u128,
+    impl_distinct: u128,
+    /// SVerify-S's lookup classes (`E1S`): succeeded, failed after tests, signature miss.
+    lookups: (u128, u128, u128),
+    /// The uncovered summaries of SVerify-S on `Set` (`UNCSET`), with multiplicities.
+    uncovered: BTreeMap<(String, String), usize>,
+    /// `E9 … e9s Set … first some|none`.
+    first_some: Option<bool>,
+}
+
+/// The package's records, keyed by fixture name: `part1-rerun.tar.gz` and `part1-aux.tar.gz`
+/// extracted into a fresh directory under `TMPDIR` through `tar` (ruling 10), read, and left there.
+fn vs_records() -> BTreeMap<String, VsRecord> {
+    let pkg = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plan/traceForge/log/dev/MIN-ENGINES.validation");
+    let tmp = std::env::var("TMPDIR").expect("conformance: V-S reads the package under TMPDIR");
+    let dir = std::path::Path::new(&tmp).join(format!("vs-package-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("conformance: the extraction directory");
+    for t in ["part1-rerun.tar.gz", "part1-aux.tar.gz"] {
+        let st = std::process::Command::new("tar")
+            .arg("xzf")
+            .arg(pkg.join(t))
+            .arg("-C")
+            .arg(&dir)
+            .status()
+            .expect("conformance: tar");
+        assert!(st.success(), "conformance: tar xzf {t}");
+    }
+    let field = |p: &[&str], i: usize| -> u128 {
+        p[i].split(' ').nth(1).unwrap_or_else(|| panic!("conformance: field {i} of {p:?}")).parse().unwrap()
+    };
+    let mut out: BTreeMap<String, VsRecord> = BTreeMap::new();
+    for sub in ["rerun", "aux"] {
+        for e in std::fs::read_dir(dir.join(sub)).expect("conformance: the extracted records") {
+            let text = std::fs::read_to_string(e.unwrap().path()).unwrap();
+            let mut name = String::new();
+            let mut unc: Vec<(String, String)> = Vec::new();
+            for l in text.lines() {
+                let p: Vec<&str> = l.split('\t').collect();
+                if p.len() > 1 && p[0].starts_with("E") {
+                    name = p[1].to_owned();
+                }
+                let r = out.entry(name.clone()).or_default();
+                match p[0] {
+                    "E1T" => {
+                        r.verdict = p[3].split(' ').nth(1).unwrap().to_owned();
+                        r.reports = field(&p, 4);
+                        r.spec_graphs = field(&p, 5);
+                        r.impl_graphs = field(&p, 6);
+                    }
+                    "E1P" => {
+                        let v = (field(&p, 3), field(&p, 4));
+                        if p[2] == "specification" {
+                            r.spec_split = v;
+                        } else {
+                            r.impl_split = v;
+                        }
+                    }
+                    "E1E" => {
+                        if p[3] == "specification" {
+                            r.spec_distinct = field(&p, 5);
+                        } else {
+                            r.impl_distinct = field(&p, 5);
+                        }
+                    }
+                    "E1S" => {
+                        let l3: Vec<u128> =
+                            p[7].split(' ').nth(1).unwrap().split('/').map(|x| x.parse().unwrap()).collect();
+                        r.lookups = (l3[0], l3[1], l3[2]);
+                    }
+                    "E9" if p[3] == "e9s" && p[4] == "Set" => {
+                        r.first_some = Some(p[6] == "first some");
+                    }
+                    "UNCSET" => unc.push((p[1].to_owned(), p[2].to_owned())),
+                    _ => {}
+                }
+            }
+            if sub == "rerun" {
+                // `UNCSET` lines precede the file's `E1T` line: keyed by the file's fixture.
+                let r = out.get_mut(&name).unwrap();
+                for k in unc {
+                    *r.uncovered.entry(k).or_default() += 1;
+                }
+            }
+        }
+    }
+    out.remove("");
+    out
+}
+
+/// SVerify-P's uncovered summaries as the record writes them: `Sig` Debug, the counts comma-joined.
+fn vs_uncovered(o: &SverifyPOutcome) -> BTreeMap<(String, String), usize> {
+    o.counters
+        .uncovered
+        .iter()
+        .map(|u| {
+            let c = u.counts();
+            let inner = c
+                .trim_start_matches("U8(")
+                .trim_start_matches("U16(")
+                .trim_start_matches('[')
+                .trim_end_matches(')')
+                .trim_end_matches(']');
+            let counts = inner.split(", ").collect::<Vec<_>>().join(",");
+            ((u.signature().to_owned(), counts), u.multiplicity())
+        })
+        .collect()
+}
+
+/// V-S1's checks of one sverify-p row (store cells or an in-process row) against its record: the
+/// failures, one per column.
+fn vs_row_checks(m: &BTreeMap<String, String>, r: &VsRecord) -> Vec<(&'static str, String)> {
+    let mut bad: Vec<(&'static str, String)> = Vec::new();
+    let mut eq = |col: &'static str, got: u128, want: u128| {
+        if got != want {
+            bad.push((col, format!("{got} vs the record's {want}")));
+        }
+    };
+    eq("reports", i4_num(m, "reports"), r.reports);
+    eq("uncovered_multiplicity", i4_num(m, "uncovered_multiplicity"), r.reports);
+    eq("spec_graphs", i4_num(m, "spec_graphs"), r.spec_graphs);
+    eq("impl_graphs", i4_num(m, "impl_graphs"), r.impl_graphs);
+    eq("spec_complete", i4_num(m, "spec_complete"), r.spec_split.0);
+    eq("spec_blocked", i4_num(m, "spec_blocked"), r.spec_split.1);
+    eq("impl_complete", i4_num(m, "impl_complete"), r.impl_split.0);
+    eq("impl_blocked", i4_num(m, "impl_blocked"), r.impl_split.1);
+    eq("orders_held", i4_num(m, "orders_held"), r.spec_distinct);
+    eq(
+        "impl_distinct_summaries",
+        i4_opt(m, "impl_distinct_summaries").unwrap_or(u128::MAX),
+        r.impl_distinct,
+    );
+    eq("lookups_succeeded", i4_num(m, "lookups_succeeded"), r.lookups.0);
+    eq("lookups_failed_after_tests", i4_num(m, "lookups_failed_after_tests"), r.lookups.1);
+    eq("lookups_signature_miss", i4_num(m, "lookups_signature_miss"), r.lookups.2);
+    let want = if r.verdict == "conforms" { "Conforms" } else { "Reported" };
+    if m["verdict"] != want {
+        bad.push(("verdict", format!("{} vs the record's {}", m["verdict"], r.verdict)));
+    }
+    let some = i4_opt(m, "wall_ms_at_first_report").is_some();
+    if Some(some) != r.first_some || i4_opt(m, "vmhwm_kb_at_first_report").is_some() != some {
+        bad.push(("first_report", format!("{some} vs the record's {:?}", r.first_some)));
+    }
+    for (b, _) in i4_identities(m).into_iter().map(|b| (b, ())) {
+        bad.push(("identities", b));
+    }
+    // V-S gate 4 round 01 M1: VS-1's two search ends (`end_class == "ok"` says only that the child
+    // completed)
+    for col in ["spec_end", "impl_end"] {
+        if m.get(col).map(String::as_str) != Some("StateSpaceExhausted") {
+            bad.push((col, format!("{:?}, not StateSpaceExhausted", m.get(col))));
+        }
+    }
+    bad
+}
+
+/// V-S's store rows by part: `catalogue` (140 × t ∈ {1, 4, 16}, `distinct=on`), `curves` (lock
+/// k3q3 and leader n4 × t ∈ {1, 2, 4, 8, 16} × {SverifyP, ExploreP}, `distinct` off), `k4q4` (lock
+/// k4q4 × t ∈ {1, 16} × both, `distinct` off, the tier `k4q4-16g`: 3 600 s / 16 000 000 kB).
+fn vs_store_rows(part: &str) -> Vec<RowSpec> {
+    let row = |fixture: &str, config: GridConfig, tier: Tier, variant: &str| RowSpec {
+        fixture: fixture.to_owned(),
+        config,
+        rep: 0,
+        tier,
+        run_kind: RunKind::Timed,
+        family: "sverify-p-vs".to_owned(),
+        knobs: String::new(),
+        k: [None; 4],
+        variant: variant.to_owned(),
+        twin_key: String::new(),
+        series: None,
+    };
+    let mut rows = Vec::new();
+    match part {
+        "catalogue" => {
+            for name in vs_catalogue().into_iter().filter(|n| !n.starts_with("e1:")) {
+                for t in [1, 4, 16] {
+                    let c = GridConfig::new(GridEngine::SverifyP).threads(t).impl_distinct(true);
+                    rows.push(row(name, c, Tier::default_tier(), "catalogue"));
+                }
+            }
+        }
+        "curves" => {
+            for name in ["apps/a3/fifo/spec/k3q3", "2pc/leader/conf/n4"] {
+                for t in [1, 2, 4, 8, 16] {
+                    for e in [GridEngine::SverifyP, GridEngine::ExploreP] {
+                        rows.push(row(name, GridConfig::new(e).threads(t), Tier::default_tier(), "curve"));
+                    }
+                }
+            }
+        }
+        "k4q4" => {
+            let tier = Tier {
+                name: "k4q4-16g".to_owned(),
+                wall: std::time::Duration::from_secs(3600),
+                mem_kb: 16_000_000,
+            };
+            for t in [1, 16] {
+                for e in [GridEngine::SverifyP, GridEngine::ExploreP] {
+                    rows.push(row("apps/a3/fifo/spec/k4q4", GridConfig::new(e).threads(t), tier.clone(), "k4q4"));
+                }
+            }
+        }
+        other => panic!("conformance: VS_PART {other}: catalogue | curves | k4q4"),
+    }
+    rows
+}
+
+/// `Max address space` from `/proc/self/limits`, in bytes (`None` = unlimited).
+fn vs_address_limit() -> Option<u64> {
+    let t = std::fs::read_to_string("/proc/self/limits").expect("conformance: /proc/self/limits");
+    let l = t.lines().find(|l| l.starts_with("Max address space")).expect("conformance: the limit");
+    l.split_whitespace().nth(3).and_then(|v| v.parse().ok())
+}
+
+/// The 1-minute load average (`/proc/loadavg`'s first field).
+fn vs_load_1m() -> f64 {
+    std::fs::read_to_string("/proc/loadavg")
+        .expect("conformance: /proc/loadavg")
+        .split_whitespace()
+        .next()
+        .and_then(|v| v.parse().ok())
+        .expect("conformance: the load average")
+}
+
+/// Every other process above 2 GiB resident, and every `java`, `javac`, `gradle`, `cargo` or `rustc`
+/// process, as `(pid, name, kB)`: a scan of `/proc/<pid>/status` (`Name`, `VmRSS`), never a pattern
+/// match on command lines.
+fn vs_heavy_processes() -> Vec<(u32, String, u64)> {
+    let me = std::process::id();
+    let mut out = Vec::new();
+    for e in std::fs::read_dir("/proc").expect("conformance: /proc").flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(st) = std::fs::read_to_string(e.path().join("status")) else {
+            continue;
+        };
+        let name = st.lines().find_map(|l| l.strip_prefix("Name:")).unwrap_or("").trim().to_owned();
+        let rss: u64 = st
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        // above 2 GiB resident, or a foreign build or benchmark (the coordinator's gate of
+        // 10:4x: no `java`, `gradle` or other session's `cargo` while a timed part runs)
+        let foreign = matches!(name.as_str(), "java" | "javac" | "gradle" | "cargo" | "rustc");
+        if rss > 2 * 1024 * 1024 || foreign {
+            out.push((pid, name, rss));
+        }
+    }
+    out
+}
+
+/// V-S's store (VS-1, VS-2), through the driver: `VS_PART` = `catalogue` (420 rows, spec
+/// `SVERIFY-P-VS`), `curves` (20) or `k4q4` (4, the tier `k4q4-16g`), the last two spec
+/// `SVERIFY-P-VS-CURVE` into their own store (the coordinator's decision of 10:3x); `VS_STORE` the
+/// store directory; `VS_COMMIT` the commit column. The part refuses to start under the other parts'
+/// address-space limit: `k4q4` only under 16 384 000 000 B (`ulimit -v 16000000`), the others only
+/// under 10 240 000 000 B (ruling 9). A timed part (`curves`, `k4q4`) starts only after a minute of
+/// 1-minute load averages under 2 (read every 5 s, recorded) with no `java`, `javac`, `gradle`,
+/// `cargo` or `rustc` process and none above 2 GiB, and runs its rows one driver run each, every
+/// row only when that process check holds again (the load recorded beside it); a failed check stops
+/// the part before that row, and a re-run resumes at the first row the store lacks.
+#[test]
+#[ignore]
+fn vs_the_store() {
+    let (Ok(out), Ok(part)) = (std::env::var("VS_STORE"), std::env::var("VS_PART")) else {
+        return;
+    };
+    let want = if part == "k4q4" { 16_384_000_000 } else { 10_240_000_000 };
+    let got = vs_address_limit();
+    assert_eq!(got, Some(want), "conformance: VS_PART {part} runs only under its address-space limit");
+    let rows = vs_store_rows(&part);
+    note!("PVS\tpart {part}\trows {}\taddress limit {got:?}", rows.len());
+    let timed = part != "catalogue";
+    let spec = Spec {
+        name: if timed { "SVERIFY-P-VS-CURVE" } else { "SVERIFY-P-VS" }.to_owned(),
+        rows: rows.clone(),
+    };
+    let commit = std::env::var("VS_COMMIT").ok();
+    let driver = |only: Option<String>| {
+        let mut probes = Probes::real();
+        if let Some(c) = commit.clone() {
+            probes.git = Box::new(move || (c.clone(), false));
+        }
+        Driver {
+            spec: spec.clone(),
+            specs: vec![spec.clone()],
+            out_dir: std::path::PathBuf::from(&out),
+            sample_period: std::time::Duration::from_millis(100),
+            probes,
+            allow_mixed: false,
+            only,
+        }
+    };
+    let report = |d: &Driver| match d.run() {
+        Ok(s) => note!(
+            "PVS\tran {}\tskipped present {}\tcensored {}\tstore {}",
+            s.ran,
+            s.skipped_present,
+            s.censored,
+            s.store.display()
+        ),
+        Err(e) => panic!("conformance: the driver refused: {}", e.text()),
+    };
+    if !timed {
+        report(&driver(std::env::var("EVAL_ONLY").ok()));
+        return;
+    }
+    // the quiet minute
+    let mut readings = Vec::new();
+    for i in 0..13 {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+        readings.push(vs_load_1m());
+    }
+    let foreign = vs_heavy_processes();
+    note!("PVSQ\tpart {part}\tthe minute's 1-minute load averages {readings:?}\tforeign or above 2 GiB {foreign:?}");
+    assert!(
+        readings.iter().all(|l| *l < 2.0) && foreign.is_empty(),
+        "conformance: VS_PART {part}: the machine is not quiet: {readings:?} {foreign:?}"
+    );
+    for r in &rows {
+        let key = r.key(crate::conformance::eval::profile_name());
+        let (load, heavy) = (vs_load_1m(), vs_heavy_processes());
+        // The load average lags: before a row it still carries this part's previous rows (a
+        // 16-thread row leaves it near 10 for a minute), so it is recorded, not gated; the gate
+        // before each row is the foreign processes and the 2 GiB rule (the first run of 10:46
+        // stopped on its own rows' load at the eighth row).
+        note!("PVSQ\t{key}\tload {load}\tforeign or above 2 GiB {heavy:?}");
+        assert!(
+            heavy.is_empty(),
+            "conformance: VS_PART {part}: not quiet before {key}: {heavy:?}"
+        );
+        report(&driver(Some(key)));
+    }
+}
+
+/// VS-1's checks on the store's catalogue rows (`VS_STORE`): every column of V-S1 against the
+/// record, I4-6's identities; the result per column class (equal / unequal / censored rows); the
+/// curves' and the k4q4 rows' tables. Ignored.
+#[test]
+#[ignore]
+fn vs_the_store_checks() {
+    let Ok(out) = std::env::var("VS_STORE") else {
+        return;
+    };
+    let parts = std::env::var("VS_PARTS").unwrap_or_else(|_| "catalogue,curves,k4q4".to_owned());
+    let rec = vs_records();
+    let rows = read_rows(&std::path::Path::new(&out).join("rows.csv"))
+        .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let by_key: BTreeMap<String, &BTreeMap<String, String>> =
+        rows.iter().map(|r| (r["key"].clone(), r)).collect();
+    let mut bad = Vec::new();
+    // the catalogue
+    let mut classes: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+    let (mut ok_rows, mut censored, mut missing) = (0, Vec::new(), Vec::new());
+    let catalogue = if parts.contains("catalogue") { vs_store_rows("catalogue") } else { Vec::new() };
+    // V-S gate 4 round 01 (the sweep): every part counts the expected keys it examined
+    let catalogue_expected = catalogue.len();
+    for spec in catalogue {
+        let key = spec.key("release");
+        let Some(m) = by_key.get(&key) else {
+            missing.push(key);
+            continue;
+        };
+        if m["end_class"] != "ok" {
+            censored.push(format!("{} t{}: {}", spec.fixture, spec.config.threads, m["end_class"]));
+            continue;
+        }
+        ok_rows += 1;
+        let r = rec.get(&spec.fixture).unwrap_or_else(|| panic!("conformance: no record for {}", spec.fixture));
+        let fails = vs_row_checks(m, r);
+        for col in [
+            "verdict", "reports", "uncovered_multiplicity", "spec_graphs", "impl_graphs",
+            "spec_complete", "spec_blocked", "impl_complete", "impl_blocked", "orders_held",
+            "impl_distinct_summaries", "lookups_succeeded", "lookups_failed_after_tests",
+            "lookups_signature_miss", "first_report", "identities", "spec_end", "impl_end",
+        ] {
+            let e = classes.entry(col).or_default();
+            if fails.iter().any(|(c, _)| *c == col) {
+                e.1 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        for (c, w) in fails {
+            bad.push(format!("{} t{}: {c}: {w}", spec.fixture, spec.config.threads));
+        }
+    }
+    note!("PVSC\tcatalogue rows ok {ok_rows}\tcensored {}\tmissing {}", censored.len(), missing.len());
+    if parts.contains("catalogue") {
+        assert_eq!(catalogue_expected, 420, "conformance: the catalogue's expected rows");
+    }
+    for (c, (e, u)) in &classes {
+        note!("PVSC\t{c}\tequal {e}\tunequal {u}");
+    }
+    for c in &censored {
+        note!("PVSC\tcensored\t{c}");
+    }
+    // the curves
+    let curves = if parts.contains("curves") { vs_store_rows("curves") } else { Vec::new() };
+    let mut walls: BTreeMap<(String, String, usize), (u128, u128, u128)> = BTreeMap::new();
+    let curves_expected = curves.len();
+    // the four complete/blocked columns of each completed curve row, by (fixture, engine, t)
+    let mut splits: BTreeMap<(String, String, usize), [u128; 4]> = BTreeMap::new();
+    for spec in curves {
+        let Some(m) = by_key.get(&spec.key("release")) else {
+            missing.push(spec.key("release"));
+            continue;
+        };
+        if m["end_class"] != "ok" {
+            bad.push(format!("curve {} {:?} t{}: {}", spec.fixture, spec.config.engine, spec.config.threads, m["end_class"]));
+            continue;
+        }
+        if spec.config.engine == GridEngine::SverifyP {
+            bad.extend(i4_identities(m).into_iter().map(|b| format!("curve {} t{}: {b}", spec.fixture, spec.config.threads)));
+            // V-S gate 4 round 01 (the sweep): a completed SverifyP curve row's two ends (the
+            // baseline's row carries none: Must alone has no search end in the row)
+            for col in ["spec_end", "impl_end"] {
+                if m.get(col).map(String::as_str) != Some("StateSpaceExhausted") {
+                    bad.push(format!("curve {} t{}: {col} {:?}", spec.fixture, spec.config.threads, m.get(col)));
+                }
+            }
+        }
+        splits.insert(
+            (spec.fixture.clone(), format!("{:?}", spec.config.engine), spec.config.threads),
+            ["spec_complete", "spec_blocked", "impl_complete", "impl_blocked"].map(|c| i4_num(m, c)),
+        );
+        walls.insert(
+            (spec.fixture.clone(), format!("{:?}", spec.config.engine), spec.config.threads),
+            (i4_num(m, "spec_wall_time_ms"), i4_num(m, "impl_wall_time_ms"), i4_num(m, "wall_ms")),
+        );
+        note!(
+            "PVSK\t{}\t{:?}\tt {}\tspec {}\tfreeze {}\timpl {}\twall {}\tspec/impl c/b {}/{} {}/{}\ttasks {}/{}\tlock held {}/{} wait {}/{}\tpeaks {} {} {} max {}\tvm_peak {}",
+            spec.fixture, spec.config.engine, spec.config.threads,
+            m["spec_wall_time_ms"], m.get("freeze_wall_time_ms").map(String::as_str).unwrap_or(""),
+            m["impl_wall_time_ms"], m["wall_ms"],
+            m["spec_complete"], m["spec_blocked"], m["impl_complete"], m["impl_blocked"],
+            m["spec_tasks"], m["impl_tasks"],
+            m.get("spec_merge_lock_held_ms").map(String::as_str).unwrap_or(""),
+            m.get("impl_merge_lock_held_ms").map(String::as_str).unwrap_or(""),
+            m.get("spec_merge_lock_wait_ms").map(String::as_str).unwrap_or(""),
+            m.get("impl_merge_lock_wait_ms").map(String::as_str).unwrap_or(""),
+            m["spec_vmhwm_kb"], m.get("freeze_vmhwm_kb").map(String::as_str).unwrap_or(""),
+            m["impl_vmhwm_kb"], m["vmhwm_kb_max"], m["vm_peak_kb"]
+        );
+    }
+    // the baseline enumerates the graphs SverifyP enumerates, per side (I4-4): its split equals
+    // the SverifyP row's at the same fixture and t
+    for ((f, e, t), s) in &splits {
+        if e == "ExploreP" {
+            match splits.get(&(f.clone(), "SverifyP".to_owned(), *t)) {
+                Some(sp) if sp == s => {}
+                other => bad.push(format!("curve {f} t{t}: the baseline's split {s:?} vs SverifyP's {other:?}")),
+            }
+        }
+    }
+    if parts.contains("curves") {
+        assert_eq!(curves_expected, 20, "conformance: the curves' expected rows");
+    }
+    for ((f, e, t), (sw, iw, w)) in &walls {
+        if let Some((s1, i1, w1)) = walls.get(&(f.clone(), e.clone(), 1)) {
+            let r = |a: &u128, b: &u128| if *b == 0 { f64::NAN } else { *a as f64 / *b as f64 };
+            note!(
+                "PVSS\t{f}\t{e}\tt {t}\tspec {sw} ms (×{:.2})\timpl {iw} ms (×{:.2})\twall {w} ms (×{:.2})",
+                r(s1, sw),
+                r(i1, iw),
+                r(w1, w)
+            );
+        }
+    }
+    // the k4q4 rows (present only after part 3)
+    let k4 = if parts.contains("k4q4") { vs_store_rows("k4q4") } else { Vec::new() };
+    let mut k4_examined = 0;
+    for spec in k4 {
+        // V-S gate 4 round 01 M2: an absent k4q4 key is missing, never skipped
+        let Some(m) = by_key.get(&spec.key("release")) else {
+            missing.push(spec.key("release"));
+            continue;
+        };
+        k4_examined += 1;
+        let class = m["end_class"].clone();
+        let stderr = std::fs::read_to_string(std::path::Path::new(&out).join(&m["run_dir"]).join("stderr"))
+            .unwrap_or_default();
+        let alloc = stderr.lines().find(|l| l.contains("memory allocation of")).unwrap_or("");
+        let outcome = match class.as_str() {
+            "ok" => "completed".to_owned(),
+            "capped_wall" | "capped_memory" => format!("{class} (not checkable)"),
+            c if c.starts_with("crashed") && !alloc.is_empty() => format!("allocation abort, memory-censored: {alloc}"),
+            c => {
+                bad.push(format!("k4q4 {:?} t{}: {c}", spec.config.engine, spec.config.threads));
+                format!("{c} (a failure)")
+            }
+        };
+        note!(
+            "PVS4\t{:?}\tt {}\toutcome {outcome}\tproc_wall_ms {}\trss_sampled_hwm_kb {} (a lower bound)\trss_child_hwm_kb {}",
+            spec.config.engine, spec.config.threads, m["proc_wall_ms"], m["rss_sampled_hwm_kb"], m["rss_child_hwm_kb"]
+        );
+    }
+    note!("PVSC\tk4q4 rows examined {k4_examined}\tmissing in all {}", missing.len());
+    assert!(missing.is_empty(), "conformance: rows missing from the store: {missing:#?}");
+    if parts.contains("k4q4") {
+        assert_eq!(k4_examined, 4, "conformance: V-S gate 4 round 01 M2: exactly the four k4q4 rows");
+    }
+    assert!(bad.is_empty(), "conformance: V-S store: {bad:#?}");
+}
+
+/// VS-1 in process, one process per thread count (`VS_T`): the four `e1:*` fixtures (ruling 2) as
+/// store rows would be (`run_grid`, `distinct=on`), every V-S1 column against the record; and the
+/// uncovered multiset of every violating catalogue fixture against
+/// the record's `UNCSET` lines (the 55 include `e1:race-bad/bag`). Ignored.
+#[test]
+#[ignore]
+fn vs_in_process_e1_rows_and_the_uncovered_multisets() {
+    let Ok(t) = std::env::var("VS_T") else {
+        return;
+    };
+    let t: usize = t.parse().expect("conformance: VS_T is a number");
+    let _g = serial();
+    let rec = vs_records();
+    assert_eq!(rec.len(), 144, "conformance: the package's 144 records");
+    let mut bad = Vec::new();
+    // V-S gate 4 round 01 (the sweep): exactly the four `e1:*` fixtures
+    assert_eq!(VS_EXTRA.iter().filter(|n| n.starts_with("e1:")).count(), 4, "conformance: the e1 fixtures");
+    for name in VS_EXTRA.iter().filter(|n| n.starts_with("e1:")) {
+        let f = crate::conformance::compact_tests::e1_fixture(name);
+        let r = i4_run(&f, &GridConfig::new(GridEngine::SverifyP).threads(t).impl_distinct(true));
+        let m = i4_cells(&r);
+        for (c, w) in vs_row_checks(&m, &rec[*name]) {
+            bad.push(format!("{name} t{t}: {c}: {w}"));
+        }
+        note!("PVSE\t{name}\tt {t}\tverdict {}\treports {}\tspec {}\timpl {}", m["verdict"], m["reports"], m["spec_graphs"], m["impl_graphs"]);
+    }
+    let (mut fixtures, mut lines) = (0, 0usize);
+    for name in vs_catalogue() {
+        let r = &rec[name];
+        if r.verdict != "reported" {
+            continue;
+        }
+        let f = if name.starts_with("e1:") {
+            crate::conformance::compact_tests::e1_fixture(name)
+        } else {
+            fx(name)
+        };
+        let cc = GridConfig::new(GridEngine::SverifyP).threads(t).conf_config(&f);
+        let o = sverify_p::run_with(&cc, &f.implementation, &f.specification);
+        let got = vs_uncovered(&o);
+        fixtures += 1;
+        lines += r.uncovered.values().sum::<usize>();
+        if got != r.uncovered {
+            let only_p: Vec<_> = got.iter().filter(|(k, v)| r.uncovered.get(*k) != Some(*v)).take(2).collect();
+            let only_r: Vec<_> = r.uncovered.iter().filter(|(k, v)| got.get(*k) != Some(*v)).take(2).collect();
+            bad.push(format!("{name} t{t}: the uncovered multiset differs: SVerify-P {only_p:?} … the record {only_r:?}"));
+        }
+    }
+    note!("PVSU\tt {t}\tviolating fixtures {fixtures}\tuncovered lines {lines}");
+    assert!(bad.is_empty(), "conformance: V-S in process: {bad:#?}");
+    // non-vacuity: the catalogue's 55 violating fixtures (`e1:race-bad/bag` among them), 3 353 lines
+    assert_eq!((fixtures, lines), (55, 3353), "conformance: non-vacuity");
 }

@@ -3079,7 +3079,7 @@ fn i1_sverify_s_uncovered_multiset() {
 /// `e1:…`, on `Bag` as their corpora run them.
 /// The record's fixture by name: the four `e1:` nested pairs, else the
 /// catalogue's.
-fn e1_fixture(name: &str) -> Fixture {
+pub(super) fn e1_fixture(name: &str) -> Fixture {
     match name {
         "e1:nested4/self" => {
             let p = crate::conformance::stateful_tests::nested4;
