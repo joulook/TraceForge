@@ -192,6 +192,20 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 site: format!("{site:?}"),
             })
             .collect(),
+        // `SVERIFY-P` P-S (tester, gate 3): the parallel stateless checker keeps
+        // its reports' graphs as `all_reports` rules (every one on, one off).
+        GridRaw::CFirstP(r) => r
+            .outcome
+            .reports
+            .iter()
+            .map(|(g, s)| Rep {
+                graph: g,
+                tag: ReportTag::CompleteCoverage,
+                cause: Cause::NoCover,
+                serialized: serialized(s),
+                site: "Completion".to_owned(),
+            })
+            .collect(),
         // `SVERIFY-P` I4: neither the partitioned checker (uncovered summaries,
         // no report graphs) nor its baseline has a report list.
         GridRaw::Verdict(_)
@@ -207,10 +221,12 @@ fn kept_impl(r: &GridResult) -> &[ExecutionGraph] {
         GridRaw::Stateful(o) => &o.kept_impl_graphs,
         GridRaw::CompleteFirst(o) => &o.kept_impl_graphs,
         GridRaw::Gated(o) => &o.kept_impl_graphs,
+        // `SVERIFY-P` P-S (tester, gate 3): no outer graph is kept beyond the reports.
         GridRaw::Enumerator(_)
         | GridRaw::Verdict(_)
         | GridRaw::Explore(_)
         | GridRaw::SverifyP(_)
+        | GridRaw::CFirstP(_)
         | GridRaw::ExploreP(_) => &[],
     }
 }
@@ -266,6 +282,16 @@ fn status(r: &GridResult) -> Status {
             end: r.outcome.impl_end,
             failure: (!r.outcome.spec_errors.is_empty())
                 .then(|| format!("{:?}", r.outcome.spec_errors)),
+        },
+        // `SVERIFY-P` P-S (tester, gate 3): the parallel stateless checker's status
+        // from its raw outcome (reports = its count; the kept graphs follow
+        // `all_reports`).
+        GridRaw::CFirstP(r) => Status {
+            reports: r.outcome.counters.base.reports,
+            exhaustions: 0,
+            end: r.outcome.impl_end,
+            failure: (r.outcome.aborted || !r.outcome.spec_errors.is_empty())
+                .then(|| format!("aborted={} {:?}", r.outcome.aborted, r.outcome.spec_errors)),
         },
         GridRaw::ExploreP(_) => Status {
             reports: 0,
@@ -2967,6 +2993,8 @@ fn inner_work(r: &GridResult) -> Option<usize> {
         ),
         // `SVERIFY-P` I4: the partitioned checker enumerates the specification once.
         GridRaw::SverifyP(r) => Some(r.outcome.counters.spec_graphs),
+        // `SVERIFY-P` P-S (tester, gate 3): the swept graphs, as complete-first.
+        GridRaw::CFirstP(r) => Some(r.outcome.counters.base.sweep_graphs),
         GridRaw::Verdict(_) | GridRaw::Explore(_) | GridRaw::ExploreP(_) => None,
     }
 }

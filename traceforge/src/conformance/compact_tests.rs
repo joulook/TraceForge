@@ -4017,7 +4017,12 @@ fn s6_the_set_index_source() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance/compact.rs");
     let text = std::fs::read_to_string(path).expect("conformance: compact.rs");
     let start = text.find("// `SVERIFY-P` I2: the set index").expect("conformance: the I2 block");
+    // `SVERIFY-P` P-S (the tester's re-pin at gate 3): the block ends where the parallel
+    // stateless engine's shared cache begins (its own checks are `sverify_p_tests`' P-S ones).
     let block = &text[start..];
+    let block = &block[..block
+        .find("// `SVERIFY-P` P-S (criteria rev 1.4, ruling 2)")
+        .unwrap_or(block.len())];
     let code: Vec<&str> = block.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
     let code = code.join("\n");
     assert!(
@@ -5004,11 +5009,13 @@ fn e1_the_plain_path_builds_no_candidate_vector() {
         .find("pub(crate) fn plain_scheduling(self) -> bool {")
         .expect("conformance: plain_scheduling");
     let body = &ctx[at..at + ctx[at..].find("\n    }\n").expect("conformance: its end")];
-    assert_eq!(body.matches("ConfMode::").count(), 4, "conformance: {body}");
+    // `SVERIFY-P` P-S (the tester's re-pin at gate 3): the twin `CFirstOuterPartitioned`.
+    assert_eq!(body.matches("ConfMode::").count(), 5, "conformance: {body}");
     for m in [
         "ConfMode::Enumerate\n",
         "ConfMode::EnumeratePartitioned",
-        "ConfMode::CFirstOuter",
+        "ConfMode::CFirstOuter\n",
+        "ConfMode::CFirstOuterPartitioned",
         "ConfMode::CFirstSweep",
     ] {
         assert!(body.contains(m), "conformance: {m} in {body}");

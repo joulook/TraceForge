@@ -80,7 +80,10 @@ use crate::conformance::{verify, verify_conformance_with_opts};
 /// flushes and lock timers, the conservation terms, `exact_hits`, the
 /// uncovered counts and the stop fields); the label at the defaults is
 /// unchanged (`LABEL_PIN`); a schema-5 store is refused as any other.
-pub(super) const SCHEMA_VERSION: u32 = 6;
+/// `SVERIFY-P` P-S: schema 7 appends the parallel stateless engine's eleven
+/// columns after `spawned_at_stop`; the label at the defaults is unchanged;
+/// a schema-6 store is refused as any other.
+pub(super) const SCHEMA_VERSION: u32 = 7;
 
 /// `GridConfig::new(GridEngine::Enumerator).label()` at this schema version.
 pub(super) const LABEL_PIN: &str =
@@ -347,6 +350,18 @@ pub(super) const ROW_OF_COLUMNS: &[&str] = &[
     "stopped_early",
     "uncovered_at_stop",
     "spawned_at_stop",
+    // `SVERIFY-P` P-S (schema 7): the parallel stateless engine's own.
+    "redundant_sweeps",
+    "unadmitted_after_cancel",
+    "unprobed_after_cancel",
+    "signature_syncs",
+    "admission_lock_held_ms",
+    "admission_lock_wait_ms",
+    "sweeps_in_warmup",
+    "sweeps_in_root_loop",
+    "sweeps_in_tasks",
+    "sweeps_abandoned",
+    "watch_probes",
 ];
 
 /// The declared header: the runner's columns, then every `row_of` column.
@@ -595,7 +610,10 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     // only), then `threads=<t>`; `ExploreP` is the eleven-field form plus
     // `threads=`. The round trip at the end refuses a non-canonical spelling
     // (`threads=04`, `flush=4096`) as it refuses every other.
-    let partitioned = matches!(p.first().copied(), Some("SverifyP") | Some("ExploreP"));
+    let partitioned = matches!(
+        p.first().copied(),
+        Some("SverifyP") | Some("ExploreP") | Some("CFirstP")
+    );
     let (threads, flush_entries) = if partitioned {
         let flush = match p.last().copied().and_then(|f| f.strip_prefix("flush=")) {
             Some(f) if p[0] == "SverifyP" => {
@@ -670,6 +688,8 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
         GridEngine::Stateful => true,
         // `SVERIFY-P` I4-1: the twin mode is plain-scheduled (I3-2).
         GridEngine::SverifyP => true,
+        // `SVERIFY-P` P-S: likewise.
+        GridEngine::CFirstP => true,
         GridEngine::CompleteFirst => !precheck,
         _ => false,
     };
@@ -717,12 +737,17 @@ pub(super) fn parse_label(label: &str) -> Option<GridConfig> {
     if parsed.index == IndexKind::Set
         && (!matches!(
             parsed.engine,
-            GridEngine::Stateful | GridEngine::CompleteFirst | GridEngine::SverifyP
+            GridEngine::Stateful
+                | GridEngine::CompleteFirst
+                | GridEngine::SverifyP
+                | GridEngine::CFirstP
         ) || parsed.completion_cover == CompletionCover::Flat)
     {
         return None;
     }
-    if parsed.engine == GridEngine::SverifyP && parsed.index != IndexKind::Set {
+    if matches!(parsed.engine, GridEngine::SverifyP | GridEngine::CFirstP)
+        && parsed.index != IndexKind::Set
+    {
         return None;
     }
     // `P5-CFCFG` F4 (gate 4 n1): only `label()`'s own spelling parses — the
@@ -751,6 +776,7 @@ pub(super) fn parse_engine(s: &str) -> Option<GridEngine> {
         "Explore" => GridEngine::Explore,
         "SverifyP" => GridEngine::SverifyP,
         "ExploreP" => GridEngine::ExploreP,
+        "CFirstP" => GridEngine::CFirstP,
         _ => return None,
     })
 }
@@ -1062,6 +1088,15 @@ fn call_with(fixture: &Fixture, config: &GridConfig, keep_graphs: bool) -> GridR
         GridEngine::ExploreP => GridRaw::ExploreP(Box::new(
             crate::conformance::grid::explore_partitioned(fixture, config),
         )),
+        // `SVERIFY-P` P-S: as `call`'s arm.
+        GridEngine::CFirstP => {
+            let cc = config.conf_config(fixture);
+            let outcome = crate::conformance::cfirst_p::run_with(&cc, &imp, &spec);
+            GridRaw::CFirstP(Box::new(crate::conformance::grid::CFirstPRun {
+                outcome,
+                vm_peak_kb: crate::conformance::grid::vm_peak_kb(),
+            }))
+        }
     }
 }
 
@@ -3661,7 +3696,8 @@ fn export_first_report(end: &GridEnd, visible: &[String], dir: &Path) -> Result<
         GridRaw::Verdict(_)
         | GridRaw::Explore(_)
         | GridRaw::SverifyP(_)
-        | GridRaw::ExploreP(_) => None,
+        | GridRaw::ExploreP(_)
+        | GridRaw::CFirstP(_) => None,
     };
     if let Some(v) = v {
         fs::create_dir_all(dir).map_err(|e| Refusal::Io(e.to_string()))?;

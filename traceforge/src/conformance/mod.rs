@@ -251,6 +251,7 @@
 pub(crate) mod canon;
 pub(crate) mod cert;
 pub(crate) mod cfirst;
+pub(crate) mod cfirst_p;
 pub(crate) mod compact;
 pub(crate) mod config;
 pub(crate) mod ctx;
@@ -836,6 +837,11 @@ fn run(
     // check (its specification phase is the §5.4 check); it leaves here.
     if cc.engine == Engine::SverifyP {
         return sverify_p::run(cc, implementation, specification);
+    }
+    // `SVERIFY-P` P-S: the parallel stateless checker — its own sequential
+    // precheck, no inner search, diagnostics or triage; it leaves here.
+    if cc.engine == Engine::CFirstP {
+        return cfirst_p::run(cc, implementation, specification);
     }
     // `P4-CFIRST` C4/C7: its own (unbounded) precheck, no inner search,
     // diagnostics or triage; it leaves here.

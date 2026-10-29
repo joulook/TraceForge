@@ -386,6 +386,20 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 },
             })
             .collect(),
+        // `SVERIFY-P` P-S (tester, gate 3): the parallel stateless checker keeps
+        // its reports' graphs as `all_reports` rules (every one on, one off).
+        GridRaw::CFirstP(r) => r
+            .outcome
+            .reports
+            .iter()
+            .map(|(g, s)| Rep {
+                graph: g,
+                tag: ReportTag::CompleteCoverage,
+                cause: Cause::NoCover,
+                serialized: serialized(s),
+                site: "Completion".to_owned(),
+            })
+            .collect(),
         // `SVERIFY-P` I4: neither the partitioned checker (uncovered summaries,
         // no report graphs) nor its baseline has a report list.
         GridRaw::Verdict(_)
@@ -410,6 +424,9 @@ fn grid_counter(r: &GridResult) -> Option<usize> {
         // `SVERIFY-P` I4: both sides in the twin of `Enumerate`, where M8 is off
         // (`SVERIFY-P` I1): not counted, as the stateful engine.
         GridRaw::SverifyP(_) => None,
+        // `SVERIFY-P` P-S (tester, gate 3): the twin of `CFirstOuter`, where M8 is
+        // off (E3): the record is `None`, as complete-first's.
+        GridRaw::CFirstP(r) => r.outcome.counters.base.invisible_ops_of_visible_threads,
         GridRaw::Explore(_) | GridRaw::ExploreP(_) => {
             unreachable!("conformance: Explore (plain Must) carries no conformance counters")
         }
@@ -1494,6 +1511,7 @@ fn raw_notes(r: &GridResult) -> Vec<String> {
         GridRaw::CompleteFirst(o) => &o.impl_notes,
         GridRaw::Gated(o) => &o.impl_notes,
         GridRaw::SverifyP(r) => &r.outcome.impl_notes,
+        GridRaw::CFirstP(r) => &r.outcome.impl_notes,
         GridRaw::Verdict(_) | GridRaw::Explore(_) | GridRaw::ExploreP(_) => return Vec::new(),
     };
     ds.iter()

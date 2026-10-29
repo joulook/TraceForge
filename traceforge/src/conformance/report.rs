@@ -340,6 +340,12 @@ impl ReportTag {
                  witness did, and an exhaustive unpruned sweep of the specification found \
                  none (lem:sig, thm:cfirst)"
             }
+            // `SVERIFY-P` P-S: the same certificate, the sweep on the worker.
+            (Engine::CFirstP, ReportTag::CompleteCoverage) => {
+                "no graph of the specification covers the reported complete graph: no cached \
+                 witness did, and an exhaustive unpruned sweep of the specification, run on \
+                 the worker that missed, found none (lem:sig, thm:cfirst)"
+            }
             // `P4-GATED` G6; `GrowingExhaustion` (a first-failure gate report)
             // and `VisibleError` (never produced) take the enumerator's text.
             (Engine::Gated, ReportTag::CompleteCoverage) => {
@@ -1072,6 +1078,111 @@ impl fmt::Display for SverifyPCounters {
     }
 }
 
+/// `SVERIFY-P` P-S (PS-4): the parallel stateless checker's counters — the
+/// complete-first record under its sequential meanings (`base`), plus the
+/// partitioned run's own: the tasks, the merged distinct count, the shared
+/// cache's signatures and bytes, the redundant sweeps, the post-cancel
+/// counts, the signature syncs, the admission lock's times, the stop fields,
+/// the uncovered summaries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CFirstPCounters {
+    pub base: CFirstCounters,
+    pub threads: usize,
+    pub tasks: usize,
+    pub tasks_nonempty: usize,
+    pub flushes: usize,
+    /// `Some` iff `impl_distinct` is on: the per-worker sets merged by move.
+    pub impl_distinct_summaries: Option<usize>,
+    pub cache_signatures: usize,
+    pub cache_summary_bytes: usize,
+    /// Sweeps whose re-probe under the admission lock hit (ruling 4).
+    pub redundant_sweeps: usize,
+    /// Successful sweeps not admitted because the token was cancelled
+    /// (ruling 13).
+    pub unadmitted_after_cancel: usize,
+    /// Completions seen after the cancel, counted and not probed (ruling 13).
+    pub unprobed_after_cancel: usize,
+    /// PS-7: where the sweeps fell — the root's warmup (sequential), the
+    /// root's loop, the tasks; their sum is `base.sweeps`.
+    pub sweeps_in_warmup: usize,
+    pub sweeps_in_root_loop: usize,
+    pub sweeps_in_tasks: usize,
+    /// Ruling 21: sweeps abandoned because the cache came to cover their
+    /// summary (in `base.sweeps`; neither admitted nor reported), and the
+    /// watches' re-probes.
+    pub sweeps_abandoned: usize,
+    pub watch_probes: usize,
+    pub signature_syncs: usize,
+    /// `Sig ==` comparisons in the workers' tables.
+    pub sig_tests: usize,
+    pub exact_hits: usize,
+    pub coordinates_compared: usize,
+    pub admission_lock_held_ms: u128,
+    pub admission_lock_wait_ms: u128,
+    pub stopped_early: bool,
+    pub spawned_at_stop: u64,
+    pub uncovered_distinct: usize,
+    pub uncovered_multiplicity: usize,
+    pub uncovered: Vec<UncoveredSummary>,
+}
+
+impl fmt::Display for CFirstPCounters {
+    /// Every field, one per line, `name: value`; the base record through its
+    /// fields, the uncovered summaries by their count.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let b = &self.base;
+        writeln!(f, "impl_graphs: {}", b.impl_graphs)?;
+        writeln!(f, "cache_probes: {}", b.cache_probes)?;
+        writeln!(f, "cache_hits: {}", b.cache_hits)?;
+        writeln!(f, "cache_tests: {}", b.cache_tests)?;
+        writeln!(f, "sweeps: {}", b.sweeps)?;
+        writeln!(f, "sweeps_successful: {}", b.sweeps_successful)?;
+        writeln!(f, "sweeps_failing: {}", b.sweeps_failing)?;
+        writeln!(f, "sweeps_aborted: {}", b.sweeps_aborted)?;
+        writeln!(f, "sweep_sizes: {:?}", b.sweep_sizes)?;
+        writeln!(f, "sweep_graphs: {}", b.sweep_graphs)?;
+        writeln!(f, "sweep_graphs_max: {}", b.sweep_graphs_max)?;
+        writeln!(f, "witnesses: {}", b.witnesses)?;
+        writeln!(f, "witness_duplicates: {}", b.witness_duplicates)?;
+        writeln!(f, "reports: {}", b.reports)?;
+        writeln!(f, "precheck_ran: {}", b.precheck_ran)?;
+        writeln!(f, "precheck_wall_time_ms: {}", b.precheck_wall_time_ms)?;
+        writeln!(f, "outer_wall_time_ms: {}", b.outer_wall_time_ms)?;
+        writeln!(f, "sweep_wall_time_ms: {}", b.sweep_wall_time_ms)?;
+        writeln!(f, "admissions: {}", b.admissions)?;
+        writeln!(f, "evictions: {}", b.evictions)?;
+        writeln!(f, "readmissions: {}", b.readmissions)?;
+        writeln!(f, "wall_ms_at_first_report: {:?}", b.wall_ms_at_first_report)?;
+        writeln!(f, "vmhwm_kb_at_first_report: {:?}", b.vmhwm_kb_at_first_report)?;
+        writeln!(f, "threads: {}", self.threads)?;
+        writeln!(f, "tasks: {}", self.tasks)?;
+        writeln!(f, "tasks_nonempty: {}", self.tasks_nonempty)?;
+        writeln!(f, "flushes: {}", self.flushes)?;
+        writeln!(f, "impl_distinct_summaries: {:?}", self.impl_distinct_summaries)?;
+        writeln!(f, "cache_signatures: {}", self.cache_signatures)?;
+        writeln!(f, "cache_summary_bytes: {}", self.cache_summary_bytes)?;
+        writeln!(f, "redundant_sweeps: {}", self.redundant_sweeps)?;
+        writeln!(f, "unadmitted_after_cancel: {}", self.unadmitted_after_cancel)?;
+        writeln!(f, "unprobed_after_cancel: {}", self.unprobed_after_cancel)?;
+        writeln!(f, "sweeps_in_warmup: {}", self.sweeps_in_warmup)?;
+        writeln!(f, "sweeps_in_root_loop: {}", self.sweeps_in_root_loop)?;
+        writeln!(f, "sweeps_in_tasks: {}", self.sweeps_in_tasks)?;
+        writeln!(f, "sweeps_abandoned: {}", self.sweeps_abandoned)?;
+        writeln!(f, "watch_probes: {}", self.watch_probes)?;
+        writeln!(f, "signature_syncs: {}", self.signature_syncs)?;
+        writeln!(f, "sig_tests: {}", self.sig_tests)?;
+        writeln!(f, "exact_hits: {}", self.exact_hits)?;
+        writeln!(f, "coordinates_compared: {}", self.coordinates_compared)?;
+        writeln!(f, "admission_lock_held_ms: {}", self.admission_lock_held_ms)?;
+        writeln!(f, "admission_lock_wait_ms: {}", self.admission_lock_wait_ms)?;
+        writeln!(f, "stopped_early: {}", self.stopped_early)?;
+        writeln!(f, "spawned_at_stop: {}", self.spawned_at_stop)?;
+        writeln!(f, "uncovered_distinct: {}", self.uncovered_distinct)?;
+        writeln!(f, "uncovered_multiplicity: {}", self.uncovered_multiplicity)?;
+        writeln!(f, "uncovered: {} summaries", self.uncovered.len())
+    }
+}
+
 /// Everything one conformance run produced.
 #[derive(Clone)]
 pub struct ConfOutcome {
@@ -1248,6 +1359,9 @@ pub struct ConfCounters {
     /// (I3-11): every engine builds `ConfCounters` with
     /// `..ConfCounters::default()`.
     pub sverify_p: Option<SverifyPCounters>,
+    /// `SVERIFY-P` P-S (PS-4): the parallel stateless checker's record —
+    /// `Some` iff `engine = CFirstP`; here for the same reason as `sverify_p`.
+    pub cfirst_p: Option<CFirstPCounters>,
 }
 
 /// One `Cover` call's counters (`P4-ENUMERATOR` criterion 13).
@@ -1285,6 +1399,11 @@ impl ConfOutcome {
     /// `SVERIFY-P` I3-8: `Some` iff `engine = SverifyP`.
     pub fn sverify_p_counters(&self) -> Option<&SverifyPCounters> {
         self.counters.sverify_p.as_ref()
+    }
+
+    /// `SVERIFY-P` P-S: `Some` iff `engine = CFirstP`.
+    pub fn cfirst_p_counters(&self) -> Option<&CFirstPCounters> {
+        self.counters.cfirst_p.as_ref()
     }
 
     /// **The random seed this run used** (F61).
@@ -2000,6 +2119,12 @@ impl fmt::Display for Diagnostics {
                 "the complete-first engine computes no inner-search diagnostics; this report \
                  is a failed coverage test at completion (lem:sig)"
             ),
+            // `SVERIFY-P` P-S: the complete-first text.
+            Diagnostics::NotProduced { by: Engine::CFirstP } => write!(
+                f,
+                "the parallel complete-first engine computes no inner-search diagnostics; \
+                 this report is a failed coverage test at completion (lem:sig)"
+            ),
             Diagnostics::NotProduced { by: Engine::Gated } => write!(
                 f,
                 "the gated engine computes no inner-search diagnostics; this report is an \
@@ -2250,6 +2375,15 @@ impl fmt::Display for ConfVerdict {
                          a sweep (thm:gated) \u{2014} and the outer exploration reached the \
                          end of its state space."
                     )?,
+                    // `SVERIFY-P` P-S, line (1).
+                    Engine::CFirstP => writeln!(
+                        f,
+                        "conformance: silence. Every complete graph of the implementation is \
+                         covered by one of the specification \u{2014} by a cached witness or by \
+                         a sweep on the worker that missed (thm:cfirst, the partitioned form) \
+                         \u{2014} and the partitioned outer exploration ran to the end of its \
+                         state space."
+                    )?,
                     // `SVERIFY-P` I3-7, line (1).
                     Engine::SverifyP => writeln!(
                         f,
@@ -2347,6 +2481,15 @@ impl fmt::Display for ConfVerdict {
                             if o.end == SearchEnd::StateSpaceExhausted {
                                 writeln!(f, "{}", if flat { GATED_EXACTLY_THE_SET_FLAT } else { GATED_EXACTLY_THE_SET })?;
                             }
+                        }
+                    }
+                    // `SVERIFY-P` P-S: the complete-first sentences, the
+                    // "exactly" only when the partitioned outer run completed.
+                    Engine::CFirstP => {
+                        writeln!(f, "{CFIRST_EACH_UNCOVERED}")?;
+                        if o.end == SearchEnd::StateSpaceExhausted {
+                            let n = o.cfirst_counters.as_ref().map_or(0, |c| c.reports);
+                            writeln!(f, "There are exactly {n} {CFIRST_EXACTLY_THE_SET}")?;
                         }
                     }
                     // `SVERIFY-P` I3-7: the always-true sentence, then the

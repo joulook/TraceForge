@@ -2335,10 +2335,12 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // (grid.rs md5 `21fdc1cd…`); `E9_HUNKS` undo it to `92d0c443…`.
     // SVERIFY-P I4 (2026-10-28, tester re-pin, gate 3): to `c8f7a859…` (grid.rs
     // md5 `7368b91d…`); `I4_HUNKS` undo it to `23713aaa…`.
+    // SVERIFY-P P-S (2026-10-28, tester re-pin, gate 3): to `04bcdc02…` (grid.rs
+    // md5 `af082a44…`, ruling 21's); `PS_HUNKS` undo it to `c8f7a859…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "c8f7a8599eb09de47c372d3b7bdcd192",
+        "04bcdc02851ca9b2b50049162eb99cd9",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -2916,6 +2918,236 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
             ),
         ),
     ];
+    // SVERIFY-P P-S (2026-10-28, tester re-pin, gate 3): the lead's twelve hunks inside
+    // the prefix (`difflib` against grid.rs `7368b91d…`, each widened by context until
+    // its new text is unique, undone in order); undoing them gives back the I4 prefix,
+    // byte for byte.
+    const PS_HUNKS: [(&str, &str); 12] = [
+        (
+            r##"    ExploreP,
+    /// `SVERIFY-P` P-S: CVerify-P, `cfirst_p::run_with(&cc, impl, spec)`, the
+    /// raw outcome; the label is the complete-first row's `index=set` form
+    /// plus `threads=<t>`.
+    CFirstP,
+}
+"##,
+            r##"    ExploreP,
+}
+"##,
+        ),
+        (
+            r##"                engine,
+                GridEngine::Stateful
+                    | GridEngine::CompleteFirst
+                    | GridEngine::SverifyP
+                    | GridEngine::CFirstP
+            ) {
+"##,
+            r##"                engine,
+                GridEngine::Stateful | GridEngine::CompleteFirst | GridEngine::SverifyP
+            ) {
+"##,
+        ),
+        (
+            r##"            GridEngine::SverifyP => Engine::SverifyP,
+            GridEngine::CFirstP => Engine::CFirstP,
+            // `P5-XBASE` F1: never reached — the `Explore` arms of `call` and
+"##,
+            r##"            GridEngine::SverifyP => Engine::SverifyP,
+            // `P5-XBASE` F1: never reached — the `Explore` arms of `call` and
+"##,
+        ),
+        (
+            r##"            (None, GridEngine::SverifyP) => "Plain".to_owned(),
+            // `SVERIFY-P` P-S: likewise (the precheck is `run`'s, not the grid's).
+            (None, GridEngine::CFirstP) => "Plain".to_owned(),
+            (None, GridEngine::CompleteFirst) if !self.precheck => "Plain".to_owned(),
+"##,
+            r##"            (None, GridEngine::SverifyP) => "Plain".to_owned(),
+            (None, GridEngine::CompleteFirst) if !self.precheck => "Plain".to_owned(),
+"##,
+        ),
+        (
+            r##"                GridEngine::SverifyP => true,
+                GridEngine::CFirstP => true,
+                GridEngine::CompleteFirst => !self.precheck,
+"##,
+            r##"                GridEngine::SverifyP => true,
+                GridEngine::CompleteFirst => !self.precheck,
+"##,
+        ),
+        (
+            r##"            }
+            GridEngine::SverifyP | GridEngine::ExploreP | GridEngine::CFirstP => {
+                format!("{base}/threads={}", self.threads)
+"##,
+            r##"            }
+            GridEngine::SverifyP | GridEngine::ExploreP => {
+                format!("{base}/threads={}", self.threads)
+"##,
+        ),
+        (
+            r##"            || self.engine == GridEngine::SverifyP
+            || self.engine == GridEngine::CFirstP
+            || (self.engine == GridEngine::CompleteFirst
+"##,
+            r##"            || self.engine == GridEngine::SverifyP
+            || (self.engine == GridEngine::CompleteFirst
+"##,
+        ),
+        (
+            r##"    ExploreP(Box<ExplorePRun>),
+    /// `SVERIFY-P` P-S: CVerify-P's raw outcome with `VmPeak` at its end.
+    CFirstP(Box<CFirstPRun>),
+}
+
+/// `SVERIFY-P` P-S: one CVerify-P run as the row sees it.
+pub(super) struct CFirstPRun {
+    pub(super) outcome: crate::conformance::cfirst_p::CFirstPOutcome,
+    pub(super) vm_peak_kb: Option<u64>,
+}
+"##,
+            r##"    ExploreP(Box<ExplorePRun>),
+}
+"##,
+        ),
+        (
+            r##"                .field("spec_end", &r.outcome.spec_end)
+                .field("spec_errors", &r.outcome.spec_errors.len())
+                .finish(),
+            GridRaw::CFirstP(r) => f
+                .debug_struct("CFirstP")
+                .field("reports", &r.outcome.counters.base.reports)
+                .field("impl_end", &r.outcome.impl_end)
+                .field("aborted", &r.outcome.aborted)
+                .field("spec_errors", &r.outcome.spec_errors.len())
+"##,
+            r##"                .field("spec_end", &r.outcome.spec_end)
+                .field("spec_errors", &r.outcome.spec_errors.len())
+"##,
+        ),
+        (
+            r##"        GridEngine::ExploreP => GridRaw::ExploreP(Box::new(explore_partitioned(fixture, config))),
+        // `SVERIFY-P` P-S: the raw outcome, `VmPeak` read at the run's end.
+        GridEngine::CFirstP => {
+            let cc = config.conf_config(fixture);
+            let outcome = crate::conformance::cfirst_p::run_with(&cc, &imp, &spec);
+            GridRaw::CFirstP(Box::new(CFirstPRun {
+                outcome,
+                vm_peak_kb: vm_peak_kb(),
+            }))
+        }
+    }
+"##,
+            r##"        GridEngine::ExploreP => GridRaw::ExploreP(Box::new(explore_partitioned(fixture, config))),
+    }
+"##,
+        ),
+        (
+            r##"        GridRaw::ExploreP(r) => explore_p_columns(&mut row, r),
+        GridRaw::CFirstP(r) => cfirst_p_columns(&mut row, r, &r.outcome.counters.base),
+    }
+"##,
+            r##"        GridRaw::ExploreP(r) => explore_p_columns(&mut row, r),
+    }
+"##,
+        ),
+        (
+            r##"    row
+}
+
+/// `SVERIFY-P` P-S: the CVerify-P row — the verdict by `run`'s rule on the raw
+/// outcome, the complete-first row's columns from the base record under their
+/// sequential meanings, then the partitioned run's own columns.
+fn cfirst_p_columns(row: &mut Row, r: &CFirstPRun, c: &crate::conformance::report::CFirstCounters) {
+    let o = &r.outcome;
+    let p = &o.counters;
+    let class = if !o.spec_errors.is_empty() {
+        "Err"
+    } else if c.reports > 0 {
+        "Reported"
+    } else {
+        "Conforms"
+    };
+    push_d(row, "verdict", class);
+    push_d(row, "reports", c.reports);
+    push(row, "impl_end", o.impl_end);
+    push_d(row, "spec_errors", o.spec_errors.len());
+    push_d(row, "aborted", o.aborted);
+    push_d(row, "impl_notes", o.impl_notes.len());
+    push_d(row, "executions", o.executions);
+    push_opt(row, "max_paper_events", o.max_paper_events);
+    push_d(row, "witness_cache_len", c.witnesses);
+    push_d(row, "sweep_ends", sweep_split_counts(c));
+    push_d(row, "impl_graphs", c.impl_graphs);
+    push_d(row, "cache_probes", c.cache_probes);
+    push_d(row, "cache_hits", c.cache_hits);
+    push_d(row, "cache_tests", c.cache_tests);
+    push_d(row, "sweeps", c.sweeps);
+    push_d(row, "sweeps_successful", c.sweeps_successful);
+    push_d(row, "sweeps_failing", c.sweeps_failing);
+    push_d(row, "sweeps_aborted", c.sweeps_aborted);
+    if r.outcome.counters.base.sweep_sizes.is_empty() {
+        push_d(row, "sweep_sizes", "");
+    } else {
+        push(row, "sweep_sizes", &c.sweep_sizes);
+    }
+    push_d(row, "sweep_graphs", c.sweep_graphs);
+    push_d(row, "sweep_graphs_max", c.sweep_graphs_max);
+    push_d(row, "witnesses", c.witnesses);
+    push_d(row, "admissions", c.admissions);
+    push_d(row, "evictions", c.evictions);
+    push_d(row, "readmissions", c.readmissions);
+    push_opt(row, "wall_ms_at_first_report", c.wall_ms_at_first_report);
+    push_opt(row, "vmhwm_kb_at_first_report", c.vmhwm_kb_at_first_report);
+    push_d(row, "witness_duplicates", c.witness_duplicates);
+    push_d(row, "counter_reports", c.reports);
+    push_d(row, "cut_reports", c.cut_reports);
+    push_d(row, "precheck_ran", c.precheck_ran);
+    push_d(row, "precheck_wall_time_ms", c.precheck_wall_time_ms);
+    push_d(row, "outer_wall_time_ms", c.outer_wall_time_ms);
+    push_d(row, "sweep_wall_time_ms", c.sweep_wall_time_ms);
+    push_d(
+        row,
+        "impl_phase_wall_ms",
+        c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),
+    );
+    push_d(row, "index_kind", "set");
+    push_d(row, "containment_tests", c.cache_tests);
+    push_opt(row, "impl_distinct_summaries", p.impl_distinct_summaries);
+    push_d(row, "signatures", p.cache_signatures);
+    push_d(row, "entries", c.witnesses);
+    push_d(row, "summary_bytes", p.cache_summary_bytes);
+    push_d(row, "sig_tests", p.sig_tests);
+    push_d(row, "coordinates_compared", p.coordinates_compared);
+    push_d(row, "exact_hits", p.exact_hits);
+    push_d(row, "threads", p.threads);
+    push_d(row, "impl_tasks", p.tasks);
+    push_d(row, "impl_tasks_nonempty", p.tasks_nonempty);
+    push_d(row, "impl_flushes", p.flushes);
+    push_d(row, "redundant_sweeps", p.redundant_sweeps);
+    push_d(row, "unadmitted_after_cancel", p.unadmitted_after_cancel);
+    push_d(row, "unprobed_after_cancel", p.unprobed_after_cancel);
+    push_d(row, "sweeps_in_warmup", p.sweeps_in_warmup);
+    push_d(row, "sweeps_in_root_loop", p.sweeps_in_root_loop);
+    push_d(row, "sweeps_in_tasks", p.sweeps_in_tasks);
+    push_d(row, "sweeps_abandoned", p.sweeps_abandoned);
+    push_d(row, "watch_probes", p.watch_probes);
+    push_d(row, "signature_syncs", p.signature_syncs);
+    push_d(row, "admission_lock_held_ms", p.admission_lock_held_ms);
+    push_d(row, "admission_lock_wait_ms", p.admission_lock_wait_ms);
+    push_d(row, "stopped_early", p.stopped_early);
+    push_d(row, "spawned_at_stop", p.spawned_at_stop);
+    push_d(row, "uncovered_distinct", p.uncovered_distinct);
+    push_d(row, "uncovered_multiplicity", p.uncovered_multiplicity);
+    push_opt(row, "vm_peak_kb", r.vm_peak_kb);
+}
+"##,
+            r##"    row
+}
+"##,
+        ),
+    ];
     // SVERIFY-P I4 (2026-10-28, tester re-pin, gate 3): the lead's twenty hunks
     // inside the prefix (`difflib` against grid.rs `21fdc1cd…`, each widened by
     // context until its new text is unique, undone in order); undoing them gives
@@ -3442,6 +3674,14 @@ fn explore_p_columns(row: &mut Row, r: &ExplorePRun) {
         ),
     ];
     let mut t = prefix.clone();
+    for (new, old) in PS_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "c8f7a8599eb09de47c372d3b7bdcd192",
+        "conformance: the prefix without P-S's hunks = the I4 prefix"
+    );
     for (new, old) in I4_HUNKS {
         t = undo(t, new, old);
     }

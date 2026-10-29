@@ -1754,6 +1754,9 @@ fn i3_1_the_two_knobs_are_read_by_the_engine_only() {
         }
     }
     let mut readers: BTreeMap<String, usize> = BTreeMap::new();
+    // `SVERIFY-P` P-S (the tester's re-pin at gate 3): `threads` is read by the parallel
+    // stateless engine too (criteria `SVERIFY-P-PS` PS-1), `flush_entries` by I3's only.
+    let mut by_knob: BTreeMap<(String, &str), usize> = BTreeMap::new();
     for rel in &files {
         for (_, l) in code_lines(rel) {
             for b in ["cc.", "conf_config.", "conf."] {
@@ -1768,6 +1771,7 @@ fn i3_1_the_two_knobs_are_read_by_the_engine_only() {
                         let word_end = after.map_or(true, |c| !(c.is_alphanumeric() || c == '_'));
                         if word_start && word_end {
                             *readers.entry(rel.clone()).or_default() += 1;
+                            *by_knob.entry((rel.clone(), k)).or_default() += 1;
                         }
                         from = end;
                     }
@@ -1777,7 +1781,19 @@ fn i3_1_the_two_knobs_are_read_by_the_engine_only() {
     }
     note!("P11\treaders {readers:?}");
     assert!(readers.get("conformance/sverify_p.rs").is_some_and(|n| *n >= 4), "conformance: non-vacuity");
-    assert_eq!(readers.len(), 1, "conformance: I3-1: readers outside sverify_p.rs: {readers:?}");
+    let files_of = |k: &str| -> Vec<String> {
+        by_knob.keys().filter(|(_, kk)| *kk == k).map(|(f, _)| f.clone()).collect()
+    };
+    assert_eq!(
+        files_of("flush_entries"),
+        vec!["conformance/sverify_p.rs".to_owned()],
+        "conformance: I3-1: flush_entries readers: {by_knob:?}"
+    );
+    assert_eq!(
+        files_of("threads"),
+        vec!["conformance/cfirst_p.rs".to_owned(), "conformance/sverify_p.rs".to_owned()],
+        "conformance: I3-1 / P-S PS-1: threads readers: {by_knob:?}"
+    );
 }
 
 /// I3-2's rows the engine meets by not calling: no `set_cut`, no `set_gate_sink`, no snapshot
@@ -2193,14 +2209,23 @@ fn i4_1_c_every_stored_key_reprints() {
                     if c.label() != label {
                         bad.push(format!("{name}: {key} reprints as {}", c.label()));
                     }
-                    let partitioned = matches!(c.engine, GridEngine::SverifyP | GridEngine::ExploreP);
+                    let partitioned = matches!(
+                        c.engine,
+                        GridEngine::SverifyP | GridEngine::ExploreP | GridEngine::CFirstP
+                    );
                     if partitioned {
                         new_engines += 1;
                         // the stores written since I4 (I4's own; V-S's two, tester re-pin
-                        // at V-S gate 3): no earlier store holds an I4 engine's key
-                        let since_i4 = ["sverify-p-i4/", "sverify-p-vs/", "sverify-p-vs-curve/"];
-                        if !since_i4.iter().any(|d| name.starts_with(d)) {
-                            bad.push(format!("{name}: an I4 engine outside the stores since I4: {key}"));
+                        // at V-S gate 3): no earlier store holds an I4 engine's key; and
+                        // `SVERIFY-P` P-S (tester re-pin at P-S gate 3): `CFirstP` keys (they
+                        // carry `threads=`) in P-S's two stores only
+                        let since: &[&str] = if c.engine == GridEngine::CFirstP {
+                            &["sverify-p-ps/", "sverify-p-ps-margin/", "sverify-p-ps-r21/"]
+                        } else {
+                            &["sverify-p-i4/", "sverify-p-vs/", "sverify-p-vs-curve/"]
+                        };
+                        if !since.iter().any(|d| name.starts_with(d)) {
+                            bad.push(format!("{name}: a partitioned engine outside its stores: {key}"));
                         }
                     } else if (c.threads, c.flush_entries, c.phase_peaks) != (1, 4096, false) {
                         bad.push(format!("{name}: {key}: the new fields not at their defaults"));
@@ -2209,7 +2234,10 @@ fn i4_1_c_every_stored_key_reprints() {
                 None => {
                     refused += 1;
                     entry.1 += 1;
-                    if label.starts_with("SverifyP/") || label.starts_with("ExploreP/") {
+                    if label.starts_with("SverifyP/")
+                        || label.starts_with("ExploreP/")
+                        || label.starts_with("CFirstP/")
+                    {
                         bad.push(format!("{name}: an I4 key refused: {key}"));
                     }
                 }
@@ -3518,4 +3546,2320 @@ fn vs_in_process_e1_rows_and_the_uncovered_multisets() {
     assert!(bad.is_empty(), "conformance: V-S in process: {bad:#?}");
     // non-vacuity: the catalogue's 55 violating fixtures (`e1:race-bad/bag` among them), 3 353 lines
     assert_eq!((fixtures, lines), (55, 3353), "conformance: non-vacuity");
+}
+
+// =========================================================================
+// SVERIFY-P P-S (gate 3, the tester): CVerify-P (`cfirst_p.rs`) against the sequential stateless
+// engine (`cfirst::run_with`) on the same configuration — criteria `SVERIFY-P-PS.md` rev 1.4
+// (7dc97388) and the derivation `log/dev/SVERIFY-P.derived-ps.md` (7bb8a9ce; D1–D7, R1–R9, PS-3's
+// table and identities, PS-5's vacuity). Every engine run takes `SERIAL`: the engine's test counts
+// and gates are process-wide.
+// =========================================================================
+
+use crate::conformance::cfirst::{self, CFirstOutcome};
+use crate::conformance::cfirst_p::{self, CFirstPOutcome};
+use crate::conformance::compact::{
+    Admission, CacheProbe, SharedCache, Watch, WorkerTable, PRE_ADMIT_GATE, PUBLICATION_GATE,
+};
+use crate::conformance::config::{Capacity, CompletionCover};
+use crate::conformance::ctx::Diagnostic;
+use crate::conformance::report::ReplaySnapshot;
+
+/// One CVerify-P configuration.
+#[derive(Clone, Copy, Debug)]
+struct Q {
+    t: usize,
+    w: Capacity,
+    split: usize,
+    stop: bool,
+    /// `impl_distinct` and `all_reports` together (ruling 1: both settings of each).
+    knobs: bool,
+}
+
+impl Q {
+    fn new(t: usize, w: Capacity, split: usize) -> Self {
+        Q { t, w, split, stop: false, knobs: true }
+    }
+}
+
+/// The sequential reference: the stateless engine on `Set` with `impl_distinct`, `all_reports`
+/// and the sweep record on (none changes another counter: they decide what is kept and counted).
+fn ps_seq_cc(f: &Fixture, w: Capacity, stop: bool) -> ConfConfig {
+    let mut cc = x1_config(GridEngine::CompleteFirst, Selector::Ltr)
+        .index(IndexKind::Set)
+        .impl_distinct(true)
+        .witness_cache(w)
+        .stop(stop)
+        .conf_config(f);
+    cc.all_reports = true;
+    cc.sweep_record = true;
+    cc
+}
+
+fn ps_seq(f: &Fixture, w: Capacity, stop: bool) -> CFirstOutcome {
+    cfirst::run_with(&ps_seq_cc(f, w, stop), &f.implementation, &f.specification, false)
+}
+
+fn ps_cc(f: &Fixture, q: &Q) -> ConfConfig {
+    let mut cc = ps_seq_cc(f, q.w, q.stop);
+    cc.engine = Engine::CFirstP;
+    cc.threads = q.t;
+    cc.impl_distinct = q.knobs;
+    cc.all_reports = q.knobs;
+    cc.config.iterations_until_split = q.split;
+    cc.config.warmup = if q.split == 1 { 1 } else { 100 };
+    cc.config.state_batch_size = 1;
+    cc
+}
+
+fn ps_par(f: &Fixture, q: &Q) -> CFirstPOutcome {
+    cfirst_p::run_with(&ps_cc(f, q), &f.implementation, &f.specification)
+}
+
+fn ps_key_of(f: &Fixture, g: &ExecutionGraph) -> Key {
+    let s = CompactSummary::at_completion(g, &f.visible, "implementation");
+    key(&s.sig, &s.ord)
+}
+
+/// A list of report graphs as a multiset of their summaries.
+fn ps_kept(f: &Fixture, reports: &[(ExecutionGraph, ReplaySnapshot)]) -> BTreeMap<Key, usize> {
+    let mut m = BTreeMap::new();
+    for (g, _) in reports {
+        *m.entry(ps_key_of(f, g)).or_default() += 1;
+    }
+    m
+}
+
+/// The sequential engine's reported multiset (every report is kept in the reference).
+fn ps_seq_uncovered(f: &Fixture, o: &CFirstOutcome) -> BTreeMap<Key, usize> {
+    ps_kept(f, &o.reports)
+}
+
+/// CVerify-P's counting set, from the outcome (ruling 1, round 01 M2).
+fn ps_par_uncovered(o: &CFirstPOutcome) -> BTreeMap<Key, usize> {
+    let mut m = BTreeMap::new();
+    for (sig, ord, n) in &o.uncovered {
+        *m.entry(key(sig, ord)).or_default() += *n;
+    }
+    m
+}
+
+fn ps_seq_distinct(o: &CFirstOutcome) -> Option<usize> {
+    o.counters.compact.as_ref().and_then(|c| c.impl_distinct_summaries)
+}
+
+fn ps_sorted(v: &[usize]) -> Vec<usize> {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    v
+}
+
+fn ps_notes(v: &[Diagnostic]) -> BTreeSet<String> {
+    v.iter().map(|d| format!("{:?}@{}@{}", d.reason, d.thread, d.pos)).collect()
+}
+
+/// `a ⊆ b` as multisets.
+fn ps_sub_multiset(a: &BTreeMap<Key, usize>, b: &BTreeMap<Key, usize>) -> bool {
+    a.iter().all(|(k, n)| b.get(k).is_some_and(|m| n <= m))
+}
+
+/// PS-3's identities (ruling 14) and the derived ones, on any run (full, stopped or aborted).
+fn ps_identities(o: &CFirstPOutcome, w: Capacity, t: usize) -> Vec<String> {
+    let (c, b) = (&o.counters, &o.counters.base);
+    let mut bad = Vec::new();
+    let mut eq = |what: &str, x: usize, y: usize| {
+        if x != y {
+            bad.push(format!("{what}: {x} vs {y}"));
+        }
+    };
+    eq(
+        "identity 1: cache_hits + sweeps + unprobed_after_cancel = impl_graphs",
+        b.cache_hits + b.sweeps + c.unprobed_after_cancel,
+        b.impl_graphs,
+    );
+    eq(
+        "identity 2 (rev 1.6): sweeps = sweeps_successful + sweeps_failing + sweeps_aborted + sweeps_abandoned",
+        b.sweeps,
+        b.sweeps_successful + b.sweeps_failing + b.sweeps_aborted + c.sweeps_abandoned,
+    );
+    if w == Capacity::Zero {
+        eq("identity 3 (w=0): admissions", b.admissions, 0);
+        eq("identity 3 (w=0): redundant_sweeps", c.redundant_sweeps, 0);
+        eq("identity 3 (w=0): unadmitted_after_cancel", c.unadmitted_after_cancel, 0);
+        eq("D6: signature_syncs under w=0", c.signature_syncs, 0);
+        eq("D6: the log under w=0", c.cache_signatures, 0);
+    } else {
+        eq(
+            "identity 3: admissions + redundant_sweeps + unadmitted_after_cancel = sweeps_successful",
+            b.admissions + c.redundant_sweeps + c.unadmitted_after_cancel,
+            b.sweeps_successful,
+        );
+    }
+    eq("identity 4: witnesses + evictions = admissions", b.witnesses + b.evictions, b.admissions);
+    eq("identity 5: reports = sweeps_failing", b.reports, b.sweeps_failing);
+    eq(
+        "O-5: sweeps_in_warmup + sweeps_in_root_loop + sweeps_in_tasks = sweeps",
+        c.sweeps_in_warmup + c.sweeps_in_root_loop + c.sweeps_in_tasks,
+        b.sweeps,
+    );
+    eq("Σ uncovered = reports (ruling 1)", c.uncovered_multiplicity, b.reports);
+    eq("Σ the outcome's uncovered", o.uncovered.iter().map(|x| x.2).sum::<usize>(), b.reports);
+    eq("uncovered_distinct", c.uncovered_distinct, o.uncovered.len());
+    eq("cache_probes + unprobed_after_cancel = impl_graphs", b.cache_probes + c.unprobed_after_cancel, b.impl_graphs);
+    eq("witness_duplicates (D1)", b.witness_duplicates, 0);
+    eq("cut_reports", b.cut_reports, 0);
+    eq("threads", c.threads, t);
+    if t == 1 {
+        eq("D5: redundant_sweeps at t = 1", c.redundant_sweeps, 0);
+        eq("D10: sweeps_abandoned at t = 1", c.sweeps_abandoned, 0);
+        eq("D10: watch_probes at t = 1", c.watch_probes, 0);
+    }
+    if w == Capacity::Zero {
+        eq("D11: sweeps_abandoned under w=0", c.sweeps_abandoned, 0);
+        eq("D11: watch_probes under w=0", c.watch_probes, 0);
+    }
+    if c.sweeps_abandoned > c.watch_probes || c.watch_probes > (t - 1) * b.admissions {
+        bad.push(format!(
+            "D11: abandoned {} ≤ watch probes {} ≤ (t − 1) · admissions {}",
+            c.sweeps_abandoned,
+            c.watch_probes,
+            (t - 1) * b.admissions
+        ));
+    }
+    if c.cache_signatures > b.admissions {
+        bad.push(format!("the log ({}) > admissions ({})", c.cache_signatures, b.admissions));
+    }
+    if c.flushes < c.tasks_nonempty {
+        bad.push(format!("flushes {} < non-empty tasks {}", c.flushes, c.tasks_nonempty));
+    }
+    if let Some(w) = b.wall_ms_at_first_report {
+        if w > b.outer_wall_time_ms {
+            bad.push(format!("first report at {w} ms > the outer wall {} ms", b.outer_wall_time_ms));
+        }
+    }
+    bad
+}
+
+/// Ruling 1's equalities on a full run (no stop, no abort), against the reference on the same
+/// configuration, and the identities. Returns the mismatches.
+fn ps_compare(f: &Fixture, s: &CFirstOutcome, o: &CFirstPOutcome, q: &Q) -> Vec<String> {
+    let mut bad = ps_identities(o, q.w, q.t);
+    let (c, b, sc) = (&o.counters, &o.counters.base, &s.counters);
+    macro_rules! eq {
+        ($a:expr, $b:expr, $what:expr) => {
+            if $a != $b {
+                bad.push(format!("{}: {:?} vs {:?}", $what, $a, $b));
+            }
+        };
+    }
+    // a full run
+    eq!(s.aborted, false, "the reference aborted");
+    eq!(o.aborted, false, "aborted");
+    eq!(o.spec_errors.len(), 0, "spec_errors");
+    eq!(o.impl_end, SearchEnd::StateSpaceExhausted, "impl_end");
+    eq!(c.stopped_early, false, "stopped_early");
+    eq!(c.spawned_at_stop, 0, "spawned_at_stop");
+    eq!(c.unprobed_after_cancel, 0, "unprobed_after_cancel");
+    eq!(c.unadmitted_after_cancel, 0, "unadmitted_after_cancel");
+    // the order-independent columns, at every w
+    eq!(b.reports, sc.reports, "reports");
+    let want = ps_seq_uncovered(f, s);
+    eq!(ps_par_uncovered(o), want, "the uncovered multiset");
+    eq!(b.impl_graphs, sc.impl_graphs, "impl_graphs");
+    eq!(b.cache_probes, sc.cache_probes, "cache_probes");
+    eq!(b.sweeps_failing, sc.sweeps_failing, "sweeps_failing");
+    eq!(b.sweeps_aborted, sc.sweeps_aborted, "sweeps_aborted");
+    eq!(o.executions, s.executions, "executions");
+    eq!(b.wall_ms_at_first_report.is_some(), b.reports > 0, "wall_ms_at_first_report Some iff a report");
+    eq!(b.vmhwm_kb_at_first_report.is_some(), b.reports > 0, "vmhwm_kb_at_first_report Some iff a report");
+    eq!(ps_notes(&o.impl_notes), ps_notes(&s.impl_notes), "the notes (as sets)");
+    eq!(o.max_paper_events, None::<usize>, "max_paper_events (the knob off)");
+    // the kept reports (ruling 1, round 01 M2)
+    let kept = ps_kept(f, &o.reports);
+    if q.knobs {
+        eq!(o.reports.len(), b.reports, "all_reports on: every report's graph kept");
+        eq!(kept, ps_par_uncovered(o), "all_reports on: the kept graphs' summaries");
+    } else {
+        eq!(o.reports.len(), b.reports.min(1), "all_reports off: one graph kept");
+        if !kept.keys().all(|k| want.contains_key(k)) {
+            bad.push("all_reports off: the kept graph's summary is not in the reference multiset".to_owned());
+        }
+    }
+    // `impl_distinct_summaries` (rev 1.4; derived: equal at every w on a full run)
+    if q.knobs {
+        eq!(c.impl_distinct_summaries, ps_seq_distinct(s), "impl_distinct_summaries");
+        if c.impl_distinct_summaries.is_none() {
+            bad.push("impl_distinct_summaries None with the knob on".to_owned());
+        }
+    } else {
+        eq!(c.impl_distinct_summaries, None::<usize>, "impl_distinct_summaries with the knob off");
+    }
+    match q.w {
+        Capacity::Zero => {
+            // ruling 1's w=0 list (round 01 m1)
+            eq!(b.cache_hits, 0, "cache_hits (w=0)");
+            eq!(sc.cache_hits, 0, "the reference's cache_hits (w=0)");
+            eq!(b.cache_tests, 0, "cache_tests (w=0)");
+            eq!(sc.cache_tests, 0, "the reference's cache_tests (w=0)");
+            eq!(b.sweeps, sc.sweeps, "sweeps (w=0)");
+            eq!(b.sweeps_successful, sc.sweeps_successful, "sweeps_successful (w=0)");
+            eq!(b.sweep_graphs, sc.sweep_graphs, "sweep_graphs (w=0)");
+            eq!(b.sweep_graphs_max, sc.sweep_graphs_max, "sweep_graphs_max (w=0)");
+            eq!(ps_sorted(&b.sweep_sizes), ps_sorted(&sc.sweep_sizes), "sweep_sizes as a multiset (w=0)");
+            for (what, x, y) in [
+                ("witnesses", b.witnesses, sc.witnesses),
+                ("admissions", b.admissions, sc.admissions),
+                ("evictions", b.evictions, sc.evictions),
+                ("readmissions", b.readmissions, sc.readmissions),
+                ("witness_duplicates", b.witness_duplicates, sc.witness_duplicates),
+            ] {
+                eq!((x, y), (0, 0), format!("{what} (w=0)"));
+            }
+        }
+        Capacity::Unbounded => {
+            eq!((b.evictions, b.readmissions), (0, 0), "evictions, readmissions (w=inf)");
+            eq!((sc.evictions, sc.readmissions), (0, 0), "the reference's evictions (w=inf)");
+        }
+        _ => {}
+    }
+    if !b.sweep_sizes.is_empty() || b.sweeps > 0 {
+        eq!(b.sweep_sizes.len(), b.sweeps, "sweep_sizes' length (the record on)");
+        eq!(b.sweep_sizes.iter().sum::<usize>(), b.sweep_graphs, "Σ sweep_sizes = sweep_graphs");
+    }
+    bad
+}
+
+/// The capacities of ruling 9.
+const PS_W: [Capacity; 3] = [Capacity::Zero, Capacity::Unbounded, Capacity::Bounded(8)];
+
+/// Rulings 1 and 16, through the lead's D-1 hook (`final_cache`): under `w=inf` the final cache
+/// covers exactly the sequential run's non-reported implementation completions (`impl_sums`, every
+/// completion's summary): a completion is covered by a held order of its signature `≤` its own iff
+/// it is not in the reported multiset `reported`. And the cache itself: its held orders are
+/// `witnesses`, every `SigId` indexes the signatures (D7), which are pairwise distinct (D1).
+fn ps_coverage(o: &CFirstPOutcome, impl_sums: &[CompactSummary], reported: &BTreeMap<Key, usize>) -> Vec<String> {
+    let (sigs, held) = &o.final_cache;
+    let mut bad = Vec::new();
+    if held.len() != o.counters.base.witnesses {
+        bad.push(format!("the final cache holds {} orders, witnesses {}", held.len(), o.counters.base.witnesses));
+    }
+    for (i, (_, a)) in sigs.iter().enumerate() {
+        if sigs[i + 1..].iter().any(|(_, b)| b == a) {
+            bad.push(format!("signature {i} published twice"));
+        }
+    }
+    let mut by_sig: BTreeMap<String, Vec<&OrdCounts>> = BTreeMap::new();
+    for (id, _, ord) in held {
+        match sigs.get(*id as usize) {
+            Some((_, s)) => by_sig.entry(format!("{s:?}")).or_default().push(ord),
+            None => bad.push(format!("a held order's SigId {id} beyond the {} signatures", sigs.len())),
+        }
+    }
+    let mut wrong = 0;
+    for c in impl_sums {
+        let k = key(&c.sig, &c.ord);
+        let covered = by_sig.get(&k.0).is_some_and(|v| v.iter().any(|h| h.le(&c.ord)));
+        if covered == reported.contains_key(&k) {
+            wrong += 1;
+            if wrong <= 5 {
+                bad.push(format!("a completion covered {covered}, reported {}", !covered));
+            }
+        }
+    }
+    if wrong > 5 {
+        bad.push(format!("… {wrong} completions in all"));
+    }
+    bad
+}
+
+/// Two small violating corpus fixtures beside the size-2 cells (all five conform: without these
+/// the report rows of ruling 1 — the multiset, the kept graphs, the first report — would be vacuous).
+const PS_VIOLATORS: [&str; 2] = ["apps/a1/silent/spec/n2r2", "apps/a1/early-abort/spec/n2r2"];
+
+/// PS-6 (ruling 9) over `ts` × `splits`: the five size-2 cells, and two small violators for the
+/// report rows, × `w` ∈ {0, inf, 8} × the knobs on and off, each against the sequential engine on
+/// the same configuration: ruling 1's equalities, the identities, the first-report reads (one iff a
+/// report), the restore check (ruling 20: 0 mismatches).
+fn ps_matrix(ts: &[usize], splits: &[usize]) {
+    let mut bad = Vec::new();
+    let (mut runs, mut redundant, mut reports, mut swept) = (0, 0, 0, 0);
+    let (mut abandoned, mut watch_probes) = (0, 0);
+    let mut covered_runs = 0;
+    for name in SIZE2_CELLS.iter().chain(PS_VIOLATORS.iter()) {
+        let f = fx(name);
+        let impl_sums = summaries(&f, "implementation");
+        for w in PS_W {
+            let s = ps_seq(&f, w, false);
+            let reported = ps_seq_uncovered(&f, &s);
+            if impl_sums.len() != s.counters.impl_graphs {
+                bad.push(format!("{name}: {} summaries, {} completions", impl_sums.len(), s.counters.impl_graphs));
+            }
+            for &t in ts {
+                for &split in splits {
+                    for knobs in [true, false] {
+                        cfirst_p::reset_counts_for_test();
+                        let q = Q { knobs, ..Q::new(t, w, split) };
+                        let o = ps_par(&f, &q);
+                        runs += 1;
+                        redundant += o.counters.redundant_sweeps;
+                        abandoned += o.counters.sweeps_abandoned;
+                        watch_probes += o.counters.watch_probes;
+                        reports += o.counters.base.reports;
+                        swept += o.counters.base.sweeps;
+                        let tag = format!("{name} {w:?} t{t} s{split} knobs {knobs}");
+                        bad.extend(ps_compare(&f, &s, &o, &q).into_iter().map(|b| format!("{tag}: {b}")));
+                        if w == Capacity::Unbounded {
+                            covered_runs += 1;
+                            bad.extend(
+                                ps_coverage(&o, &impl_sums, &reported).into_iter().map(|b| format!("{tag}: coverage: {b}")),
+                            );
+                        }
+                        let reads = cfirst_p::first_report_reads_for_test();
+                        if reads != usize::from(o.counters.base.reports > 0) {
+                            bad.push(format!("{tag}: {reads} first-report reads"));
+                        }
+                        let mm = cfirst_p::current_must_mismatches_for_test();
+                        if mm != 0 {
+                            bad.push(format!("{tag}: {mm} current-Must mismatches after a sweep"));
+                        }
+                    }
+                }
+            }
+            note!(
+                "PS6\t{name}\t{w:?}\treports {}\timpl_graphs {}\tsweeps {}\tcache_hits {}",
+                s.counters.reports,
+                s.counters.impl_graphs,
+                s.counters.sweeps,
+                s.counters.cache_hits
+            );
+        }
+    }
+    note!(
+        "PS6\tt {ts:?}\tsplit {splits:?}\truns {runs}\tcoverage checked {covered_runs}\treports {reports}\tsweeps {swept}\tredundant {redundant}\tabandoned {abandoned}\twatch probes {watch_probes}\tmismatches {}",
+        bad.len()
+    );
+    for b in &bad {
+        note!("PS6\tmismatch\t{b}");
+    }
+    assert!(reports > 0 && swept > 0, "conformance: non-vacuity: reports {reports}, sweeps {swept}");
+    assert!(bad.is_empty(), "conformance: PS-6 the size-2 matrix: {} mismatches", bad.len());
+}
+
+/// PS-6 in the suites: t ∈ {1, 16}, the split at every execution (84 runs).
+#[test]
+fn ps_6_the_size2_cells_at_t1_and_t16() {
+    let _g = serial();
+    ps_matrix(&[1, 16], &[1]);
+}
+
+/// PS-6's whole matrix (420 runs: t ∈ {1, 2, 4, 8, 16} × split ∈ {1, 100}); ignored, one process
+/// (69 s in release on 2026-10-28).
+#[test]
+#[ignore]
+fn ps_6_the_size2_cells_over_the_whole_matrix() {
+    let _g = serial();
+    ps_matrix(&[1, 2, 4, 8, 16], &[1, 100]);
+}
+
+/// Ruling 15's stop row on one fixture and thread count; `want` is the full sequential run's
+/// reported multiset.
+fn ps_stop_checks(f: &Fixture, t: usize, want: &BTreeMap<Key, usize>, full_impl_graphs: usize) -> Vec<String> {
+    cfirst_p::reset_counts_for_test();
+    let q = Q { stop: true, ..Q::new(t, Capacity::Unbounded, 1) };
+    let o = ps_par(f, &q);
+    let (c, b) = (&o.counters, &o.counters.base);
+    let tag = format!("{} t{t}", f.name);
+    let mut bad: Vec<String> = ps_identities(&o, q.w, t).into_iter().map(|x| format!("{tag}: {x}")).collect();
+    let got = ps_par_uncovered(&o);
+    if b.reports < 1 || b.reports > t {
+        bad.push(format!("{tag}: {} reports (1 ..= {t})", b.reports));
+    }
+    if !ps_sub_multiset(&got, want) {
+        bad.push(format!("{tag}: the reported summaries are not a sub-multiset of the full run's"));
+    }
+    if o.impl_end != SearchEnd::StoppedAtFirstReport || !c.stopped_early {
+        bad.push(format!("{tag}: impl_end {:?}, stopped_early {}", o.impl_end, c.stopped_early));
+    }
+    if c.spawned_at_stop != c.tasks as u64 - 1 {
+        bad.push(format!("{tag}: spawned_at_stop {}, tasks {}", c.spawned_at_stop, c.tasks));
+    }
+    if b.impl_graphs > full_impl_graphs {
+        bad.push(format!("{tag}: impl_graphs {} > the full run's {full_impl_graphs}", b.impl_graphs));
+    }
+    if cfirst_p::first_report_reads_for_test() != 1 {
+        bad.push(format!("{tag}: {} first-report reads", cfirst_p::first_report_reads_for_test()));
+    }
+    if o.reports.len() != b.reports {
+        bad.push(format!("{tag}: {} kept graphs, {} reports (all_reports on)", o.reports.len(), b.reports));
+    }
+    if b.wall_ms_at_first_report.is_none() || o.aborted {
+        bad.push(format!("{tag}: first report {:?}, aborted {}", b.wall_ms_at_first_report, o.aborted));
+    }
+    if cfirst_p::current_must_mismatches_for_test() != 0 {
+        bad.push(format!("{tag}: current-Must mismatches"));
+    }
+    // the public verdict
+    let cc = ps_cc(f, &q);
+    let (i, s) = (Arc::clone(&f.implementation), Arc::clone(&f.specification));
+    match crate::conformance::verify(cc, move || i(), move || s()) {
+        Ok(ConfVerdict::Reported(_)) => {}
+        other => bad.push(format!("{tag}: the public verdict {other:?}")),
+    }
+    note!(
+        "PS15S\t{tag}\treports {}\tuncovered {}\timpl_graphs {} of {full_impl_graphs}\tunprobed {}\tunadmitted {}\ttasks {}\tspawned_at_stop {}",
+        b.reports,
+        got.len(),
+        b.impl_graphs,
+        c.unprobed_after_cancel,
+        c.unadmitted_after_cancel,
+        c.tasks,
+        c.spawned_at_stop
+    );
+    bad
+}
+
+/// Ruling 15, the stop knob, at t ∈ {1, 2, 16}: on a `late_violation` program whose stop comes after
+/// the split (chosen by a dry run at t = 1, as I3's), and on the two corpus fixtures A1 silent and
+/// early-abort n2r3. The reference multiset: the sequential stateless run on the late program; on
+/// the corpus fixtures SVerify-S's (the sequential stateless run sweeps 1.9–2.1 M graphs there; the
+/// record shows `UNCS = UNC` on every checkable fixture, MIN-ENGINES digest cross-check (b)).
+#[test]
+fn ps_15_the_stop_path() {
+    let _g = serial();
+    let mut bad = Vec::new();
+    // the late program
+    let mut tried = Vec::new();
+    let mut chosen = None;
+    'scan: for (k, recvs) in [(3, 1), (4, 1), (5, 1), (4, 2), (5, 2)] {
+        for badi in 1..k {
+            let f = late_violation(k, badi, recvs);
+            let s = ps_seq(&f, Capacity::Unbounded, false);
+            if s.counters.reports == 0 {
+                continue;
+            }
+            let o = ps_par(&f, &Q { stop: true, ..Q::new(1, Capacity::Unbounded, 1) });
+            tried.push(format!(
+                "{}: spawned_at_stop {}, impl_graphs {} of {}",
+                f.name, o.counters.spawned_at_stop, o.counters.base.impl_graphs, s.counters.impl_graphs
+            ));
+            if o.counters.spawned_at_stop >= 1 && o.counters.base.impl_graphs < s.counters.impl_graphs {
+                chosen = Some((f, s));
+                break 'scan;
+            }
+        }
+    }
+    let Some((f, s)) = chosen else {
+        panic!("conformance: non-vacuity: no late program stops after a spawn: {tried:#?}")
+    };
+    note!("PS15S\tchosen {}\tafter {} candidates", f.name, tried.len());
+    let want = ps_seq_uncovered(&f, &s);
+    for t in [1, 2, 16] {
+        bad.extend(ps_stop_checks(&f, t, &want, s.counters.impl_graphs));
+    }
+    // the two corpus fixtures
+    for name in ["apps/a1/silent/spec/n2r3", "apps/a1/early-abort/spec/n2r3"] {
+        let f = fx(name);
+        let r = seq(&f, false);
+        let want = seq_uncovered(&f, &r);
+        if want.is_empty() {
+            bad.push(format!("{name}: non-vacuity: no report in the reference"));
+        }
+        for t in [1, 2, 16] {
+            bad.extend(ps_stop_checks(&f, t, &want, r.counters.impl_graphs));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: ruling 15, the stop: {bad:#?}");
+}
+
+/// `k` senders (`s0` first, sending its index) and a receiver `r` taking `recvs` messages under
+/// `NoOrder`; with `assert_order`, `r` asserts that its first message is not the last sender's —
+/// an execution that is not the first in the sweep's order, so only the sweeps that reach it abort.
+fn ps_senders(k: usize, recvs: usize, assert_order: bool) -> Prog {
+    prog(move || {
+        let (tx, rx) = crate::channel::Builder::<i32>::new()
+            .with_comm(CommunicationModel::NoOrder)
+            .build();
+        let t0 = tx.clone();
+        let _s0 = named("s0", move || t0.send_msg(0));
+        let _r = named("r", move || {
+            let first: i32 = rx.recv_msg_block();
+            for _ in 1..recvs {
+                let _v: i32 = rx.recv_msg_block();
+            }
+            if assert_order {
+                crate::assert(first != k as i32 - 1);
+            }
+        });
+        for i in 1..k {
+            let t = tx.clone();
+            let _s = named(&format!("s{i}"), move || t.send_msg(i as i32));
+        }
+    })
+}
+
+/// The senders' program as both sides (`abort` = the specification asserts the order).
+fn ps_senders_fixture(k: usize, recvs: usize, abort: bool) -> Fixture {
+    let mut f = fx("apps/a1/correct/spec/n2r2");
+    f.name = format!("ps:senders/k{k}r{recvs}{}", if abort { "-abort" } else { "" });
+    f.specification = ps_senders(k, recvs, abort);
+    f.implementation = ps_senders(k, recvs, false);
+    f.visible = vec!["r".to_owned()];
+    f.config = crate::conformance::grid::cfg(ConsType::Bag);
+    f
+}
+
+/// Every specification assertion failure of a program, as `cfirst::spec_errors_of` renders a sweep's.
+fn ps_all_spec_errors(f: &Fixture) -> BTreeSet<String> {
+    let cc = ps_seq_cc(f, Capacity::Unbounded, false);
+    let mut config = cc.config.clone();
+    config.max_iterations = None;
+    let run = enumerate(
+        EnumRun {
+            config,
+            visible: f.visible.clone(),
+            mode: ConfMode::Enumerate,
+            sink: Box::new(|_, _| SinkVerdict::Continue),
+            cut: false,
+            stop_at_first_report: false,
+            gate_sink: None,
+            paper_events: false,
+        },
+        &f.specification,
+    );
+    cfirst::spec_errors_of(&run).into_iter().map(|(t, e, v)| format!("{t}@{e}@{v}")).collect()
+}
+
+/// Ruling 15's abort row (ruling 5) on the specification-error program (every sweep aborts) and on
+/// the senders' program whose specification fails only in later executions (some sweeps find a
+/// witness first, so the abort can come in a task, with sweeps in flight), at t ∈ {1, 2, 16}, `w`
+/// 0 and inf: `aborted`, `sweeps_aborted` ≥ 1, `spec_errors` non-empty and each a genuine failure of the
+/// specification, the token cancelled (`impl_end` `StoppedAtFirstReport`, `stopped_early`), the
+/// identities with the post-cancel terms; the public path's precheck finds it first, word for word
+/// the sequential engine's.
+#[test]
+fn ps_15_the_abort() {
+    let _g = serial();
+    let mut bad = Vec::new();
+    for f in [i4_spec_error_fixture(), ps_senders_fixture(5, 2, true)] {
+    let all = ps_all_spec_errors(&f);
+    if all.is_empty() {
+        bad.push(format!("{}: non-vacuity: the specification has no error", f.name));
+    }
+    let s = ps_seq(&f, Capacity::Unbounded, false);
+    if !s.aborted {
+        bad.push(format!("{}: the reference does not abort", f.name));
+    }
+    for t in [1, 2, 16] {
+        for w in [Capacity::Zero, Capacity::Unbounded] {
+            cfirst_p::reset_counts_for_test();
+            let q = Q::new(t, w, 1);
+            let o = ps_par(&f, &q);
+            let (c, b) = (&o.counters, &o.counters.base);
+            let tag = format!("{} t{t} {w:?}", f.name);
+            bad.extend(ps_identities(&o, w, t).into_iter().map(|x| format!("{tag}: {x}")));
+            if !o.aborted || b.sweeps_aborted < 1 || o.spec_errors.is_empty() {
+                bad.push(format!(
+                    "{tag}: aborted {}, sweeps_aborted {}, spec_errors {}",
+                    o.aborted,
+                    b.sweeps_aborted,
+                    o.spec_errors.len()
+                ));
+            }
+            for (th, e, v) in &o.spec_errors {
+                if !all.contains(&format!("{th}@{e}@{v}")) {
+                    bad.push(format!("{tag}: {th}@{e} is not a failure of the specification"));
+                }
+            }
+            if o.impl_end != SearchEnd::StoppedAtFirstReport || !c.stopped_early {
+                bad.push(format!("{tag}: impl_end {:?}, stopped_early {}", o.impl_end, c.stopped_early));
+            }
+            if o.impl_end != s.impl_end {
+                bad.push(format!("{tag}: impl_end {:?}, the reference's {:?}", o.impl_end, s.impl_end));
+            }
+            note!(
+                "PS15A\t{tag}\tsweeps_aborted {}\tspec_errors {}\timpl_graphs {}\tunprobed {}\tunadmitted {}",
+                b.sweeps_aborted,
+                o.spec_errors.len(),
+                b.impl_graphs,
+                c.unprobed_after_cancel,
+                c.unadmitted_after_cancel
+            );
+        }
+    }
+    }
+    let f = i4_spec_error_fixture();
+    // the public path: the sequential precheck first (ruling 10), the same error as the
+    // sequential engine's
+    let cfg = f.config.clone();
+    let mk = |engine| {
+        ConfBuilder::new()
+            .config(cfg.clone())
+            .visible_threads(f.visible.clone())
+            .engine(engine)
+            .threads(16)
+            .build()
+            .expect("conformance: in scope")
+    };
+    let (i, sp) = (Arc::clone(&f.implementation), Arc::clone(&f.specification));
+    let a = crate::conformance::verify(mk(Engine::CompleteFirst), move || i(), move || sp());
+    let (i, sp) = (Arc::clone(&f.implementation), Arc::clone(&f.specification));
+    let p = crate::conformance::verify(mk(Engine::CFirstP), move || i(), move || sp());
+    match (&a, &p) {
+        (Err(ConfError::SpecNotErrorFree { detail: x }), Err(ConfError::SpecNotErrorFree { detail: y })) => {
+            if x != y {
+                bad.push(format!("the public detail: {x:?} vs {y:?}"));
+            }
+        }
+        _ => bad.push(format!("the public path: complete-first {a:?}, complete-first-p {p:?}")),
+    }
+    assert!(bad.is_empty(), "conformance: ruling 15, the abort: {bad:#?}");
+}
+
+/// Ruling 12 (R9): a sweep panic cancels the token before it is re-raised, so the other workers stop
+/// at their next completion. The specification panics at its `AT`-th execution process-wide; under
+/// `w=0` every completion sweeps, so the sinks reach at most `AT` completions before the panic and
+/// each worker at most one after it (the token is read first): `sink_calls ≤ AT + 2t`. Without the
+/// cancel the other workers run to the end (`sink_calls` near the full run's `impl_graphs`, checked
+/// to be far above the bound). The payload reaches the caller; the outer `Must` was restored.
+#[test]
+fn ps_12_a_sweep_panic_cancels_and_is_re_raised() {
+    let _g = serial();
+    const AT: usize = 10;
+    let f = ps_senders_fixture(6, 3, false);
+    let full = ps_seq(&f, Capacity::Zero, false);
+    let mut bad = Vec::new();
+    for t in [2, 4, 16] {
+        let bound = AT + 2 * t;
+        if full.counters.impl_graphs < 2 * bound {
+            bad.push(format!("t{t}: non-vacuity: the full run's {} completions vs the bound {bound}", full.counters.impl_graphs));
+        }
+        let n = Arc::new(AtomicUsize::new(0));
+        let mut g = f.clone();
+        let (inner, n2) = (Arc::clone(&f.specification), Arc::clone(&n));
+        g.specification = prog(move || {
+            if n2.fetch_add(1, Ordering::SeqCst) + 1 == AT {
+                panic!("conformance: planted sweep panic");
+            }
+            inner()
+        });
+        cfirst_p::reset_counts_for_test();
+        let got = panic_of(|| ps_par(&g, &Q::new(t, Capacity::Zero, 1)));
+        let calls = cfirst_p::sink_calls_for_test();
+        if !got.as_deref().is_some_and(|m| m.contains("planted sweep panic")) {
+            bad.push(format!("t{t}: the payload {got:?}"));
+        }
+        if calls > bound {
+            bad.push(format!("t{t}: {calls} sink calls > {bound} (the other workers did not stop)"));
+        }
+        if cfirst_p::current_must_mismatches_for_test() != 0 {
+            bad.push(format!("t{t}: current-Must mismatches"));
+        }
+        note!("PS12\tt{t}\tsink calls {calls}\tbound {bound}\tfull {}\tspec executions {}", full.counters.impl_graphs, n.load(Ordering::SeqCst));
+    }
+    // the sequential engine re-raises the same payload
+    let n = Arc::new(AtomicUsize::new(0));
+    let mut g = f.clone();
+    let (inner, n2) = (Arc::clone(&f.specification), Arc::clone(&n));
+    g.specification = prog(move || {
+        if n2.fetch_add(1, Ordering::SeqCst) + 1 == AT {
+            panic!("conformance: planted sweep panic");
+        }
+        inner()
+    });
+    let got = panic_of(|| ps_seq(&g, Capacity::Zero, false));
+    if !got.as_deref().is_some_and(|m| m.contains("planted sweep panic")) {
+        bad.push(format!("the sequential engine: {got:?}"));
+    }
+    assert!(bad.is_empty(), "conformance: ruling 12: {bad:#?}");
+}
+
+/// Compact summaries of one signature from the size-2 cells and the small violators: a witness and
+/// a summary it covers — a specification summary `s` and an implementation one `q` with
+/// `s.ord ≤ q.ord`, `s.ord ≠ q.ord` where one exists, else a specification summary and itself — and
+/// two specification summaries with incomparable orders.
+fn ps_pairs() -> (Option<(CompactSummary, CompactSummary)>, Option<(CompactSummary, CompactSummary)>) {
+    let (mut cover, mut incomparable, mut itself) = (None, None, None);
+    for name in SIZE2_CELLS.iter().chain(PS_VIOLATORS.iter()) {
+        let f = fx(name);
+        let spec = summaries(&f, "specification");
+        let imp = summaries(&f, "implementation");
+        if itself.is_none() {
+            itself = spec.first().map(|s| (s.clone(), s.clone()));
+        }
+        for a in &spec {
+            for b in &imp {
+                if cover.is_none() && a.sig == b.sig && a.ord != b.ord && a.ord.le(&b.ord) {
+                    cover = Some((a.clone(), b.clone()));
+                }
+            }
+            for b in &spec {
+                if incomparable.is_none()
+                    && a.sig == b.sig
+                    && !a.ord.le(&b.ord)
+                    && !b.ord.le(&a.ord)
+                {
+                    incomparable = Some((a.clone(), b.clone()));
+                }
+            }
+        }
+        if cover.is_some() && incomparable.is_some() {
+            break;
+        }
+    }
+    note!("PSD	pairs: a strict covering pair {}, an incomparable pair {}", cover.is_some(), incomparable.is_some());
+    (cover.or(itself), incomparable)
+}
+
+/// D2, D1 and the stale-table row of PS-5, deterministically on the shared cache (the interleaving
+/// is the call order; the workers are two tables): (a) worker B's probe after worker A's admission
+/// syncs the new signature and hits (with the sync deleted it would miss); (b) two workers that
+/// both missed admit one witness: the second's re-probe hits — `Redundant`, nothing stored twice;
+/// (c) a worker whose table never saw a signature admits a second order of it: the re-probe's sync
+/// finds the signature, so it is published once (`L`'s signatures pairwise distinct, every `SigId`
+/// its log index, D7); (d) a cancelled admission stores nothing; (e) under `Zero` nothing is
+/// admitted and nothing published.
+#[test]
+fn ps_d1_d2_the_shared_cache_interleavings() {
+    let (cover, incomparable) = ps_pairs();
+    let (w0, q0) = cover.expect("conformance: non-vacuity: a covering pair of one signature");
+    let mut bad = Vec::new();
+    // (a)
+    let c = SharedCache::new(Capacity::Unbounded);
+    let (mut a, mut b) = (WorkerTable::new(), WorkerTable::new());
+    if c.probe(&mut b, &q0).0 != CacheProbe::Miss || c.probe(&mut a, &q0).0 != CacheProbe::Miss {
+        bad.push("(a) an empty cache hit".to_owned());
+    }
+    if c.admit(&mut a, &w0, &q0, || false) != Admission::Admitted {
+        bad.push("(a) the admission".to_owned());
+    }
+    let syncs = b.syncs;
+    if c.probe(&mut b, &q0).0 != CacheProbe::Hit || b.syncs != syncs + 1 {
+        bad.push(format!("(a) the stale table: no hit after the sync (syncs {} → {})", syncs, b.syncs));
+    }
+    // (b)
+    let c = SharedCache::new(Capacity::Unbounded);
+    let (mut a, mut b) = (WorkerTable::new(), WorkerTable::new());
+    let _ = (c.probe(&mut a, &q0), c.probe(&mut b, &q0));
+    let first = c.admit(&mut a, &w0, &q0, || false);
+    let second = c.admit(&mut b, &w0, &q0, || false);
+    let st = c.stats();
+    if (first, second) != (Admission::Admitted, Admission::Redundant)
+        || (st.admissions, st.redundant_sweeps, st.entries, st.signatures) != (1, 1, 1, 1)
+    {
+        bad.push(format!("(b) {first:?} {second:?} {st:?}"));
+    }
+    // (c)
+    if let Some((x, y)) = incomparable.clone() {
+        let c = SharedCache::new(Capacity::Unbounded);
+        let (mut a, mut b) = (WorkerTable::new(), WorkerTable::new());
+        let one = c.admit(&mut a, &x, &x, || false);
+        let two = c.admit(&mut b, &y, &y, || false);
+        let st = c.stats();
+        let sigs = c.signatures();
+        let ids: BTreeSet<_> = c.entries().into_iter().map(|(id, _, _)| id).collect();
+        if (one, two) != (Admission::Admitted, Admission::Admitted)
+            || sigs.len() != 1
+            || st.entries != 2
+            || ids.iter().any(|id| *id as usize >= sigs.len())
+        {
+            bad.push(format!("(c) {one:?} {two:?} signatures {} entries {} ids {ids:?}", sigs.len(), st.entries));
+        }
+    } else {
+        note!("PSD\t(c) no incomparable pair of one signature in the cells: (c) not run");
+    }
+    // (d)
+    let c = SharedCache::new(Capacity::Unbounded);
+    let mut a = WorkerTable::new();
+    let d = c.admit(&mut a, &w0, &q0, || true);
+    let st = c.stats();
+    if d != Admission::UnadmittedAfterCancel || st.entries != 0 || st.signatures != 0 || st.unadmitted_after_cancel != 1 {
+        bad.push(format!("(d) {d:?} {st:?}"));
+    }
+    // (e)
+    let c = SharedCache::new(Capacity::Zero);
+    let mut a = WorkerTable::new();
+    let e1 = c.admit(&mut a, &w0, &q0, || false);
+    let e2 = c.admit(&mut a, &w0, &q0, || true);
+    let st = c.stats();
+    if (e1, e2) != (Admission::Refused, Admission::Refused) || st != Default::default() || c.probe(&mut a, &q0).0 != CacheProbe::Miss {
+        bad.push(format!("(e) {e1:?} {e2:?} {st:?}"));
+    }
+    assert!(bad.is_empty(), "conformance: D1/D2: {bad:#?}");
+}
+
+/// Under `Bounded(n)` the shared cache evicts and counts as `SetCache` does: the same admission
+/// sequence (every specification summary of the cells, in order, each admitted when it misses)
+/// gives equal held orders, admissions, evictions and re-admissions, at n ∈ {1, 2, 3, 8}.
+#[test]
+fn ps_the_bounded_cache_evicts_as_the_set_cache() {
+    use crate::conformance::compact::{Probe, SetCache};
+    let mut bad = Vec::new();
+    let mut evictions = 0;
+    for name in SIZE2_CELLS.iter().chain(PS_VIOLATORS.iter()) {
+        let sums = summaries(&fx(name), "specification");
+        // twice over, so that evicted orders come back
+        let seq: Vec<&CompactSummary> = sums.iter().chain(sums.iter()).collect();
+        for n in [1, 2, 3, 8] {
+            let mut set = SetCache::new(Capacity::Bounded(n));
+            let shared = SharedCache::new(Capacity::Bounded(n));
+            let mut tbl = WorkerTable::new();
+            for s in &seq {
+                let hit_set = matches!(set.probe(s).0, Probe::Hit | Probe::MemoHit);
+                let hit_shared = shared.probe(&mut tbl, s).0 == CacheProbe::Hit;
+                if hit_set != hit_shared {
+                    bad.push(format!("{name} n{n}: the probes differ"));
+                    break;
+                }
+                if !hit_set {
+                    let x = set.admit(s, s);
+                    let y = shared.admit(&mut tbl, s, s, || false) == Admission::Admitted;
+                    if x != y {
+                        bad.push(format!("{name} n{n}: the admissions differ"));
+                        break;
+                    }
+                }
+            }
+            let b = shared.stats();
+            evictions += b.evictions;
+            let a = (set.len(), set.admissions(), set.evictions(), set.readmissions());
+            if a != (b.entries, b.admissions, b.evictions, b.readmissions) {
+                bad.push(format!("{name} n{n}: set {a:?} vs shared {b:?}"));
+            }
+        }
+    }
+    note!("PSB\tevictions {evictions}");
+    assert!(evictions > 0, "conformance: non-vacuity: no eviction");
+    assert!(bad.is_empty(), "conformance: the bounded cache: {bad:#?}");
+}
+
+/// Opens a test gate when dropped, so that a failing test never leaves the process held.
+struct PsOpen(&'static crate::conformance::compact::TestGate);
+
+impl Drop for PsOpen {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// This thread's id, from `/proc/thread-self` (`/proc/<pid>/task/<tid>`).
+fn ps_tid() -> u32 {
+    std::fs::read_link("/proc/thread-self")
+        .ok()
+        .and_then(|p| p.file_name()?.to_str()?.parse().ok())
+        .expect("conformance: /proc/thread-self")
+}
+
+/// Whether thread `tid` of this process reads as sleeping (`S`) five times running, 20 ms apart,
+/// within `secs` seconds (a thread held at a gate's condition variable).
+fn ps_wait_sleeping(tid: u32, secs: u64) -> bool {
+    let start = std::time::Instant::now();
+    let mut streak = 0;
+    while start.elapsed() < std::time::Duration::from_secs(secs) {
+        let st = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).unwrap_or_default();
+        let state = st.rsplit_once(") ").and_then(|(_, r)| r.chars().next());
+        streak = if state == Some('S') { streak + 1 } else { 0 };
+        if streak >= 5 {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// D7 and PS-5's race row (round 01 M1; ruling 20's publication gate): an admission of a new
+/// signature held between its slot push and its log append; a probe of that signature in the
+/// interval misses (`NoSig`: the log has not the signature yet), never panics, and finds no absent
+/// slot; after the append the probe syncs and hits. (Reversed — the log first — the synced
+/// signature's slot would be absent: the absent-slot count would read 1.)
+#[test]
+fn ps_d7_a_probe_between_the_two_publication_steps() {
+    let _g = serial();
+    let (cover, _) = ps_pairs();
+    let (w0, q0) = cover.expect("conformance: non-vacuity: a covering pair");
+    let c = Arc::new(SharedCache::new(Capacity::Unbounded));
+    PUBLICATION_GATE.close();
+    let _open = PsOpen(&PUBLICATION_GATE);
+    let tid = Arc::new(Mutex::new(None));
+    let h = {
+        let (c, w0, q0, tid) = (Arc::clone(&c), w0.clone(), q0.clone(), Arc::clone(&tid));
+        std::thread::spawn(move || {
+            *tid.lock().unwrap() = Some(ps_tid());
+            let mut t = WorkerTable::new();
+            c.admit(&mut t, &w0, &q0, || false)
+        })
+    };
+    let start = std::time::Instant::now();
+    let tid = loop {
+        if let Some(t) = *tid.lock().unwrap() {
+            break t;
+        }
+        assert!(start.elapsed().as_secs() < 10, "conformance: the admitting thread did not start");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let held = ps_wait_sleeping(tid, 10);
+    let mut b = WorkerTable::new();
+    let mut during_probe = None;
+    let during = panic_of(|| during_probe = Some(c.probe(&mut b, &q0).0));
+    let absent = c.absent_slots_for_test();
+    let logged = c.signatures().len();
+    PUBLICATION_GATE.open();
+    let admitted = h.join().expect("conformance: the admitting thread");
+    let after = c.probe(&mut b, &q0).0;
+    note!("PSD7\theld {held}\tduring {during:?} {during_probe:?}\tabsent {absent}\tlogged {logged}\tadmitted {admitted:?}\tafter {after:?}");
+    assert!(held, "conformance: the admitting thread never waited at the publication gate");
+    assert_eq!(during, None, "conformance: the probe in the interval panicked");
+    assert_eq!(during_probe, Some(CacheProbe::Miss), "conformance: the probe in the interval");
+    assert_eq!(absent, 0, "conformance: an absent slot");
+    assert_eq!(logged, 0, "conformance: the log entry before the gate (the slot comes first)");
+    assert_eq!(admitted, Admission::Admitted);
+    assert_eq!(after, CacheProbe::Hit, "conformance: no hit after the publication");
+    assert_eq!(c.absent_slots_for_test(), 0);
+}
+
+/// Gate 4 round 01 M1 (criteria rev 1.5, ruling 13's linearization): every cancel runs under the
+/// admission lock (`under_admission`) and `admit` reads the live token inside that lock. An
+/// admission of a witness the cache does not cover, held at `PRE_ADMIT_GATE` (its entry, before the
+/// lock) while the test cancels through `under_admission`, reads the cancel: `UnadmittedAfterCancel`,
+/// nothing published (`len`, `entries`, `signatures` unchanged), counted once. The other order: the
+/// admission before the cancel is `Admitted`, and the cancel afterwards changes nothing. **Red on the
+/// old code:** there the sink read the token before calling `admit` and passed the snapshot (`false`,
+/// read before the cancel), and the cancel took only the token's own lock — the held admission would
+/// publish after the cancel: `Admitted`, one order and one signature held, `unadmitted_after_cancel` 0.
+#[test]
+fn ps_m1_an_admission_held_before_its_lock_sees_a_cancel() {
+    let _g = serial();
+    let (cover, _) = ps_pairs();
+    let (w0, q0) = cover.expect("conformance: non-vacuity: a covering pair");
+    // the held admission, cancelled before it takes the lock
+    let c = Arc::new(SharedCache::new(Capacity::Unbounded));
+    let token = Arc::new(CancelToken::new());
+    PRE_ADMIT_GATE.close();
+    let _open = PsOpen(&PRE_ADMIT_GATE);
+    let tid = Arc::new(Mutex::new(None));
+    let h = {
+        let (c, token, w0, q0, tid) = (Arc::clone(&c), Arc::clone(&token), w0.clone(), q0.clone(), Arc::clone(&tid));
+        std::thread::spawn(move || {
+            *tid.lock().unwrap() = Some(ps_tid());
+            let mut t = WorkerTable::new();
+            c.admit(&mut t, &w0, &q0, || token.is_cancelled())
+        })
+    };
+    let start = std::time::Instant::now();
+    let tid = loop {
+        if let Some(t) = *tid.lock().unwrap() {
+            break t;
+        }
+        assert!(start.elapsed().as_secs() < 10, "conformance: the admitting thread did not start");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let held = ps_wait_sleeping(tid, 10);
+    let before = (c.len(), c.entries(), c.signatures().len());
+    c.under_admission(|| token.cancel());
+    PRE_ADMIT_GATE.open();
+    let got = h.join().expect("conformance: the admitting thread");
+    let after = (c.len(), c.entries(), c.signatures().len());
+    let st = c.stats();
+    note!("PSM1\theld {held}\tgot {got:?}\tbefore {before:?}\tafter {after:?}\tunadmitted {}", st.unadmitted_after_cancel);
+    assert!(held, "conformance: the admission never waited at PRE_ADMIT_GATE");
+    assert_eq!(got, Admission::UnadmittedAfterCancel, "conformance: the held admission after the cancel");
+    assert_eq!(before, (0, Vec::new(), 0), "conformance: the cache before");
+    assert_eq!(after, before, "conformance: something published after the cancel");
+    assert_eq!((st.unadmitted_after_cancel, st.admissions, st.redundant_sweeps), (1, 0, 0));
+    // the other order: admitted before the cancel; the cancel changes nothing
+    let c = SharedCache::new(Capacity::Unbounded);
+    let token = CancelToken::new();
+    let mut t = WorkerTable::new();
+    let got = c.admit(&mut t, &w0, &q0, || token.is_cancelled());
+    let admitted = (c.len(), c.entries(), c.signatures().len());
+    c.under_admission(|| token.cancel());
+    let st = c.stats();
+    assert!(token.is_cancelled());
+    assert_eq!(got, Admission::Admitted, "conformance: the admission before the cancel");
+    assert_eq!(admitted.0, 1);
+    assert_eq!((c.len(), c.entries(), c.signatures().len()), admitted, "conformance: the cancel changed the cache");
+    assert_eq!((st.unadmitted_after_cancel, st.admissions), (0, 1));
+}
+
+/// Ruling 21 (PS-R21, D8, D11): the admission counter moves exactly once per stored order — every
+/// `Admitted` (re-admissions included) bumps it by one; an eviction, a `Redundant`, an
+/// `UnadmittedAfterCancel` and a `Refused` admission never move it; under `Zero` it stays 0. The
+/// sequence: every specification summary of the cells, twice over (so that held ones come back as
+/// `Redundant` and evicted ones as re-admissions), every third admission cancelled, under
+/// `Unbounded`, `Bounded(1)`, `Bounded(2)` and `Zero`.
+#[test]
+fn ps_r21_the_counter_moves_once_per_stored_order() {
+    let mut bad = Vec::new();
+    let (mut evictions, mut readmissions, mut redundant, mut unadmitted) = (0, 0, 0, 0);
+    for name in SIZE2_CELLS.iter().chain(PS_VIOLATORS.iter()) {
+        let sums = summaries(&fx(name), "specification");
+        let seq: Vec<&CompactSummary> = sums.iter().chain(sums.iter()).collect();
+        for cap in [Capacity::Unbounded, Capacity::Bounded(1), Capacity::Bounded(2), Capacity::Zero] {
+            let c = SharedCache::new(cap);
+            let mut tbl = WorkerTable::new();
+            let mut admitted = 0u64;
+            for (i, s) in seq.iter().enumerate() {
+                let cancelled = i % 3 == 2;
+                let before = c.admission_version();
+                let a = c.admit(&mut tbl, s, s, || cancelled);
+                let after = c.admission_version();
+                let want = u64::from(a == Admission::Admitted);
+                if after != before + want {
+                    bad.push(format!("{name} {cap:?} #{i}: {a:?} moved the counter {before} → {after}"));
+                }
+                admitted += want;
+            }
+            let st = c.stats();
+            evictions += st.evictions;
+            readmissions += st.readmissions;
+            redundant += st.redundant_sweeps;
+            unadmitted += st.unadmitted_after_cancel;
+            if c.admission_version() != admitted || admitted as usize != st.admissions {
+                bad.push(format!("{name} {cap:?}: counter {} admitted {admitted} admissions {}", c.admission_version(), st.admissions));
+            }
+            if cap == Capacity::Zero && c.admission_version() != 0 {
+                bad.push(format!("{name}: the counter moved under Zero"));
+            }
+        }
+    }
+    note!("PSR21C\tevictions {evictions}\treadmissions {readmissions}\tredundant {redundant}\tunadmitted {unadmitted}");
+    assert!(
+        evictions > 0 && readmissions > 0 && redundant > 0 && unadmitted > 0,
+        "conformance: non-vacuity: evictions {evictions}, readmissions {readmissions}, redundant {redundant}, unadmitted {unadmitted}"
+    );
+    assert!(bad.is_empty(), "conformance: ruling 21's counter: {bad:#?}");
+}
+
+/// Ruling 21 (PS-R21, race (b)): `SharedCache::watch`'s cases, deterministically. Not moved: no
+/// re-probe (the watching table not even synced). Moved by an order covering the watched summary,
+/// of a signature the watching table has never seen: the re-probe syncs it and answers `Covered`, and
+/// `seen` takes the counter's value; read again: not moved. Moved by an order that does not cover the
+/// summary (an incomparable order of its signature): `NotCovered`. A cancelled or refused admission
+/// moves nothing: not moved. Since gate 4 round 03 (m1) `watch` answers on the counter value its
+/// caller read (one read per specification completion) and loads nothing: given the value already
+/// seen after a move, it answers `NotMoved` with no re-probe.
+#[test]
+fn ps_r21_the_watchs_four_cases() {
+    let (cover, incomparable) = ps_pairs();
+    let (w0, q0) = cover.expect("conformance: non-vacuity: a covering pair");
+    let mut bad = Vec::new();
+    let c = SharedCache::new(Capacity::Unbounded);
+    let (mut a, mut b) = (WorkerTable::new(), WorkerTable::new());
+    let mut seen = c.admission_version();
+    let r = c.watch(&mut b, &q0, &mut seen, c.admission_version());
+    if r != Watch::NotMoved || b.syncs != 0 {
+        bad.push(format!("not moved: {r:?}, syncs {}", b.syncs));
+    }
+    let _ = c.admit(&mut a, &w0, &q0, || true);
+    if c.watch(&mut b, &q0, &mut seen, c.admission_version()) != Watch::NotMoved {
+        bad.push("a cancelled admission moved the counter".to_owned());
+    }
+    if c.admit(&mut a, &w0, &q0, || false) != Admission::Admitted {
+        bad.push("the admission".to_owned());
+    }
+    // gate 4 round 03 m1: `watch` takes the caller's one read and loads nothing itself — given the
+    // value already seen it answers `NotMoved` without a re-probe though the counter has moved
+    let before = seen;
+    if c.watch(&mut b, &q0, &mut seen, before) != Watch::NotMoved || b.syncs != 0 || seen != before {
+        bad.push("watch loaded the counter itself (moved, but given the value seen)".to_owned());
+    }
+    let current = c.admission_version();
+    let r = c.watch(&mut b, &q0, &mut seen, current);
+    if r != Watch::Covered || seen != current || b.syncs != 1 {
+        bad.push(format!("covered, a new signature: {r:?}, seen {seen}, syncs {}", b.syncs));
+    }
+    if c.watch(&mut b, &q0, &mut seen, c.admission_version()) != Watch::NotMoved {
+        bad.push("read again: moved".to_owned());
+    }
+    match incomparable {
+        Some((x, y)) => {
+            let c = SharedCache::new(Capacity::Unbounded);
+            let (mut a, mut b) = (WorkerTable::new(), WorkerTable::new());
+            let mut seen = c.admission_version();
+            let _ = c.admit(&mut a, &x, &x, || false);
+            let r = c.watch(&mut b, &y, &mut seen, c.admission_version());
+            if r != Watch::NotCovered || seen != 1 {
+                bad.push(format!("not covered: {r:?}, seen {seen}"));
+            }
+        }
+        None => bad.push("non-vacuity: no incomparable pair".to_owned()),
+    }
+    let z = SharedCache::new(Capacity::Zero);
+    let mut seen = z.admission_version();
+    let _ = z.admit(&mut a, &w0, &q0, || false);
+    if z.watch(&mut b, &q0, &mut seen, z.admission_version()) != Watch::NotMoved {
+        bad.push("a refused admission moved the counter".to_owned());
+    }
+    assert!(bad.is_empty(), "conformance: the watch's cases: {bad:#?}");
+}
+
+/// Ruling 21, gate 4 round 03 m1, hardened at round 04 (its m1): the counter is read **once per
+/// specification completion**. At the source, over the crate's non-test code:
+/// - in the engine's watch (`cfirst_p.rs`, from `let watch: Box<dyn FnMut() -> bool> = {` to
+///   `let swept = catch_unwind(`, comments and string literals dropped) one `admission_version` before
+///   the closure (the sweep's start) and one inside it, before its `if current == seen`; the closure
+///   hands that value to `shared.cache.watch(&mut w.table, &cs, &mut seen, current)`;
+/// - **every call in that region is allowlisted** (before the closure: `Box::new`, `FnMut` (the
+///   type), `Arc::clone`, `clone`, `admission_version`; inside it: `admission_version` once, `with`,
+///   `borrow_mut`, `as_mut`, `expect`, `watch`): a helper of any name fails it;
+/// - `sweep_inline`'s sink calls the watch once per completion;
+/// - `SharedCache::watch`'s body loads nothing (no `admission_version`, no `.load(`);
+/// - **the crate-wide census of the identifier `admission_version`** in non-test code is exactly:
+///   two calls `.admission_version()` (both in `cfirst_p.rs`, the two above); in `compact.rs` the
+///   field's declaration and initializer, `fn admission_version`, and two field accesses — the bump
+///   (`.fetch_add(`) and the reader's `.load(`. A second load through any other name adds a call or a
+///   field access and fails it.
+/// The behaviour half is `ps_r21_the_watchs_four_cases`. The failing mutations, built in the test from
+/// the crate's files: a second load passed to `watch`; a load inside `SharedCache::watch`; the
+/// closure's load removed; a second watch call in the sink; **round 04's: a helper outside the region
+/// that loads the counter, called once more inside the closure**; a new `SharedCache` method reading
+/// the field, called inside the closure.
+#[test]
+fn ps_r21_r03_m1_one_counter_load_per_completion() {
+    let files = ps_crate_sources();
+    let bad = ps_one_load_failures(&files);
+    assert!(bad.is_empty(), "conformance: gate 4 rounds 03/04 m1: {bad:#?}");
+    let (cfp, cmp) = (&files["conformance/cfirst_p.rs"], &files["conformance/compact.rs"]);
+    let call = "shared.cache.watch(&mut w.table, &cs, &mut seen, current)";
+    let fast = "let current = shared.cache.admission_version();\n";
+    let body = "        if current == *seen {\n            return Watch::NotMoved;\n        }\n";
+    let sink_call = "                if w() {\n";
+    let sweep_inline = "pub(crate) fn sweep_inline(";
+    let entries = "    /// Every published signature with its hash, by `SigId`.";
+    assert_eq!(
+        [call, fast, sink_call, sweep_inline].map(|s| cfp.matches(s).count()),
+        [1, 1, 1, 1],
+        "conformance: the mutations' anchors in cfirst_p.rs"
+    );
+    assert_eq!([body, entries].map(|s| cmp.matches(s).count()), [1, 1], "conformance: the anchors in compact.rs");
+    let with = |rel: &str, text: String| {
+        let mut f = files.clone();
+        f.insert(rel.to_owned(), text);
+        f
+    };
+    let indent = "                ";
+    let mutations = [
+        (
+            "a second load passed to watch",
+            with("conformance/cfirst_p.rs", cfp.replacen(call, "shared.cache.watch(&mut w.table, &cs, &mut seen, shared.cache.admission_version())", 1)),
+        ),
+        (
+            "a load inside SharedCache::watch",
+            with("conformance/compact.rs", cmp.replacen(body, &format!("        let current = self.admission_version();\n{body}"), 1)),
+        ),
+        ("the closure's load removed", with("conformance/cfirst_p.rs", cfp.replacen(fast, "let current = seen;\n", 1))),
+        (
+            "a second watch call in the sink",
+            with("conformance/cfirst_p.rs", cfp.replacen(sink_call, &format!("                let _ = w();\n{sink_call}"), 1)),
+        ),
+        (
+            "round 04: a helper outside the region that loads the counter, called once more inside the closure",
+            with(
+                "conformance/cfirst_p.rs",
+                cfp.replacen(
+                    sweep_inline,
+                    &format!("fn peek_version(shared: &Shared) -> u64 {{\n    shared.cache.admission_version()\n}}\n\n{sweep_inline}"),
+                    1,
+                )
+                .replacen(fast, &format!("{fast}{indent}let _again = peek_version(&shared);\n"), 1),
+            ),
+        ),
+        (
+            "a new SharedCache method reading the field, called inside the closure",
+            with(
+                "conformance/compact.rs",
+                cmp.replacen(
+                    entries,
+                    &format!("    pub(crate) fn version_again(&self) -> u64 {{\n        self.admission_version\n            .load(std::sync::atomic::Ordering::SeqCst)\n    }}\n\n{entries}"),
+                    1,
+                ),
+            )
+            .into_iter()
+            .map(|(k, v)| {
+                if k == "conformance/cfirst_p.rs" {
+                    let v = v.replacen(fast, &format!("{fast}{indent}let _again = shared.cache.version_again();\n"), 1);
+                    (k, v)
+                } else {
+                    (k, v)
+                }
+            })
+            .collect(),
+        ),
+    ];
+    let mut red = Vec::new();
+    for (what, m) in &mutations {
+        let f = ps_one_load_failures(m);
+        note!("PSR21R04\tmutation: {what}\t{f:?}");
+        if f.is_empty() {
+            red.push(*what);
+        }
+    }
+    assert!(red.is_empty(), "conformance: gate 4 rounds 03/04 m1: mutations not caught: {red:?}");
+}
+
+/// The crate's non-test sources by path under `src/` (`*_tests.rs` left out; a file's trailing
+/// `#[cfg(test)] mod` cut, as `code_lines`).
+fn ps_crate_sources() -> BTreeMap<String, String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = BTreeMap::new();
+    let mut stack = vec![root.clone()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).expect("conformance: src") {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") && !p.to_string_lossy().ends_with("_tests.rs") {
+                let text = std::fs::read_to_string(&p).unwrap();
+                let body = match text.find("#[cfg(test)]\nmod ") {
+                    Some(at) => text[..at].to_owned(),
+                    None => text,
+                };
+                out.insert(p.strip_prefix(&root).unwrap().to_string_lossy().into_owned(), body);
+            }
+        }
+    }
+    out
+}
+
+/// Comment lines dropped and, with `strip`, string literals emptied (escapes and the `'"'` char
+/// literal honoured).
+fn ps_code(text: &str, strip: bool) -> String {
+    let joined = text.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    if !strip {
+        return joined;
+    }
+    let chars: Vec<char> = joined.chars().collect();
+    let mut out = String::new();
+    let (mut i, mut in_str) = (0, false);
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_str {
+            if ch == '\\' {
+                i += 2;
+                continue;
+            }
+            if ch == '"' {
+                in_str = false;
+                out.push('"');
+            }
+        } else if ch == '\'' && chars.get(i + 1) == Some(&'"') && chars.get(i + 2) == Some(&'\'') {
+            out.push_str("' '");
+            i += 3;
+            continue;
+        } else if ch == '"' {
+            in_str = true;
+            out.push('"');
+        } else {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Every call in a code text: the identifier (with its path) before a `(`.
+fn ps_calls(code: &str) -> Vec<String> {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_alphabetic() || chars[i] == '_' {
+            let s = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == ':') {
+                i += 1;
+            }
+            let ident: String = chars[s..i].iter().collect();
+            let mut j = i;
+            while j < chars.len() && chars[j] == ' ' {
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '(' && !["if", "while", "match", "for", "return"].contains(&ident.as_str()) {
+                out.push(ident);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// The rounds 03/04 m1 check on the crate's non-test sources: the failures, empty when the counter is
+/// loaded once at a sweep's start and once per completion, by the allowlisted calls only, and the
+/// crate holds no other load of it.
+fn ps_one_load_failures(files: &BTreeMap<String, String>) -> Vec<String> {
+    let cfp = ps_code(&files["conformance/cfirst_p.rs"], true);
+    let cmp = ps_code(&files["conformance/compact.rs"], true);
+    let mut bad = Vec::new();
+    let w0 = cfp.find("let watch: Box<dyn FnMut() -> bool> = {").expect("conformance: the engine's watch");
+    let w1 = w0 + cfp[w0..].find("let swept = catch_unwind(").expect("conformance: its end");
+    let region = &cfp[w0..w1];
+    let split = region.find("Box::new(move ||").expect("conformance: the closure");
+    let (before, closure) = region.split_at(split);
+    let (n0, n1) = (before.matches("admission_version").count(), closure.matches("admission_version").count());
+    if (n0, n1) != (1, 1) {
+        bad.push(format!("the engine's watch loads the counter {n0} time(s) at the sweep's start and {n1} per completion"));
+    }
+    match (closure.find("admission_version()"), closure.find("if current == seen")) {
+        (Some(load), Some(test)) if load < test => {}
+        other => bad.push(format!("the load does not precede the closure's test: {other:?}")),
+    }
+    if !closure.contains("shared.cache.watch(&mut w.table, &cs, &mut seen, current)") {
+        bad.push("the closure does not hand its one read to SharedCache::watch".to_owned());
+    }
+    // the allowlist (round 04)
+    let last = |c: &String| c.rsplit("::").next().unwrap_or(c).to_owned();
+    let allowed_before = ["Box::new", "FnMut", "Arc::clone", "clone", "admission_version"];
+    let allowed_closure = ["Box::new", "admission_version", "with", "borrow_mut", "as_mut", "expect", "watch"];
+    for c in ps_calls(before) {
+        if !allowed_before.contains(&c.as_str()) {
+            bad.push(format!("a call before the closure not allowlisted: {c}"));
+        }
+    }
+    for c in ps_calls(closure) {
+        if !allowed_closure.contains(&c.as_str()) && !allowed_closure.contains(&last(&c).as_str()) {
+            bad.push(format!("a call in the closure not allowlisted: {c}"));
+        }
+    }
+    let s0 = cfp.find("pub(crate) fn sweep_inline(").expect("conformance: sweep_inline");
+    let s1 = s0 + cfp[s0..].find("let run = enumerate(").expect("conformance: its run");
+    // the watch's calls (` w()`: not `.borrow()`)
+    let calls = cfp[s0..s1].matches(" w()").count();
+    if calls != 1 {
+        bad.push(format!("the sweep's sink calls the watch {calls} time(s) per completion"));
+    }
+    let c0 = cmp.find("pub(crate) fn watch(").expect("conformance: SharedCache::watch");
+    let c1 = c0 + cmp[c0..].find("pub(crate) fn entries(").expect("conformance: its end");
+    let body = &cmp[c0..c1];
+    if body.contains("admission_version") || body.contains(".load(") {
+        bad.push("SharedCache::watch loads the counter".to_owned());
+    }
+    // the crate-wide census (round 04)
+    let mut census: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+    let mut accesses: Vec<String> = Vec::new();
+    // strings kept: a literal naming the counter counts as "other" and fails loudly
+    for (rel, text) in files {
+        let code = ps_code(text, false);
+        let mut from = 0;
+        while let Some(at) = code[from..].find("admission_version") {
+            let i = from + at;
+            let after = &code[i + "admission_version".len()..];
+            let pre = &code[..i];
+            let next = after.trim_start();
+            let kind = if pre.ends_with("fn ") {
+                "fn"
+            } else if after.starts_with(':') && !after.starts_with("::") {
+                "field declaration or initializer"
+            } else if pre.ends_with('.') && next.starts_with('(') {
+                "call"
+            } else if pre.ends_with('.') {
+                accesses.push(format!("{rel}: {}", next.chars().take(12).collect::<String>()));
+                "field access"
+            } else {
+                "other"
+            };
+            *census.entry((rel.clone(), kind)).or_default() += 1;
+            from = i + "admission_version".len();
+        }
+    }
+    let want: BTreeMap<(String, &'static str), usize> = [
+        (("conformance/cfirst_p.rs".to_owned(), "call"), 2),
+        (("conformance/compact.rs".to_owned(), "field access"), 2),
+        (("conformance/compact.rs".to_owned(), "field declaration or initializer"), 2),
+        (("conformance/compact.rs".to_owned(), "fn"), 1),
+    ]
+    .into_iter()
+    .collect();
+    if census != want {
+        bad.push(format!("the census of admission_version: {census:?}"));
+    }
+    let mut kinds: Vec<&str> = accesses
+        .iter()
+        .map(|a| if a.contains(".fetch_add(") { "bump" } else if a.contains(".load(") { "load" } else { "other" })
+        .collect();
+    kinds.sort_unstable();
+    if kinds != ["bump", "load"] {
+        bad.push(format!("the field accesses: {accesses:?}"));
+    }
+    bad
+}
+
+/// Ruling 21, gate 1 round 03 m1 (rev 1.6): at the source, in `SharedCache::admit`, the counter's
+/// one increment comes after the order's insertion (`slot.insert(`) and inside the scope of that
+/// insertion's store write guard (no `drop(store)` between; the bump's line in the guard's block). The
+/// failing mutations: the bump moved before `slot.insert(`; moved out of the guard's block (after the
+/// admission's closure, or into an outer block); a `drop(store)` before it; a second bump site.
+#[test]
+fn ps_r21_m1_the_bump_after_the_insertion_inside_its_guard() {
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance/compact.rs"),
+    )
+    .unwrap();
+    let bad = ps_m1_failures(&text);
+    assert!(bad.is_empty(), "conformance: rev 1.6 m1: {bad:#?}");
+    // the check's vacuity: the failing mutations, built from the file itself
+    let bump = "            self.admission_version\n                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);\n";
+    let ins = "            slot.insert(witness.ord.clone(), seq);\n";
+    let close = "        })();\n        tally.held += held_from.elapsed();\n";
+    assert_eq!((text.matches(bump).count(), text.matches(ins).count(), text.matches(close).count()), (1, 1, 1));
+    let without = text.replacen(bump, "", 1);
+    let outer = bump.replace("            self", "        self").replace("                .fetch", "            .fetch");
+    let mutations = [
+        ("the bump before the insertion", without.replacen(ins, &format!("{bump}{ins}"), 1)),
+        ("the bump after the admission's closure", without.replacen(close, &format!("        }})();\n{outer}        tally.held += held_from.elapsed();\n"), 1)),
+        ("the guard dropped before the bump", text.replacen(bump, &format!("            drop(store);\n{bump}"), 1)),
+        ("a second bump site", text.replacen(ins, &format!("{ins}{bump}"), 1)),
+    ];
+    let mut red = Vec::new();
+    for (what, m) in &mutations {
+        let f = ps_m1_failures(m);
+        note!("PSR21M1\tmutation: {what}\t{f:?}");
+        if f.is_empty() {
+            red.push(*what);
+        }
+    }
+    assert!(red.is_empty(), "conformance: rev 1.6 m1: mutations not caught: {red:?}");
+}
+
+/// The m1 check on a `compact.rs` text: the failures, empty when the counter's one increment in
+/// `SharedCache::admit` follows `slot.insert(` inside the insertion's write guard's block.
+fn ps_m1_failures(text: &str) -> Vec<String> {
+    let region = &text[text.find("// `SVERIFY-P` P-S (criteria rev 1.4, ruling 2)").expect("conformance: the region")..];
+    let lines: Vec<&str> = region.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+    let at = |from: usize, s: &str| (from..lines.len()).find(|&i| lines[i].contains(s));
+    let start = at(0, "pub(crate) fn admit(").expect("conformance: admit");
+    let end = at(start, "pub(crate) fn stats(").expect("conformance: stats");
+    let bumps: Vec<usize> = (0..lines.len())
+        .filter(|&i| {
+            lines[i].contains("admission_version.fetch_add(")
+                || (lines[i].trim_end().ends_with("admission_version")
+                    && lines.get(i + 1).is_some_and(|n| n.trim_start().starts_with(".fetch_add(")))
+        })
+        .collect();
+    let insert = at(start, "slot.insert(").filter(|&i| i < end).expect("conformance: the insertion");
+    let guard = (start..insert)
+        .rev()
+        .find(|&i| lines[i].contains("let mut store = self.store.write()"))
+        .expect("conformance: the insertion's guard");
+    let indent = |l: &str| l.len() - l.trim_start().len();
+    // the guard's block ends at the first later line indented less than the guard's
+    let block_end = (guard + 1..end)
+        .find(|&i| !lines[i].trim().is_empty() && indent(lines[i]) < indent(lines[guard]))
+        .unwrap_or(end);
+    let mut bad = Vec::new();
+    if bumps.len() != 1 {
+        bad.push(format!("{} bump sites", bumps.len()));
+    }
+    if let Some(&bump) = bumps.first() {
+        if !(start < bump && bump < end) {
+            bad.push("the bump is not in admit".to_owned());
+        }
+        if bump < insert {
+            bad.push("the bump precedes the insertion".to_owned());
+        }
+        if bump >= block_end || indent(lines[bump]) < indent(lines[guard]) {
+            bad.push("the bump is outside the insertion's write guard".to_owned());
+        }
+        if bump > guard && lines[guard..bump].iter().any(|l| l.contains("drop(store)")) {
+            bad.push("the guard is dropped before the bump".to_owned());
+        }
+    }
+    bad
+}
+
+/// Ruling 21 (PS-R21, PS-2): a deterministic abandonment through `sweep_inline`'s closure. On a
+/// query whose sweep tests at least four specification graphs before its witness (found by a scan of
+/// the cells' implementation summaries with no watch), a watch that answers `true` at its third call
+/// stops the sweep there: abandoned, two graphs tested (the abandoning completion is not tested), no
+/// witness, the watch called three times, no error. A watch that never fires leaves the sweep as with
+/// none (its tested count and its witness). With the closure ignored (the fault) the sweep would run
+/// to its witness: not abandoned, more than two graphs tested.
+#[test]
+fn ps_r21_a_deterministic_abandonment_through_the_closure() {
+    let _g = serial();
+    let _current = crate::conformance::testing::CurrentMustGuard;
+    let mut chosen = None;
+    'scan: for name in SIZE2_CELLS.iter().chain(PS_VIOLATORS.iter()) {
+        let f = fx(name);
+        let cc = ps_seq_cc(&f, Capacity::Unbounded, false);
+        for q in summaries(&f, "implementation") {
+            let (s, ab) = cfirst_p::sweep_inline(&cc.config, &f.visible, &f.specification, q.clone(), true, None);
+            if !ab && s.witness_summary.is_some() && s.tested >= 4 {
+                chosen = Some((f, cc, q, s));
+                break 'scan;
+            }
+        }
+    }
+    let (f, cc, q, reference) = chosen.expect("conformance: non-vacuity: no sweep testing four graphs");
+    const K: usize = 3;
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+    let watch: Box<dyn FnMut() -> bool> = {
+        let calls = std::rc::Rc::clone(&calls);
+        Box::new(move || {
+            calls.set(calls.get() + 1);
+            calls.get() == K
+        })
+    };
+    let (s, ab) = cfirst_p::sweep_inline(&cc.config, &f.visible, &f.specification, q.clone(), true, Some(watch));
+    note!(
+        "PSR21A\t{}\treference tested {}\tabandoned {ab}\ttested {}\twatch calls {}",
+        f.name,
+        reference.tested,
+        s.tested,
+        calls.get()
+    );
+    assert!(ab, "conformance: the sweep was not abandoned");
+    assert_eq!(s.tested, K - 1, "conformance: the graphs tested before the abandonment");
+    assert!(s.witness_summary.is_none(), "conformance: an abandoned sweep stored a witness");
+    assert_eq!(calls.get(), K, "conformance: the watch's calls");
+    assert!(s.run.visible_errors.is_empty(), "conformance: an error in an abandoned sweep");
+    let (s2, ab2) = cfirst_p::sweep_inline(&cc.config, &f.visible, &f.specification, q, true, Some(Box::new(|| false)));
+    assert!(!ab2, "conformance: a silent watch abandoned the sweep");
+    assert_eq!(s2.tested, reference.tested, "conformance: a silent watch changed the sweep");
+    assert_eq!(
+        s2.witness_summary.as_ref().map(|w| key(&w.sig, &w.ord)),
+        reference.witness_summary.as_ref().map(|w| key(&w.sig, &w.ord)),
+        "conformance: a silent watch changed the witness"
+    );
+}
+
+/// Ruling 20's admission gate is wired between a sweep and its admission: closed, a run stops at
+/// its first miss — one sink call, held — until the test opens it; the run then equals the
+/// sequential one. The gate cannot force an engine-level race: the root's warmup reaches the
+/// first miss before any task exists, so the held worker is the only one (the races are
+/// `ps_d1_d2_…`'s, on the cache).
+#[test]
+fn ps_20_the_admission_gate_holds_the_first_miss() {
+    let _g = serial();
+    let f = fx("apps/a1/correct/spec/n2r2");
+    let q = Q::new(4, Capacity::Unbounded, 1);
+    let s = ps_seq(&f, q.w, false);
+    cfirst_p::reset_counts_for_test();
+    cfirst_p::ADMISSION_GATE.close();
+    let _open = PsOpen(&cfirst_p::ADMISSION_GATE);
+    let h = {
+        let f = f.clone();
+        std::thread::spawn(move || ps_par(&f, &q))
+    };
+    let start = std::time::Instant::now();
+    while cfirst_p::sink_calls_for_test() == 0 && start.elapsed().as_secs() < 30 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let c1 = cfirst_p::sink_calls_for_test();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let c2 = cfirst_p::sink_calls_for_test();
+    cfirst_p::ADMISSION_GATE.open();
+    let o = h.join().expect("conformance: the run");
+    note!("PS20\tsink calls while held {c1} {c2}\tafter {}", cfirst_p::sink_calls_for_test());
+    let mut bad = ps_compare(&f, &s, &o, &q);
+    if (c1, c2) != (1, 1) {
+        bad.push(format!("held: sink calls {c1}, {c2} (1, 1)"));
+    }
+    assert!(bad.is_empty(), "conformance: the admission gate: {bad:#?}");
+}
+
+/// PS-7 and R4 at the source: `cfirst_p.rs` creates no thread and makes no rayon call; the sink reads
+/// the token before it builds a summary (ruling 13); the outer `Must` is restored before a sweep's
+/// panic is re-raised, and the token cancelled first (rulings 3, 12). The shared cache's region of
+/// `compact.rs`: no `unsafe`, no `Sync` impl; the slot pushed before the log entry (ruling 2); the
+/// probe's slot lookup checked (`get`).
+#[test]
+fn ps_7_the_sweep_runs_on_the_worker_source() {
+    let mut bad = Vec::new();
+    let code = code_lines("conformance/cfirst_p.rs").into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n");
+    for no in ["thread::Builder", "thread::spawn", "spawn_scoped", "std::thread", "rayon::", "par_iter", "unsafe"] {
+        if code.contains(no) {
+            bad.push(format!("cfirst_p.rs has {no}"));
+        }
+    }
+    let sink = &code[code.find("fn sink_for(").expect("conformance: the sink")..];
+    let at = |s: &str| sink.find(s).unwrap_or_else(|| panic!("conformance: no {s} in the sink"));
+    if at("is_cancelled()") > at("CompactSummary::at_completion") {
+        bad.push("the sink builds a summary before it reads the token".to_owned());
+    }
+    if !(at("let saved = Must::current();") < at("sweep_inline(")
+        && at("sweep_inline(") < at("Must::set_current(saved")
+        && at("Must::set_current(saved") < at("resume_unwind(payload)"))
+    {
+        bad.push("the save, the sweep, the restore and the re-raise are not in that order".to_owned());
+    }
+    let arm = &sink[at("Err(payload) => {")..at("resume_unwind(payload)")];
+    if !arm.contains("under_admission(|| shared.cancel.cancel())") {
+        bad.push("a caught sweep panic does not cancel the token under the admission lock".to_owned());
+    }
+    // gate 4 round 01 M1 (rev 1.5, ruling 13's linearization): every cancel under the admission
+    // lock, and the admission reads the live token
+    let cancels = code.matches(".cancel()").count();
+    let locked = code.matches("under_admission(|| shared.cancel.cancel())").count();
+    if cancels == 0 || cancels != locked {
+        bad.push(format!("{cancels} cancels, {locked} of them under the admission lock"));
+    }
+    if !sink.contains(".admit(&mut w.table, ws, probed, || shared.cancel.is_cancelled())") {
+        bad.push("the admission does not read the live token".to_owned());
+    }
+    // ruling 21: the watch reads no token, and an abandoned sweep never reaches `classify`
+    let watch = &sink[at("let watch: Box<dyn FnMut() -> bool> = {")..at("let swept = catch_unwind(")];
+    if watch.contains("cancel") {
+        bad.push("the watch reads the token".to_owned());
+    }
+    if !sink.contains("let end = (!abandoned).then(|| classify(&swept, false));") {
+        bad.push("an abandoned sweep may reach classify".to_owned());
+    }
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/conformance/compact.rs"),
+    )
+    .unwrap();
+    let region = &text[text.find("// `SVERIFY-P` P-S (criteria rev 1.4, ruling 2)").expect("conformance: the region")..];
+    let rcode: String = region.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+    for no in ["unsafe", "impl Sync", "impl Send"] {
+        if rcode.contains(no) {
+            bad.push(format!("the shared cache has {no}"));
+        }
+    }
+    let admit = &rcode[rcode.find("pub(crate) fn admit(").unwrap()..rcode.find("pub(crate) fn stats(").unwrap()];
+    let (push, append) = (admit.find("store.orders.push("), admit.find("log.entries.push("));
+    if !matches!((push, append), (Some(p), Some(a)) if p < a) {
+        bad.push(format!("the publication order: slot push {push:?}, log append {append:?}"));
+    }
+    let probe = &rcode[rcode.find("pub(crate) fn probe(").unwrap()..rcode.find("pub(crate) fn admit(").unwrap()];
+    if !probe.contains("store.orders.get(id as usize)") || probe.contains("store.orders[") {
+        bad.push("the probe's slot lookup is not checked".to_owned());
+    }
+    assert!(bad.is_empty(), "conformance: PS-7 / R4 / ruling 2 at the source: {bad:#?}");
+}
+
+/// The distinct threads named `conformance-*` (the sequential engine's sweep threads) seen while
+/// `run` runs, sampled every millisecond.
+fn ps_sweep_threads_seen(run: impl FnOnce()) -> usize {
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::new(Mutex::new(BTreeSet::new()));
+    let h = {
+        let (stop, seen) = (Arc::clone(&stop), Arc::clone(&seen));
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                for e in std::fs::read_dir("/proc/self/task").into_iter().flatten().flatten() {
+                    let comm = std::fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+                    if comm.starts_with("conformance-") {
+                        seen.lock().unwrap().insert(e.file_name());
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    };
+    run();
+    stop.store(true, Ordering::SeqCst);
+    h.join().unwrap();
+    let n = seen.lock().unwrap().len();
+    n
+}
+
+/// PS-7 at run time: under `w=0` (every completion sweeps) the sequential engine's sweep threads are
+/// seen (non-vacuity), CVerify-P's run shows none.
+#[test]
+fn ps_7_no_sweep_thread_at_run_time() {
+    let _g = serial();
+    let f = ps_senders_fixture(6, 3, false);
+    let seq_seen = ps_sweep_threads_seen(|| {
+        let _ = ps_seq(&f, Capacity::Zero, false);
+    });
+    let par_seen = ps_sweep_threads_seen(|| {
+        let _ = ps_par(&f, &Q::new(2, Capacity::Zero, 1));
+    });
+    note!("PS7\tsequential sweep threads seen {seq_seen}\tCVerify-P {par_seen}");
+    assert!(seq_seen >= 1, "conformance: non-vacuity: no sequential sweep thread seen");
+    assert_eq!(par_seen, 0, "conformance: CVerify-P created a sweep thread");
+}
+
+fn ps_class(v: &Result<ConfVerdict, ConfError>) -> (String, usize) {
+    match v {
+        Ok(ConfVerdict::Conforms(c)) => ("conforms".to_owned(), c.outcome().report_count()),
+        Ok(ConfVerdict::Reported(o)) => ("reported".to_owned(), o.report_count()),
+        Ok(ConfVerdict::Inconclusive(o)) => ("inconclusive".to_owned(), o.report_count()),
+        Err(e) => (format!("error {e:?}"), 0),
+    }
+}
+
+/// PS-1 and ruling 10: `run`'s six refusals as `KnobConflict`s (and `run_with`'s panics); the public
+/// verdict on the size-2 cells and the small violators equal to complete-first's, the precheck run
+/// sequentially, both records present.
+#[test]
+fn ps_1_the_public_refusals_and_the_verdicts() {
+    let _g = serial();
+    let f = fx("apps/a1/correct/spec/n2r2");
+    let base = ps_cc(&f, &Q::new(2, Capacity::Unbounded, 1));
+    let mut bad = Vec::new();
+    let cases: Vec<(&str, Box<dyn Fn(&mut ConfConfig)>)> = vec![
+        ("threads(0)", Box::new(|c| c.threads = 0)),
+        ("max_iterations(Some(_))", Box::new(|c| c.config.max_iterations = Some(5))),
+        ("parallel(true)", Box::new(|c| c.config.parallel = true)),
+        ("completion_cover(Flat)", Box::new(|c| {
+            c.completion_cover = CompletionCover::Flat;
+            c.index = IndexKind::Current;
+        })),
+        ("early_error_cut(true)", Box::new(|c| c.early_error_cut = true)),
+        ("witness_cache(Bounded(0))", Box::new(|c| c.witness_cache = Capacity::Bounded(0))),
+    ];
+    for (knob, m) in &cases {
+        let mut cc = base.clone();
+        m(&mut cc);
+        match cfirst_p::run(cc.clone(), Arc::clone(&f.implementation), Arc::clone(&f.specification)) {
+            Err(ConfError::KnobConflict { knob: k, .. }) if k == *knob => {}
+            other => bad.push(format!("run, {knob}: {:?}", other.err())),
+        }
+        if panic_of(|| cfirst_p::run_with(&cc, &f.implementation, &f.specification)).is_none() {
+            bad.push(format!("run_with, {knob}: no refusal"));
+        }
+    }
+    for name in SIZE2_CELLS.iter().chain(PS_VIOLATORS.iter()) {
+        let f = fx(name);
+        let mk = |engine| {
+            ConfBuilder::new()
+                .config(f.config.clone())
+                .visible_threads(f.visible.clone())
+                .engine(engine)
+                .threads(4)
+                .build()
+                .expect("conformance: in scope")
+        };
+        let (i, s) = (Arc::clone(&f.implementation), Arc::clone(&f.specification));
+        let a = crate::conformance::verify(mk(Engine::CompleteFirst), move || i(), move || s());
+        let (i, s) = (Arc::clone(&f.implementation), Arc::clone(&f.specification));
+        let p = crate::conformance::verify(mk(Engine::CFirstP), move || i(), move || s());
+        if ps_class(&a) != ps_class(&p) {
+            bad.push(format!("{name}: complete-first {:?}, complete-first-p {:?}", ps_class(&a), ps_class(&p)));
+        }
+        let o = match &p {
+            Ok(ConfVerdict::Conforms(c)) => Some(c.outcome()),
+            Ok(ConfVerdict::Reported(o)) | Ok(ConfVerdict::Inconclusive(o)) => Some(o),
+            Err(_) => None,
+        };
+        match o {
+            Some(o) => {
+                let ok = o.cfirst_p_counters().is_some()
+                    && o.cfirst_counters().is_some_and(|c| c.precheck_ran);
+                if !ok {
+                    bad.push(format!("{name}: the records (cfirst_p, cfirst with precheck_ran)"));
+                }
+            }
+            None => bad.push(format!("{name}: no outcome")),
+        }
+    }
+    assert!(bad.is_empty(), "conformance: PS-1, the public path: {bad:#?}");
+}
+
+/// The three A1 `n2r3` violators: out of the pilot processes, at t = 16 only (ruling 18).
+const PS_PILOT_OUT: [&str; 3] = [
+    "apps/a1/silent/spec/n2r3",
+    "apps/a1/eager/spec/n2r3",
+    "apps/a1/early-abort/spec/n2r3",
+];
+
+/// The rows with the largest stateless `sweep_graphs_max` in the record (e7s, `Set`): 4 096 (the
+/// three violators), 3 550 (A1 correct n3r3), 3 549 (A1 control-reverse and correct n2r3); the next
+/// is 1 680. Ruling 11's margin run takes them at t = 1.
+const PS_MARGIN: [&str; 6] = [
+    "apps/a1/silent/spec/n2r3",
+    "apps/a1/eager/spec/n2r3",
+    "apps/a1/early-abort/spec/n2r3",
+    "apps/a1/correct/spec/n3r3",
+    "apps/a1/control-reverse/spec/n2r3",
+    "apps/a1/correct/spec/n2r3",
+];
+
+/// One fixture's stateless record (MIN-ENGINES §4's package).
+#[derive(Clone, Debug, Default)]
+struct PsRecord {
+    /// The `E7 … e7s` line (the stateless engine on `Set`), field → value.
+    e7s: BTreeMap<String, String>,
+    /// `UNCS`: the stateless engine's uncovered summaries, rendered, with multiplicities.
+    uncs: BTreeMap<(String, String), usize>,
+    /// `E1E … implementation … distinct`.
+    impl_distinct: Option<u128>,
+    /// `E1C … executions`.
+    executions: Option<u128>,
+    /// `E9 … e9c Set … first some|none`.
+    first_some: Option<bool>,
+}
+
+/// The package's stateless records, keyed by fixture: the two tarballs extracted into a fresh
+/// directory under `TMPDIR` through `tar`, as V-S's `vs_records`.
+fn ps_records() -> BTreeMap<String, PsRecord> {
+    let pkg = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../plan/traceForge/log/dev/MIN-ENGINES.validation");
+    let tmp = std::env::var("TMPDIR").expect("conformance: P-S reads the package under TMPDIR");
+    let dir = std::path::Path::new(&tmp).join(format!("ps-package-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("conformance: the extraction directory");
+    for t in ["part1-rerun.tar.gz", "part1-aux.tar.gz"] {
+        let st = std::process::Command::new("tar")
+            .arg("xzf")
+            .arg(pkg.join(t))
+            .arg("-C")
+            .arg(&dir)
+            .status()
+            .expect("conformance: tar");
+        assert!(st.success(), "conformance: tar xzf {t}");
+    }
+    let num = |s: &str| -> u128 {
+        s.split(' ').nth(1).unwrap_or_else(|| panic!("conformance: {s}")).parse().unwrap()
+    };
+    let mut out: BTreeMap<String, PsRecord> = BTreeMap::new();
+    for sub in ["rerun", "aux"] {
+        for e in std::fs::read_dir(dir.join(sub)).expect("conformance: the extracted records") {
+            let text = std::fs::read_to_string(e.unwrap().path()).unwrap();
+            let mut name = String::new();
+            let mut uncs: Vec<(String, String)> = Vec::new();
+            for l in text.lines() {
+                let p: Vec<&str> = l.split('\t').collect();
+                if p.len() > 1 && p[0].starts_with('E') {
+                    name = p[1].to_owned();
+                }
+                match p[0] {
+                    "UNCS" => uncs.push((p[1].to_owned(), p[2].to_owned())),
+                    "E7" if p[3] == "e7s" => {
+                        let r = out.entry(name.clone()).or_default();
+                        for f in &p[4..] {
+                            if let Some((k, v)) = f.split_once(' ') {
+                                r.e7s.insert(k.to_owned(), v.to_owned());
+                            }
+                        }
+                    }
+                    "E1E" if p[3] == "implementation" => {
+                        out.entry(name.clone()).or_default().impl_distinct = Some(num(p[5]));
+                    }
+                    "E1C" => out.entry(name.clone()).or_default().executions = Some(num(p[4])),
+                    "E9" if p[3] == "e9c" && p[4] == "Set" => {
+                        out.entry(name.clone()).or_default().first_some = Some(p[6] == "first some");
+                    }
+                    _ => {}
+                }
+            }
+            if !uncs.is_empty() {
+                let r = out.entry(name.clone()).or_default();
+                for k in uncs {
+                    *r.uncs.entry(k).or_default() += 1;
+                }
+            }
+        }
+    }
+    out.remove("");
+    out
+}
+
+/// CVerify-P's uncovered summaries as the record writes them (V-S's rendering): `Sig` Debug, the
+/// counts comma-joined.
+fn ps_rendered(o: &CFirstPOutcome) -> BTreeMap<(String, String), usize> {
+    o.counters
+        .uncovered
+        .iter()
+        .map(|u| {
+            let c = u.counts();
+            let inner = c
+                .trim_start_matches("U8(")
+                .trim_start_matches("U16(")
+                .trim_start_matches('[')
+                .trim_end_matches(')')
+                .trim_end_matches(']');
+            let counts = inner.split(", ").collect::<Vec<_>>().join(",");
+            ((u.signature().to_owned(), counts), u.multiplicity())
+        })
+        .collect()
+}
+
+/// One full `w=inf` run against its stateless record: the order-independent columns of ruling 1,
+/// the uncovered multiset (`UNCS`), `impl_distinct_summaries` (`E1E`), the first report (`E9`), the
+/// identities.
+fn ps_record_checks(o: &CFirstPOutcome, r: &PsRecord, t: usize) -> Vec<String> {
+    let mut bad = ps_identities(o, Capacity::Unbounded, t);
+    let b = &o.counters.base;
+    let num = |k: &str| -> u128 {
+        r.e7s.get(k).and_then(|v| v.parse().ok()).unwrap_or_else(|| panic!("conformance: e7s {k}"))
+    };
+    for (what, got, want) in [
+        ("reports", b.reports as u128, num("reports")),
+        ("impl_graphs", b.impl_graphs as u128, num("impl_graphs")),
+        ("cache_probes", b.cache_probes as u128, num("cache_probes")),
+        ("sweeps_failing", b.sweeps_failing as u128, num("sweeps_failing")),
+        ("sweeps_aborted", b.sweeps_aborted as u128, num("sweeps_aborted")),
+    ] {
+        if got != want {
+            bad.push(format!("{what}: {got} vs the record's {want}"));
+        }
+    }
+    let verdict = if b.reports > 0 { "reported" } else { "conforms" };
+    if r.e7s.get("verdict").map(String::as_str) != Some(verdict) {
+        bad.push(format!("verdict {verdict} vs the record's {:?}", r.e7s.get("verdict")));
+    }
+    if o.impl_end != SearchEnd::StateSpaceExhausted || o.aborted || !o.spec_errors.is_empty() {
+        bad.push(format!("impl_end {:?}, aborted {}", o.impl_end, o.aborted));
+    }
+    if r.executions != Some(o.executions as u128) {
+        bad.push(format!("executions {} vs the record's {:?}", o.executions, r.executions));
+    }
+    if ps_rendered(o) != r.uncs {
+        bad.push(format!("the uncovered multiset ({} distinct) vs UNCS ({} distinct)", o.uncovered.len(), r.uncs.len()));
+    }
+    if o.counters.impl_distinct_summaries.map(|n| n as u128) != r.impl_distinct {
+        bad.push(format!("impl_distinct_summaries {:?} vs E1E {:?}", o.counters.impl_distinct_summaries, r.impl_distinct));
+    }
+    if Some(b.wall_ms_at_first_report.is_some()) != r.first_some {
+        bad.push(format!("first report {:?} vs E9 {:?}", b.wall_ms_at_first_report.is_some(), r.first_some));
+    }
+    bad
+}
+
+/// PS-6's pilot (ruling 9, ruling 18): the 132-fixture pilot without the three A1 `n2r3` violators
+/// (129 fixtures) at `w=inf`, the knobs on, at one thread count per process (`PS_T`), against the
+/// record; the order-dependent counts summed beside the record's.
+#[test]
+#[ignore]
+fn ps_the_pilot_at_one_thread_count() {
+    let Ok(_) = std::env::var("PS_T") else {
+        return;
+    };
+    let _g = serial();
+    let t = env_list("PS_T", &[1])[0];
+    let rec = ps_records();
+    let mut bad = Vec::new();
+    let (mut n, mut reported, mut reports, mut redundant, mut syncs) = (0, 0, 0, 0, 0);
+    let (mut abandoned, mut watch_probes) = (0, 0);
+    let mut sums: BTreeMap<&str, (u128, u128)> = BTreeMap::new();
+    let mut warmup_root_tasks = (0, 0, 0);
+    let started = std::time::Instant::now();
+    for name in PILOT_NAMES.iter().filter(|n| !PS_PILOT_OUT.contains(n)) {
+        let f = fx(name);
+        cfirst_p::reset_counts_for_test();
+        let o = ps_par(&f, &Q::new(t, Capacity::Unbounded, 1));
+        let r = rec.get(*name).unwrap_or_else(|| panic!("conformance: no record for {name}"));
+        n += 1;
+        let b = &o.counters.base;
+        reported += usize::from(b.reports > 0);
+        reports += b.reports;
+        redundant += o.counters.redundant_sweeps;
+        syncs += o.counters.signature_syncs;
+        abandoned += o.counters.sweeps_abandoned;
+        watch_probes += o.counters.watch_probes;
+        bad.extend(ps_record_checks(&o, r, t).into_iter().map(|x| format!("{name}: {x}")));
+        // the coverage of the final cache (rulings 1 and 16), against the run's own reported
+        // multiset, which `ps_record_checks` compares with `UNCS`
+        let impl_sums = summaries(&f, "implementation");
+        bad.extend(ps_coverage(&o, &impl_sums, &ps_par_uncovered(&o)).into_iter().map(|x| format!("{name}: coverage: {x}")));
+        warmup_root_tasks.0 += o.counters.sweeps_in_warmup;
+        warmup_root_tasks.1 += o.counters.sweeps_in_root_loop;
+        warmup_root_tasks.2 += o.counters.sweeps_in_tasks;
+        if cfirst_p::first_report_reads_for_test() != usize::from(b.reports > 0) {
+            bad.push(format!("{name}: {} first-report reads", cfirst_p::first_report_reads_for_test()));
+        }
+        if cfirst_p::current_must_mismatches_for_test() != 0 {
+            bad.push(format!("{name}: current-Must mismatches"));
+        }
+        let num = |k: &str| -> u128 { r.e7s.get(k).and_then(|v| v.parse().ok()).unwrap_or(0) };
+        for (k, got) in [
+            ("sweeps", b.sweeps),
+            ("cache_hits", b.cache_hits),
+            ("admissions", b.admissions),
+            ("sweep_graphs", b.sweep_graphs),
+        ] {
+            let e = sums.entry(k).or_default();
+            e.0 += got as u128;
+            e.1 += num(k);
+        }
+    }
+    note!(
+        "PSP\tpilot\tt {t}\tfixtures {n}\treported {reported}\treports {reports}\tredundant {redundant}\tsyncs {syncs}\tmismatches {}\twall {} s",
+        bad.len(),
+        started.elapsed().as_secs()
+    );
+    for (k, (p, s)) in &sums {
+        note!("PSP\torder-dependent\t{k}\tCVerify-P {p}\tthe record {s}");
+    }
+    note!(
+        "PSP\twhere the sweeps ran (O-5)\twarmup {}\troot loop {}\ttasks {}",
+        warmup_root_tasks.0,
+        warmup_root_tasks.1,
+        warmup_root_tasks.2
+    );
+    note!("PSP\truling 21\tabandoned {abandoned}\twatch probes {watch_probes}");
+    // D10 (ruling 21): at t = 1 no admission happens while a sweep runs, so the run is the
+    // pre-ruling one: every order-dependent sum equals the record's
+    if t == 1 {
+        for (k, (p, s)) in &sums {
+            if p != s {
+                bad.push(format!("D10: at t = 1 the {k} sum {p} vs the record's {s}"));
+            }
+        }
+    }
+    for b in &bad {
+        note!("PSP\tmismatch\t{b}");
+    }
+    assert!(n == 129, "conformance: {n} fixtures");
+    assert!(bad.is_empty(), "conformance: the pilot at t{t}: {} mismatches", bad.len());
+}
+
+/// P-S's store rows by part: `heavy` (A3 fifo k3q3 and leader n4 at `w=inf`, the size-2 lock — A3
+/// fifo k2q2 — at `w=0`, each at t ∈ {1, 4, 16}), `violators` (the three A1 `n2r3` violators at t =
+/// 16, `w=inf`), `margin` (`PS_MARGIN` at t = 1, `w=inf`, under `RUST_MIN_STACK=1048576`).
+fn ps_store_rows(part: &str) -> Vec<RowSpec> {
+    let row = |fixture: &str, config: GridConfig, variant: &str| RowSpec {
+        fixture: fixture.to_owned(),
+        config,
+        rep: 0,
+        tier: Tier::default_tier(),
+        run_kind: RunKind::Timed,
+        family: "sverify-p-ps".to_owned(),
+        knobs: String::new(),
+        k: [None; 4],
+        variant: variant.to_owned(),
+        twin_key: String::new(),
+        series: None,
+    };
+    let c = |t: usize, w: Capacity| GridConfig::new(GridEngine::CFirstP).threads(t).witness_cache(w);
+    let mut rows = Vec::new();
+    match part {
+        "heavy" => {
+            for (name, w) in [
+                ("apps/a3/fifo/spec/k3q3", Capacity::Unbounded),
+                ("2pc/leader/conf/n4", Capacity::Unbounded),
+                ("apps/a3/fifo/spec/k2q2", Capacity::Zero),
+            ] {
+                for t in [1, 4, 16] {
+                    rows.push(row(name, c(t, w), "heavy"));
+                }
+            }
+        }
+        "violators" => {
+            for name in PS_PILOT_OUT {
+                rows.push(row(name, c(16, Capacity::Unbounded), "violators"));
+            }
+        }
+        "margin" => {
+            for name in PS_MARGIN {
+                rows.push(row(name, c(1, Capacity::Unbounded), "margin"));
+            }
+        }
+        // ruling 21's evidence: the lock row at t 1, 4, 16 and the leader row at t 16, after the
+        // abandonment (`log/eval/sverify-p-ps-r21/`)
+        "r21" => {
+            for t in [1, 4, 16] {
+                rows.push(row("apps/a3/fifo/spec/k3q3", c(t, Capacity::Unbounded), "r21"));
+            }
+            rows.push(row("2pc/leader/conf/n4", c(16, Capacity::Unbounded), "r21"));
+        }
+        other => panic!("conformance: PS_PART {other}: heavy | violators | margin | r21"),
+    }
+    rows
+}
+
+/// P-S's store, through the driver: `PS_PART` (`ps_store_rows`), `PS_STORE` the store directory
+/// (`margin` into its own), `PS_COMMIT` the commit column; only under the 10 240 000 000 B address
+/// limit; `margin` only with `RUST_MIN_STACK=1048576` in the environment (the rows' children inherit
+/// it; the engine never sets it), the others only without it. The timed parts (`heavy`,
+/// `violators`) start only after V-S's quiet minute (1-minute load averages under 2, no `java`,
+/// `javac`, `gradle`, `cargo` or `rustc`, nothing above 2 GiB) and run one driver run per row, each
+/// after the process check; `margin` takes the process check only. A re-run resumes at the first
+/// row the store lacks.
+#[test]
+#[ignore]
+fn ps_the_store() {
+    let (Ok(out), Ok(part)) = (std::env::var("PS_STORE"), std::env::var("PS_PART")) else {
+        return;
+    };
+    let got = vs_address_limit();
+    assert_eq!(got, Some(10_240_000_000), "conformance: PS_PART {part} runs only under its address-space limit");
+    let margin = part == "margin";
+    let stack = std::env::var("RUST_MIN_STACK").ok();
+    assert_eq!(
+        stack.as_deref(),
+        if margin { Some("1048576") } else { None },
+        "conformance: PS_PART {part}: RUST_MIN_STACK"
+    );
+    let rows = ps_store_rows(&part);
+    note!("PSS\tpart {part}\trows {}\taddress limit {got:?}\tRUST_MIN_STACK {stack:?}", rows.len());
+    let spec = Spec {
+        name: match part.as_str() {
+            "margin" => "SVERIFY-P-PS-MARGIN",
+            "r21" => "SVERIFY-P-PS-R21",
+            _ => "SVERIFY-P-PS",
+        }
+        .to_owned(),
+        rows: rows.clone(),
+    };
+    let commit = std::env::var("PS_COMMIT").ok();
+    let driver = |only: Option<String>| {
+        let mut probes = Probes::real();
+        if let Some(c) = commit.clone() {
+            probes.git = Box::new(move || (c.clone(), false));
+        }
+        Driver {
+            spec: spec.clone(),
+            specs: vec![spec.clone()],
+            out_dir: std::path::PathBuf::from(&out),
+            sample_period: std::time::Duration::from_millis(100),
+            probes,
+            allow_mixed: false,
+            only,
+        }
+    };
+    let report = |d: &Driver| match d.run() {
+        Ok(s) => note!(
+            "PSS\tran {}\tskipped present {}\tcensored {}\tstore {}",
+            s.ran,
+            s.skipped_present,
+            s.censored,
+            s.store.display()
+        ),
+        Err(e) => panic!("conformance: the driver refused: {}", e.text()),
+    };
+    if !margin {
+        let mut readings = Vec::new();
+        for i in 0..13 {
+            if i > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+            }
+            readings.push(vs_load_1m());
+        }
+        let foreign = vs_heavy_processes();
+        note!("PSSQ\tpart {part}\tthe minute's 1-minute load averages {readings:?}\tforeign or above 2 GiB {foreign:?}");
+        assert!(
+            readings.iter().all(|l| *l < 2.0) && foreign.is_empty(),
+            "conformance: PS_PART {part}: the machine is not quiet: {readings:?} {foreign:?}"
+        );
+    }
+    for r in &rows {
+        let key = r.key(crate::conformance::eval::profile_name());
+        let (load, heavy) = (vs_load_1m(), vs_heavy_processes());
+        note!("PSSQ\t{key}\tload {load}\tforeign or above 2 GiB {heavy:?}");
+        assert!(heavy.is_empty(), "conformance: PS_PART {part}: not quiet before {key}: {heavy:?}");
+        report(&driver(Some(key)));
+    }
+}
+
+/// The store's checks (`PS_STORE`, `PS_PARTS`): every `ok` row's identities (ruling 14, from the
+/// cells); the rows in the record (A3 fifo k3q3, the violators, the margin rows) against it; leader
+/// n4 against V-S's `SverifyP` rows (ruling 19 (b): the verdict and the report count); the size-2
+/// lock at `w=0` against the sequential engine run here (ruling 1's `w=0` list); a table of the
+/// walls (information, PS-7).
+#[test]
+#[ignore]
+fn ps_the_store_checks() {
+    let Ok(out) = std::env::var("PS_STORE") else {
+        return;
+    };
+    let parts = std::env::var("PS_PARTS").unwrap_or_else(|_| "heavy,violators".to_owned());
+    let rec = ps_records();
+    let rows = read_rows(&std::path::Path::new(&out).join("rows.csv"))
+        .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let by_key: BTreeMap<String, &BTreeMap<String, String>> =
+        rows.iter().map(|r| (r["key"].clone(), r)).collect();
+    let vs_rows = read_rows(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plan/traceForge/log/eval/sverify-p-vs-curve/rows.csv"),
+    )
+    .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let n4_vs: Vec<(String, u128)> = vs_rows
+        .iter()
+        .filter(|m| m["fixture"] == "2pc/leader/conf/n4" && m["engine"] == "SverifyP" && m["end_class"] == "ok")
+        .map(|m| (m["verdict"].clone(), i4_num(m, "uncovered_multiplicity")))
+        .collect();
+    let lock = fx("apps/a3/fifo/spec/k2q2");
+    let lock_ref = ps_seq(&lock, Capacity::Zero, false);
+    let mut bad = Vec::new();
+    let (mut ok, mut censored, mut missing) = (0, Vec::new(), Vec::new());
+    for part in parts.split(',') {
+        for spec in ps_store_rows(part) {
+            let key = spec.key("release");
+            let Some(m) = by_key.get(&key) else {
+                missing.push(key);
+                continue;
+            };
+            let t = spec.config.threads;
+            let zero = spec.config.witness_cache == Capacity::Zero;
+            let tag = format!("{} t{t} {:?}", spec.fixture, spec.config.witness_cache);
+            note!(
+                "PSST\t{tag}\tend {}\tproc_wall_ms {}\twall_ms {}\trss_child_hwm_kb {}\treports {}\timpl_graphs {}\tsweeps {}\tcache_hits {}\tsweep_graphs {}\tredundant {}\tsyncs {}\tlock_held_ms {}\tlock_wait_ms {}\tsweeps warmup/root/tasks {}/{}/{}\tabandoned {}\twatch probes {}\tadmissions {}",
+                m["end_class"], m["proc_wall_ms"], m["wall_ms"], m["rss_child_hwm_kb"], m["reports"], m["impl_graphs"],
+                m["sweeps"], m["cache_hits"], m["sweep_graphs"], m["redundant_sweeps"], m["signature_syncs"],
+                m["admission_lock_held_ms"], m["admission_lock_wait_ms"], m["sweeps_in_warmup"],
+                m["sweeps_in_root_loop"], m["sweeps_in_tasks"], m["sweeps_abandoned"], m["watch_probes"],
+                m["admissions"]
+            );
+            if m["end_class"] != "ok" {
+                censored.push(format!("{tag}: {}", m["end_class"]));
+                continue;
+            }
+            ok += 1;
+            let n = |k: &str| i4_num(m, k);
+            let mut eq = |what: &str, a: u128, b: u128| {
+                if a != b {
+                    bad.push(format!("{tag}: {what}: {a} vs {b}"));
+                }
+            };
+            eq("identity 1", n("cache_hits") + n("sweeps") + n("unprobed_after_cancel"), n("impl_graphs"));
+            eq(
+                "identity 2 (rev 1.6)",
+                n("sweeps"),
+                n("sweeps_successful") + n("sweeps_failing") + n("sweeps_aborted") + n("sweeps_abandoned"),
+            );
+            let d11 = n("sweeps_abandoned") > n("watch_probes")
+                || n("watch_probes") > (t as u128 - 1) * n("admissions");
+            eq("D11: abandoned ≤ watch probes ≤ (t − 1) · admissions (1 = broken)", u128::from(d11), 0);
+            if zero {
+                eq("identity 3 (w=0)", n("admissions") + n("redundant_sweeps") + n("unadmitted_after_cancel"), 0);
+            } else {
+                eq(
+                    "identity 3",
+                    n("admissions") + n("redundant_sweeps") + n("unadmitted_after_cancel"),
+                    n("sweeps_successful"),
+                );
+            }
+            eq("identity 4", n("witnesses") + n("evictions"), n("admissions"));
+            eq("identity 5", n("reports"), n("sweeps_failing"));
+            eq("Σ uncovered", n("uncovered_multiplicity"), n("reports"));
+            eq("O-5", n("sweeps_in_warmup") + n("sweeps_in_root_loop") + n("sweeps_in_tasks"), n("sweeps"));
+            if spec.fixture == "2pc/leader/conf/n4" {
+                let want = if n("reports") > 0 { "Reported" } else { "Conforms" };
+                for (v, r) in &n4_vs {
+                    if v != want || *r != n("reports") {
+                        bad.push(format!("{tag}: {want}/{} vs V-S's SverifyP {v}/{r}", n("reports")));
+                    }
+                }
+                if n4_vs.is_empty() {
+                    bad.push(format!("{tag}: no V-S SverifyP row on n4"));
+                }
+            } else if spec.fixture == "apps/a3/fifo/spec/k2q2" {
+                let c = &lock_ref.counters;
+                for (what, a, b) in [
+                    ("reports", n("reports"), c.reports as u128),
+                    ("impl_graphs", n("impl_graphs"), c.impl_graphs as u128),
+                    ("sweeps", n("sweeps"), c.sweeps as u128),
+                    ("sweeps_successful", n("sweeps_successful"), c.sweeps_successful as u128),
+                    ("sweep_graphs", n("sweep_graphs"), c.sweep_graphs as u128),
+                    ("sweep_graphs_max", n("sweep_graphs_max"), c.sweep_graphs_max as u128),
+                    ("cache_hits", n("cache_hits"), 0),
+                ] {
+                    eq(what, a, b);
+                }
+            } else {
+                let r = rec.get(&spec.fixture).unwrap_or_else(|| panic!("conformance: no record for {}", spec.fixture));
+                let num = |k: &str| -> u128 { r.e7s.get(k).and_then(|v| v.parse().ok()).unwrap_or(u128::MAX) };
+                for k in ["reports", "impl_graphs", "cache_probes", "sweeps_failing", "sweeps_aborted"] {
+                    eq(k, n(k), num(k));
+                }
+                let want = if num("reports") > 0 { "Reported" } else { "Conforms" };
+                if m["verdict"] != want {
+                    bad.push(format!("{tag}: verdict {} vs {want}", m["verdict"]));
+                }
+            }
+        }
+    }
+    note!("PSSC\trows ok {ok}\tcensored {}\tmissing {}\tmismatches {}", censored.len(), missing.len(), bad.len());
+    for c in &censored {
+        note!("PSSC\tcensored\t{c}");
+    }
+    for k in &missing {
+        note!("PSSC\tmissing\t{k}");
+    }
+    for b in &bad {
+        note!("PSSC\tmismatch\t{b}");
+    }
+    assert!(bad.is_empty(), "conformance: the P-S store: {bad:#?}");
 }

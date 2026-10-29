@@ -81,6 +81,11 @@ pub(crate) enum ConfMode {
     /// behaviour under its own label, and the only mode that may carry the
     /// early-error cut (C5).
     CFirstOuter,
+    /// `SVERIFY-P` P-S: `CFirstOuter`'s twin for the parallel stateless
+    /// checker's worker contexts — the same behaviour under its own label and
+    /// the second scope predicate, no cut (the cut stays sequential),
+    /// plain-scheduled, a completion sink.
+    CFirstOuterPartitioned,
     /// `P4-CFIRST` C2: one sweep of the specification inside the complete-first
     /// checker's `Covered` — `Enumerate`'s behaviour under its own label.
     CFirstSweep,
@@ -104,6 +109,7 @@ impl ConfMode {
             ConfMode::Enumerate => "stateful",
             ConfMode::EnumeratePartitioned => "sverify-p",
             ConfMode::CFirstOuter => "complete-first",
+            ConfMode::CFirstOuterPartitioned => "complete-first-p",
             ConfMode::CFirstSweep => "complete-first sweep",
             ConfMode::GatedOuter => "gated",
             ConfMode::GatedSweep => "gated sweep",
@@ -118,6 +124,7 @@ impl ConfMode {
             ConfMode::Enumerate
                 | ConfMode::EnumeratePartitioned
                 | ConfMode::CFirstOuter
+                | ConfMode::CFirstOuterPartitioned
                 | ConfMode::CFirstSweep
                 | ConfMode::GatedOuter
                 | ConfMode::GatedSweep
@@ -137,6 +144,7 @@ impl ConfMode {
             ConfMode::Enumerate
                 | ConfMode::EnumeratePartitioned
                 | ConfMode::CFirstOuter
+                | ConfMode::CFirstOuterPartitioned
                 | ConfMode::CFirstSweep
         )
     }

@@ -361,6 +361,19 @@ fn reports_of(r: &GridResult) -> Vec<Rep<'_>> {
                 serialized: serialized(s),
             })
             .collect(),
+        // `SVERIFY-P` P-S (tester, gate 3): the parallel stateless checker keeps
+        // its reports' graphs as `all_reports` rules (every one on, one off).
+        GridRaw::CFirstP(r) => r
+            .outcome
+            .reports
+            .iter()
+            .map(|(g, s)| Rep {
+                graph: g,
+                tag: ReportTag::CompleteCoverage,
+                cause: Cause::NoCover,
+                serialized: serialized(s),
+            })
+            .collect(),
         // `SVERIFY-P` I4: neither the partitioned checker (uncovered summaries,
         // no report graphs) nor its baseline has a report list.
         GridRaw::Verdict(_)
@@ -418,6 +431,16 @@ fn st(r: &GridResult) -> St {
             end: r.outcome.impl_end,
             failure: (!r.outcome.spec_errors.is_empty())
                 .then(|| format!("{:?}", r.outcome.spec_errors)),
+        },
+        // `SVERIFY-P` P-S (tester, gate 3): the parallel stateless checker's status
+        // from its raw outcome (reports = its count; the kept graphs follow
+        // `all_reports`).
+        GridRaw::CFirstP(r) => St {
+            reports: r.outcome.counters.base.reports,
+            exhaustions: 0,
+            end: r.outcome.impl_end,
+            failure: (r.outcome.aborted || !r.outcome.spec_errors.is_empty())
+                .then(|| format!("aborted={} {:?}", r.outcome.aborted, r.outcome.spec_errors)),
         },
         GridRaw::ExploreP(_) => St {
             reports: 0,

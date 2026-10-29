@@ -377,8 +377,10 @@ fn c04_the_header_and_the_stack() {
     // fix round P3 (`sig_aliases`): 209.
     // SVERIFY-P I4 re-pin (2026-10-28, gate 3, ruling 8): schema 6, the forty columns
     // after `memo_clears` (249).
-    assert_eq!(SCHEMA_VERSION, 6, "conformance: schema");
-    assert_eq!(header().len(), 249, "conformance: header width");
+    // SVERIFY-P P-S re-pin (2026-10-28, gate 3): schema 7, the eleven columns after
+    // `spawned_at_stop` (260; three of them the lead's O-5 fix, two ruling 21's).
+    assert_eq!(SCHEMA_VERSION, 7, "conformance: schema");
+    assert_eq!(header().len(), 260, "conformance: header width");
     for name in [
         "apps/a4/hash/a4a/k2q2m2",
         "2pc/leader/conf/n2",

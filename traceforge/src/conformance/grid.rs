@@ -1297,6 +1297,10 @@ pub(super) enum GridEngine {
     /// `Config` with the same `threads` (`explore_partitioned`); the label is
     /// the eleven-field form plus `threads=<t>`.
     ExploreP,
+    /// `SVERIFY-P` P-S: CVerify-P, `cfirst_p::run_with(&cc, impl, spec)`, the
+    /// raw outcome; the label is the complete-first row's `index=set` form
+    /// plus `threads=<t>`.
+    CFirstP,
 }
 
 /// The enumerator's search budget (X3: the default-budget arm and the
@@ -1422,7 +1426,10 @@ impl GridConfig {
             // `Current` for the rest, whose keys print no index field.
             index: if matches!(
                 engine,
-                GridEngine::Stateful | GridEngine::CompleteFirst | GridEngine::SverifyP
+                GridEngine::Stateful
+                    | GridEngine::CompleteFirst
+                    | GridEngine::SverifyP
+                    | GridEngine::CFirstP
             ) {
                 IndexKind::Set
             } else {
@@ -1556,6 +1563,7 @@ impl GridConfig {
             GridEngine::CompleteFirst => Engine::CompleteFirst,
             GridEngine::Gated => Engine::Gated,
             GridEngine::SverifyP => Engine::SverifyP,
+            GridEngine::CFirstP => Engine::CFirstP,
             // `P5-XBASE` F1: never reached — the `Explore` arms of `call` and
             // `call_with` do not build a conformance configuration.
             GridEngine::Explore => {
@@ -1621,6 +1629,8 @@ impl GridConfig {
             (None, GridEngine::Stateful) => "Plain".to_owned(),
             // `SVERIFY-P` I4-1: the twin mode is plain-scheduled (I3-2).
             (None, GridEngine::SverifyP) => "Plain".to_owned(),
+            // `SVERIFY-P` P-S: likewise (the precheck is `run`'s, not the grid's).
+            (None, GridEngine::CFirstP) => "Plain".to_owned(),
             (None, GridEngine::CompleteFirst) if !self.precheck => "Plain".to_owned(),
             (None, _) => format!("{:?}", self.selector),
         }
@@ -1633,6 +1643,7 @@ impl GridConfig {
             && match self.engine {
                 GridEngine::Stateful => true,
                 GridEngine::SverifyP => true,
+                GridEngine::CFirstP => true,
                 GridEngine::CompleteFirst => !self.precheck,
                 _ => false,
             }
@@ -1704,7 +1715,7 @@ impl GridConfig {
             GridEngine::SverifyP if self.flush_entries != 4096 => {
                 format!("{base}/threads={}/flush={}", self.threads, self.flush_entries)
             }
-            GridEngine::SverifyP | GridEngine::ExploreP => {
+            GridEngine::SverifyP | GridEngine::ExploreP | GridEngine::CFirstP => {
                 format!("{base}/threads={}", self.threads)
             }
             _ => base,
@@ -1712,6 +1723,7 @@ impl GridConfig {
         // `SVERIFY-P` I4: the knob acts in SVerify-P as in the stateful engine.
         let distinct_effective = self.engine == GridEngine::Stateful
             || self.engine == GridEngine::SverifyP
+            || self.engine == GridEngine::CFirstP
             || (self.engine == GridEngine::CompleteFirst
                 && matches!(self.index, IndexKind::Compact | IndexKind::Set));
         if self.impl_distinct && distinct_effective {
@@ -1770,6 +1782,14 @@ pub(super) enum GridRaw {
     SverifyP(Box<SverifyPRun>),
     /// `SVERIFY-P` I4-4: the baseline's two partitioned explorations.
     ExploreP(Box<ExplorePRun>),
+    /// `SVERIFY-P` P-S: CVerify-P's raw outcome with `VmPeak` at its end.
+    CFirstP(Box<CFirstPRun>),
+}
+
+/// `SVERIFY-P` P-S: one CVerify-P run as the row sees it.
+pub(super) struct CFirstPRun {
+    pub(super) outcome: crate::conformance::cfirst_p::CFirstPOutcome,
+    pub(super) vm_peak_kb: Option<u64>,
 }
 
 /// `SVERIFY-P` I4: one SVerify-P run as the row sees it.
@@ -1844,6 +1864,13 @@ impl std::fmt::Debug for GridRaw {
                 .field("reports", &r.outcome.counters.reports)
                 .field("impl_end", &r.outcome.impl_end)
                 .field("spec_end", &r.outcome.spec_end)
+                .field("spec_errors", &r.outcome.spec_errors.len())
+                .finish(),
+            GridRaw::CFirstP(r) => f
+                .debug_struct("CFirstP")
+                .field("reports", &r.outcome.counters.base.reports)
+                .field("impl_end", &r.outcome.impl_end)
+                .field("aborted", &r.outcome.aborted)
                 .field("spec_errors", &r.outcome.spec_errors.len())
                 .finish(),
             GridRaw::ExploreP(r) => f
@@ -2071,6 +2098,15 @@ fn call(fixture: &Fixture, config: &GridConfig) -> GridRaw {
             }))
         }
         GridEngine::ExploreP => GridRaw::ExploreP(Box::new(explore_partitioned(fixture, config))),
+        // `SVERIFY-P` P-S: the raw outcome, `VmPeak` read at the run's end.
+        GridEngine::CFirstP => {
+            let cc = config.conf_config(fixture);
+            let outcome = crate::conformance::cfirst_p::run_with(&cc, &imp, &spec);
+            GridRaw::CFirstP(Box::new(CFirstPRun {
+                outcome,
+                vm_peak_kb: vm_peak_kb(),
+            }))
+        }
     }
 }
 
@@ -2769,8 +2805,96 @@ pub(super) fn row_of(r: &GridResult) -> Row {
         }
         GridRaw::SverifyP(r) => sverify_p_columns(&mut row, r),
         GridRaw::ExploreP(r) => explore_p_columns(&mut row, r),
+        GridRaw::CFirstP(r) => cfirst_p_columns(&mut row, r, &r.outcome.counters.base),
     }
     row
+}
+
+/// `SVERIFY-P` P-S: the CVerify-P row — the verdict by `run`'s rule on the raw
+/// outcome, the complete-first row's columns from the base record under their
+/// sequential meanings, then the partitioned run's own columns.
+fn cfirst_p_columns(row: &mut Row, r: &CFirstPRun, c: &crate::conformance::report::CFirstCounters) {
+    let o = &r.outcome;
+    let p = &o.counters;
+    let class = if !o.spec_errors.is_empty() {
+        "Err"
+    } else if c.reports > 0 {
+        "Reported"
+    } else {
+        "Conforms"
+    };
+    push_d(row, "verdict", class);
+    push_d(row, "reports", c.reports);
+    push(row, "impl_end", o.impl_end);
+    push_d(row, "spec_errors", o.spec_errors.len());
+    push_d(row, "aborted", o.aborted);
+    push_d(row, "impl_notes", o.impl_notes.len());
+    push_d(row, "executions", o.executions);
+    push_opt(row, "max_paper_events", o.max_paper_events);
+    push_d(row, "witness_cache_len", c.witnesses);
+    push_d(row, "sweep_ends", sweep_split_counts(c));
+    push_d(row, "impl_graphs", c.impl_graphs);
+    push_d(row, "cache_probes", c.cache_probes);
+    push_d(row, "cache_hits", c.cache_hits);
+    push_d(row, "cache_tests", c.cache_tests);
+    push_d(row, "sweeps", c.sweeps);
+    push_d(row, "sweeps_successful", c.sweeps_successful);
+    push_d(row, "sweeps_failing", c.sweeps_failing);
+    push_d(row, "sweeps_aborted", c.sweeps_aborted);
+    if r.outcome.counters.base.sweep_sizes.is_empty() {
+        push_d(row, "sweep_sizes", "");
+    } else {
+        push(row, "sweep_sizes", &c.sweep_sizes);
+    }
+    push_d(row, "sweep_graphs", c.sweep_graphs);
+    push_d(row, "sweep_graphs_max", c.sweep_graphs_max);
+    push_d(row, "witnesses", c.witnesses);
+    push_d(row, "admissions", c.admissions);
+    push_d(row, "evictions", c.evictions);
+    push_d(row, "readmissions", c.readmissions);
+    push_opt(row, "wall_ms_at_first_report", c.wall_ms_at_first_report);
+    push_opt(row, "vmhwm_kb_at_first_report", c.vmhwm_kb_at_first_report);
+    push_d(row, "witness_duplicates", c.witness_duplicates);
+    push_d(row, "counter_reports", c.reports);
+    push_d(row, "cut_reports", c.cut_reports);
+    push_d(row, "precheck_ran", c.precheck_ran);
+    push_d(row, "precheck_wall_time_ms", c.precheck_wall_time_ms);
+    push_d(row, "outer_wall_time_ms", c.outer_wall_time_ms);
+    push_d(row, "sweep_wall_time_ms", c.sweep_wall_time_ms);
+    push_d(
+        row,
+        "impl_phase_wall_ms",
+        c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),
+    );
+    push_d(row, "index_kind", "set");
+    push_d(row, "containment_tests", c.cache_tests);
+    push_opt(row, "impl_distinct_summaries", p.impl_distinct_summaries);
+    push_d(row, "signatures", p.cache_signatures);
+    push_d(row, "entries", c.witnesses);
+    push_d(row, "summary_bytes", p.cache_summary_bytes);
+    push_d(row, "sig_tests", p.sig_tests);
+    push_d(row, "coordinates_compared", p.coordinates_compared);
+    push_d(row, "exact_hits", p.exact_hits);
+    push_d(row, "threads", p.threads);
+    push_d(row, "impl_tasks", p.tasks);
+    push_d(row, "impl_tasks_nonempty", p.tasks_nonempty);
+    push_d(row, "impl_flushes", p.flushes);
+    push_d(row, "redundant_sweeps", p.redundant_sweeps);
+    push_d(row, "unadmitted_after_cancel", p.unadmitted_after_cancel);
+    push_d(row, "unprobed_after_cancel", p.unprobed_after_cancel);
+    push_d(row, "sweeps_in_warmup", p.sweeps_in_warmup);
+    push_d(row, "sweeps_in_root_loop", p.sweeps_in_root_loop);
+    push_d(row, "sweeps_in_tasks", p.sweeps_in_tasks);
+    push_d(row, "sweeps_abandoned", p.sweeps_abandoned);
+    push_d(row, "watch_probes", p.watch_probes);
+    push_d(row, "signature_syncs", p.signature_syncs);
+    push_d(row, "admission_lock_held_ms", p.admission_lock_held_ms);
+    push_d(row, "admission_lock_wait_ms", p.admission_lock_wait_ms);
+    push_d(row, "stopped_early", p.stopped_early);
+    push_d(row, "spawned_at_stop", p.spawned_at_stop);
+    push_d(row, "uncovered_distinct", p.uncovered_distinct);
+    push_d(row, "uncovered_multiplicity", p.uncovered_multiplicity);
+    push_opt(row, "vm_peak_kb", r.vm_peak_kb);
 }
 
 /// `SVERIFY-P` I4-2, I4-6: the sverify-p row — the verdict by `run`'s rule

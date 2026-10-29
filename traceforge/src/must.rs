@@ -333,10 +333,14 @@ impl Must {
         &mut self,
         ctx: crate::conformance::ctx::ConfCtx,
     ) {
-        assert_eq!(
-            ctx.mode(),
-            crate::conformance::ctx::ConfMode::EnumeratePartitioned,
-            "conformance: enable_conformance_partitioned takes the partitioned checker's mode only"
+        assert!(
+            matches!(
+                ctx.mode(),
+                crate::conformance::ctx::ConfMode::EnumeratePartitioned
+                    | crate::conformance::ctx::ConfMode::CFirstOuterPartitioned
+            ),
+            "conformance: enable_conformance_partitioned takes a partitioned checker's mode only \
+             (SVERIFY-P I3-2, P-S)"
         );
         crate::conformance::assert_config_in_scope_partitioned(
             &self.config,

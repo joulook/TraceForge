@@ -1984,3 +1984,491 @@ impl OrderStore {
         self.orders.iter().map(|m| (m.len(), m.capacity())).collect()
     }
 }
+
+// ---------------------------------------------------------------------------
+// `SVERIFY-P` P-S (criteria rev 1.4, ruling 2): the parallel stateless engine's
+// shared witness cache — I3's split made appendable. A signature log
+// (append-only, behind a mutex, with a version), a signature table per worker
+// synced from the log, the order store behind a read-write lock (plain data,
+// `Sync`), and one admission lock. Nothing is made `Sync` that is not, and no
+// `unsafe` is used. The lock order is the admission lock → the store's write
+// lock → the log's mutex; a probe takes the log's mutex (to sync) and then
+// the store's read lock, never both at once. The invariant: a signature's
+// slot exists in the store before its log entry is published, so the store's
+// length is never below the log's and a synced signature's slot is present.
+// ---------------------------------------------------------------------------
+
+/// The signature log: entry `i` is the signature with `SigId` `i`.
+struct SigLog {
+    entries: Vec<(SigHash, Sig)>,
+    /// Bumped at every append; a worker's table records the version it
+    /// synced at.
+    version: u64,
+}
+
+/// The order store: slot `i` holds `SigId` `i`'s orders in admission order;
+/// the FIFO and the eviction history of `w=<n>` beside them, under the same
+/// write lock.
+struct CacheStore {
+    orders: Vec<indexmap::IndexMap<OrdCounts, u64>>,
+    next_seq: u64,
+    fifo: VecDeque<(SigId, u64)>,
+    evicted: HashSet<MemoKey>,
+    /// Held orders (Σ over the slots).
+    held: usize,
+    summary_bytes: usize,
+    admissions: usize,
+    evictions: usize,
+    readmissions: usize,
+}
+
+/// The admission lock's tally.
+#[derive(Default)]
+struct AdmissionTally {
+    redundant: usize,
+    unadmitted_after_cancel: usize,
+    held: std::time::Duration,
+    wait: std::time::Duration,
+}
+
+/// The shared witness cache (one per run).
+pub(crate) struct SharedCache {
+    log: std::sync::Mutex<SigLog>,
+    store: std::sync::RwLock<CacheStore>,
+    admission: std::sync::Mutex<AdmissionTally>,
+    capacity: Capacity,
+    /// Ruling 21: bumped once per stored order (after the insertion, under the
+    /// write lock); a running sweep's watch re-probes only when it moved.
+    admission_version: std::sync::atomic::AtomicU64,
+    /// Ruling 20, test builds only: lookups that found no slot for a synced
+    /// signature — 0 by the invariant.
+    #[cfg(test)]
+    absent_slots: std::sync::atomic::AtomicUsize,
+}
+
+/// A worker's view of the signatures: its table, synced from the log.
+pub(crate) struct WorkerTable {
+    buckets: HashMap<SigHash, Vec<(SigId, Sig)>>,
+    /// The log entries this table holds (the next index to sync from).
+    synced: usize,
+    pub(crate) syncs: usize,
+    /// `Sig ==` comparisons made in resolution.
+    pub(crate) sig_tests: usize,
+}
+
+/// A probe's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CacheProbe {
+    /// A held order `≤` the summary's in its signature's slot.
+    Hit,
+    /// No slot for the signature at the synced version, or no held order `≤`.
+    Miss,
+}
+
+/// An admission's outcome (ruling 2, rulings 4 and 13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// The witness's order stored (a new signature published first).
+    Admitted,
+    /// The re-probe under the admission lock hit: another worker's witness
+    /// covers the probed summary; nothing stored, the sweep was redundant.
+    Redundant,
+    /// The token was cancelled before the admission: nothing stored.
+    UnadmittedAfterCancel,
+    /// Under `Capacity::Zero` nothing is ever admitted.
+    Refused,
+}
+
+/// Ruling 21: a watch step's answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Watch {
+    /// The admission counter has not moved: no re-probe.
+    NotMoved,
+    /// It moved, and the cache now covers the summary: abandon the sweep.
+    Covered,
+    /// It moved, and the cache still does not cover the summary.
+    NotCovered,
+}
+
+/// The cache's counters at the end, in the sequential engine's record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SharedCacheStats {
+    pub(crate) signatures: usize,
+    pub(crate) entries: usize,
+    pub(crate) summary_bytes: usize,
+    pub(crate) admissions: usize,
+    pub(crate) evictions: usize,
+    pub(crate) readmissions: usize,
+    pub(crate) redundant_sweeps: usize,
+    pub(crate) unadmitted_after_cancel: usize,
+    pub(crate) admission_lock_held_ms: u128,
+    pub(crate) admission_lock_wait_ms: u128,
+}
+
+impl WorkerTable {
+    pub(crate) fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            synced: 0,
+            syncs: 0,
+            sig_tests: 0,
+        }
+    }
+
+    /// Resolve by the creation-order scan on `Sig ==` (no hint: `render_hash`
+    /// is `None` since `MIN-ENGINES` E4).
+    fn resolve(&mut self, hash: SigHash, sig: &Sig) -> SigLookup {
+        let Some(slots) = self.buckets.get(&hash) else {
+            return SigLookup::NoBucket;
+        };
+        for (id, held) in slots {
+            self.sig_tests += 1;
+            if held == sig {
+                return SigLookup::Found(*id);
+            }
+        }
+        SigLookup::NoSig
+    }
+
+    fn add(&mut self, hash: SigHash, id: SigId, sig: Sig) {
+        self.buckets.entry(hash).or_default().push((id, sig));
+    }
+}
+
+impl SharedCache {
+    pub(crate) fn new(capacity: Capacity) -> Self {
+        Self {
+            log: std::sync::Mutex::new(SigLog {
+                entries: Vec::new(),
+                version: 0,
+            }),
+            store: std::sync::RwLock::new(CacheStore {
+                orders: Vec::new(),
+                next_seq: 0,
+                fifo: VecDeque::new(),
+                evicted: HashSet::new(),
+                held: 0,
+                summary_bytes: 0,
+                admissions: 0,
+                evictions: 0,
+                readmissions: 0,
+            }),
+            admission: std::sync::Mutex::new(AdmissionTally::default()),
+            capacity,
+            admission_version: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            absent_slots: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn capacity(&self) -> Capacity {
+        self.capacity
+    }
+
+    /// Bring `table` up to the log: clone the entries it has not seen. One
+    /// sync is counted when something was new.
+    fn sync(&self, table: &mut WorkerTable) {
+        let log = self.log.lock().expect("conformance: the signature log");
+        if log.entries.len() > table.synced {
+            for (i, (hash, sig)) in log.entries.iter().enumerate().skip(table.synced) {
+                table.add(*hash, i as SigId, sig.clone());
+            }
+            table.synced = log.entries.len();
+            table.syncs += 1;
+        }
+    }
+
+    /// The probe (ruling 2): sync, resolve, then the slot's exact-hit probe
+    /// and admission-ordered scan under the read lock (`covers_in`, the one
+    /// body). A `NoSig`/`NoBucket` miss is trusted at the synced version.
+    pub(crate) fn probe(
+        &self,
+        table: &mut WorkerTable,
+        s: &CompactSummary,
+    ) -> (CacheProbe, QueryCounts) {
+        let mut q = QueryCounts::default();
+        self.sync(table);
+        let id = match table.resolve(s.hash, &s.sig) {
+            SigLookup::NoBucket | SigLookup::NoSig => return (CacheProbe::Miss, q),
+            SigLookup::Found(id) => id,
+        };
+        let store = self.store.read().expect("conformance: the order store");
+        let Some(slot) = store.orders.get(id as usize) else {
+            // Impossible by the invariant (the slot is pushed before the log
+            // entry); a transient miss if it ever happens, and counted.
+            #[cfg(test)]
+            self.absent_slots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return (CacheProbe::Miss, q);
+        };
+        match covers_in(slot, &s.ord, &mut q) {
+            Covers::Found(_) => (CacheProbe::Hit, q),
+            Covers::NotFound | Covers::NoBucket | Covers::NoSig => (CacheProbe::Miss, q),
+        }
+    }
+
+    /// Run `f` under the admission lock: the engine makes **every** cancel of
+    /// its token through this (gate 4 round 01, M1), so a cancel and an
+    /// admission are linearized by this one lock — an admission that read
+    /// the token as not cancelled inside the lock publishes before any cancel
+    /// can take effect, and one after a cancel sees it and stores nothing.
+    pub(crate) fn under_admission<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _tally = self.admission.lock().expect("conformance: the admission lock");
+        f()
+    }
+
+    /// The admission (ruling 2): under the admission lock, the live token
+    /// (`is_cancelled`, read inside the lock: ruling 13's linearization with
+    /// `under_admission`), the re-probe; then a new signature's slot pushed
+    /// under the write lock and released, its log entry appended; then the
+    /// order inserted under the write lock (evicting first under `w=<n>`, as
+    /// `SetCache::admit`).
+    pub(crate) fn admit(
+        &self,
+        table: &mut WorkerTable,
+        witness: &CompactSummary,
+        probed: &CompactSummary,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Admission {
+        debug_assert!(
+            witness.sig == probed.sig,
+            "conformance: a sweep's witness has the probed summary's signature"
+        );
+        if matches!(self.capacity, Capacity::Zero | Capacity::Bounded(0)) {
+            return Admission::Refused;
+        }
+        #[cfg(test)]
+        gate_wait(&PRE_ADMIT_GATE);
+        let waited = std::time::Instant::now();
+        let mut tally = self.admission.lock().expect("conformance: the admission lock");
+        tally.wait += waited.elapsed();
+        let held_from = std::time::Instant::now();
+        let outcome = (|| {
+            if is_cancelled() {
+                tally.unadmitted_after_cancel += 1;
+                return Admission::UnadmittedAfterCancel;
+            }
+            // The re-probe: another worker's witness may cover the probed
+            // summary since this worker's sweep began.
+            if self.probe(table, probed).0 == CacheProbe::Hit {
+                tally.redundant += 1;
+                return Admission::Redundant;
+            }
+            let id = match table.resolve(witness.hash, &witness.sig) {
+                SigLookup::Found(id) => id,
+                SigLookup::NoBucket | SigLookup::NoSig => {
+                    // Publication, slot first (the invariant), then the log.
+                    let id = {
+                        let mut store = self.store.write().expect("conformance: the order store");
+                        let id = store.orders.len() as SigId;
+                        store.orders.push(indexmap::IndexMap::new());
+                        id
+                    };
+                    #[cfg(test)]
+                    gate_wait(&PUBLICATION_GATE);
+                    {
+                        let mut log = self.log.lock().expect("conformance: the signature log");
+                        debug_assert_eq!(log.entries.len() as SigId, id);
+                        log.entries.push((witness.hash, witness.sig.clone()));
+                        log.version += 1;
+                    }
+                    table.add(witness.hash, id, witness.sig.clone());
+                    table.synced += 1;
+                    id
+                }
+            };
+            let mut store = self.store.write().expect("conformance: the order store");
+            if let Capacity::Bounded(n) = self.capacity {
+                while store.held >= n {
+                    let Some((eid, seq)) = store.fifo.pop_front() else {
+                        break;
+                    };
+                    let slot = &mut store.orders[eid as usize];
+                    if let Some(i) = slot.values().position(|&q| q == seq) {
+                        if let Some((ord, _)) = slot.shift_remove_index(i) {
+                            store.summary_bytes -= ord.payload_bytes();
+                            store.evicted.insert((eid, ord));
+                            store.evictions += 1;
+                            store.held -= 1;
+                        }
+                    }
+                }
+            }
+            let seq = store.next_seq;
+            store.next_seq = seq
+                .checked_add(1)
+                .expect("conformance: more than u64::MAX admissions (seq overflow)");
+            let slot = &mut store.orders[id as usize];
+            // The re-probe missed, so no held order is `≤` the probed
+            // summary's; the witness's order is `≤` it, so it is not held.
+            assert!(
+                !slot.contains_key(&witness.ord),
+                "conformance: the parallel stateless engine admitted a witness the cache \
+                 holds; the re-probe should have hit"
+            );
+            slot.insert(witness.ord.clone(), seq);
+            store.held += 1;
+            store.summary_bytes += witness.ord.payload_bytes();
+            store.admissions += 1;
+            // Ruling 21: one bump per stored order, under the write lock.
+            self.admission_version
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if matches!(self.capacity, Capacity::Bounded(_)) {
+                if store.evicted.contains(&(id, witness.ord.clone())) {
+                    store.readmissions += 1;
+                }
+                store.fifo.push_back((id, seq));
+            }
+            Admission::Admitted
+        })();
+        tally.held += held_from.elapsed();
+        outcome
+    }
+
+    /// The cache's counters at the end.
+    pub(crate) fn stats(&self) -> SharedCacheStats {
+        // Each lock alone, never two at once (gate 3, O-1: nesting the store's
+        // read lock under or over the admission lock would invert the order
+        // the admission takes them in).
+        let mut out = {
+            let tally = self.admission.lock().expect("conformance: the admission lock");
+            SharedCacheStats {
+                redundant_sweeps: tally.redundant,
+                unadmitted_after_cancel: tally.unadmitted_after_cancel,
+                admission_lock_held_ms: tally.held.as_millis(),
+                admission_lock_wait_ms: tally.wait.as_millis(),
+                ..SharedCacheStats::default()
+            }
+        };
+        {
+            let store = self.store.read().expect("conformance: the order store");
+            out.entries = store.held;
+            out.summary_bytes = store.summary_bytes;
+            out.admissions = store.admissions;
+            out.evictions = store.evictions;
+            out.readmissions = store.readmissions;
+        }
+        out.signatures = self
+            .log
+            .lock()
+            .expect("conformance: the signature log")
+            .entries
+            .len();
+        out
+    }
+
+    /// Held orders.
+    pub(crate) fn len(&self) -> usize {
+        self.store.read().expect("conformance: the order store").held
+    }
+
+    /// Ruling 21: the stored orders so far (evictions do not lower it).
+    pub(crate) fn admission_version(&self) -> u64 {
+        self.admission_version
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Ruling 21, a running sweep's watch step on the counter value `current`
+    /// the caller read (its one read per specification completion — gate 4
+    /// round 03, m1): if it has not moved since `*seen`, `NotMoved`; else
+    /// record it in `*seen` and re-probe the cache for `s` (the worker's table,
+    /// synced as any probe), answering `Covered` or `NotCovered`. The re-probe
+    /// sees every order whose bump was read (the bump follows the insertion,
+    /// under the write lock).
+    pub(crate) fn watch(
+        &self,
+        table: &mut WorkerTable,
+        s: &CompactSummary,
+        seen: &mut u64,
+        current: u64,
+    ) -> Watch {
+        if current == *seen {
+            return Watch::NotMoved;
+        }
+        *seen = current;
+        match self.probe(table, s).0 {
+            CacheProbe::Hit => Watch::Covered,
+            CacheProbe::Miss => Watch::NotCovered,
+        }
+    }
+
+    /// Every held order with its signature's id and admission number (the
+    /// coverage check of ruling 1, through a copy; slots by `SigId`, orders in
+    /// admission order).
+    pub(crate) fn entries(&self) -> Vec<(SigId, u64, OrdCounts)> {
+        let store = self.store.read().expect("conformance: the order store");
+        store
+            .orders
+            .iter()
+            .enumerate()
+            .flat_map(|(id, m)| {
+                m.iter()
+                    .map(move |(ord, &seq)| (id as SigId, seq, ord.clone()))
+            })
+            .collect()
+    }
+
+    /// Every published signature with its hash, by `SigId`.
+    pub(crate) fn signatures(&self) -> Vec<(SigHash, Sig)> {
+        self.log
+            .lock()
+            .expect("conformance: the signature log")
+            .entries
+            .clone()
+    }
+
+    /// Ruling 20, test builds only: the absent-slot lookups (0 by the invariant).
+    #[cfg(test)]
+    pub(crate) fn absent_slots_for_test(&self) -> usize {
+        self.absent_slots.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Ruling 20, test builds only: a gate a test holds closed — the publication
+/// gate sits between a new signature's slot push and its log append. Open by
+/// default; `gate_close`/`gate_open` from the test.
+#[cfg(test)]
+pub(crate) struct TestGate {
+    closed: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TestGate {
+    pub(crate) const fn new() -> Self {
+        Self {
+            closed: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        *self.closed.lock().expect("conformance: a test gate") = true;
+    }
+
+    pub(crate) fn open(&self) {
+        *self.closed.lock().expect("conformance: a test gate") = false;
+        self.cv.notify_all();
+    }
+}
+
+/// Wait at a test gate while it is closed.
+#[cfg(test)]
+pub(crate) fn gate_wait(gate: &TestGate) {
+    let mut closed = gate.closed.lock().expect("conformance: a test gate");
+    while *closed {
+        closed = gate.cv.wait(closed).expect("conformance: a test gate");
+    }
+}
+
+/// Ruling 20, test builds only: the publication gate (between a new
+/// signature's slot push and its log append).
+#[cfg(test)]
+pub(crate) static PUBLICATION_GATE: TestGate = TestGate::new();
+
+/// Gate 4 round 01 M1, test builds only: the gate at an admission's entry,
+/// before the admission lock — a test holds a successful sweep there,
+/// cancels through `under_admission`, releases it, and sees
+/// `UnadmittedAfterCancel` with nothing published.
+#[cfg(test)]
+pub(crate) static PRE_ADMIT_GATE: TestGate = TestGate::new();

@@ -76,6 +76,18 @@ pub enum Engine {
     /// `triage`, `search_budget`, `inner_order`, `memo` and
     /// `skip_spec_errfree_check` (its specification phase is the §5.4 check).
     SverifyP,
+    /// CVerify-P (`SVERIFY-P` P-S): the complete-first engine's outer run on
+    /// the partitioned parallel Must, each miss's sweep inline on the worker
+    /// that missed, the witness cache shared (the set cache, appendable).
+    /// Reads `threads`, `witness_cache`, `quiet_sweeps`, `sweep_record`,
+    /// `stop_at_first_report`, `all_reports`, `impl_distinct` and
+    /// `paper_events`; refuses `max_iterations`, `parallel`,
+    /// `completion_cover(Flat)` and `early_error_cut`; ignores `index`
+    /// (always the set cache), `antichain`, `probe_memo`, `bucket`,
+    /// `flush_entries`, `gated_mode`, `gate_policy`, `triage`,
+    /// `search_budget`, `inner_order` and `memo`; the sequential precheck as
+    /// `CompleteFirst`.
+    CFirstP,
 }
 
 /// `P4-GATED` G5: the gated checker's reporting contract.
