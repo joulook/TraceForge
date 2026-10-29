@@ -77,6 +77,10 @@ pub(crate) struct CFirstPOutcome {
     pub(crate) impl_notes: Vec<Diagnostic>,
     /// Every outer execution (the contexts' `executions`, summed over tasks).
     pub(crate) executions: usize,
+    /// `SVERIFY-P` V-C (VC-0): the outer run's complete and blocked endings,
+    /// the partitioned runner's `stats.execs` and `stats.block` as they are.
+    pub(crate) impl_complete: usize,
+    pub(crate) impl_blocked: usize,
     pub(crate) max_paper_events: Option<usize>,
     pub(crate) aborted: bool,
     /// Rulings 1 and 16, test builds only: the final cache — its signatures
@@ -634,6 +638,8 @@ pub(crate) fn run_with(
         spec_errors: abort.clone().unwrap_or_default(),
         impl_notes: a.diagnostics,
         executions: a.executions,
+        impl_complete: run.stats.execs,
+        impl_blocked: run.stats.block,
         max_paper_events: cc.paper_events.then_some(a.max_paper),
         aborted: abort.is_some(),
         #[cfg(test)]

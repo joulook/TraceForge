@@ -2337,10 +2337,14 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // md5 `7368b91d…`); `I4_HUNKS` undo it to `23713aaa…`.
     // SVERIFY-P P-S (2026-10-28, tester re-pin, gate 3): to `04bcdc02…` (grid.rs
     // md5 `af082a44…`, ruling 21's); `PS_HUNKS` undo it to `c8f7a859…`.
+    // SVERIFY-P V-C (2026-10-29, tester re-pin, gate 3): to `6615e593…` (grid.rs md5
+    // `cac3b127…`, VC-0's split on the CFirstP row); `VC_HUNKS` undo it to `04bcdc02…`.
+    // SVERIFY-P V-C Q14 (a) (2026-10-29, tester re-pin): to `4653dceb…` (grid.rs md5
+    // `4b3aac66…`); `Q14_HUNKS` undo it to `6615e593…`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "04bcdc02851ca9b2b50049162eb99cd9",
+        "4653dceb140fcdfb15d3ad9c752125ac",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -3673,7 +3677,72 @@ fn explore_p_columns(row: &mut Row, r: &ExplorePRun) {
             ),
         ),
     ];
+    // SVERIFY-P V-C (2026-10-29, tester re-pin, gate 3): the lead's one hunk inside the
+    // prefix (VC-0: `cfirst_p_columns` pushes the outer run's split after `executions`);
+    // undoing it gives back the P-S prefix, byte for byte.
+    const VC_HUNKS: [(&str, &str); 1] = [(
+        concat!(
+            "    push_d(row, \"executions\", o.executions);\n",
+            "    // `SVERIFY-P` V-C (VC-0, schema 8): the outer run's split.\n",
+            "    push_d(row, \"impl_complete\", o.impl_complete);\n",
+            "    push_d(row, \"impl_blocked\", o.impl_blocked);\n",
+            "    push_opt(row, \"max_paper_events\", o.max_paper_events);\n"
+        ),
+        concat!(
+            "    push_d(row, \"executions\", o.executions);\n",
+            "    push_opt(row, \"max_paper_events\", o.max_paper_events);\n"
+        ),
+    )];
+    // SVERIFY-P V-C Q14 (a) (2026-10-29, tester re-pin, gate 3 again): the lead's one hunk in
+    // `cfirst_p_columns` (the comment and the cell blank above one thread); undoing it gives back
+    // the VC-0 prefix (`6615e593…`), byte for byte.
+    const Q14_HUNKS: [(&str, &str); 1] = [(
+        concat!(
+            "    push_d(row, \"outer_wall_time_ms\", c.outer_wall_time_ms);\n",
+            "    // `SVERIFY-P` V-C (Q14 a): `sweep_wall_time_ms` sums the sweeps' times\n",
+            "    // over the workers. At one thread they run in the exploring thread, so\n",
+            "    // outer minus sweep is the implementation phase's wall. Above one thread\n",
+            "    // the sweeps overlap the exploration and the sum is worker time, not a\n",
+            "    // wall: the run has no implementation phase to time, and the cell is\n",
+            "    // blank (the sweep share is `sweep_wall_time_ms` over the row's CPU time).\n",
+            "    push_d(row, \"sweep_wall_time_ms\", c.sweep_wall_time_ms);\n",
+            "    if p.threads > 1 {\n",
+            "        push_d(row, \"impl_phase_wall_ms\", \"\");\n",
+            "    } else {\n",
+            "        push_d(\n",
+            "            row,\n",
+            "            \"impl_phase_wall_ms\",\n",
+            "            c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),\n",
+            "        );\n",
+            "    }\n"
+        ),
+        concat!(
+            "    push_d(row, \"outer_wall_time_ms\", c.outer_wall_time_ms);\n",
+            "    push_d(row, \"sweep_wall_time_ms\", c.sweep_wall_time_ms);\n",
+            "    push_d(\n",
+            "        row,\n",
+            "        \"impl_phase_wall_ms\",\n",
+            "        c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),\n",
+            "    );\n"
+        ),
+    )];
     let mut t = prefix.clone();
+    for (new, old) in Q14_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "6615e593b5ec1d352014a87d8dfd04d4",
+        "conformance: the prefix without Q14's hunk = the VC-0 prefix"
+    );
+    for (new, old) in VC_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "04bcdc02851ca9b2b50049162eb99cd9",
+        "conformance: the prefix without V-C's hunk = the P-S prefix"
+    );
     for (new, old) in PS_HUNKS {
         t = undo(t, new, old);
     }

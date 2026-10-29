@@ -83,7 +83,12 @@ use crate::conformance::{verify, verify_conformance_with_opts};
 /// `SVERIFY-P` P-S: schema 7 appends the parallel stateless engine's eleven
 /// columns after `spawned_at_stop`; the label at the defaults is unchanged;
 /// a schema-6 store is refused as any other.
-pub(super) const SCHEMA_VERSION: u32 = 7;
+/// `SVERIFY-P` V-C (VC-0): schema 8 appends `cpu_user_ms` and `cpu_sys_ms`
+/// after `watch_probes` and fills `impl_complete`/`impl_blocked` on the
+/// CFirstP row, whose `impl_phase_wall_ms` is blank above one thread (Q14 a);
+/// the label at the defaults is unchanged; a schema-7 store is refused as any
+/// other.
+pub(super) const SCHEMA_VERSION: u32 = 8;
 
 /// `GridConfig::new(GridEngine::Enumerator).label()` at this schema version.
 pub(super) const LABEL_PIN: &str =
@@ -362,6 +367,9 @@ pub(super) const ROW_OF_COLUMNS: &[&str] = &[
     "sweeps_in_tasks",
     "sweeps_abandoned",
     "watch_probes",
+    // `SVERIFY-P` V-C (schema 8): the child process's CPU time (VC-0).
+    "cpu_user_ms",
+    "cpu_sys_ms",
 ];
 
 /// The declared header: the runner's columns, then every `row_of` column.
@@ -1220,6 +1228,11 @@ pub(super) struct RowMeta {
     pub(super) variant: String,
     pub(super) twin_key: String,
     pub(super) comm_model: String,
+    /// `SVERIFY-P` V-C (VC-0): the parent's CPU reading for a row the child
+    /// did not record (the reading at the kill, or the last sample on a
+    /// crash); blank otherwise. A child's record carries its own.
+    pub(super) cpu_user_ms: String,
+    pub(super) cpu_sys_ms: String,
 }
 
 impl RowMeta {
@@ -1347,6 +1360,8 @@ pub(super) fn eval_row_of(end: &GridEnd, meta: &RowMeta) -> Row {
         .to_owned(),
     );
     p("direction", "none".to_owned());
+    p("cpu_user_ms", meta.cpu_user_ms.clone());
+    p("cpu_sys_ms", meta.cpu_sys_ms.clone());
     for (k, v) in inner {
         if k == "ended" {
             continue;
@@ -1911,7 +1926,18 @@ fn eval_row() {
     if matches!(spec.config.engine, GridEngine::SverifyP | GridEngine::ExploreP) {
         spec.config.phase_peaks = true;
     }
-    let row = child_row(&spec, &commit).unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let mut row =
+        child_row(&spec, &commit).unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    // `SVERIFY-P` V-C (VC-0): the child's own CPU time, read after the engine
+    // returned (a panic is caught inside `child_row`), before the record.
+    let (user, sys) = cpu_cells(cpu_ms_of_pid(std::process::id()));
+    for (k, v) in row.iter_mut() {
+        if *k == "cpu_user_ms" {
+            *v = user.clone();
+        } else if *k == "cpu_sys_ms" {
+            *v = sys.clone();
+        }
+    }
     let line = format!("{SENTINEL}{}\n", csv_line(&record_of(&row)));
     let mut out = std::io::stdout().lock();
     out.write_all(line.as_bytes())
@@ -1957,6 +1983,10 @@ struct ChildOutcome {
     sampled_hwm_kb: Option<u64>,
     sentinel: Option<Vec<String>>,
     pid: u32,
+    /// `SVERIFY-P` V-C (VC-0): the parent's last CPU reading of the child,
+    /// taken with each resident sample, and its reading just before a kill.
+    cpu_sampled: Option<(u64, u64)>,
+    cpu_at_kill: Option<(u64, u64)>,
 }
 
 impl Driver {
@@ -2323,6 +2353,8 @@ impl Driver {
         let pid = child.id();
         let mut sampled: Option<u64> = None;
         let mut killed: Option<&'static str> = None;
+        let mut cpu_sampled: Option<(u64, u64)> = None;
+        let mut cpu_at_kill: Option<(u64, u64)> = None;
         // The exit is polled finely (so `proc_wall_ms` is not quantised to
         // the sampling period); `VmHWM` is sampled once per period. A zero
         // reading (the process before its exec) is not a sample.
@@ -2341,11 +2373,15 @@ impl Driver {
                         killed = Some("memory");
                     }
                 }
+                if let Some(c) = parent_cpu_reading(pid, CpuReason::Sample) {
+                    cpu_sampled = Some(c);
+                }
             }
             if started.elapsed() >= spec.tier.wall {
                 killed = Some("wall");
             }
             if killed.is_some() {
+                cpu_at_kill = parent_cpu_reading(pid, CpuReason::Kill);
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -2369,6 +2405,8 @@ impl Driver {
             sampled_hwm_kb: sampled,
             sentinel,
             pid,
+            cpu_sampled,
+            cpu_at_kill,
         })
     }
 
@@ -2389,6 +2427,7 @@ impl Driver {
         };
         match (out.killed, &out.sentinel) {
             (Some(reason), _) => {
+                (meta.cpu_user_ms, meta.cpu_sys_ms) = cpu_cells(out.cpu_at_kill);
                 meta.censored = true;
                 meta.censor_via = "kill".to_owned();
                 meta.end_class = if reason == "wall" {
@@ -2447,6 +2486,8 @@ impl Driver {
                     })
                     .unwrap_or_else(|| "unknown".to_owned());
                 meta.end_class = format!("crashed({status})");
+                // A lower bound: the child is gone; its last sampled reading.
+                (meta.cpu_user_ms, meta.cpu_sys_ms) = cpu_cells(out.cpu_sampled);
                 meta.proc_wall_ms = out.elapsed.as_millis().to_string();
                 let end = GridEnd::Panicked {
                     fixture: spec.fixture.clone(),
@@ -2479,6 +2520,100 @@ fn vm_hwm_of(pid: u32) -> Option<u64> {
     let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let line = status.lines().find(|l| l.starts_with("VmHWM:"))?;
     line.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// `SVERIFY-P` V-C (VC-0): user and system CPU time in milliseconds from a
+/// `/proc/<pid>/stat` line — fields 14 (`utime`) and 15 (`stime`), counted
+/// after the last `)` so a `comm` holding spaces or `)` cannot shift them;
+/// ticks at Linux's `USER_HZ` of 100 per second (10 ms each).
+pub(super) fn cpu_ms_of_stat(stat: &str) -> Option<(u64, u64)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace().skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some((utime * 10, stime * 10))
+}
+
+/// A process's CPU time (all its threads), or `None` if it cannot be read.
+fn cpu_ms_of_pid(pid: u32) -> Option<(u64, u64)> {
+    cpu_ms_of_stat(&fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The two cells of a reading: numbers, or blank when there was none.
+pub(super) fn cpu_cells(reading: Option<(u64, u64)>) -> (String, String) {
+    reading.map_or((String::new(), String::new()), |(u, s)| {
+        (u.to_string(), s.to_string())
+    })
+}
+
+/// Why the parent read the child's CPU time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CpuReason {
+    /// With a resident sample.
+    Sample,
+    /// Just before a kill.
+    Kill,
+}
+
+/// The seam's sentinels: not multiples of 10, so never a real reading.
+pub(super) const CPU_SENTINEL_SAMPLE: (u64, u64) = (1_111, 111);
+pub(super) const CPU_SENTINEL_KILL: (u64, u64) = (2_221, 221);
+
+thread_local! {
+    /// VC-0's seam, inert unless a test enables it on its own thread (the
+    /// driver reads its children on the calling thread): each parent reading
+    /// with its reason and the real value, replaced by the reason's sentinel.
+    static CPU_SEAM: std::cell::RefCell<Option<Vec<(CpuReason, Option<(u64, u64)>)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Turns the seam on for this thread, with an empty log, while the returned
+/// guard lives (`SVERIFY-P-VC-CODE` round 01, M1).
+pub(super) fn cpu_seam_enable() -> CpuSeamGuard {
+    let prior = CPU_SEAM.with(|s| s.borrow_mut().replace(Vec::new()));
+    CpuSeamGuard { prior }
+}
+
+/// Turns the seam off for this thread and returns its log.
+pub(super) fn cpu_seam_take() -> Vec<(CpuReason, Option<(u64, u64)>)> {
+    CPU_SEAM.with(|s| s.borrow_mut().take().unwrap_or_default())
+}
+
+/// Whether the seam is on for this thread.
+pub(super) fn cpu_seam_is_on() -> bool {
+    CPU_SEAM.with(|s| s.borrow().is_some())
+}
+
+/// The seam's guard: when dropped, at the end of its scope or when a panic
+/// unwinds through it, it puts back the state it found (off, unless a
+/// guard is nested), so a test's seam never reaches a later test that the
+/// harness runs on the same thread.
+#[must_use = "the seam is turned back off when the guard is dropped"]
+pub(super) struct CpuSeamGuard {
+    prior: Option<Vec<(CpuReason, Option<(u64, u64)>)>>,
+}
+
+impl Drop for CpuSeamGuard {
+    fn drop(&mut self) {
+        let prior = self.prior.take();
+        let _ = CPU_SEAM.try_with(|s| *s.borrow_mut() = prior);
+    }
+}
+
+/// The parent's reading of a child; through the seam when it is on (a
+/// reading that failed stays `None`: the sentinel replaces a reading only).
+fn parent_cpu_reading(pid: u32, reason: CpuReason) -> Option<(u64, u64)> {
+    let real = cpu_ms_of_pid(pid);
+    CPU_SEAM.with(|s| match s.borrow_mut().as_mut() {
+        Some(log) => {
+            log.push((reason, real));
+            real.map(|_| match reason {
+                CpuReason::Sample => CPU_SENTINEL_SAMPLE,
+                CpuReason::Kill => CPU_SENTINEL_KILL,
+            })
+        }
+        None => real,
+    })
 }
 
 /// A filesystem-safe name for a row's run directory.

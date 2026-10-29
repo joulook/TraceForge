@@ -1251,8 +1251,10 @@ fn c02_verdict_rows_carry_the_run_with_counters() {
     // after `memo_clears` (249).
     // SVERIFY-P P-S re-pin (2026-10-28, gate 3): schema 7, the eleven columns after
     // `spawned_at_stop` (260; three of them the lead's O-5 fix, two ruling 21's).
-    assert_eq!(SCHEMA_VERSION, 7, "conformance: the schema version");
-    assert_eq!(header().len(), 260, "conformance: the header's width");
+    // SVERIFY-P V-C re-pin (2026-10-29, VC-0): schema 8, `cpu_user_ms` and `cpu_sys_ms`
+    // after `watch_probes` (262).
+    assert_eq!(SCHEMA_VERSION, 8, "conformance: the schema version");
+    assert_eq!(header().len(), 262, "conformance: the header's width");
     for c in CFIRST_COUNTER_COLUMNS
         .iter()
         .chain(GATED_COUNTER_COLUMNS.iter())

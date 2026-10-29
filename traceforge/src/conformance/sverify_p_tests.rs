@@ -2218,9 +2218,19 @@ fn i4_1_c_every_stored_key_reprints() {
                         // the stores written since I4 (I4's own; V-S's two, tester re-pin
                         // at V-S gate 3): no earlier store holds an I4 engine's key; and
                         // `SVERIFY-P` P-S (tester re-pin at P-S gate 3): `CFirstP` keys (they
-                        // carry `threads=`) in P-S's two stores only
+                        // carry `threads=`) in P-S's two stores only; `SVERIFY-P` V-C (tester
+                        // re-pin at V-C gate 3): and in V-C's two, and their Q14 (a) `.q14-before`
+                        // copies (gate 3's first run, kept)
                         let since: &[&str] = if c.engine == GridEngine::CFirstP {
-                            &["sverify-p-ps/", "sverify-p-ps-margin/", "sverify-p-ps-r21/"]
+                            &[
+                                "sverify-p-ps/",
+                                "sverify-p-ps-margin/",
+                                "sverify-p-ps-r21/",
+                                "sverify-p-vc/",
+                                "sverify-p-vc-curve/",
+                                "sverify-p-vc.q14-before/",
+                                "sverify-p-vc-curve.q14-before/",
+                            ]
                         } else {
                             &["sverify-p-i4/", "sverify-p-vs/", "sverify-p-vs-curve/"]
                         };
@@ -5862,4 +5872,1613 @@ fn ps_the_store_checks() {
         note!("PSSC\tmismatch\t{b}");
     }
     assert!(bad.is_empty(), "conformance: the P-S store: {bad:#?}");
+}
+
+// =========================================================================
+// SVERIFY-P V-C (gate 3, the tester): the parallel stateless engine against the sequential one on
+// V-S's catalogue at t ∈ {1, 4, 16}, its curve, schema 8 — criteria `SVERIFY-P-VC.md` rev 1.4 and
+// `log/dev/SVERIFY-P.derived-vc.md` (923cd12c). The references are MIN-ENGINES §4's package
+// (`e7s`, `E1C`, `UNCS`, `e9c Set`, `E1E`, `E1P`; `E1T` and `UNC` for A4 hash k3q3m3), read as
+// V-S and P-S read it; nothing sequential is re-run. VC-0's own tests are in `eval_tests.rs`.
+// =========================================================================
+
+/// The curve's two fixtures (V-S's).
+const VC_CURVE: [&str; 2] = ["apps/a3/fifo/spec/k3q3", "2pc/leader/conf/n4"];
+
+/// The one catalogue fixture with no stateless reference (censored at 1 200 s in the package).
+const VC_NO_E7S: &str = "apps/a4/hash/a4a/k3q3m3";
+
+/// The fixture of VC-5's split and reference directions: implementation split 13/8 (`E1P`; both
+/// non-zero and unequal), a violator (8 reports).
+const VC_SPLIT_FIXTURE: &str = "apps/a3/never-grant/spec/k2q2";
+
+/// The A3 lock sizes the catalogue holds, with the criteria's N (VC-3).
+const VC3_SIZES: [(&str, u128); 4] = [
+    ("apps/a3/fifo/spec/k2q1", 2),
+    ("apps/a3/fifo/spec/k2q2", 6),
+    ("apps/a3/fifo/spec/k3q1", 6),
+    ("apps/a3/fifo/spec/k3q3", 1680),
+];
+
+/// VC-1's equal-at-every-t columns as the class table counts them.
+const VC_EQUAL_COLUMNS: [&str; 26] = [
+    "verdict",
+    "reports",
+    "uncovered_multiplicity",
+    "sweeps_failing",
+    "sweeps_aborted",
+    "impl_graphs",
+    "cache_probes",
+    "executions",
+    "impl_complete",
+    "impl_blocked",
+    "impl_distinct_summaries",
+    "first_report",
+    "impl_end",
+    "aborted",
+    "stopped_early",
+    "spec_errors",
+    "witness_duplicates",
+    "cut_reports",
+    "unprobed_after_cancel",
+    "unadmitted_after_cancel",
+    "spawned_at_stop",
+    "identities",
+    "impl_split vs ExploreP",
+    "no e7s: E1T/E1P/UNC",
+    "cpu",
+    "impl_phase_wall_ms",
+];
+
+/// VC-1's order-dependent columns, recorded beside the package.
+const VC_ORDER_DEPENDENT: [&str; 9] = [
+    "sweeps",
+    "sweeps_successful",
+    "cache_hits",
+    "cache_tests",
+    "admissions",
+    "witnesses",
+    "sweep_graphs",
+    "sweep_graphs_max",
+    "sweep_sizes",
+];
+
+/// CFirstP as V-C runs it: `stop` off, `w=inf`, the engine's own `Set` index, `t` workers.
+fn vc_config(t: usize, distinct: bool) -> GridConfig {
+    GridConfig::new(GridEngine::CFirstP)
+        .threads(t)
+        .witness_cache(Capacity::Unbounded)
+        .stop(false)
+        .impl_distinct(distinct)
+}
+
+fn vc_row(fixture: &str, config: GridConfig, family: &str, variant: &str) -> RowSpec {
+    RowSpec {
+        fixture: fixture.to_owned(),
+        config,
+        rep: 0,
+        tier: Tier::default_tier(),
+        run_kind: RunKind::Timed,
+        family: family.to_owned(),
+        knobs: String::new(),
+        k: [None; 4],
+        variant: variant.to_owned(),
+        twin_key: String::new(),
+        series: None,
+    }
+}
+
+/// V-C's store rows: `catalogue` (V-S's 140 store fixtures × t ∈ {1, 4, 16}, `distinct=on`: 420),
+/// `curve` (`VC_CURVE` × t ∈ {1, 2, 4, 8, 16}, `distinct` off: 10), `schema` (VC-5's schema 7 → 8
+/// set: every `GridEngine` arm on never-grant k2q2 and A1 correct n2r1 at t = 1, the three
+/// parallel engines also at t = 4: 24).
+fn vc_store_rows(part: &str) -> Vec<RowSpec> {
+    let mut rows = Vec::new();
+    match part {
+        "catalogue" => {
+            for name in vs_catalogue().into_iter().filter(|n| !n.starts_with("e1:")) {
+                for t in [1, 4, 16] {
+                    rows.push(vc_row(name, vc_config(t, true), "sverify-p-vc", "catalogue"));
+                }
+            }
+        }
+        "curve" => {
+            for name in VC_CURVE {
+                for t in [1, 2, 4, 8, 16] {
+                    rows.push(vc_row(name, vc_config(t, false), "sverify-p-vc", "curve"));
+                }
+            }
+        }
+        "schema" => {
+            for name in [VC_SPLIT_FIXTURE, "apps/a1/correct/spec/n2r1"] {
+                for e in [
+                    GridEngine::Enumerator,
+                    GridEngine::Stateful,
+                    GridEngine::CompleteFirst,
+                    GridEngine::Gated,
+                    GridEngine::Verify,
+                    GridEngine::Explore,
+                    GridEngine::SverifyP,
+                    GridEngine::ExploreP,
+                    GridEngine::CFirstP,
+                ] {
+                    let parallel =
+                        matches!(e, GridEngine::SverifyP | GridEngine::ExploreP | GridEngine::CFirstP);
+                    for t in if parallel { vec![1, 4] } else { vec![1] } {
+                        let c = if parallel { GridConfig::new(e).threads(t) } else { GridConfig::new(e) };
+                        rows.push(vc_row(name, c, "sverify-p-vc-schema", "schema"));
+                    }
+                }
+            }
+        }
+        other => panic!("conformance: VC_PART {other}: catalogue | curve | schema"),
+    }
+    rows
+}
+
+/// V-C's references: the stateless records (P-S's reader), the stateful ones (V-S's reader:
+/// `E1T`, `E1P`, `E1E`, `UNCSET`), and the number of `UNC` lines per fixture.
+struct VcRecords {
+    ps: BTreeMap<String, PsRecord>,
+    vs: BTreeMap<String, VsRecord>,
+    unc: BTreeMap<String, usize>,
+}
+
+fn vc_records() -> VcRecords {
+    let ps = ps_records();
+    let vs = vs_records();
+    // `vs_records` left its extraction under TMPDIR: each rerun file's `UNC` lines, by the file's
+    // `E1T` fixture
+    let tmp = std::env::var("TMPDIR").expect("conformance: V-C reads the package under TMPDIR");
+    let dir = std::path::Path::new(&tmp)
+        .join(format!("vs-package-{}", std::process::id()))
+        .join("rerun");
+    let mut unc = BTreeMap::new();
+    for e in std::fs::read_dir(&dir).expect("conformance: the extracted rerun records") {
+        let text = std::fs::read_to_string(e.unwrap().path()).unwrap();
+        let name = text
+            .lines()
+            .find_map(|l| {
+                let p: Vec<&str> = l.split('\t').collect();
+                (p.len() > 1 && p[0] == "E1T").then(|| p[1].to_owned())
+            })
+            .expect("conformance: a rerun file's E1T line");
+        unc.insert(name, text.lines().filter(|l| l.starts_with("UNC\t")).count());
+    }
+    assert_eq!((ps.len(), vs.len(), unc.len()), (144, 144, 144), "conformance: the package's 144 records");
+    VcRecords { ps, vs, unc }
+}
+
+type VcFails = Vec<(&'static str, String)>;
+
+/// VC-1's equal-at-every-t columns against the package: `e7s` (verdict, reports, the uncovered
+/// multiplicity, failing and aborting sweeps, `impl_graphs`, `cache_probes`), `E1C` executions,
+/// `E1P`'s implementation split (each cell), `E1E` (when the row has `distinct=on`), `e9c Set`'s
+/// first report.
+fn vc_reference_checks(m: &BTreeMap<String, String>, ps: &PsRecord, vs: &VsRecord, distinct: bool) -> VcFails {
+    let e7 = |k: &str| -> u128 {
+        ps.e7s.get(k).and_then(|v| v.parse().ok()).unwrap_or_else(|| panic!("conformance: e7s {k}"))
+    };
+    let mut bad: VcFails = Vec::new();
+    let mut eq = |col: &'static str, got: u128, want: u128| {
+        if got != want {
+            bad.push((col, format!("{got} vs the package's {want}")));
+        }
+    };
+    eq("reports", i4_num(m, "reports"), e7("reports"));
+    eq("uncovered_multiplicity", i4_num(m, "uncovered_multiplicity"), e7("reports"));
+    eq("sweeps_failing", i4_num(m, "sweeps_failing"), e7("sweeps_failing"));
+    eq("sweeps_aborted", i4_num(m, "sweeps_aborted"), e7("sweeps_aborted"));
+    eq("impl_graphs", i4_num(m, "impl_graphs"), e7("impl_graphs"));
+    eq("cache_probes", i4_num(m, "cache_probes"), e7("cache_probes"));
+    eq("executions", i4_num(m, "executions"), ps.executions.expect("conformance: E1C"));
+    eq("impl_complete", i4_num(m, "impl_complete"), vs.impl_split.0);
+    eq("impl_blocked", i4_num(m, "impl_blocked"), vs.impl_split.1);
+    if distinct {
+        eq(
+            "impl_distinct_summaries",
+            i4_opt(m, "impl_distinct_summaries").unwrap_or(u128::MAX),
+            ps.impl_distinct.expect("conformance: E1E"),
+        );
+    }
+    let want = if ps.e7s.get("verdict").map(String::as_str) == Some("conforms") { "Conforms" } else { "Reported" };
+    if m["verdict"] != want {
+        bad.push(("verdict", format!("{} vs the package's {want}", m["verdict"])));
+    }
+    let some = i4_opt(m, "wall_ms_at_first_report").is_some();
+    if Some(some) != ps.first_some || i4_opt(m, "vmhwm_kb_at_first_report").is_some() != some {
+        bad.push(("first_report", format!("{some} vs e9c Set {:?}", ps.first_some)));
+    }
+    bad
+}
+
+/// A4 hash k3q3m3 (no stateless reference; VC-1): a completing row against SVerify-S's `E1T`
+/// (verdict, reports, `impl_graphs`), its split against `E1P`, its uncovered cells against `UNC`.
+fn vc_no_e7s_checks(m: &BTreeMap<String, String>, vs: &VsRecord, unc: usize) -> VcFails {
+    let mut bad: VcFails = Vec::new();
+    let mut eq = |got: u128, want: u128, what: &str| {
+        if got != want {
+            bad.push(("no e7s: E1T/E1P/UNC", format!("{what} {got} vs {want}")));
+        }
+    };
+    eq(i4_num(m, "reports"), vs.reports, "reports vs E1T");
+    eq(i4_num(m, "impl_graphs"), vs.impl_graphs, "impl_graphs vs E1T");
+    eq(i4_num(m, "impl_complete"), vs.impl_split.0, "impl_complete vs E1P");
+    eq(i4_num(m, "impl_blocked"), vs.impl_split.1, "impl_blocked vs E1P");
+    eq(i4_num(m, "uncovered_multiplicity"), unc as u128, "uncovered_multiplicity vs UNC lines");
+    let want = if vs.verdict == "conforms" { "Conforms" } else { "Reported" };
+    if m["verdict"] != want {
+        bad.push(("no e7s: E1T/E1P/UNC", format!("verdict {} vs E1T {}", m["verdict"], vs.verdict)));
+    }
+    bad
+}
+
+/// VC-1's run-shape cells: the search end as its own column (V-S gate 4's M1), `aborted`,
+/// `stopped_early`, `spec_errors`, the full-run zeros, never `Err`.
+fn vc_end_checks(m: &BTreeMap<String, String>) -> VcFails {
+    let mut bad: VcFails = Vec::new();
+    for (col, want) in [
+        ("impl_end", "StateSpaceExhausted"),
+        ("aborted", "false"),
+        ("stopped_early", "false"),
+        ("spec_errors", "0"),
+    ] {
+        if m.get(col).map(String::as_str) != Some(want) {
+            bad.push((col, format!("{:?}, not {want}", m.get(col))));
+        }
+    }
+    if m.get("verdict").map(String::as_str) == Some("Err") {
+        bad.push(("verdict", "Err".to_owned()));
+    }
+    for col in [
+        "witness_duplicates",
+        "cut_reports",
+        "unprobed_after_cancel",
+        "unadmitted_after_cancel",
+        "spawned_at_stop",
+    ] {
+        let v = i4_num(m, col);
+        if v != 0 {
+            bad.push((col, format!("{v}, not 0 on a full run")));
+        }
+    }
+    bad
+}
+
+/// VC-1's identities (1)–(9) on a row's cells (`t` its thread count); each failure names its
+/// identity (the column class `identities` counts any of them).
+fn vc_identities(m: &BTreeMap<String, String>, t: usize) -> VcFails {
+    let n = |k: &str| i4_num(m, k);
+    let mut bad: VcFails = Vec::new();
+    let mut eq = |id: &'static str, a: u128, b: u128| {
+        if a != b {
+            bad.push((id, format!("{a} vs {b}")));
+        }
+    };
+    let t = t as u128;
+    eq("identity 1", n("cache_hits") + n("sweeps") + n("unprobed_after_cancel"), n("impl_graphs"));
+    eq(
+        "identity 2",
+        n("sweeps"),
+        n("sweeps_successful") + n("sweeps_failing") + n("sweeps_aborted") + n("sweeps_abandoned"),
+    );
+    eq(
+        "identity 3",
+        n("admissions") + n("redundant_sweeps") + n("unadmitted_after_cancel"),
+        n("sweeps_successful"),
+    );
+    eq("identity 4", n("witnesses") + n("evictions"), n("admissions"));
+    eq("identity 4 (w=inf: no eviction)", n("evictions"), 0);
+    eq("identity 5 (reports = sweeps_failing)", n("reports"), n("sweeps_failing"));
+    eq("identity 5 (sweeps_failing = uncovered_multiplicity)", n("sweeps_failing"), n("uncovered_multiplicity"));
+    eq("identity 6", n("sweeps_in_warmup") + n("sweeps_in_root_loop") + n("sweeps_in_tasks"), n("sweeps"));
+    eq(
+        "identity 7 (abandoned ≤ watch probes; 1 = broken)",
+        u128::from(n("sweeps_abandoned") > n("watch_probes")),
+        0,
+    );
+    eq(
+        "identity 7 (watch probes ≤ (t − 1) · admissions; 1 = broken)",
+        u128::from(n("watch_probes") > (t - 1) * n("admissions")),
+        0,
+    );
+    if t == 1 {
+        eq(
+            "identity 7 (t = 1: no redundant or abandoned sweep, no probe)",
+            n("redundant_sweeps") + n("sweeps_abandoned") + n("watch_probes"),
+            0,
+        );
+    }
+    eq(
+        "identity 8 (sweep_graphs_max ≤ sweep_graphs; 1 = broken)",
+        u128::from(n("sweep_graphs_max") > n("sweep_graphs")),
+        0,
+    );
+    eq(
+        "identity 8 (sweep_graphs ≥ sweeps − abandoned; 1 = broken)",
+        u128::from(n("sweep_graphs") + n("sweeps_abandoned") < n("sweeps")),
+        0,
+    );
+    eq("identity 9 (complete + blocked = executions)", n("impl_complete") + n("impl_blocked"), n("executions"));
+    eq("identity 9 (executions = impl_graphs)", n("executions"), n("impl_graphs"));
+    bad
+}
+
+/// An order-dependent cell beside the package's value: `e7s` as it is; `witnesses` as `e7s`
+/// `admissions − evictions` (identity 4); `cache_tests` has no `e7s` field (`None`);
+/// `sweep_sizes` as text (the CFirstP row leaves it blank: the grid's run keeps no sweep record,
+/// so a blank cell is counted apart, not as a difference).
+fn vc_order_pair(m: &BTreeMap<String, String>, ps: Option<&PsRecord>, col: &str) -> (String, Option<String>) {
+    let got = m.get(col).cloned().unwrap_or_default();
+    let Some(ps) = ps.filter(|p| !p.e7s.is_empty()) else {
+        return (got, None);
+    };
+    let want = match col {
+        "cache_tests" => None,
+        "witnesses" => {
+            let g = |k: &str| ps.e7s.get(k).and_then(|v| v.parse::<u128>().ok());
+            g("admissions").zip(g("evictions")).map(|(a, e)| (a - e).to_string())
+        }
+        _ => ps.e7s.get(col).cloned(),
+    };
+    (got, want)
+}
+
+/// The `ExploreP` rows' implementation split by (fixture, t), from V-S's curve store (completed
+/// rows only; the lead's ruling 4: V-S's rows, none run here).
+fn vc_explore_splits(rows: &[BTreeMap<String, String>]) -> BTreeMap<(String, usize), (u128, u128)> {
+    rows.iter()
+        .filter(|m| m["engine"] == "ExploreP" && m["end_class"] == "ok")
+        .map(|m| {
+            (
+                (m["fixture"].clone(), m["threads"].parse().expect("conformance: threads")),
+                (i4_num(m, "impl_complete"), i4_num(m, "impl_blocked")),
+            )
+        })
+        .collect()
+}
+
+/// What V-C's checks found in one part of a store.
+#[derive(Debug, Default)]
+struct VcPart {
+    /// Failures, each naming its row and column.
+    bad: Vec<String>,
+    missing: Vec<String>,
+    unexpected: Vec<String>,
+    censored: Vec<String>,
+    ok: usize,
+    /// Per equal-class column: (equal, unequal) over the checkable rows.
+    classes: BTreeMap<&'static str, (usize, usize)>,
+    /// Per order-dependent column at t = 1: (equal, unequal, no reference, the row's cell blank).
+    order_t1: BTreeMap<&'static str, (usize, usize, usize, usize)>,
+    /// The t = 1 differences, by row and column (recorded, not failed).
+    order_t1_diffs: Vec<String>,
+    /// The checkable rows by (fixture, t).
+    rows: BTreeMap<(String, usize), BTreeMap<String, String>>,
+    /// The CPU time over the checkable rows (ms), and the rows whose CPU exceeds
+    /// `(t + 2) · proc_wall_ms` (the lead's ruling 5: recorded, never failed).
+    cpu_total_ms: u128,
+    cpu_over_bound: Vec<String>,
+}
+
+/// V-C's checks of one part's store rows (`catalogue` or `curve`) as written by `profile`: the
+/// exact expected key set (an unexpected key fails, an absent one is missing) and the row count;
+/// each row's configuration cells; every `ok` row's end, identity and reference checks (A4 hash
+/// k3q3m3 against `E1T`/`E1P`/`UNC`; leader n4 has no package record), its split against
+/// `ExploreP` where V-S has that row; the t = 1 order-dependent tallies. Pure on its inputs: VC-5
+/// runs it on scratch copies of the stores.
+fn vc_check_part(
+    part: &str,
+    profile: &str,
+    rows: &[BTreeMap<String, String>],
+    rec: &VcRecords,
+    explore: &BTreeMap<(String, usize), (u128, u128)>,
+) -> VcPart {
+    let mut out = VcPart::default();
+    let expected = vc_store_rows(part);
+    let want_n = match part {
+        "catalogue" => 420,
+        "curve" => 10,
+        other => panic!("conformance: vc_check_part {other}"),
+    };
+    if expected.len() != want_n {
+        out.bad.push(format!("{part}: {} expected rows, not {want_n}", expected.len()));
+    }
+    if rows.len() != want_n {
+        out.bad.push(format!("{part}: the store holds {} rows, not {want_n}", rows.len()));
+    }
+    let keys: BTreeSet<String> = expected.iter().map(|s| s.key(profile)).collect();
+    let mut by_key: BTreeMap<String, &BTreeMap<String, String>> = BTreeMap::new();
+    for m in rows {
+        let k = m["key"].clone();
+        if !keys.contains(&k) {
+            out.unexpected.push(k.clone());
+        }
+        if by_key.insert(k.clone(), m).is_some() {
+            out.bad.push(format!("{part}: the key {k} twice"));
+        }
+    }
+    for spec in &expected {
+        let key = spec.key(profile);
+        let Some(m) = by_key.get(&key) else {
+            out.missing.push(key);
+            continue;
+        };
+        let t = spec.config.threads;
+        let name = spec.fixture.as_str();
+        let tag = format!("{part} {name} t{t}");
+        // the row's own configuration cells beyond its key (a censored row, built by the parent,
+        // has no engine cells: its `threads` is checked on `ok` rows only)
+        for (col, want) in [
+            ("engine", "CFirstP".to_owned()),
+            ("tier", spec.tier.name.clone()),
+            ("fixture", spec.fixture.clone()),
+        ] {
+            if m.get(col) != Some(&want) {
+                out.bad.push(format!("{tag}: {col} {:?}, not {want}", m.get(col)));
+            }
+        }
+        if m["end_class"] != "ok" {
+            out.censored.push(format!("{tag}: {}", m["end_class"]));
+            continue;
+        }
+        out.ok += 1;
+        if m.get("threads") != Some(&t.to_string()) {
+            out.bad.push(format!("{tag}: threads {:?}, not {t}", m.get("threads")));
+        }
+        // the columns this row is compared on (the class table counts these only)
+        let mut applicable: Vec<&'static str> = vec![
+            "verdict",
+            "impl_end",
+            "aborted",
+            "stopped_early",
+            "spec_errors",
+            "witness_duplicates",
+            "cut_reports",
+            "unprobed_after_cancel",
+            "unadmitted_after_cancel",
+            "spawned_at_stop",
+            "identities",
+            "cpu",
+            "impl_phase_wall_ms",
+        ];
+        // Q14 (a): the implementation phase's wall at one thread (outer − sweep), blank above
+        let phase = m.get("impl_phase_wall_ms").map(String::as_str).unwrap_or("<absent>");
+        let phase_want = if t == 1 {
+            i4_num(m, "outer_wall_time_ms").saturating_sub(i4_num(m, "sweep_wall_time_ms")).to_string()
+        } else {
+            String::new()
+        };
+        let phase_fail = (phase != phase_want)
+            .then(|| ("impl_phase_wall_ms", format!("{phase:?}, not {phase_want:?} at t = {t}")));
+        let mut fails = vc_end_checks(m);
+        fails.extend(phase_fail);
+        fails.extend(vc_identities(m, t).into_iter().map(|(id, w)| ("identities", format!("{id}: {w}"))));
+        // VC-0: an `ok` row carries the child's own CPU reading, two numbers in 10 ms units
+        let cpu: Vec<Option<u128>> =
+            ["cpu_user_ms", "cpu_sys_ms"].iter().map(|c| m.get(*c).and_then(|v| v.parse().ok())).collect();
+        match (cpu[0], cpu[1]) {
+            (Some(u), Some(s)) if u % 10 == 0 && s % 10 == 0 => {
+                out.cpu_total_ms += u + s;
+                let bound = (t as u128 + 2) * i4_num(m, "proc_wall_ms");
+                if u + s > bound {
+                    out.cpu_over_bound.push(format!("{tag}: cpu {} ms > (t + 2) · proc_wall_ms = {bound}", u + s));
+                }
+            }
+            _ => fails.push(("cpu", format!("{:?} {:?}", m.get("cpu_user_ms"), m.get("cpu_sys_ms")))),
+        }
+        let ps = rec.ps.get(name).filter(|p| !p.e7s.is_empty());
+        if name == VC_NO_E7S {
+            applicable.push("no e7s: E1T/E1P/UNC");
+            fails.extend(vc_no_e7s_checks(m, &rec.vs[name], rec.unc[name]));
+        } else if let (Some(ps), Some(vs)) = (ps, rec.vs.get(name)) {
+            applicable.extend([
+                "reports",
+                "uncovered_multiplicity",
+                "sweeps_failing",
+                "sweeps_aborted",
+                "impl_graphs",
+                "cache_probes",
+                "executions",
+                "impl_complete",
+                "impl_blocked",
+                "first_report",
+            ]);
+            if spec.config.impl_distinct {
+                applicable.push("impl_distinct_summaries");
+            }
+            fails.extend(vc_reference_checks(m, ps, vs, spec.config.impl_distinct));
+        } else if part == "catalogue" {
+            fails.push(("verdict", "no package record for a catalogue fixture".to_owned()));
+        }
+        if let Some((c, b)) = explore.get(&(spec.fixture.clone(), t)) {
+            applicable.push("impl_split vs ExploreP");
+            let got = (i4_num(m, "impl_complete"), i4_num(m, "impl_blocked"));
+            if got != (*c, *b) {
+                fails.push(("impl_split vs ExploreP", format!("{got:?} vs V-S's ExploreP {:?}", (c, b))));
+            }
+        }
+        for col in VC_EQUAL_COLUMNS.into_iter().filter(|c| applicable.contains(c)) {
+            let e = out.classes.entry(col).or_default();
+            if fails.iter().any(|(c, _)| *c == col) {
+                e.1 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        if t == 1 {
+            for col in VC_ORDER_DEPENDENT {
+                let (got, want) = vc_order_pair(m, ps, col);
+                let e = out.order_t1.entry(col).or_default();
+                match want {
+                    _ if got.is_empty() => e.3 += 1,
+                    None => e.2 += 1,
+                    Some(w) if w == got => e.0 += 1,
+                    Some(w) => {
+                        e.1 += 1;
+                        out.order_t1_diffs.push(format!("{name} t1: {col} {got} vs e7s {w}"));
+                    }
+                }
+            }
+        }
+        for (c, w) in fails {
+            out.bad.push(format!("{tag}: {c}: {w}"));
+        }
+        out.rows.insert((spec.fixture.clone(), t), (*m).clone());
+    }
+    out
+}
+
+/// One line of VC-2's table.
+#[derive(Clone, Debug, PartialEq)]
+struct VcCurveLine {
+    fixture: String,
+    t: usize,
+    outer_ms: u128,
+    /// The implementation phase's wall: a number at t = 1, blank (`None`) above (Q14 a).
+    impl_phase_ms: Option<u128>,
+    /// `sweep_wall_time_ms`: a wall at t = 1, the workers' summed sweep time above.
+    sweep_ms: u128,
+    proc_wall_ms: u128,
+    /// The outer wall at t = 1 over the outer wall at t (the same fixture).
+    speedup: Option<f64>,
+    /// `cpu_user_ms + cpu_sys_ms`.
+    cpu_ms: Option<u128>,
+    /// `cpu_ms / proc_wall_ms`: the average number of busy threads.
+    busy: Option<f64>,
+    /// `sweep_ms / cpu_ms`: the sweeps' share of the row's CPU time (Q14 a).
+    sweep_share: Option<f64>,
+    /// The root's seeded items and the number of splits, from the row's stdout.
+    seeded: Option<u128>,
+    splits: usize,
+}
+
+/// VC-2's table from a curve store's `ok` rows and each row's stdout (`stdout`): the walls, the
+/// speed-up against the same fixture's t = 1 row, the CPU time and its ratio to `proc_wall_ms`,
+/// the root's seeded items and the splits. Pure on its inputs; sorted by fixture and t.
+fn vc_curve_table(
+    rows: &[BTreeMap<String, String>],
+    stdout: &dyn Fn(&BTreeMap<String, String>) -> String,
+) -> Vec<VcCurveLine> {
+    let ok: Vec<&BTreeMap<String, String>> = rows.iter().filter(|m| m["end_class"] == "ok").collect();
+    let base: BTreeMap<String, u128> = ok
+        .iter()
+        .filter(|m| m["threads"] == "1")
+        .map(|m| (m["fixture"].clone(), i4_num(m, "outer_wall_time_ms")))
+        .collect();
+    let mut out: Vec<VcCurveLine> = ok
+        .iter()
+        .map(|m| {
+            let outer = i4_num(m, "outer_wall_time_ms");
+            let proc = i4_num(m, "proc_wall_ms");
+            let cpu = i4_opt(m, "cpu_user_ms").zip(i4_opt(m, "cpu_sys_ms")).map(|(u, s)| u + s);
+            let text = stdout(m);
+            let seeded = text
+                .lines()
+                .find_map(|l| l.split("root seeded ").nth(1))
+                .and_then(|r| r.split(' ').next())
+                .and_then(|v| v.parse().ok());
+            VcCurveLine {
+                fixture: m["fixture"].clone(),
+                t: m["threads"].parse().expect("conformance: threads"),
+                outer_ms: outer,
+                impl_phase_ms: i4_opt(m, "impl_phase_wall_ms"),
+                sweep_ms: i4_num(m, "sweep_wall_time_ms"),
+                proc_wall_ms: proc,
+                speedup: base.get(&m["fixture"]).filter(|_| outer > 0).map(|b| *b as f64 / outer as f64),
+                cpu_ms: cpu,
+                busy: cpu.filter(|_| proc > 0).map(|c| c as f64 / proc as f64),
+                sweep_share: cpu.filter(|c| *c > 0).map(|c| i4_num(m, "sweep_wall_time_ms") as f64 / c as f64),
+                seeded,
+                splits: text.lines().filter(|l| l.contains(": split ")).count(),
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| (a.fixture.as_str(), a.t).cmp(&(b.fixture.as_str(), b.t)));
+    out
+}
+
+/// VC-3's measured premises. From the package, per A3 lock size: N = `E1P` specification
+/// `execs + block`, equal to `E1T`'s `spec_graphs` and to the criteria's N, `block` 0; the `e7s`
+/// line's `sweeps = admissions = N` and `sweep_graphs = N(N + 1)/2`. From V-C's own t = 1 rows
+/// (`t1`, by fixture): the same two equalities. Returns (the lines, the package's failures, the
+/// rows' failures); a row failure is reported, not a VC-1 failure.
+fn vc3_premises(
+    rec: &VcRecords,
+    t1: &BTreeMap<String, BTreeMap<String, String>>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let (mut lines, mut pkg, mut rows) = (Vec::new(), Vec::new(), Vec::new());
+    for (name, n_criteria) in VC3_SIZES {
+        let vs = &rec.vs[name];
+        let n = vs.spec_split.0 + vs.spec_split.1;
+        let e7 = |k: &str| rec.ps[name].e7s.get(k).and_then(|v| v.parse::<u128>().ok());
+        let tri = n * (n + 1) / 2;
+        for (what, ok) in [
+            ("N = E1T spec_graphs", n == vs.spec_graphs),
+            ("E1P specification block 0", vs.spec_split.1 == 0),
+            ("N = the criteria's N", n == n_criteria),
+            ("e7s sweeps = N", e7("sweeps") == Some(n)),
+            ("e7s admissions = N", e7("admissions") == Some(n)),
+            ("e7s sweep_graphs = N(N + 1)/2", e7("sweep_graphs") == Some(tri)),
+        ] {
+            if !ok {
+                pkg.push(format!("{name}: {what}"));
+            }
+        }
+        let row = t1.get(name);
+        match row {
+            Some(m) => {
+                for (what, ok) in [
+                    ("sweeps = N", i4_num(m, "sweeps") == n),
+                    ("admissions = N", i4_num(m, "admissions") == n),
+                    ("sweep_graphs = N(N + 1)/2", i4_num(m, "sweep_graphs") == tri),
+                ] {
+                    if !ok {
+                        rows.push(format!("{name} t1: {what}"));
+                    }
+                }
+            }
+            None => rows.push(format!("{name} t1: no checkable row")),
+        }
+        lines.push(format!(
+            "{name}\tN {n} (E1P spec {}+{}; E1T spec_graphs {})\te7s sweeps {:?} admissions {:?} sweep_graphs {:?} (N(N+1)/2 {tri})\tV-C t1 {}",
+            vs.spec_split.0,
+            vs.spec_split.1,
+            vs.spec_graphs,
+            e7("sweeps"),
+            e7("admissions"),
+            e7("sweep_graphs"),
+            row.map(|m| format!("sweeps {} admissions {} sweep_graphs {}", m["sweeps"], m["admissions"], m["sweep_graphs"]))
+                .unwrap_or_else(|| "none".to_owned())
+        ));
+    }
+    (lines, pkg, rows)
+}
+
+/// The package's stateless uncovered lines (`UNCS`) over the 143 fixtures the in-process check
+/// runs: 55 fixtures carry lines, 3 353 lines in all (counted from the rerun files at gate 3 with
+/// `grep -P '^UNCS\t'`; a first count of 6 706 matched the `UNCSET` lines too, and the t = 1 run
+/// of 11:52 failed on it alone; A4 hash k3q3m3 and the aux files carry none).
+const VC_UNCS_NONVACUITY: (usize, usize) = (55, 3353);
+
+/// The columns that differ between two runs of one binary by construction: the driver's process
+/// cells (`pid`, `commit`, the resident readings, the CPU pair) and every wall, timer and resident
+/// peak (`*_ms`, `*_ms_*`, `*vmhwm*`, `vm_hwm_*`, `vm_peak_kb`). Declared for VC-5's schema 7 → 8
+/// comparison; a second schema-8 run checks the declaration at t = 1.
+fn vc_nondeterministic(col: &str) -> bool {
+    matches!(
+        col,
+        "pid" | "commit" | "rss_sampled_hwm_kb" | "rss_child_hwm_kb" | "vm_peak_kb" | "vm_hwm_kb_before" | "vm_hwm_kb_after"
+    ) || col.ends_with("_ms")
+        || col.contains("_ms_")
+        || col.contains("vmhwm")
+}
+
+/// VC-5's schema 7 → 8 comparison on the fixed set (`vc_store_rows("schema")`): every store holds
+/// exactly the set's keys, every row `ok`; per row, the two CPU columns absent at schema 7 and
+/// numbers at schema 8; on the CFirstP rows the split blank at 7 and numbers at 8; every other
+/// column equal unless declared non-deterministic, or, at t = 4, unequal between the two schema-8
+/// runs (`s8`, `s8b`; order-dependent there). At t = 1 a column the two schema-8 runs disagree on
+/// and the declaration misses fails, and is still compared with schema 7. Returns (the failures, the notes).
+fn vc_schema_compare(
+    s7: &[BTreeMap<String, String>],
+    s8: &[BTreeMap<String, String>],
+    s8b: &[BTreeMap<String, String>],
+    profile: &str,
+) -> (Vec<String>, Vec<String>) {
+    let expected: BTreeSet<String> = vc_store_rows("schema").iter().map(|s| s.key(profile)).collect();
+    let index = |rows: &[BTreeMap<String, String>]| -> BTreeMap<String, BTreeMap<String, String>> {
+        rows.iter().map(|m| (m["key"].clone(), m.clone())).collect()
+    };
+    let (a, b, c) = (index(s7), index(s8), index(s8b));
+    let (mut bad, mut notes) = (Vec::new(), Vec::new());
+    for (name, m, n) in [("schema 7", &a, s7.len()), ("schema 8", &b, s8.len()), ("schema 8 (control)", &c, s8b.len())] {
+        let keys: BTreeSet<String> = m.keys().cloned().collect();
+        if keys != expected || n != expected.len() {
+            bad.push(format!(
+                "{name}: {n} rows; keys not in the set {:?}; set keys absent {:?}",
+                keys.difference(&expected).collect::<Vec<_>>(),
+                expected.difference(&keys).collect::<Vec<_>>()
+            ));
+        }
+    }
+    let (mut nd, mut t4, mut presence) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    let mut compared = 0usize;
+    for spec in vc_store_rows("schema") {
+        let key = spec.key(profile);
+        let (Some(r7), Some(r8), Some(r8b)) = (a.get(&key), b.get(&key), c.get(&key)) else {
+            continue;
+        };
+        let (e, t) = (spec.config.engine, spec.config.threads);
+        let tag = format!("{} {e:?} t{t}", spec.fixture);
+        for (name, m) in [("7", r7), ("8", r8), ("8b", r8b)] {
+            if m["end_class"] != "ok" {
+                bad.push(format!("{tag}: schema {name}: {}", m["end_class"]));
+            }
+        }
+        for col in ["cpu_user_ms", "cpu_sys_ms"] {
+            if r7.contains_key(col) {
+                bad.push(format!("{tag}: {col} at schema 7"));
+            }
+            if r8.get(col).and_then(|v| v.parse::<u64>().ok()).is_none() {
+                bad.push(format!("{tag}: {col} {:?} at schema 8", r8.get(col)));
+            }
+        }
+        // Q14 (a): wherever `impl_phase_wall_ms` is a number it is outer − sweep in its own row
+        for (name, m) in [("7", r7), ("8", r8), ("8b", r8b)] {
+            if let Some(v) = m.get("impl_phase_wall_ms").filter(|v| !v.is_empty()) {
+                let want = i4_num(m, "outer_wall_time_ms").saturating_sub(i4_num(m, "sweep_wall_time_ms"));
+                if *v != want.to_string() {
+                    bad.push(format!("{tag}: impl_phase_wall_ms (schema {name}) {v} ≠ outer − sweep {want}"));
+                }
+            }
+        }
+        let cols: BTreeSet<&String> = r7.keys().chain(r8.keys()).collect();
+        for col in cols {
+            let col = col.as_str();
+            if col == "cpu_user_ms" || col == "cpu_sys_ms" {
+                continue;
+            }
+            let (v7, v8, v8b) = (r7.get(col), r8.get(col), r8b.get(col));
+            if e == GridEngine::CFirstP && (col == "impl_complete" || col == "impl_blocked") {
+                if v7.map(String::as_str) != Some("") || v8.and_then(|v| v.parse::<u128>().ok()).is_none() {
+                    bad.push(format!("{tag}: the split {col}: schema 7 {v7:?}, schema 8 {v8:?}"));
+                }
+                continue;
+            }
+            if vc_nondeterministic(col) {
+                nd.insert(col.to_owned());
+                // Q14 (a): the value differs run to run, whether the cell is blank does not
+                let blank = |v: Option<&String>| v.is_none_or(|x| x.is_empty());
+                if e == GridEngine::CFirstP && col == "impl_phase_wall_ms" && t > 1 {
+                    if blank(v7) || !blank(v8) || !blank(v8b) {
+                        bad.push(format!(
+                            "{tag}: {col}: schema 7 {v7:?}, schema 8 {v8:?}/{v8b:?}: a number at 7 and blank at 8 expected (Q14 a)"
+                        ));
+                    }
+                } else if col == "rss_sampled_hwm_kb" || blank(v8) != blank(v8b) {
+                    // the parent's resident sample is blank when a short child ends before the
+                    // first sample that counts: its presence is timing, not code
+                    presence.insert(col.to_owned());
+                } else if blank(v7) != blank(v8) {
+                    bad.push(format!("{tag}: {col}: blank at one schema only: schema 7 {v7:?}, schema 8 {v8:?}"));
+                }
+                continue;
+            }
+            if v8 != v8b {
+                if t == 1 {
+                    bad.push(format!("{tag}: {col} differs between the two schema-8 runs ({v8:?}, {v8b:?}) and is not declared"));
+                } else {
+                    t4.insert(col.to_owned());
+                    continue;
+                }
+            }
+            compared += 1;
+            if v7 != v8 {
+                bad.push(format!("{tag}: {col}: schema 7 {v7:?}, schema 8 {v8:?}"));
+            }
+        }
+    }
+    notes.push(format!("cells compared {compared}"));
+    notes.push(format!("declared non-deterministic, skipped: {nd:?}"));
+    notes.push(format!("t = 4, unequal between the two schema-8 runs, skipped: {t4:?}"));
+    notes.push(format!("declared columns blank in one schema-8 run only (presence not compared): {presence:?}"));
+    (bad, notes)
+}
+
+/// V-C's stores through the driver: `VC_PART` = `catalogue` (420 rows, spec `SVERIFY-P-VC`),
+/// `curve` (10, spec `SVERIFY-P-VC-CURVE`) or `schema` (24, spec `SVERIFY-P-VC-SCHEMA`, VC-5's
+/// fixed set); `VC_STORE` the store directory; `VC_COMMIT` the commit column. Only under the
+/// standing address limit (10 240 000 000 B). `catalogue` and `schema` run as one driver run (one
+/// child at a time; `EVAL_ONLY` narrows); `curve` starts only after V-S's quiet minute (1-minute
+/// load averages under 2, read every 5 s; no `java`, `javac`, `gradle`, `cargo` or `rustc`;
+/// nothing above 2 GiB) and runs one driver run per row, each after the process check (the
+/// lagging load recorded). A re-run resumes at the first row the store lacks.
+#[test]
+#[ignore]
+fn vc_the_store() {
+    let (Ok(out), Ok(part)) = (std::env::var("VC_STORE"), std::env::var("VC_PART")) else {
+        return;
+    };
+    let got = vs_address_limit();
+    assert_eq!(got, Some(10_240_000_000), "conformance: VC_PART {part} runs only under the standing limit");
+    let rows = vc_store_rows(&part);
+    note!("PVCS\tpart {part}\trows {}\taddress limit {got:?}", rows.len());
+    let spec = Spec {
+        name: match part.as_str() {
+            "catalogue" => "SVERIFY-P-VC",
+            "curve" => "SVERIFY-P-VC-CURVE",
+            _ => "SVERIFY-P-VC-SCHEMA",
+        }
+        .to_owned(),
+        rows: rows.clone(),
+    };
+    let commit = std::env::var("VC_COMMIT").ok();
+    let driver = |only: Option<String>| {
+        let mut probes = Probes::real();
+        if let Some(c) = commit.clone() {
+            probes.git = Box::new(move || (c.clone(), false));
+        }
+        Driver {
+            spec: spec.clone(),
+            specs: vec![spec.clone()],
+            out_dir: std::path::PathBuf::from(&out),
+            sample_period: std::time::Duration::from_millis(100),
+            probes,
+            allow_mixed: false,
+            only,
+        }
+    };
+    let report = |d: &Driver| match d.run() {
+        Ok(s) => note!(
+            "PVCS\tran {}\tskipped present {}\tcensored {}\tstore {}",
+            s.ran,
+            s.skipped_present,
+            s.censored,
+            s.store.display()
+        ),
+        Err(e) => panic!("conformance: the driver refused: {}", e.text()),
+    };
+    if part != "curve" {
+        report(&driver(std::env::var("EVAL_ONLY").ok()));
+        return;
+    }
+    let mut readings = Vec::new();
+    for i in 0..13 {
+        if i > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+        readings.push(vs_load_1m());
+    }
+    let foreign = vs_heavy_processes();
+    note!("PVCQ\tthe minute's 1-minute load averages {readings:?}\tforeign or above 2 GiB {foreign:?}");
+    assert!(
+        readings.iter().all(|l| *l < 2.0) && foreign.is_empty(),
+        "conformance: the curve: the machine is not quiet: {readings:?} {foreign:?}"
+    );
+    for r in &rows {
+        let key = r.key(crate::conformance::eval::profile_name());
+        let (load, heavy) = (vs_load_1m(), vs_heavy_processes());
+        note!("PVCQ\t{key}\tload {load}\tforeign or above 2 GiB {heavy:?}");
+        assert!(heavy.is_empty(), "conformance: the curve: not quiet before {key}: {heavy:?}");
+        report(&driver(Some(key)));
+    }
+}
+
+/// V-S's curve store's rows (the `ExploreP` baseline and its split).
+fn vc_vs_curve_rows() -> Vec<BTreeMap<String, String>> {
+    read_rows(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plan/traceForge/log/eval/sverify-p-vs-curve/rows.csv"),
+    )
+    .unwrap_or_else(|e| panic!("conformance: {}", e.text()))
+}
+
+fn vc_store_of(var: &str) -> (String, Vec<BTreeMap<String, String>>) {
+    let dir = std::env::var(var).unwrap_or_else(|_| panic!("conformance: {var}"));
+    let rows = read_rows(&std::path::Path::new(&dir).join("rows.csv"))
+        .unwrap_or_else(|e| panic!("conformance: {var}: {}", e.text()));
+    (dir, rows)
+}
+
+/// VC-1, VC-2 and VC-3 on the stores (`VC_STORE` the catalogue's, `VC_CURVE_STORE` the curve's;
+/// `VC_PARTS`, default both): `vc_check_part` per part — the result per column class, the
+/// censored rows, the t = 1 order-dependent tallies; the curve's table (`vc_curve_table`) with the
+/// counts, the CPU ratio and the seeding; VC-3's premises from the package and the catalogue's
+/// t = 1 rows. Fails on any failure, missing or unexpected key. Ignored.
+#[test]
+#[ignore]
+fn vc_the_store_checks() {
+    let parts = std::env::var("VC_PARTS").unwrap_or_else(|_| "catalogue,curve".to_owned());
+    if std::env::var("VC_STORE").is_err() && std::env::var("VC_CURVE_STORE").is_err() {
+        return;
+    }
+    let rec = vc_records();
+    let explore = vc_explore_splits(&vc_vs_curve_rows());
+    note!("PVCC\tExploreP splits from V-S {explore:?}");
+    let (mut bad, mut missing, mut unexpected) = (Vec::new(), Vec::new(), Vec::new());
+    for part in parts.split(',') {
+        let (dir, rows) = vc_store_of(if part == "catalogue" { "VC_STORE" } else { "VC_CURVE_STORE" });
+        let p = vc_check_part(part, "release", &rows, &rec, &explore);
+        note!(
+            "PVCC\t{part}\trows {}\tok {}\tcensored {}\tmissing {}\tunexpected {}\tfailures {}",
+            rows.len(),
+            p.ok,
+            p.censored.len(),
+            p.missing.len(),
+            p.unexpected.len(),
+            p.bad.len()
+        );
+        for (c, (e, u)) in &p.classes {
+            note!("PVCC\t{part}\tclass\t{c}\tequal {e}\tunequal {u}");
+        }
+        for (c, (e, u, n, b)) in &p.order_t1 {
+            note!("PVCC\t{part}\tt1 order-dependent\t{c}\tequal {e}\tunequal {u}\tno reference {n}\tthe row's cell blank {b}");
+        }
+        for d in &p.order_t1_diffs {
+            note!("PVCC\t{part}\tt1 difference (recorded)\t{d}");
+        }
+        for c in &p.censored {
+            note!("PVCC\t{part}\tcensored (not checkable)\t{c}");
+        }
+        note!("PVCC\t{part}\tcpu over the ok rows {} ms\tabove (t + 2) · proc_wall_ms (recorded) {:?}", p.cpu_total_ms, p.cpu_over_bound);
+        if p.ok > 0 && p.cpu_total_ms == 0 {
+            bad.push(format!("{part}: non-vacuity: no CPU time on any ok row"));
+        }
+        if part == "curve" {
+            let stdout = |m: &BTreeMap<String, String>| {
+                std::fs::read_to_string(std::path::Path::new(&dir).join(&m["run_dir"]).join("stdout")).unwrap_or_default()
+            };
+            for l in vc_curve_table(&rows, &stdout) {
+                let m = &p.rows[&(l.fixture.clone(), l.t)];
+                note!(
+                    "PVCK\t{}\tt {}\touter {} ms\timpl phase {}\tsweep {} ms (share of CPU {})\tproc {} ms\tspeed-up {}\tcpu {:?} ms\tbusy {}\tseeded {:?}\tsplits {}{}\tsweeps {}\tredundant {}\tabandoned {}\twatch probes {}\tsweep_graphs {}\tlock held {} wait {} ms\tvm_peak {}\tsweeps warmup/root/tasks {}/{}/{}",
+                    l.fixture,
+                    l.t,
+                    l.outer_ms,
+                    l.impl_phase_ms.map(|v| format!("{v} ms")).unwrap_or_else(|| "blank".to_owned()),
+                    l.sweep_ms,
+                    l.sweep_share.map(|s| format!("{s:.3}")).unwrap_or_default(),
+                    l.proc_wall_ms,
+                    l.speedup.map(|s| format!("×{s:.2}")).unwrap_or_default(),
+                    l.cpu_ms,
+                    l.busy.map(|b| format!("{b:.2}")).unwrap_or_default(),
+                    l.seeded,
+                    l.splits,
+                    if l.splits == 0 { " (the implementation side did not split)" } else { "" },
+                    m["sweeps"],
+                    m["redundant_sweeps"],
+                    m["sweeps_abandoned"],
+                    m["watch_probes"],
+                    m["sweep_graphs"],
+                    m["admission_lock_held_ms"],
+                    m["admission_lock_wait_ms"],
+                    m["vm_peak_kb"],
+                    m["sweeps_in_warmup"],
+                    m["sweeps_in_root_loop"],
+                    m["sweeps_in_tasks"]
+                );
+            }
+        }
+        if part == "catalogue" {
+            let t1: BTreeMap<String, BTreeMap<String, String>> =
+                p.rows.iter().filter(|((_, t), _)| *t == 1).map(|((f, _), m)| (f.clone(), m.clone())).collect();
+            let (lines, pkg, row_fails) = vc3_premises(&rec, &t1);
+            for l in &lines {
+                note!("PVC3\t{l}");
+            }
+            note!("PVC3\tthe package's premises fail: {pkg:?}\tV-C's t = 1 rows fail (reported): {row_fails:?}");
+            bad.extend(pkg.into_iter().map(|x| format!("VC-3 package: {x}")));
+        }
+        bad.extend(p.bad);
+        missing.extend(p.missing);
+        unexpected.extend(p.unexpected);
+    }
+    for b in &bad {
+        note!("PVCC\tfailure\t{b}");
+    }
+    assert!(missing.is_empty(), "conformance: keys missing from the stores: {missing:#?}");
+    assert!(unexpected.is_empty(), "conformance: unexpected keys: {unexpected:#?}");
+    assert!(bad.is_empty(), "conformance: V-C: {} failures", bad.len());
+}
+
+/// VC-1 in process, one process per thread count (`VC_T`): the four `e1:*` fixtures as store rows
+/// would be (`run_grid`, `distinct=on`), every VC-1 column; and for every catalogue fixture but A4
+/// hash k3q3m3 (no stateless reference; unbounded in process) the uncovered multiset against
+/// `UNCS` and the final cache's coverage of every completion not reported (rulings 1 and 16).
+/// Ignored.
+#[test]
+#[ignore]
+fn vc_in_process_e1_rows_the_uncovered_multisets_and_the_coverage() {
+    let Ok(t) = std::env::var("VC_T") else {
+        return;
+    };
+    let t: usize = t.parse().expect("conformance: VC_T is a number");
+    let _g = serial();
+    let rec = vc_records();
+    let mut bad = Vec::new();
+    let e1: Vec<&str> = VS_EXTRA.iter().copied().filter(|n| n.starts_with("e1:")).collect();
+    assert_eq!(e1.len(), 4, "conformance: the four e1 fixtures");
+    for name in &e1 {
+        let f = crate::conformance::compact_tests::e1_fixture(name);
+        let r = i4_run(&f, &vc_config(t, true));
+        let m = i4_cells(&r);
+        let mut fails = vc_reference_checks(&m, &rec.ps[*name], &rec.vs[*name], true);
+        fails.extend(vc_end_checks(&m));
+        fails.extend(vc_identities(&m, t));
+        for (c, w) in fails {
+            bad.push(format!("{name} t{t}: {c}: {w}"));
+        }
+        note!(
+            "PVCE\t{name}\tt {t}\tverdict {}\treports {}\timpl_graphs {}\texecutions {}\tsplit {}/{}",
+            m["verdict"],
+            m["reports"],
+            m["impl_graphs"],
+            m["executions"],
+            m["impl_complete"],
+            m["impl_blocked"]
+        );
+    }
+    let started = std::time::Instant::now();
+    let (mut fixtures, mut with_lines, mut lines) = (0, 0, 0usize);
+    for name in vs_catalogue() {
+        if name == VC_NO_E7S {
+            continue;
+        }
+        let f = if name.starts_with("e1:") { crate::conformance::compact_tests::e1_fixture(name) } else { fx(name) };
+        let cc = vc_config(t, true).conf_config(&f);
+        let o = cfirst_p::run_with(&cc, &f.implementation, &f.specification);
+        let r = &rec.ps[name];
+        fixtures += 1;
+        lines += r.uncs.values().sum::<usize>();
+        with_lines += usize::from(!r.uncs.is_empty());
+        let got = ps_rendered(&o);
+        if got != r.uncs {
+            let only_p: Vec<_> = got.iter().filter(|(k, v)| r.uncs.get(*k) != Some(*v)).take(2).collect();
+            let only_r: Vec<_> = r.uncs.iter().filter(|(k, v)| got.get(*k) != Some(*v)).take(2).collect();
+            bad.push(format!("{name} t{t}: the uncovered multiset: CVerify-P {only_p:?} … UNCS {only_r:?}"));
+        }
+        let impl_sums = summaries(&f, "implementation");
+        bad.extend(
+            ps_coverage(&o, &impl_sums, &ps_par_uncovered(&o))
+                .into_iter()
+                .map(|x| format!("{name} t{t}: coverage: {x}")),
+        );
+    }
+    note!(
+        "PVCU\tt {t}\tfixtures {fixtures}\twith UNCS lines {with_lines}\tUNCS lines {lines}\twall {} s",
+        started.elapsed().as_secs()
+    );
+    for b in &bad {
+        note!("PVCU\tfailure\t{b}");
+    }
+    assert!(bad.is_empty(), "conformance: V-C in process at t{t}: {} failures", bad.len());
+    assert_eq!(fixtures, 143, "conformance: every catalogue fixture but A4 hash k3q3m3");
+    // non-vacuity: the package's stateless uncovered lines over those fixtures
+    assert_eq!((with_lines, lines), VC_UNCS_NONVACUITY, "conformance: non-vacuity");
+}
+
+/// VC-5's schema 7 → 8 comparison on stores (`VC_S7_STORE`, `VC_S8_STORE`, `VC_S8B_STORE`): see
+/// `vc_schema_compare`. Ignored.
+#[test]
+#[ignore]
+fn vc_the_schema_comparison() {
+    if std::env::var("VC_S7_STORE").is_err() {
+        return;
+    }
+    let (_, s7) = vc_store_of("VC_S7_STORE");
+    let (_, s8) = vc_store_of("VC_S8_STORE");
+    let (_, s8b) = vc_store_of("VC_S8B_STORE");
+    let (bad, notes) = vc_schema_compare(&s7, &s8, &s8b, "release");
+    for n in &notes {
+        note!("PVC7\t{n}");
+    }
+    for b in &bad {
+        note!("PVC7\tfailure\t{b}");
+    }
+    assert!(bad.is_empty(), "conformance: schema 7 → 8: {} failures", bad.len());
+}
+
+/// VC-1's rows pinned (no run): 420 catalogue rows over V-S's 140 store fixtures × {1, 4, 16},
+/// CFirstP, `w=inf`, `stop` off, `distinct=on`, distinct keys; 10 curve rows, `distinct` off; 30
+/// schema rows over the nine arms (24: six arms at t = 1, three at t = 1 and 4, two fixtures); the named fixtures in the catalogue.
+#[test]
+fn vc_1_the_store_rows_and_their_keys() {
+    let cat = vc_store_rows("catalogue");
+    assert_eq!(cat.len(), 420);
+    let keys: BTreeSet<String> = cat.iter().map(|s| s.key("release")).collect();
+    assert_eq!(keys.len(), 420);
+    let names: BTreeSet<&str> = cat.iter().map(|s| s.fixture.as_str()).collect();
+    assert_eq!(names.len(), 140);
+    assert!(names.iter().all(|n| !n.starts_with("e1:")));
+    for n in [VC_NO_E7S, VC_SPLIT_FIXTURE, VC_CURVE[0]] {
+        assert!(names.contains(n), "conformance: {n}");
+    }
+    for (n, _) in VC3_SIZES {
+        assert!(names.contains(n), "conformance: {n}");
+    }
+    for s in &cat {
+        let c = &s.config;
+        assert_eq!(
+            (c.engine, c.witness_cache, c.stop_at_first_report, c.impl_distinct),
+            (GridEngine::CFirstP, Capacity::Unbounded, false, true)
+        );
+        assert!([1, 4, 16].contains(&c.threads));
+        assert_eq!((s.rep, s.run_kind, s.tier.name.as_str()), (0, RunKind::Timed, Tier::default_tier().name.as_str()));
+    }
+    let cur = vc_store_rows("curve");
+    assert_eq!(cur.len(), 10);
+    assert_eq!(cur.iter().map(|s| s.key("release")).collect::<BTreeSet<_>>().len(), 10);
+    assert!(cur.iter().all(|s| !s.config.impl_distinct && s.config.engine == GridEngine::CFirstP));
+    let sch = vc_store_rows("schema");
+    assert_eq!(sch.len(), 24);
+    assert_eq!(sch.iter().map(|s| s.key("release")).collect::<BTreeSet<_>>().len(), 24);
+}
+
+/// One curve row for the builder's scratch store.
+fn vc5_curve_row(fixture: &str, t: usize, cells: [u128; 4], cpu: (&str, &str), end: &str) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for (k, v) in [
+        ("fixture", fixture.to_owned()),
+        ("threads", t.to_string()),
+        ("end_class", end.to_owned()),
+        ("outer_wall_time_ms", cells[0].to_string()),
+        // Q14 (a): the CFirstP row's rule, blank above one thread
+        ("impl_phase_wall_ms", if t > 1 { String::new() } else { cells[1].to_string() }),
+        ("sweep_wall_time_ms", cells[2].to_string()),
+        ("proc_wall_ms", cells[3].to_string()),
+        ("cpu_user_ms", cpu.0.to_owned()),
+        ("cpu_sys_ms", cpu.1.to_owned()),
+        ("run_dir", format!("runs/{fixture}-{t}")),
+    ] {
+        m.insert(k.to_owned(), v);
+    }
+    m
+}
+
+/// **VC-5, the curve table:** the builder on a scratch store with fixed walls and CPU cells
+/// against hand-computed speed-ups, CPU sums, busy ratios, sweep shares of CPU, seeding and
+/// splits, the implementation phase blank above one thread (Q14 a); a censored row left out; then
+/// the t = 1 wall, one row's wall, one CPU cell and one sweep cell perturbed, each alone, and the
+/// output differs where the hand computation says.
+#[test]
+fn vc_5_the_curve_table_builder_on_a_scratch_store() {
+    let rows = vec![
+        vc5_curve_row("lock", 1, [80_000, 2_000, 78_000, 81_000], ("79990", "1010"), "ok"),
+        vc5_curve_row("lock", 4, [40_000, 1_000, 39_000, 41_000], ("120000", "3000"), "ok"),
+        vc5_curve_row("lock", 16, [0, 0, 0, 600_000], ("", ""), "capped_wall"),
+        vc5_curve_row("leader", 1, [10_000, 9_000, 1_000, 10_500], ("10000", "500"), "ok"),
+        vc5_curve_row("leader", 16, [2_500, 2_000, 500, 3_000], ("30000", "0"), "ok"),
+    ];
+    let stdout = |m: &BTreeMap<String, String>| -> String {
+        match (m["fixture"].as_str(), m["threads"].as_str()) {
+            ("lock", "4") => "test x ... \nRevisitQueueRayon: root seeded 4 items (13 revisits), batch_size=1, 4 workers\n  rt1: split 2 items (3 revisits), batch_size=1\n  rt2: split 1 items (1 revisits), batch_size=1\nEVALROW\t...\n".to_owned(),
+            ("lock", _) => "\nRevisitQueueRayon: root seeded 4 items (13 revisits), batch_size=1, 1 workers\n".to_owned(),
+            ("leader", "16") => "\nRevisitQueueRayon: root seeded 2 items (27 revisits), batch_size=1, 16 workers\n".to_owned(),
+            _ => String::new(),
+        }
+    };
+    let line = |fixture: &str, t: usize, w: [u128; 4], speedup: f64, cpu: u128, busy: f64, seeded: Option<u128>, splits: usize| VcCurveLine {
+        fixture: fixture.to_owned(),
+        t,
+        outer_ms: w[0],
+        impl_phase_ms: (t == 1).then_some(w[1]),
+        sweep_ms: w[2],
+        proc_wall_ms: w[3],
+        speedup: Some(speedup),
+        cpu_ms: Some(cpu),
+        busy: Some(busy),
+        sweep_share: Some(w[2] as f64 / cpu as f64),
+        seeded,
+        splits,
+    };
+    // hand-computed: lock 80 000 / 40 000 = 2; 81 000 / 81 000 = 1; 123 000 / 41 000 = 3;
+    // leader 10 000 / 2 500 = 4; 10 500 / 10 500 = 1; 30 000 / 3 000 = 10
+    let want = vec![
+        line("leader", 1, [10_000, 9_000, 1_000, 10_500], 1.0, 10_500, 1.0, None, 0),
+        line("leader", 16, [2_500, 2_000, 500, 3_000], 4.0, 30_000, 10.0, Some(2), 0),
+        line("lock", 1, [80_000, 2_000, 78_000, 81_000], 1.0, 81_000, 1.0, Some(4), 0),
+        line("lock", 4, [40_000, 1_000, 39_000, 41_000], 2.0, 123_000, 3.0, Some(4), 2),
+    ];
+    assert_eq!(vc_curve_table(&rows, &stdout), want);
+    // the t = 1 wall perturbed: every speed-up of that fixture moves
+    let mut r = rows.clone();
+    r[0].insert("outer_wall_time_ms".to_owned(), "60000".to_owned());
+    let got = vc_curve_table(&r, &stdout);
+    assert_ne!(got, want);
+    assert_eq!(got[3].speedup, Some(1.5));
+    // one row's wall perturbed: its speed-up moves
+    let mut r = rows.clone();
+    r[4].insert("outer_wall_time_ms".to_owned(), "2000".to_owned());
+    let got = vc_curve_table(&r, &stdout);
+    assert_ne!(got, want);
+    assert_eq!(got[1].speedup, Some(5.0));
+    // one CPU cell perturbed: the sum and the ratio move
+    let mut r = rows.clone();
+    r[1].insert("cpu_user_ms".to_owned(), "120010".to_owned());
+    let got = vc_curve_table(&r, &stdout);
+    assert_ne!(got, want);
+    assert_eq!(got[3].cpu_ms, Some(123_010));
+    assert_ne!(got[3].busy, Some(3.0));
+    // Q14 (a): the implementation phase blank above one thread, a number at one; one sweep cell
+    // perturbed moves its share of the CPU time
+    assert_eq!((want[0].impl_phase_ms, want[1].impl_phase_ms, want[3].impl_phase_ms), (Some(9_000), None, None));
+    let mut r = rows.clone();
+    r[1].insert("sweep_wall_time_ms".to_owned(), "40000".to_owned());
+    let got = vc_curve_table(&r, &stdout);
+    assert_ne!(got, want);
+    assert_eq!(got[3].sweep_share, Some(40_000.0 / 123_000.0));
+}
+
+/// The new failures of a scratch copy's checks against the unmodified store's: failures, missing
+/// and unexpected keys.
+fn vc5_fresh(p: &VcPart, base: &VcPart) -> Vec<String> {
+    let mut out: Vec<String> = p.bad.iter().filter(|b| !base.bad.contains(b)).cloned().collect();
+    out.extend(p.missing.iter().filter(|k| !base.missing.contains(k)).map(|k| format!("missing: {k}")));
+    out.extend(p.unexpected.iter().filter(|k| !base.unexpected.contains(k)).map(|k| format!("unexpected: {k}")));
+    out
+}
+
+/// **VC-5's failing directions on scratch copies of the stores** (`VC_STORE`, `VC_CURVE_STORE`;
+/// the copies are in memory, the stores are only read): each mutation of the criteria's table that
+/// a store check catches, applied alone to a copy, fails on its row and names its column or
+/// identity; the reference perturbations that keep identities (1)–(9) fail only the reference
+/// columns; VC-3's two directions. Ignored.
+#[test]
+#[ignore]
+fn vc_5_the_failing_directions_on_scratch_copies_of_the_stores() {
+    if std::env::var("VC_STORE").is_err() {
+        return;
+    }
+    let rec = vc_records();
+    let explore = vc_explore_splits(&vc_vs_curve_rows());
+    let (_, cat) = vc_store_of("VC_STORE");
+    let (_, cur) = vc_store_of("VC_CURVE_STORE");
+    let base = vc_check_part("catalogue", "release", &cat, &rec, &explore);
+    let base_cur = vc_check_part("curve", "release", &cur, &rec, &explore);
+    let i = cat
+        .iter()
+        .position(|m| m["fixture"] == VC_SPLIT_FIXTURE && m["threads"] == "1" && m["end_class"] == "ok")
+        .expect("conformance: never-grant k2q2's t = 1 row");
+    let tag = format!("catalogue {VC_SPLIT_FIXTURE} t1");
+    let key = cat[i]["key"].clone();
+    let mut errors: Vec<String> = Vec::new();
+    let mut late_errors: Vec<String> = Vec::new();
+    // one direction: the mutated copy's new failures must contain every `want` and no `forbid`;
+    // `exact`, when given, is their number
+    let mut direction = |what: &str, part: &str, rows: Vec<BTreeMap<String, String>>, want: Vec<String>, forbid: &[&str], exact: Option<usize>| {
+        let b = if part == "catalogue" { &base } else { &base_cur };
+        let p = vc_check_part(part, "release", &rows, &rec, &explore);
+        let fresh = vc5_fresh(&p, b);
+        let missing: Vec<&String> = want.iter().filter(|w| !fresh.iter().any(|f| f.contains(w.as_str()))).collect();
+        let forbidden: Vec<&String> = fresh.iter().filter(|f| forbid.iter().any(|x| f.contains(x))).collect();
+        let count_ok = exact.is_none_or(|n| n == fresh.len());
+        if missing.is_empty() && forbidden.is_empty() && count_ok && !fresh.is_empty() {
+            note!("PVC5\t{what}\tfails as expected\t{fresh:?}");
+        } else {
+            errors.push(format!("{what}: expected {want:?} (forbid {forbid:?}, count {exact:?}); got {fresh:?}"));
+        }
+    };
+    let with = |edits: &[(&str, String)]| -> Vec<BTreeMap<String, String>> {
+        let mut rows = cat.clone();
+        for (k, v) in edits {
+            rows[i].insert((*k).to_owned(), v.clone());
+        }
+        rows
+    };
+    let cell = |k: &str| -> u128 { i4_num(&cat[i], k) };
+    let plus = |k: &str, d: i64| -> String { ((cell(k) as i128) + d as i128).to_string() };
+    // the split export
+    let (c, b) = (cat[i]["impl_complete"].clone(), cat[i]["impl_blocked"].clone());
+    assert!(c != b && b != "0", "conformance: the split row needs blocked > 0 and ≠ complete: {c}/{b}");
+    direction(
+        "split swapped",
+        "catalogue",
+        with(&[("impl_complete", b.clone()), ("impl_blocked", c.clone())]),
+        vec![format!("{tag}: impl_complete"), format!("{tag}: impl_blocked")],
+        &["identities"],
+        None,
+    );
+    direction(
+        "impl_blocked zeroed",
+        "catalogue",
+        with(&[("impl_blocked", "0".to_owned())]),
+        vec![format!("{tag}: impl_blocked"), format!("{tag}: identities: identity 9 (complete + blocked = executions)")],
+        &[],
+        None,
+    );
+    let blank = with(&[("impl_complete", String::new()), ("impl_blocked", String::new())]);
+    let r = catch_unwind(AssertUnwindSafe(|| vc_check_part("catalogue", "release", &blank, &rec, &explore)));
+    match r.map_err(|e| panic_text(&e)) {
+        Err(t) if t.contains("impl_") && t.contains("is not a number") => note!("PVC5\tsplit blank\tfails as expected\t{t}"),
+        other => late_errors.push(format!("split blank: {:?}", other.map(|p| p.bad))),
+    }
+    // identity (9)
+    direction(
+        "executions +1",
+        "catalogue",
+        with(&[("executions", plus("executions", 1))]),
+        vec![
+            format!("{tag}: identities: identity 9 (complete + blocked = executions)"),
+            format!("{tag}: identities: identity 9 (executions = impl_graphs)"),
+        ],
+        &[],
+        None,
+    );
+    direction(
+        "impl_graphs +1",
+        "catalogue",
+        with(&[("impl_graphs", plus("impl_graphs", 1))]),
+        vec![format!("{tag}: identities: identity 9 (executions = impl_graphs)")],
+        &[],
+        None,
+    );
+    // the reference comparison: identities kept
+    direction(
+        "reports, uncovered, failing +1; successful, admissions, witnesses −1",
+        "catalogue",
+        with(&[
+            ("reports", plus("reports", 1)),
+            ("uncovered_multiplicity", plus("uncovered_multiplicity", 1)),
+            ("sweeps_failing", plus("sweeps_failing", 1)),
+            ("sweeps_successful", plus("sweeps_successful", -1)),
+            ("admissions", plus("admissions", -1)),
+            ("witnesses", plus("witnesses", -1)),
+        ]),
+        vec![format!("{tag}: reports"), format!("{tag}: uncovered_multiplicity"), format!("{tag}: sweeps_failing")],
+        &["identities"],
+        Some(3),
+    );
+    direction(
+        "executions, impl_graphs, cache_probes, impl_complete, cache_hits +1",
+        "catalogue",
+        with(&[
+            ("executions", plus("executions", 1)),
+            ("impl_graphs", plus("impl_graphs", 1)),
+            ("cache_probes", plus("cache_probes", 1)),
+            ("impl_complete", plus("impl_complete", 1)),
+            ("cache_hits", plus("cache_hits", 1)),
+        ]),
+        vec![
+            format!("{tag}: executions"),
+            format!("{tag}: impl_graphs"),
+            format!("{tag}: cache_probes"),
+            format!("{tag}: impl_complete"),
+        ],
+        &["identities"],
+        Some(4),
+    );
+    // impl_end
+    direction(
+        "impl_end StoppedAtFirstReport",
+        "catalogue",
+        with(&[("impl_end", "StoppedAtFirstReport".to_owned())]),
+        vec![format!("{tag}: impl_end")],
+        &[],
+        Some(1),
+    );
+    // identities (1)–(8), one cell each
+    for (id, col, v) in [
+        ("identity 1", "unprobed_after_cancel", plus("unprobed_after_cancel", 1)),
+        ("identity 2", "sweeps_aborted", plus("sweeps_aborted", 1)),
+        ("identity 3", "redundant_sweeps", plus("redundant_sweeps", 1)),
+        ("identity 4", "evictions", plus("evictions", 1)),
+        ("identity 5 (sweeps_failing = uncovered_multiplicity)", "uncovered_multiplicity", plus("uncovered_multiplicity", 1)),
+        ("identity 6", "sweeps_in_tasks", plus("sweeps_in_tasks", 1)),
+        ("identity 7", "watch_probes", plus("watch_probes", 1)),
+        ("identity 8 (sweep_graphs_max", "sweep_graphs_max", plus("sweep_graphs", 1)),
+    ] {
+        direction(
+            &format!("{id}: {col} → {v}"),
+            "catalogue",
+            with(&[(col, v.clone())]),
+            vec![format!("{tag}: identities: {id}")],
+            &[],
+            None,
+        );
+    }
+    // keys and counts
+    let mut fewer = cat.clone();
+    fewer.remove(i);
+    direction(
+        "one row too few",
+        "catalogue",
+        fewer,
+        vec![format!("missing: {key}"), "the store holds 419 rows".to_owned()],
+        &[],
+        None,
+    );
+    let mut more = cat.clone();
+    let mut extra = cat[i].clone();
+    let extra_key = vc_row("apps/a3/never-grant/spec/vc5", vc_config(1, true), "sverify-p-vc", "catalogue").key("release");
+    extra.insert("key".to_owned(), extra_key.clone());
+    more.push(extra);
+    direction(
+        "one row too many",
+        "catalogue",
+        more,
+        vec![format!("unexpected: {extra_key}"), "the store holds 421 rows".to_owned()],
+        &[],
+        None,
+    );
+    let j = cur.iter().position(|m| m["threads"] == "1").expect("conformance: a curve t = 1 row");
+    let cur_key = cur[j]["key"].clone();
+    let mut cur_fewer = cur.clone();
+    cur_fewer.remove(j);
+    direction(
+        "curve: one row too few",
+        "curve",
+        cur_fewer,
+        vec![format!("missing: {cur_key}"), "the store holds 9 rows".to_owned()],
+        &[],
+        None,
+    );
+    let mut cur_more = cur.clone();
+    let mut cur_extra = cur[j].clone();
+    let cur_extra_key = vc_row(VC_CURVE[0], vc_config(32, false), "sverify-p-vc", "curve").key("release");
+    cur_extra.insert("key".to_owned(), cur_extra_key.clone());
+    cur_more.push(cur_extra);
+    direction(
+        "curve: one row too many",
+        "curve",
+        cur_more,
+        vec![format!("unexpected: {cur_extra_key}"), "the store holds 11 rows".to_owned()],
+        &[],
+        None,
+    );
+    // the launcher's configuration, one dimension at a time
+    let other_tier = Tier { name: "vc5-other".to_owned(), wall: std::time::Duration::from_secs(60), mem_kb: 1_000_000 };
+    let mut tiered = vc_row(VC_SPLIT_FIXTURE, vc_config(1, true), "sverify-p-vc", "catalogue");
+    tiered.tier = other_tier;
+    for (dim, spec) in [
+        ("fixture", vc_row("2pc/leader/conf/n4", vc_config(1, true), "sverify-p-vc", "catalogue")),
+        ("t", vc_row(VC_SPLIT_FIXTURE, vc_config(2, true), "sverify-p-vc", "catalogue")),
+        ("engine CFirst", vc_row(VC_SPLIT_FIXTURE, GridConfig::new(GridEngine::CompleteFirst).impl_distinct(true), "sverify-p-vc", "catalogue")),
+        ("engine ExploreP", vc_row(VC_SPLIT_FIXTURE, GridConfig::new(GridEngine::ExploreP).threads(1), "sverify-p-vc", "catalogue")),
+        ("w", vc_row(VC_SPLIT_FIXTURE, vc_config(1, true).witness_cache(Capacity::Zero), "sverify-p-vc", "catalogue")),
+        ("distinct", vc_row(VC_SPLIT_FIXTURE, vc_config(1, false), "sverify-p-vc", "catalogue")),
+        ("stop", vc_row(VC_SPLIT_FIXTURE, vc_config(1, true).stop(true), "sverify-p-vc", "catalogue")),
+        ("tier", tiered),
+    ] {
+        let k = spec.key("release");
+        assert_ne!(k, key, "conformance: {dim} changes the key");
+        direction(
+            &format!("configuration: {dim}"),
+            "catalogue",
+            with(&[("key", k.clone())]),
+            vec![format!("unexpected: {k}"), format!("missing: {key}")],
+            &[],
+            None,
+        );
+    }
+    // Q14 (a): the implementation phase's cell
+    let k4 = cat
+        .iter()
+        .position(|m| m["fixture"] == VC_SPLIT_FIXTURE && m["threads"] == "4" && m["end_class"] == "ok")
+        .expect("conformance: never-grant k2q2's t = 4 row");
+    let mut filled = cat.clone();
+    filled[k4].insert("impl_phase_wall_ms".to_owned(), "123".to_owned());
+    direction(
+        "Q14: the cell filled at t = 4",
+        "catalogue",
+        filled,
+        vec![format!("catalogue {VC_SPLIT_FIXTURE} t4: impl_phase_wall_ms")],
+        &[],
+        Some(1),
+    );
+    direction(
+        "Q14: the cell blank at t = 1",
+        "catalogue",
+        with(&[("impl_phase_wall_ms", String::new())]),
+        vec![format!("{tag}: impl_phase_wall_ms")],
+        &[],
+        Some(1),
+    );
+    direction(
+        "Q14: the cell off by one at t = 1",
+        "catalogue",
+        with(&[("impl_phase_wall_ms", plus("impl_phase_wall_ms", 1))]),
+        vec![format!("{tag}: impl_phase_wall_ms")],
+        &[],
+        Some(1),
+    );
+    drop(direction);
+    errors.append(&mut late_errors);
+    // VC-3
+    let t1: BTreeMap<String, BTreeMap<String, String>> =
+        base.rows.iter().filter(|((_, t), _)| *t == 1).map(|((f, _), m)| (f.clone(), m.clone())).collect();
+    let (_, pkg0, rows0) = vc3_premises(&rec, &t1);
+    let mut vs = rec.vs.clone();
+    vs.get_mut("apps/a3/fifo/spec/k3q3").unwrap().spec_split.0 += 1;
+    let bumped = VcRecords { ps: rec.ps.clone(), vs, unc: rec.unc.clone() };
+    let (_, pkg1, _) = vc3_premises(&bumped, &t1);
+    if pkg0.is_empty() && pkg1.iter().any(|f| f.starts_with("apps/a3/fifo/spec/k3q3: N = E1T spec_graphs")) {
+        note!("PVC5\tVC-3 N + 1\tfails as expected\t{pkg1:?}");
+    } else {
+        errors.push(format!("VC-3 N + 1: before {pkg0:?}, after {pkg1:?}"));
+    }
+    let mut t1b = t1.clone();
+    let m = t1b.get_mut("apps/a3/fifo/spec/k3q3").expect("conformance: the k3q3 t = 1 row");
+    let sg = i4_num(m, "sweep_graphs") + 1;
+    m.insert("sweep_graphs".to_owned(), sg.to_string());
+    let (_, _, rows1) = vc3_premises(&rec, &t1b);
+    if rows0.is_empty() && rows1.iter().any(|f| f.contains("k3q3 t1: sweep_graphs = N(N + 1)/2")) {
+        note!("PVC5\tVC-3 sweep_graphs +1\tfails as expected\t{rows1:?}");
+    } else {
+        errors.push(format!("VC-3 sweep_graphs +1: before {rows0:?}, after {rows1:?}"));
+    }
+    for e in &errors {
+        note!("PVC5\tNOT CAUGHT\t{e}");
+    }
+    assert!(errors.is_empty(), "conformance: VC-5: {} directions not caught", errors.len());
+}
+
+// =========================================================================
+// SVERIFY-P V-C, Q14 (a) (criteria rev 1.5; the tester, 2026-10-29): `impl_phase_wall_ms` on the
+// CFirstP row is outer − sweep at one thread and blank above it; the CompleteFirst row (the other
+// writer of the cell) is unchanged. Derived in `log/dev/SVERIFY-P.derived-vc.md` § Q14 (a).
+// =========================================================================
+
+/// **Q14 (a), in process:** never-grant k2q2 through `run_grid` — CFirstP at t = 1: the cell is
+/// `outer_wall_time_ms − sweep_wall_time_ms`; at t = 4 and 16: blank; the CompleteFirst row:
+/// outer − sweep. Failing directions (scratch copy, M11–M13): the cell filled above one thread;
+/// blank at one thread; the CompleteFirst cell blanked.
+#[test]
+fn vc_q14_the_impl_phase_cell_by_threads() {
+    let _g = serial();
+    let f = fx(VC_SPLIT_FIXTURE);
+    for t in [1, 4, 16] {
+        let m = i4_cells(&i4_run(&f, &vc_config(t, false)));
+        assert_eq!(m["threads"], t.to_string(), "conformance: the row's threads");
+        let want = if t == 1 {
+            i4_num(&m, "outer_wall_time_ms").saturating_sub(i4_num(&m, "sweep_wall_time_ms")).to_string()
+        } else {
+            String::new()
+        };
+        assert_eq!(m["impl_phase_wall_ms"], want, "conformance: CFirstP at t = {t}");
+    }
+    let m = i4_cells(&i4_run(&f, &GridConfig::new(GridEngine::CompleteFirst)));
+    let want = i4_num(&m, "outer_wall_time_ms").saturating_sub(i4_num(&m, "sweep_wall_time_ms"));
+    assert_eq!(m["impl_phase_wall_ms"], want.to_string(), "conformance: the CompleteFirst row");
+}
+
+/// **Q14 (a), the comparison's directions** (`VC_S7_STORE`, `VC_S8_STORE`, `VC_S8B_STORE`; scratch
+/// copies of both schema-8 stores, as a code change would show in both runs): the stores as they are
+/// compare clean; a CFirstP t = 4 row's cell filled fails on that row; a CompleteFirst row's cell
+/// blanked fails on that row. Ignored.
+#[test]
+#[ignore]
+fn vc_q14_the_schema_comparison_directions() {
+    if std::env::var("VC_S7_STORE").is_err() {
+        return;
+    }
+    let (_, s7) = vc_store_of("VC_S7_STORE");
+    let (_, s8) = vc_store_of("VC_S8_STORE");
+    let (_, s8b) = vc_store_of("VC_S8B_STORE");
+    let (base, _) = vc_schema_compare(&s7, &s8, &s8b, "release");
+    assert!(base.is_empty(), "conformance: the unmodified stores: {base:#?}");
+    let at = |rows: &[BTreeMap<String, String>], engine: &str, t4: bool| {
+        rows.iter()
+            .position(|m| {
+                m["fixture"] == VC_SPLIT_FIXTURE
+                    && m["engine"] == engine
+                    && (!t4 || m["key"].contains("/threads=4|"))
+            })
+            .unwrap_or_else(|| panic!("conformance: the {engine} row"))
+    };
+    for (what, engine, t4, value, want) in [
+        ("a CFirstP t = 4 cell filled", "CFirstP", true, "123", "CFirstP t4: impl_phase_wall_ms"),
+        ("a CompleteFirst cell blanked", "CompleteFirst", false, "", "CompleteFirst t1: impl_phase_wall_ms"),
+    ] {
+        let (mut a, mut b) = (s8.clone(), s8b.clone());
+        let (i, j) = (at(&a, engine, t4), at(&b, engine, t4));
+        a[i].insert("impl_phase_wall_ms".to_owned(), value.to_owned());
+        b[j].insert("impl_phase_wall_ms".to_owned(), value.to_owned());
+        let (bad, _) = vc_schema_compare(&s7, &a, &b, "release");
+        note!("PVCQ14\t{what}\t{bad:?}");
+        assert!(
+            !bad.is_empty() && bad.iter().all(|x| x.contains(want)),
+            "conformance: {what}: {bad:#?}"
+        );
+    }
 }

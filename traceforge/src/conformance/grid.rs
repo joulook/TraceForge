@@ -2830,6 +2830,9 @@ fn cfirst_p_columns(row: &mut Row, r: &CFirstPRun, c: &crate::conformance::repor
     push_d(row, "aborted", o.aborted);
     push_d(row, "impl_notes", o.impl_notes.len());
     push_d(row, "executions", o.executions);
+    // `SVERIFY-P` V-C (VC-0, schema 8): the outer run's split.
+    push_d(row, "impl_complete", o.impl_complete);
+    push_d(row, "impl_blocked", o.impl_blocked);
     push_opt(row, "max_paper_events", o.max_paper_events);
     push_d(row, "witness_cache_len", c.witnesses);
     push_d(row, "sweep_ends", sweep_split_counts(c));
@@ -2860,12 +2863,22 @@ fn cfirst_p_columns(row: &mut Row, r: &CFirstPRun, c: &crate::conformance::repor
     push_d(row, "precheck_ran", c.precheck_ran);
     push_d(row, "precheck_wall_time_ms", c.precheck_wall_time_ms);
     push_d(row, "outer_wall_time_ms", c.outer_wall_time_ms);
+    // `SVERIFY-P` V-C (Q14 a): `sweep_wall_time_ms` sums the sweeps' times
+    // over the workers. At one thread they run in the exploring thread, so
+    // outer minus sweep is the implementation phase's wall. Above one thread
+    // the sweeps overlap the exploration and the sum is worker time, not a
+    // wall: the run has no implementation phase to time, and the cell is
+    // blank (the sweep share is `sweep_wall_time_ms` over the row's CPU time).
     push_d(row, "sweep_wall_time_ms", c.sweep_wall_time_ms);
-    push_d(
-        row,
-        "impl_phase_wall_ms",
-        c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),
-    );
+    if p.threads > 1 {
+        push_d(row, "impl_phase_wall_ms", "");
+    } else {
+        push_d(
+            row,
+            "impl_phase_wall_ms",
+            c.outer_wall_time_ms.saturating_sub(c.sweep_wall_time_ms),
+        );
+    }
     push_d(row, "index_kind", "set");
     push_d(row, "containment_tests", c.cache_tests);
     push_opt(row, "impl_distinct_summaries", p.impl_distinct_summaries);

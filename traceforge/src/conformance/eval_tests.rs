@@ -56,6 +56,11 @@ thread_local! {
     /// Set by `c04_fixture_by_name_rejects_a_duplicate_name` on its own
     /// thread only: `test_fixtures()` then registers `eval/dup` twice.
     static INJECT_DUPLICATE: Cell<bool> = const { Cell::new(false) };
+    /// `SVERIFY-P` V-C (VC-0, the lead's ruling 2): set by the crashed-row test on its own
+    /// thread, so the parent resolves `eval/abort_late`; the child resolves it from its own
+    /// `EVAL_ROW`. No other test sees it: the registry keeps its eleven names (campaign T8,
+    /// APPTAB C2, the T0 row counts).
+    static INJECT_ABORT_LATE: Cell<bool> = const { Cell::new(false) };
 }
 
 fn test_fixture(name: &str, visible: &[&str], imp: Prog, spec: Prog) -> Fixture {
@@ -96,6 +101,15 @@ fn trivial(secs_per_rep: Option<u64>) -> Prog {
             .name("a".to_string())
             .spawn(|| {})
             .unwrap();
+    })
+}
+
+/// `SVERIFY-P` V-C (VC-0): aborts after 300 ms, so the parent has read the child's CPU time at
+/// three sample instants or more (100 ms apart, the first at once) before the crash.
+fn abort_late() -> Prog {
+    prog(|| {
+        std::thread::sleep(Duration::from_millis(300));
+        std::process::abort();
     })
 }
 
@@ -191,6 +205,16 @@ pub(super) fn test_fixtures() -> Vec<Fixture> {
             prog(|| std::process::abort()),
         ),
     ];
+    if INJECT_ABORT_LATE.with(Cell::get)
+        || std::env::var("EVAL_ROW").is_ok_and(|r| r.contains("eval/abort_late"))
+    {
+        v.push(test_fixture(
+            "eval/abort_late",
+            &["a"],
+            abort_late(),
+            abort_late(),
+        ));
+    }
     if INJECT_DUPLICATE.with(Cell::get) {
         v.push(test_fixture(
             "eval/dup",
@@ -486,6 +510,9 @@ const HEADER_PIN_V4_TAIL: &str = "impl_distinct_summaries,index_kind,impl_phase_
 /// Schema 7 (`SVERIFY-P` P-S; tester re-pin 2026-10-28, gate 3): the eleven columns appended after
 /// `spawned_at_stop` (the parallel stateless engine's own counters; three of them, where the
 /// sweeps ran, the lead's O-5 fix; the last two ruling 21's).
+/// Schema 8 (`SVERIFY-P` V-C, VC-0; tester re-pin 2026-10-29): the child's CPU time, two columns
+/// appended after `watch_probes`.
+const HEADER_PIN_V8_TAIL: &str = "cpu_user_ms,cpu_sys_ms";
 const HEADER_PIN_V7_TAIL: &str = "redundant_sweeps,unadmitted_after_cancel,unprobed_after_cancel,signature_syncs,admission_lock_held_ms,admission_lock_wait_ms,sweeps_in_warmup,sweeps_in_root_loop,sweeps_in_tasks,sweeps_abandoned,watch_probes";
 const HEADER_PIN_V6_TAIL: &str = "threads,flush_entries,iterations_until_split,warmup,state_batch_size,freeze_wall_time_ms,spec_vmhwm_kb,freeze_vmhwm_kb,impl_vmhwm_kb,vmhwm_kb_max,phase_peaks,vm_peak_kb,spec_complete,spec_blocked,impl_complete,impl_blocked,spec_tasks,impl_tasks,spec_tasks_nonempty,impl_tasks_nonempty,spec_flushes,impl_flushes,spec_merge_lock_held_ms,spec_merge_lock_wait_ms,impl_merge_lock_held_ms,impl_merge_lock_wait_ms,spec_flush_entries,spec_worker_duplicates,spec_merge_duplicates,impl_seen_flush_entries,impl_seen_worker_duplicates,exact_hits,uncovered_distinct,uncovered_multiplicity,uncovered_flush_entries,uncovered_worker_duplicates,uncovered_merge_duplicates,stopped_early,uncovered_at_stop,spawned_at_stop";
 const HEADER_PIN_V5_TAIL: &str = "impl_distinct_summaries,index_kind,impl_phase_wall_ms,antichain_effective,entries,buckets,bucket_max,admitted,duplicates,antichain_dropped_new,antichain_dropped_old,insert_tests,summary_bytes,sig_bytes_est,signatures_seen,sig_tests,sig_aliases,coordinates_compared,inverted_used,inverted_words,trie_nodes_visited,memo_on,memo_entries,memo_clears";
@@ -493,7 +520,10 @@ const HEADER_PIN_V3: &str = "key,run_kind,profile,commit,rep,tier,end_class,cens
 
 /// **Label pinning** (H1, round 03 m1): `LABEL_PIN` is today's
 /// `GridConfig::new(GridEngine::Enumerator).label()`, and `header()` is the
-/// pinned list, both beside `SCHEMA_VERSION == 7`.
+/// pinned list, both beside `SCHEMA_VERSION == 8`.
+///
+/// Schema 8 (`SVERIFY-P` V-C, VC-0; tester re-pin 2026-10-29): schema 7's 260 columns followed
+/// by the two of [`HEADER_PIN_V8_TAIL`] (262); `LABEL_PIN` unchanged.
 ///
 /// Schema 7 (`SVERIFY-P` P-S; tester re-pin 2026-10-28, gate 3): schema 6's 249 columns followed
 /// by the eleven of [`HEADER_PIN_V7_TAIL`] (260); `LABEL_PIN` unchanged.
@@ -516,7 +546,7 @@ const HEADER_PIN_V3: &str = "key,run_kind,profile,commit,rep,tier,end_class,cens
 #[test]
 fn pin_the_label_format_and_the_header_beside_the_schema_version() {
     assert_eq!(
-        SCHEMA_VERSION, 7,
+        SCHEMA_VERSION, 8,
         "conformance: bump the pins with the version"
     );
     assert_eq!(
@@ -530,7 +560,10 @@ fn pin_the_label_format_and_the_header_beside_the_schema_version() {
     );
     assert_eq!(
         header().join(","),
-        format!("{HEADER_PIN_V3},{HEADER_PIN_V5_TAIL},{HEADER_PIN_V6_TAIL},{HEADER_PIN_V7_TAIL}"),
+        format!(
+            "{HEADER_PIN_V3},{HEADER_PIN_V5_TAIL},{HEADER_PIN_V6_TAIL},{HEADER_PIN_V7_TAIL},\
+             {HEADER_PIN_V8_TAIL}"
+        ),
         "conformance: the header changed; bump SCHEMA_VERSION"
     );
     assert_eq!(HEADER_PIN_V3.split(',').count(), 185);
@@ -538,6 +571,7 @@ fn pin_the_label_format_and_the_header_beside_the_schema_version() {
     assert_eq!(HEADER_PIN_V5_TAIL.split(',').count(), 24);
     assert_eq!(HEADER_PIN_V6_TAIL.split(',').count(), 40);
     assert_eq!(HEADER_PIN_V7_TAIL.split(',').count(), 11);
+    assert_eq!(HEADER_PIN_V8_TAIL.split(',').count(), 2);
     // Schema 5 = schema 4 with `sig_bytes` replaced by eight columns.
     assert_eq!(
         HEADER_PIN_V5_TAIL,
@@ -547,7 +581,8 @@ fn pin_the_label_format_and_the_header_beside_the_schema_version() {
              inverted_used,inverted_words,trie_nodes_visited,"
         )
     );
-    assert_eq!(header().len(), 260);
+    assert_eq!(header().len(), 262);
+    assert_eq!(header()[260..], ["cpu_user_ms", "cpu_sys_ms"]);
 }
 
 /// H1: every label the grid builds parses back to the same configuration
@@ -3426,4 +3461,543 @@ fn c07_baselines_under_the_runner() {
         sum.ran,
         sum.skipped_present
     );
+}
+
+// =========================================================================
+// SVERIFY-P V-C, VC-0 (schema 8): the CPU columns (the tester's, 2026-10-29)
+// =========================================================================
+//
+// Derived from `criteria/SVERIFY-P-VC.md` rev 1.3 (VC-0 item 3, VC-5's CPU rows, the lead's
+// rulings 1–8 at the tester's alignment) and `log/dev/SVERIFY-P.derived-vc.md` before the
+// lead's code was read; the source check below reads `eval.rs` as landed.
+
+/// A `/proc/<pid>/stat` line whose `comm` holds spaces and `)`; every field k ≥ 4 but 14 and
+/// 15 holds 1000 + k, so each misread lands on a distinct wrong value.
+fn vc0_stat_line(utime: u64, stime: u64) -> String {
+    let f: Vec<String> = (4..=52u64)
+        .map(|k| match k {
+            14 => utime.to_string(),
+            15 => stime.to_string(),
+            _ => (1000 + k).to_string(),
+        })
+        .collect();
+    format!("4242 (a) b) c)) S {}", f.join(" "))
+}
+
+/// **VC-5, the stat fields and the unit:** fields 14 and 15 counted after the last `)`, ticks
+/// × 10. Failing directions by value: fields 13/14 give (10 130, 70); 16/17 (`cutime`,
+/// `cstime`) give (10 160, 10 170); a whitespace split from the line's start is shifted by
+/// the `comm`'s two spaces; ticks written as milliseconds give (7, 3).
+#[test]
+fn vc0_cpu_ms_of_stat_reads_fields_14_and_15_after_the_last_paren() {
+    use crate::conformance::eval::cpu_ms_of_stat;
+    let line = vc0_stat_line(7, 3);
+    assert_eq!(cpu_ms_of_stat(&line), Some((70, 30)));
+    assert_eq!(cpu_ms_of_stat(&vc0_stat_line(0, 0)), Some((0, 0)));
+    assert_eq!(
+        cpu_ms_of_stat(&vc0_stat_line(123_456, 1)),
+        Some((1_234_560, 10))
+    );
+    // The adversarial line is adversarial: a naive split reads fields 12 and 13 there.
+    let naive: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!((naive[13], naive[14]), ("1012", "1013"));
+    for wrong in [(10_130, 70), (10_160, 10_170), (10_120, 10_130), (7, 3)] {
+        assert_ne!(cpu_ms_of_stat(&line), Some(wrong), "conformance: {wrong:?}");
+    }
+    assert_eq!(cpu_ms_of_stat(""), None);
+    assert_eq!(cpu_ms_of_stat("4242 (x) S 1 2 3"), None);
+    assert_eq!(
+        cpu_ms_of_stat("4242 (x S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15"),
+        None
+    );
+}
+
+/// **VC-5, crashed without a sample** (the lead's ruling 3): no reading gives two blank
+/// cells, never `0`; a reading gives its two numbers.
+#[test]
+fn vc0_cpu_cells_are_blank_without_a_reading() {
+    use crate::conformance::eval::cpu_cells;
+    assert_eq!(cpu_cells(None), (String::new(), String::new()));
+    assert_eq!(
+        cpu_cells(Some((70, 30))),
+        ("70".to_owned(), "30".to_owned())
+    );
+    assert_eq!(cpu_cells(Some((0, 0))), ("0".to_owned(), "0".to_owned()));
+}
+
+/// **VC-0 item 3:** the conversion assumes `USER_HZ` = 100; on a machine with another value
+/// this fails instead of the store mis-scaling.
+#[test]
+fn vc0_user_hz_is_100() {
+    let out = std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .expect("conformance: getconf");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "100");
+}
+
+/// **The lead's ruling 8:** the two sentinels differ and are not multiples of 10, so neither
+/// can pass for a reading.
+#[test]
+fn vc0_the_sentinels_are_never_a_reading() {
+    use crate::conformance::eval::{CPU_SENTINEL_KILL, CPU_SENTINEL_SAMPLE};
+    for (u, s) in [CPU_SENTINEL_SAMPLE, CPU_SENTINEL_KILL] {
+        assert!(u % 10 != 0 && s % 10 != 0, "conformance: ({u}, {s})");
+    }
+    assert_ne!(CPU_SENTINEL_SAMPLE, CPU_SENTINEL_KILL);
+}
+
+/// The text of `src` from the first `from` to the first `to` after it.
+fn vc0_between<'a>(src: &'a str, from: &str, to: &str) -> &'a str {
+    let i = src
+        .find(from)
+        .unwrap_or_else(|| panic!("conformance: no {from:?}"));
+    let j = src[i..]
+        .find(to)
+        .unwrap_or_else(|| panic!("conformance: no {to:?} after {from:?}"));
+    &src[i..i + j]
+}
+
+/// **VC-0 item 3 and the lead's rulings 1, 3, 6, by source:** the killed branch takes the
+/// pre-kill reading, the crashed branch the last sample, the child's-record branch (`ok`,
+/// `panicked`, post-hoc `capped_memory`) no parent reading; the child reads its own after
+/// `child_row` and before the record; `eval_row_of` (the in-process path) reads nothing; the
+/// kill reading precedes the kill; one `Sample` and one `Kill` reading site.
+#[test]
+fn vc0_the_cpu_sources_by_branch() {
+    let src = include_str!("eval.rs");
+    let killed = vc0_between(src, "(Some(reason), _) => {", "(None, Some(cells)) => {");
+    assert_eq!(killed.matches("cpu_cells(out.cpu_at_kill)").count(), 1);
+    assert!(!killed.contains("cpu_sampled"), "conformance: {killed}");
+    let record = vc0_between(src, "(None, Some(cells)) => {", "(None, None) => {");
+    assert!(!record.contains("cpu_"), "conformance: {record}");
+    let crashed = vc0_between(src, "(None, None) => {", "pub(super) fn glob_match");
+    assert_eq!(crashed.matches("cpu_cells(out.cpu_sampled)").count(), 1);
+    assert!(!crashed.contains("cpu_at_kill"), "conformance: {crashed}");
+    let child = vc0_between(src, "fn eval_row() {", "pub(super) struct Driver");
+    let read = child
+        .find("cpu_cells(cpu_ms_of_pid(std::process::id()))")
+        .expect("conformance: the child's own reading");
+    let made = child.find("child_row(&spec, &commit)").unwrap();
+    let written = child.find("csv_line(&record_of(&row))").unwrap();
+    assert!(
+        made < read && read < written,
+        "conformance: {made} {read} {written}"
+    );
+    let in_process = vc0_between(src, "fn eval_row_of(", "\n}\n");
+    assert!(
+        !in_process.contains("cpu_ms_of") && !in_process.contains("parent_cpu_reading"),
+        "conformance: eval_row_of reads CPU"
+    );
+    assert_eq!(
+        src.matches("parent_cpu_reading(pid, CpuReason::Sample)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        src.matches("parent_cpu_reading(pid, CpuReason::Kill)")
+            .count(),
+        1
+    );
+    let kill = vc0_between(
+        src,
+        "cpu_at_kill = parent_cpu_reading(pid, CpuReason::Kill);",
+        "break None;",
+    );
+    assert!(kill.contains("child.kill()"), "conformance: {kill}");
+    assert_eq!(
+        src.matches("cpu_ms_of_pid(").count(),
+        3,
+        "conformance: def + 2 calls"
+    );
+}
+
+/// **The lead's ruling 6:** an in-process row (`child_row`, no child) has blank CPU cells.
+#[test]
+fn vc0_an_in_process_row_has_blank_cpu_cells() {
+    let rs = row_spec(
+        "eval/sleeper",
+        GridConfig::new(GridEngine::Stateful),
+        0,
+        &Tier::default_tier(),
+        RunKind::Timed,
+    );
+    let row = child_row(&rs, "vc0").unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    for k in ["cpu_user_ms", "cpu_sys_ms"] {
+        let v = row.iter().find(|(c, _)| *c == k).map(|(_, v)| v.as_str());
+        assert_eq!(v, Some(""), "conformance: {k}");
+    }
+}
+
+type Vc0Log = Vec<(crate::conformance::eval::CpuReason, Option<(u64, u64)>)>;
+
+/// One driver run with the seam on (this thread only); the store's rows and the seam's log.
+fn vc0_run(name: &str, rows: Vec<RowSpec>) -> (Vec<BTreeMap<String, String>>, Vc0Log, PathBuf) {
+    let dir = fresh(name);
+    let s = spec(name, rows);
+    let d = real_driver(s.clone(), vec![s], &dir);
+    // Gate 4 round 01 M1: the guard lives to the end of this function, so a panic in `d.run()`
+    // turns the seam back off as it unwinds.
+    let _seam = crate::conformance::eval::cpu_seam_enable();
+    let r = d.run();
+    let log = crate::conformance::eval::cpu_seam_take();
+    r.unwrap_or_else(|e| panic!("conformance: driver refused: {}", e.text()));
+    (store_of(&d), log, dir)
+}
+
+/// The child's own record of a row, from `runs/<hash>/stdout`: (`cpu_user_ms`, `cpu_sys_ms`).
+fn vc0_child_record(dir: &Path, row: &BTreeMap<String, String>) -> (String, String) {
+    let text = fs::read_to_string(dir.join(get(row, "run_dir")).join("stdout")).unwrap();
+    let sentinel = crate::conformance::eval::SENTINEL;
+    let i = text.find(sentinel).expect("conformance: no child record");
+    let cells = parse_csv_line(text[i + sentinel.len()..].lines().next().unwrap()).unwrap();
+    let h = header();
+    let at = |k: &str| cells[h.iter().position(|c| *c == k).unwrap()].clone();
+    (at("cpu_user_ms"), at("cpu_sys_ms"))
+}
+
+fn vc0_cells(row: &BTreeMap<String, String>) -> (String, String) {
+    (
+        get(row, "cpu_user_ms").to_owned(),
+        get(row, "cpu_sys_ms").to_owned(),
+    )
+}
+
+fn vc0_as_cells((u, s): (u64, u64)) -> (String, String) {
+    (u.to_string(), s.to_string())
+}
+
+/// **VC-5, CPU on `ok` and `panicked` rows** (seam on): the row's cells are the child's record
+/// line, numeric, multiples of 10, neither sentinel; the parent read at least one sample and
+/// never a kill. Failing direction: the parent's reading written over the child's makes the
+/// row a sentinel.
+#[test]
+#[ignore]
+fn vc0_cpu_ok_and_panicked_rows_carry_the_childs_reading() {
+    use crate::conformance::eval::{CpuReason, CPU_SENTINEL_KILL, CPU_SENTINEL_SAMPLE};
+    let t = Tier::default_tier();
+    let (rows, log, dir) = vc0_run(
+        "VC0ok",
+        vec![
+            row_spec(
+                "eval/sleeper",
+                GridConfig::new(GridEngine::Stateful),
+                1,
+                &t,
+                RunKind::Timed,
+            ),
+            row_spec(
+                "eval/panic",
+                GridConfig::new(GridEngine::Stateful),
+                0,
+                &t,
+                RunKind::Timed,
+            ),
+        ],
+    );
+    assert_eq!(rows.len(), 2);
+    for (fx, class) in [("eval/sleeper", "ok"), ("eval/panic", "panicked")] {
+        let r = rows.iter().find(|r| get(r, "fixture") == fx).unwrap();
+        assert_eq!(get(r, "end_class"), class);
+        let cells = vc0_cells(r);
+        assert_eq!(cells, vc0_child_record(&dir, r), "conformance: {fx}");
+        for sent in [CPU_SENTINEL_SAMPLE, CPU_SENTINEL_KILL] {
+            assert_ne!(cells, vc0_as_cells(sent), "conformance: {fx}");
+        }
+        for v in [&cells.0, &cells.1] {
+            let n: u64 = v
+                .parse()
+                .unwrap_or_else(|_| panic!("conformance: {fx} {v:?}"));
+            assert_eq!(n % 10, 0, "conformance: {fx} {n}");
+        }
+        note!("vc0 {fx}: cpu {cells:?}, wall {}", get(r, "proc_wall_ms"));
+    }
+    assert!(log
+        .iter()
+        .any(|(r, v)| *r == CpuReason::Sample && v.is_some()));
+    assert!(
+        log.iter().all(|(r, _)| *r == CpuReason::Sample),
+        "conformance: {log:?}"
+    );
+}
+
+/// **VC-5, CPU on capped rows** (seam on): `capped_wall` (`eval/sleeper` rep 1, 3 s, under a
+/// 1 s tier) and `capped_memory` by the kill (`eval/alloc256` under 64 MiB) carry the `kill`
+/// sentinel, not the `sample` one; each run's log holds exactly one real `kill` reading.
+/// Failing direction: the last sample used at the kill makes the row the `sample` sentinel.
+#[test]
+#[ignore]
+fn vc0_cpu_capped_rows_carry_the_kill_reading() {
+    use crate::conformance::eval::{CpuReason, CPU_SENTINEL_KILL};
+    let cases = [
+        (
+            "VC0w",
+            "eval/sleeper",
+            1,
+            tier("vc0w", 1_000, Tier::default_tier().mem_kb),
+            "capped_wall",
+        ),
+        (
+            "VC0m",
+            "eval/alloc256",
+            0,
+            tier("vc0m", 600_000, 65_536),
+            "capped_memory",
+        ),
+    ];
+    for (name, fx, rep, t, class) in cases {
+        let (rows, log, _) = vc0_run(
+            name,
+            vec![row_spec(
+                fx,
+                GridConfig::new(GridEngine::Stateful),
+                rep,
+                &t,
+                RunKind::Timed,
+            )],
+        );
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!((get(r, "end_class"), get(r, "censor_via")), (class, "kill"));
+        assert_eq!(
+            vc0_cells(r),
+            vc0_as_cells(CPU_SENTINEL_KILL),
+            "conformance: {fx}"
+        );
+        let kills: Vec<_> = log.iter().filter(|(r, _)| *r == CpuReason::Kill).collect();
+        assert_eq!(kills.len(), 1, "conformance: {fx} {log:?}");
+        assert!(
+            kills[0].1.is_some(),
+            "conformance: {fx}: the pre-kill read failed"
+        );
+        assert!(
+            log.iter().any(|(r, _)| *r == CpuReason::Sample),
+            "conformance: {fx}"
+        );
+        note!(
+            "vc0 {fx}: {} readings, the real kill reading {:?}",
+            log.len(),
+            kills[0].1
+        );
+    }
+}
+
+/// **VC-5, CPU on a crashed row with a sample** (seam on): `eval/abort_late` aborts after
+/// 300 ms; the row is `crashed(signal 6)` with the `sample` sentinel (the parent's last
+/// reading, a lower bound); the log holds three samples or more and no kill. Failing
+/// direction: `0` or blank written. `eval/abort` (at once) is recorded only: whether a
+/// reading preceded its crash is timing.
+#[test]
+#[ignore]
+fn vc0_cpu_crashed_rows_carry_the_last_sample() {
+    use crate::conformance::eval::{CpuReason, CPU_SENTINEL_SAMPLE};
+    // Ruling 9: the guard clears the flag when this section ends, on a panic too.
+    let guard = AbortLateGuard::set();
+    let t = Tier::default_tier();
+    let (rows, log, _) = vc0_run(
+        "VC0c",
+        vec![row_spec(
+            "eval/abort_late",
+            GridConfig::new(GridEngine::Stateful),
+            0,
+            &t,
+            RunKind::Timed,
+        )],
+    );
+    drop(guard);
+    assert!(
+        !INJECT_ABORT_LATE.with(Cell::get),
+        "conformance: ruling 9: the flag is cleared"
+    );
+    assert_eq!(rows.len(), 1);
+    let r = &rows[0];
+    assert_eq!(get(r, "end_class"), "crashed(signal 6)");
+    assert_eq!(vc0_cells(r), vc0_as_cells(CPU_SENTINEL_SAMPLE));
+    let samples = log
+        .iter()
+        .filter(|(r, v)| *r == CpuReason::Sample && v.is_some())
+        .count();
+    assert!(samples >= 3, "conformance: {samples} samples");
+    assert!(
+        log.iter().all(|(r, _)| *r == CpuReason::Sample),
+        "conformance: {log:?}"
+    );
+    let (rows, log, _) = vc0_run(
+        "VC0a",
+        vec![row_spec(
+            "eval/abort",
+            GridConfig::new(GridEngine::Stateful),
+            0,
+            &t,
+            RunKind::Timed,
+        )],
+    );
+    note!(
+        "vc0 eval/abort: {:?} cells {:?}, {} readings",
+        get(&rows[0], "end_class"),
+        vc0_cells(&rows[0]),
+        log.len()
+    );
+}
+
+/// `SVERIFY-P` V-C ruling 9 (criteria rev 1.4): sets `INJECT_ABORT_LATE` on this thread and clears
+/// it when dropped — at the end of its scope or on a panic inside it.
+struct AbortLateGuard;
+
+impl AbortLateGuard {
+    fn set() -> Self {
+        INJECT_ABORT_LATE.with(|c| c.set(true));
+        AbortLateGuard
+    }
+}
+
+impl Drop for AbortLateGuard {
+    fn drop(&mut self) {
+        INJECT_ABORT_LATE.with(|c| c.set(false));
+    }
+}
+
+/// **Ruling 9's second condition:** with the flag off and no `EVAL_ROW`, the test registry has
+/// exactly its eleven names and no `eval/abort_late`; with the guard, twelve; the guard clears the
+/// flag when its scope ends and when a panic unwinds through it, and the eleven names return.
+#[test]
+fn vc0_r9_the_registry_keeps_eleven_names_and_the_flag_is_cleared() {
+    assert!(
+        std::env::var_os("EVAL_ROW").is_none(),
+        "conformance: a test process has no EVAL_ROW"
+    );
+    let names = || {
+        test_fixtures()
+            .into_iter()
+            .map(|f| f.name)
+            .collect::<Vec<String>>()
+    };
+    assert!(!INJECT_ABORT_LATE.with(Cell::get));
+    let off = names();
+    assert_eq!(off.len(), 11, "conformance: {off:?}");
+    assert_eq!(off.iter().collect::<BTreeSet<_>>().len(), 11);
+    assert!(!off.iter().any(|n| n == "eval/abort_late"));
+    {
+        let _g = AbortLateGuard::set();
+        let on = names();
+        assert_eq!(on.len(), 12, "conformance: {on:?}");
+        assert!(on.iter().any(|n| n == "eval/abort_late"));
+        assert!(fixture_by_name("eval/abort_late").is_ok());
+    }
+    assert!(
+        !INJECT_ABORT_LATE.with(Cell::get),
+        "conformance: the guard cleared the flag"
+    );
+    assert!(fixture_by_name("eval/abort_late").is_err());
+    let r = std::panic::catch_unwind(|| {
+        let _g = AbortLateGuard::set();
+        panic!("conformance: a panic inside the guard (expected)");
+    });
+    assert!(r.is_err());
+    assert!(
+        !INJECT_ABORT_LATE.with(Cell::get),
+        "conformance: the guard cleared the flag on a panic"
+    );
+    assert_eq!(names(), off);
+}
+
+/// **VC-5, schema pins:** a store written at schema 7 is refused on resume by its schema, the
+/// override notwithstanding. Failing direction: `SCHEMA_VERSION` left at 7 accepts it.
+#[test]
+fn vc0_a_schema_7_store_is_refused() {
+    let dir = temp("vc0-schema7");
+    write_store(&dir, &declared(), "#host: H; schema=7", &[]);
+    for allow in [false, true] {
+        let mut d = driver_with(
+            spec("E", Vec::new()),
+            vec![spec("E", Vec::new())],
+            &dir,
+            Duration::from_millis(100),
+            fake_probes("c1", false, "H"),
+        );
+        d.allow_mixed = allow;
+        assert_eq!(refusal_of(&d), Some(Refusal::Schema("7".to_owned())));
+    }
+}
+
+/// **Gate 4 round 01 M1** (the seam's guard), on one thread: the seam is off at the start; on
+/// inside a guarded scope and off after it ends; on inside a guarded scope that panics, and off
+/// after `catch_unwind` returns; a nested guard leaves the outer one on, and both scopes leave it
+/// off. Failing direction (scratch copy): `CpuSeamGuard::drop` a no-op.
+#[test]
+fn vc0_m1_the_seam_is_off_after_its_scope_and_after_a_panic_in_it() {
+    use crate::conformance::eval::{cpu_seam_enable, cpu_seam_is_on};
+    assert!(!cpu_seam_is_on(), "conformance: off at the start");
+    {
+        let _seam = cpu_seam_enable();
+        assert!(cpu_seam_is_on(), "conformance: on inside the scope");
+    }
+    assert!(!cpu_seam_is_on(), "conformance: off after the scope");
+    let inside = Cell::new(false);
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _seam = cpu_seam_enable();
+        inside.set(cpu_seam_is_on());
+        panic!("conformance: a panic inside the seam's scope (expected)");
+    }));
+    assert!(r.is_err());
+    assert!(inside.get(), "conformance: on inside the panicking scope");
+    assert!(!cpu_seam_is_on(), "conformance: off after the caught panic");
+    {
+        let _outer = cpu_seam_enable();
+        {
+            let _inner = cpu_seam_enable();
+            assert!(cpu_seam_is_on());
+        }
+        assert!(cpu_seam_is_on(), "conformance: the outer guard still holds");
+    }
+    assert!(!cpu_seam_is_on(), "conformance: off after both");
+}
+
+/// **M1, a driver after a caught panic** (ignored, child): a panic inside a guarded scope caught on
+/// this thread, then a driver run without enabling the seam — `eval/sleeper` rep 1 under a 1 s
+/// tier, `capped_wall` by the kill — carries a real reading (two numbers, multiples of 10), not
+/// `CPU_SENTINEL_KILL`. Failing direction (scratch copy): `CpuSeamGuard::drop` a no-op leaves the
+/// seam on, and the row carries the kill sentinel.
+#[test]
+#[ignore]
+fn vc0_m1_a_driver_after_a_caught_panic_reads_real_cpu() {
+    use crate::conformance::eval::{cpu_seam_enable, cpu_seam_is_on, CPU_SENTINEL_KILL};
+    let r = std::panic::catch_unwind(|| {
+        let _seam = cpu_seam_enable();
+        panic!("conformance: a panic inside the seam's scope (expected)");
+    });
+    assert!(r.is_err());
+    let on = cpu_seam_is_on();
+    let dir = fresh("VC0m1");
+    let t = tier("vc0m1", 1_000, Tier::default_tier().mem_kb);
+    let s = spec(
+        "VC0m1",
+        vec![row_spec(
+            "eval/sleeper",
+            GridConfig::new(GridEngine::Stateful),
+            1,
+            &t,
+            RunKind::Timed,
+        )],
+    );
+    let d = real_driver(s.clone(), vec![s], &dir);
+    run_ok(&d);
+    let rows = store_of(&d);
+    assert_eq!(rows.len(), 1);
+    let cells = vc0_cells(&rows[0]);
+    note!("vc0 m1: the seam on after the caught panic: {on}; the capped row's cells {cells:?}");
+    assert_eq!(
+        (get(&rows[0], "end_class"), get(&rows[0], "censor_via")),
+        ("capped_wall", "kill")
+    );
+    assert_ne!(
+        cells,
+        vc0_as_cells(CPU_SENTINEL_KILL),
+        "conformance: the seam leaked into the driver"
+    );
+    for v in [&cells.0, &cells.1] {
+        let n: u64 = v.parse().unwrap_or_else(|_| panic!("conformance: {v:?}"));
+        assert_eq!(n % 10, 0, "conformance: {n}");
+    }
+    assert!(!on, "conformance: the seam is off after the caught panic");
 }

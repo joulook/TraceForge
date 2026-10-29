@@ -916,9 +916,11 @@ fn c07_schema_three() {
     // after `memo_clears` (249).
     // SVERIFY-P P-S re-pin (2026-10-28, gate 3): schema 7, the eleven columns after
     // `spawned_at_stop` (260; three of them the lead's O-5 fix, two ruling 21's).
-    assert_eq!(SCHEMA_VERSION, 7, "conformance: schema");
+    // SVERIFY-P V-C re-pin (2026-10-29, VC-0): schema 8, `cpu_user_ms` and `cpu_sys_ms`
+    // after `watch_probes` (262).
+    assert_eq!(SCHEMA_VERSION, 8, "conformance: schema");
     let h = header();
-    assert_eq!(h.len(), 260, "conformance: header width");
+    assert_eq!(h.len(), 262, "conformance: header width");
     let i = h.iter().position(|c| *c == "witnesses").unwrap();
     assert_eq!(
         &h[i + 1..i + 6],
