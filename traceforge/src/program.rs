@@ -10,7 +10,8 @@
 //! <bin> export spec|impl --out FILE [--model …] [--program S] [--size S] [ARGS…]
 //! <bin> conf   [--engine stateful|stateless|gated|enumerator] [--threads N]
 //!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
-//! <bin> online …                                    (reserved; not implemented)
+//! <bin> online --spec FILE [--stop-at-first] [--out FILE [--program S] [--size S]]
+//!              [--budget N] [--model …] [ARGS…]
 //! <bin> row    --model … --seed N [--threshold N] -- ARGS   (with EVAL_ROW, EVAL_COMMIT)
 //! ```
 //!
@@ -36,6 +37,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use crate::conformance::config::IndexKind;
+use crate::conformance::online::{self, Mode, OnlineOpts, OnlineOut};
 use crate::conformance::record::{self, Subject};
 use crate::conformance::{self, ConfBuilder, ConfVerdict, Engine, ExportHeader};
 use crate::{Config, ConsType};
@@ -86,7 +88,9 @@ const USAGE: &str = "usage: <bin> count spec|impl [options] [ARGS…]\n       \
     options: --model fifo|bag|causal, --seed N, --threshold N, --program S, --size S; \
     `--` ends the options\n       \
     <bin> row --model fifo|bag|causal --seed N [--threshold N] -- ARGS   \
-    (EVAL_ROW, EVAL_COMMIT)\n";
+    (EVAL_ROW, EVAL_COMMIT)\n       \
+    <bin> online --spec FILE [--stop-at-first] [--out FILE [--program S] [--size S]] \
+    [--budget N] [--model …] [--seed N] [--threshold N] [ARGS…]\n";
 
 /// The options of every subcommand, and the program's own arguments.
 struct Opts {
@@ -100,6 +104,8 @@ struct Opts {
     out: Option<String>,
     program: Option<String>,
     size: Option<String>,
+    spec: Option<String>,
+    budget: Option<u64>,
     args: Vec<String>,
 }
 
@@ -115,6 +121,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         out: None,
         program: None,
         size: None,
+        spec: None,
+        budget: None,
         args: Vec::new(),
     };
     let mut i = 0;
@@ -155,6 +163,14 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--out" => o.out = Some(value()?),
             "--program" => o.program = Some(value()?),
             "--size" => o.size = Some(value()?),
+            "--spec" => o.spec = Some(value()?),
+            "--budget" => {
+                let b: u64 = value()?.parse().map_err(|_| "--budget needs a number")?;
+                if b == 0 {
+                    return Err("--budget needs at least 1".to_string());
+                }
+                o.budget = Some(b);
+            }
             _ if a.starts_with("--") => return Err(format!("unknown option `{a}`")),
             _ => {
                 o.args = args[i..].to_vec();
@@ -188,19 +204,26 @@ fn row_config(o: &Opts, seed: u64) -> Config {
     b.build()
 }
 
-/// The first option of `args` that `row` does not take, if any; `row`'s
-/// settings come from the row's label.
-fn row_foreign_option(args: &[String]) -> Option<&str> {
+/// The first option of `args` that a subcommand does not take, if any:
+/// `valued` options take a value, `flags` do not.
+fn foreign_option<'a>(args: &'a [String], valued: &[&str], flags: &[&str]) -> Option<&'a str> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--" => return None,
-            "--model" | "--seed" | "--threshold" => i += 2,
+            a if valued.contains(&a) => i += 2,
+            a if flags.contains(&a) => i += 1,
             a if a.starts_with("--") => return Some(a),
             _ => return None,
         }
     }
     None
+}
+
+/// The first option of `args` that `row` does not take, if any; `row`'s
+/// settings come from the row's label.
+fn row_foreign_option(args: &[String]) -> Option<&str> {
+    foreign_option(args, &["--model", "--seed", "--threshold"], &[])
 }
 
 fn builder_of(p: &Program, o: &Opts) -> ConfBuilder {
@@ -326,7 +349,57 @@ fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
                 Err(e) => (format!("{bin}: {e}\n"), 2),
             }
         }
-        "online" => (format!("{bin}: online: not implemented\n"), 2),
+        "online" => {
+            let valued = [
+                "--spec",
+                "--out",
+                "--program",
+                "--size",
+                "--budget",
+                "--model",
+                "--seed",
+                "--threshold",
+            ];
+            if let Some(a) = foreign_option(&args[1..], &valued, &["--stop-at-first"]) {
+                return fail(format!("online does not take `{a}`"));
+            }
+            let o = match parse_opts(&args[1..]) {
+                Ok(o) => o,
+                Err(e) => return fail(e),
+            };
+            let Some(spec) = o.spec.clone() else {
+                return fail("online needs --spec FILE".to_string());
+            };
+            if o.out.is_none() && (o.program.is_some() || o.size.is_some()) {
+                return fail(
+                    "--program and --size name the --out file's implementation".to_string(),
+                );
+            }
+            let mode = if o.stop_at_first {
+                Mode::BugFinder
+            } else {
+                Mode::Full
+            };
+            let out = o.out.clone().map(|path| OnlineOut {
+                path: path.into(),
+                header: ExportHeader {
+                    program: o.program.clone().unwrap_or_else(|| format!("{bin}:impl")),
+                    size: o.size.clone().unwrap_or_else(|| o.args.join(",")),
+                },
+            });
+            let visible = (p.visible)(&o.args);
+            let imp = (p.imp)(&o.args);
+            match online::online(
+                &config_of(&o),
+                &visible,
+                imp,
+                Path::new(&spec),
+                OnlineOpts::new(mode, o.budget, out),
+            ) {
+                Ok(r) => (r.render(), r.exit_code()),
+                Err(e) => fail(format!("online refused: {e}")),
+            }
+        }
         "row" => {
             if let Some(a) = row_foreign_option(&args[1..]) {
                 return fail(format!(

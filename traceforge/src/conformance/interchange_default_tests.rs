@@ -1063,9 +1063,10 @@ fn g1_t7_the_shared_main() {
     }
     let (out, code) = cli(&p, &["conf", "--model", "bag", "2"]);
     assert_eq!(code, 1, "conformance: G1: bag reports: {out}");
+    // `C` implements `online`: with no `--spec` it is a usage error (exit 2).
     let (out, code) = cli(&p, &["online"]);
     assert!(
-        code == 2 && out.contains("not implemented"),
+        code == 2 && out.contains("online needs --spec") && out.contains("usage:"),
         "conformance: G1: {out}"
     );
     let (out, code) = cli(&p, &["frob"]);

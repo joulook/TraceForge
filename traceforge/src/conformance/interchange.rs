@@ -52,7 +52,7 @@ use crate::ConsType;
 // ---------------------------------------------------------------- encoder --
 
 /// A JSON string literal, `serde_json`'s escaping.
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     serde_json::to_string(s).expect("conformance: a string always serialises")
 }
 
@@ -520,7 +520,7 @@ fn render_line(
 }
 
 /// The declared names, sorted (byte order, as `OrdCounts::of`) and deduplicated.
-fn sorted_names(visible: &[String]) -> Vec<String> {
+pub(crate) fn sorted_names(visible: &[String]) -> Vec<String> {
     let mut names = visible.to_vec();
     names.sort_unstable();
     names.dedup();
@@ -605,7 +605,7 @@ fn header_line(h: &ExportHeader, names: &[String], model: &str) -> String {
 
 /// The line of one entry of the specification's index (X2), its values encoded
 /// by `enc`.
-fn line_of(
+pub(crate) fn line_of(
     sig: &Sig,
     ord: &OrdCounts,
     names: &[String],
@@ -637,7 +637,7 @@ fn line_of(
 
 /// X4: the text goes to `<path>.tmp`, which is renamed into place, so the path
 /// holds its earlier content or the whole export, and no `.tmp` stays behind.
-fn write_replacing(path: &Path, text: &str) -> Result<(), ExportError> {
+pub(crate) fn write_replacing(path: &Path, text: &str) -> Result<(), ExportError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -902,7 +902,7 @@ fn exact_keys(
 
 /// One summary line (R2, R3): its normal form, which is also the duplicate
 /// key, and its summary for the index. `names` are the header's, sorted.
-fn parse_line(text: &str, names: &[String]) -> Result<(String, CompactSummary), String> {
+pub(crate) fn parse_line(text: &str, names: &[String]) -> Result<(String, CompactSummary), String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
     let Value::Object(m) = v else {
         return Err("the line is not a JSON object".to_string());
@@ -1083,12 +1083,12 @@ fn header_of(text: &str) -> Result<FileHead, String> {
 
 /// A file read whole: its header and, per line, its number, its normal form
 /// and its summary. A duplicate line is refused (R4, ruling Q4).
-struct ReadFile {
-    head: FileHead,
-    lines: Vec<(usize, String, CompactSummary)>,
+pub(crate) struct ReadFile {
+    pub(crate) head: FileHead,
+    pub(crate) lines: Vec<(usize, String, CompactSummary)>,
 }
 
-fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
+pub(crate) fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
     let at = |line: Option<usize>, what: String| {
         JoinError(match line {
             Some(n) => format!("{}: line {n}: {what}", path.display()),

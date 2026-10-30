@@ -261,6 +261,8 @@ pub(crate) mod gated;
 pub(crate) mod interchange;
 pub(crate) mod morphism;
 pub(crate) mod obs;
+/// `C`: the online check, two exploration modes (`criteria/ONLINE.md`).
+pub(crate) mod online;
 pub(crate) mod precheck;
 pub(crate) mod probe;
 pub(crate) mod prober;
@@ -561,6 +563,8 @@ mod x5_tests;
 mod interchange_tests;
 #[cfg(test)]
 mod interchange_default_tests;
+#[cfg(test)]
+mod online_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
 /// truth the differential harness measures the tool against, it is the naive
 /// exponential algorithm the paper's algorithm exists to avoid, and nothing

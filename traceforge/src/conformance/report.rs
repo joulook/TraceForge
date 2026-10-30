@@ -3094,3 +3094,85 @@ impl interchange::JoinReport {
         out
     }
 }
+
+// ---------------------------------------------------------------------------
+// `C`: the rendering of the online check (`online.rs`), JMC's lines
+// (`MpLauncher.java`, OL1), here in the one rendering module (S5 criterion 1).
+// ---------------------------------------------------------------------------
+
+impl fmt::Display for crate::conformance::online::OnlineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use crate::conformance::online::OnlineError as E;
+        match self {
+            E::Spec(e) => f.write_str(e),
+            E::NotComplete { path, enumeration } => write!(
+                f,
+                "{path}: the specification is `{enumeration}`, not `complete`"
+            ),
+            E::Visible { file, program } => write!(
+                f,
+                "the specification's `visible` list {file:?} is not the program's {program:?}"
+            ),
+            E::Model(e) => write!(f, "--out: {e}"),
+        }
+    }
+}
+
+impl crate::conformance::online::OnlineReport {
+    /// The online check's lines (ONLINE-1), labels padded to 12 columns; the
+    /// failure line last when the run failed.
+    pub(crate) fn render(&self) -> String {
+        use crate::conformance::online::{End, MissKind, Mode, Verdict};
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let h = &self.spec;
+        let _ = writeln!(
+            out,
+            "spec:       {} (program {}, size {}, model {}, tool {}; {} lines, {} distinct \
+             summaries held, 0 duplicates)",
+            self.spec_path, h.program, h.size, h.model, h.tool, self.spec_lines, self.held
+        );
+        let _ = writeln!(
+            out,
+            "lookups:    {} ({} found, {} signature misses, {} not found)",
+            self.lookups, self.found, self.signature_misses, self.not_found
+        );
+        let verdict = match self.verdict() {
+            Verdict::Conforms => "conforms",
+            Verdict::Reports => "reports",
+            Verdict::Partial => "partial",
+        };
+        let _ = writeln!(out, "verdict:    {verdict}");
+        let mode = match self.mode {
+            Mode::Full => "full",
+            Mode::BugFinder => "bug-finder (--stop-at-first)",
+        };
+        let _ = writeln!(out, "mode:       {mode}");
+        if let Some(m) = &self.first {
+            let _ = writeln!(out, "first miss: iteration {}, {} ms", m.iteration, m.wall_ms);
+        }
+        let _ = writeln!(
+            out,
+            "uncovered:  {} graphs ({} distinct summaries)",
+            self.uncovered_total, self.uncovered_distinct
+        );
+        if let Some(m) = &self.first {
+            let _ = writeln!(out, "witness:    {}", m.line);
+            let answer = match m.kind {
+                MissKind::NoSig => "NoSig (no specification summary has this signature)",
+                MissKind::NotFound => {
+                    "NotFound (the signature is held, no order is <= the query's)"
+                }
+            };
+            let _ = writeln!(out, "at:         iteration {}, {answer}", m.iteration);
+        }
+        if self.end == End::Failed {
+            let _ = writeln!(
+                out,
+                "FAILED:     {}",
+                self.failure.as_deref().unwrap_or("the run failed")
+            );
+        }
+        out
+    }
+}
