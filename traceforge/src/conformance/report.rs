@@ -3007,30 +3007,35 @@ pub(crate) fn build_report_for(
 // module (S5 criterion 1); the types and their logic stay in `interchange.rs`.
 // ---------------------------------------------------------------------------
 
-impl fmt::Display for interchange::EncodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            interchange::EncodeError::OutOfRange(v) => {
-                write!(f, "the integer {v} is outside signed 64 bits")
-            }
-        }
-    }
-}
-
 impl fmt::Display for interchange::ExportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use interchange::ExportError as E;
         match self {
             E::NotSet => write!(f, "the export runs under `index(Set)` only"),
             E::Model(c) => write!(f, "the consistency model {c} has no format `model`"),
-            E::Unregistered { type_name } => {
-                write!(f, "a visible value of type `{type_name}` has no registered encoder")
+            E::Unparsed { type_name, rendering, at } => write!(
+                f,
+                "the `Debug` rendering of a value of type `{type_name}` does not parse at byte \
+                 {at} (a hand-written `Debug`?): {rendering}"
+            ),
+            E::Refused { type_name, rendering, what } => write!(
+                f,
+                "a value of type `{type_name}` holds {what}, which the format refuses: {rendering}"
+            ),
+            E::Thread { type_name, reason } => write!(
+                f,
+                "a value of type `{type_name}` holds a thread identity without a role name: \
+                 {reason}"
+            ),
+            E::Collision { line } => write!(
+                f,
+                "two entries render the same line, so their values' `Debug` and `PartialEq` \
+                 disagree: {line}"
+            ),
+            E::NotExhausted(end) => {
+                write!(f, "the specification run ended {end}, not exhausted")
             }
-            E::Encode(e) => write!(f, "{e}"),
             E::SpecErrors(n) => write!(f, "the program raised {n} assertion failure(s)"),
-            E::NotReflexive { reports } => {
-                write!(f, "the program checked against itself reported {reports} time(s)")
-            }
             E::Io(e) => write!(f, "{e}"),
         }
     }

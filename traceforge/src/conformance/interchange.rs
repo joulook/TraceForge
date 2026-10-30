@@ -1,15 +1,19 @@
-//! `J3` (batch cross-tool checking): TraceForge's side of the compact summary
-//! interchange format, version 1 (`plan/jmc-must/SUMMARY-FORMAT.md`).
+//! `J3` and `G1`: TraceForge's side of the compact summary interchange format,
+//! version 1 (`plan/jmc-must/SUMMARY-FORMAT.md`), for any Must program.
 //!
-//! - **The encoder** (J3-1): [`SummaryEncode`], an opt-in trait a message type
-//!   implements to give its values the format's canonical form — integers and
-//!   tagged values only ([`EncVal`]; ruling Q9). An [`Encoders`] registry, keyed
-//!   by the concrete type, is what the exporter consults; no engine reads it.
-//! - **The exporter** (J3-2): [`export`] runs the program as the stateful
-//!   engine's specification under `IndexKind::Set` — and as its implementation,
-//!   so the run checks the program against itself (ruling Q5) — and writes one
-//!   line per entry of the specification's `SetIndex` after the run; `n` is
-//!   omitted. No engine changes.
+//! - **The generic encoder** (G1-1): a value's canonical form is parsed from its
+//!   derived `Debug` rendering ([`encode_generic`]): a struct, tuple struct or
+//!   variant becomes `{"t":<name>,"f":[…]}`, lists, sets (sorted), integers,
+//!   strings and booleans as the format says, a `ThreadId` its role name;
+//!   anything else is refused with the value's type. Preconditions P1–P3 of
+//!   `criteria/G1.md`: no map-typed value; the text `ThreadId { opaque_id: N }`
+//!   reserved; a value's `Debug` agrees with its `PartialEq`. No per-program
+//!   encoder exists.
+//! - **The exporter** (G1-3): [`export`] enumerates the program once as a
+//!   specification with its own sink, which fills a `SetIndex` exactly as the
+//!   stateful engine's specification sink does and records the thread names;
+//!   after the run every entry is encoded and written, `n` omitted. No engine
+//!   changes.
 //! - **The reader and the join** (J3-3): [`conf_join`] reads two files, inserts
 //!   the specification's summaries into a `SetIndex` and queries each
 //!   implementation summary with `SetIndex::covers`; the command `conf-join`
@@ -21,137 +25,423 @@
 //! value's, and `JoinReport::render` — is in `report.rs`, the one rendering
 //! module (S5 criterion 1).
 
-use std::any::{Any, TypeId};
-use std::collections::{BTreeMap, HashMap};
-use std::fmt::{self, Write as _};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use serde_json::Value;
 
 use crate::conformance::compact::{CompactSummary, Covers, OrdCounts, SetIndex};
 use crate::conformance::config::{ConfConfig, IndexKind};
+use crate::conformance::ctx::{CompletionSink, ConfMode, DiagnosticReason, SinkVerdict};
 use crate::conformance::morphism::Status;
 use crate::conformance::obs::Obs;
+use crate::conformance::report::SearchEnd;
 use crate::conformance::sig::Sig;
 use crate::conformance::stateful;
+use crate::exec_graph::ExecutionGraph;
 use crate::msg::Val;
+use crate::must::MustState;
 use crate::ConsType;
 
 // ---------------------------------------------------------------- encoder --
 
-/// A value in the format's canonical form (J3-1): an integer within signed 64
-/// bits, or a tagged value `{"t":<tag>,"f":[…]}` — a record, a tuple struct or
-/// an enum variant, its fields in declaration order; a unit variant has none.
-/// J3 implements no other kind (ruling Q9).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EncVal {
-    Int(i64),
-    Tagged(String, Vec<EncVal>),
+/// A JSON string literal, `serde_json`'s escaping.
+fn json_string(s: &str) -> String {
+    serde_json::to_string(s).expect("conformance: a string always serialises")
 }
 
-/// Why a value has no canonical form.
+// -------------------------------------------------------- generic encoder --
+
+/// `G1`: a run's thread names, by the number of `ThreadId` (its `Display` is
+/// `t<N>`, its derived `Debug` `ThreadId { opaque_id: N }`), recorded by the
+/// export's sink from every explored graph.
+pub(crate) type ThreadNames = HashMap<u32, ThreadName>;
+
+/// What the explored graphs say about one thread's name.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EncodeError {
-    /// An integer outside signed 64 bits (E4), as `Display` writes it.
-    OutOfRange(String),
+pub(crate) enum ThreadName {
+    Named(String),
+    Unnamed,
+    /// Two graphs named the thread differently.
+    Conflict(String, String),
 }
 
-impl EncVal {
-    /// An integer, refused outside signed 64 bits (E4).
-    pub(crate) fn int<T>(v: T) -> Result<Self, EncodeError>
-    where
-        T: TryInto<i64> + Copy + fmt::Display,
-    {
-        v.try_into()
-            .map(EncVal::Int)
-            .map_err(|_| EncodeError::OutOfRange(v.to_string()))
-    }
-
-    /// A tagged value, its fields in declaration order (`[]` for a unit variant).
-    pub(crate) fn tagged(tag: &str, fields: Vec<EncVal>) -> Self {
-        EncVal::Tagged(tag.to_string(), fields)
-    }
-
-    /// The canonical bytes: `t` before `f`, no whitespace, integers in decimal.
-    pub(crate) fn render(&self) -> String {
-        let mut out = String::new();
-        self.write(&mut out);
-        out
-    }
-
-    fn write(&self, out: &mut String) {
-        match self {
-            EncVal::Int(i) => out.push_str(&i.to_string()),
-            EncVal::Tagged(tag, fields) => {
-                out.push_str("{\"t\":");
-                out.push_str(&json_string(tag));
-                out.push_str(",\"f\":[");
-                for (i, v) in fields.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    v.write(out);
-                }
-                out.push_str("]}");
+/// Records every thread of `g` into `names`.
+pub(crate) fn record_thread_names(g: &ExecutionGraph, names: &mut ThreadNames) {
+    for tid in g.thread_ids() {
+        let Some(n) = tid
+            .to_string()
+            .strip_prefix('t')
+            .and_then(|d| d.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let seen = match g.thread_name(tid) {
+            Some(s) => ThreadName::Named(s.to_string()),
+            None => ThreadName::Unnamed,
+        };
+        match names.get(&n) {
+            None => {
+                names.insert(n, seen);
+            }
+            Some(old) if *old == seen => {}
+            Some(ThreadName::Conflict(..)) => {}
+            Some(old) => {
+                let label = |t: &ThreadName| match t {
+                    ThreadName::Named(s) => s.clone(),
+                    _ => "(unnamed)".to_string(),
+                };
+                let c = ThreadName::Conflict(label(old), label(&seen));
+                names.insert(n, c);
             }
         }
     }
 }
 
-/// The encoder (J3-1, ruling 1): opt-in, implemented by a message type that
-/// takes part in an export; not a bound on `Message`. Equal values (the type's
-/// `PartialEq`, which `msg_equals` uses) must encode to equal bytes and unequal
-/// values to unequal bytes (E2, E3), so a slot's representative signature
-/// encodes as any member of the slot would.
-pub(crate) trait SummaryEncode: 'static {
-    fn encode(&self) -> Result<EncVal, EncodeError>;
+/// A value parsed from its derived `Debug` rendering (G1-1).
+enum DbgVal {
+    Int(i128),
+    Bool(bool),
+    Str(String),
+    /// A struct, a tuple struct or an enum variant; a unit one has no fields.
+    Named(String, Vec<DbgVal>),
+    List(Vec<DbgVal>),
+    /// `{a, b}`; also an empty `{}`, which an empty map prints too (P1).
+    Set(Vec<DbgVal>),
+    /// The reserved shape `ThreadId { opaque_id: N }` (P2).
+    Thread(u32),
 }
 
-type EncodeFn = fn(&dyn Any) -> Result<EncVal, EncodeError>;
-
-fn encode_as<T: SummaryEncode>(v: &dyn Any) -> Result<EncVal, EncodeError> {
-    v.downcast_ref::<T>()
-        .expect("conformance: the registry maps a type to its own encoder")
-        .encode()
+/// Why a rendering has no canonical form.
+enum DbgError {
+    /// Text outside the derived-`Debug` grammar, at this byte offset.
+    Unparsed(usize),
+    /// A form the format refuses, named.
+    Refused(&'static str),
+    /// A `ThreadId` without a role name in this run.
+    Thread(String),
 }
 
-/// The encoders an export may use, by concrete type (J3-1). A visible value
-/// of a type not registered here refuses the export (E5).
-#[derive(Clone, Default)]
-pub(crate) struct Encoders {
-    by_type: HashMap<TypeId, EncodeFn>,
+/// The parser of derived `Debug` text: its separators are exactly `", "` and
+/// `": "`, a braced body is `" { "` … `" }"`; anything else refuses.
+struct DbgParser<'a> {
+    s: &'a str,
+    pos: usize,
 }
 
-impl Encoders {
-    pub(crate) fn new() -> Self {
-        Self::default()
+impl<'a> DbgParser<'a> {
+    fn rest(&self) -> &'a str {
+        &self.s[self.pos..]
     }
 
-    /// Registers `T`'s encoder.
-    pub(crate) fn register<T: SummaryEncode>(mut self) -> Self {
-        self.by_type.insert(TypeId::of::<T>(), encode_as::<T>);
-        self
+    fn peek(&self) -> Option<char> {
+        self.rest().chars().next()
     }
 
-    /// The value's canonical bytes; an unregistered type is refused by name.
-    fn encode(&self, v: &Val) -> Result<String, ExportError> {
-        let any = v.as_any_ref();
-        let f = self
-            .by_type
-            .get(&any.type_id())
-            .ok_or_else(|| ExportError::Unregistered {
-                type_name: v.type_name.clone(),
-            })?;
-        f(any).map(|e| e.render()).map_err(ExportError::Encode)
+    fn eat(&mut self, lit: &str) -> bool {
+        if self.rest().starts_with(lit) {
+            self.pos += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn want(&mut self, lit: &str) -> Result<(), DbgError> {
+        if self.eat(lit) {
+            Ok(())
+        } else {
+            Err(DbgError::Unparsed(self.pos))
+        }
+    }
+
+    /// The length of the identifier at the cursor (0 if none).
+    fn ident_len(&self) -> usize {
+        let mut chars = self.rest().char_indices();
+        match chars.next() {
+            Some((_, c)) if c == '_' || c.is_alphabetic() => {}
+            _ => return 0,
+        }
+        chars
+            .find(|(_, c)| !(*c == '_' || c.is_alphanumeric()))
+            .map_or(self.rest().len(), |(i, _)| i)
+    }
+
+    fn value(&mut self) -> Result<DbgVal, DbgError> {
+        match self.peek() {
+            Some('"') => self.string().map(DbgVal::Str),
+            Some('\'') => Err(DbgError::Refused("a char")),
+            Some('[') => {
+                self.pos += 1;
+                self.seq("]").map(DbgVal::List)
+            }
+            Some('{') => self.brace(),
+            Some('(') => Err(DbgError::Refused("an anonymous tuple")),
+            Some(c) if c == '-' || c.is_ascii_digit() => self.number(),
+            Some(c) if c == '_' || c.is_alphabetic() => self.named(),
+            _ => Err(DbgError::Unparsed(self.pos)),
+        }
+    }
+
+    /// `value (", " value)*` up to `close`, or nothing.
+    fn seq(&mut self, close: &str) -> Result<Vec<DbgVal>, DbgError> {
+        let mut out = Vec::new();
+        if self.eat(close) {
+            return Ok(out);
+        }
+        loop {
+            out.push(self.value()?);
+            if self.eat(close) {
+                return Ok(out);
+            }
+            self.want(", ")?;
+        }
+    }
+
+    fn brace(&mut self) -> Result<DbgVal, DbgError> {
+        self.pos += 1;
+        if self.eat("}") {
+            // P1: an empty set and an empty map print alike.
+            return Ok(DbgVal::Set(Vec::new()));
+        }
+        let first = self.value()?;
+        if self.rest().starts_with(": ") {
+            return Err(DbgError::Refused("a map"));
+        }
+        let mut out = vec![first];
+        loop {
+            if self.eat("}") {
+                return Ok(DbgVal::Set(out));
+            }
+            self.want(", ")?;
+            out.push(self.value()?);
+        }
+    }
+
+    fn number(&mut self) -> Result<DbgVal, DbgError> {
+        let start = self.pos;
+        if self.rest().starts_with("-inf") {
+            return Err(DbgError::Refused("a float"));
+        }
+        self.eat("-");
+        let digits = self.rest().bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return Err(DbgError::Unparsed(self.pos));
+        }
+        self.pos += digits;
+        if self.rest().starts_with("..") {
+            return Err(DbgError::Refused("a range"));
+        }
+        if matches!(self.peek(), Some('.' | 'e' | 'E')) {
+            return Err(DbgError::Refused("a float"));
+        }
+        self.s[start..self.pos]
+            .parse::<i128>()
+            .map(DbgVal::Int)
+            .map_err(|_| DbgError::Refused("an integer outside signed 64 bits"))
+    }
+
+    fn named(&mut self) -> Result<DbgVal, DbgError> {
+        let len = self.ident_len();
+        let ident = &self.s[self.pos..self.pos + len];
+        self.pos += len;
+        match ident {
+            "true" => return Ok(DbgVal::Bool(true)),
+            "false" => return Ok(DbgVal::Bool(false)),
+            "NaN" | "inf" => return Err(DbgError::Refused("a float")),
+            _ => {}
+        }
+        if self.eat("(") {
+            let fields = self.seq(")")?;
+            return Ok(DbgVal::Named(ident.to_string(), fields));
+        }
+        if self.eat(" { ") {
+            let mut names = Vec::new();
+            let mut fields = Vec::new();
+            loop {
+                if self.rest().starts_with("..") {
+                    return Err(DbgError::Refused("`..` (a non-exhaustive rendering)"));
+                }
+                let flen = self.ident_len();
+                if flen == 0 {
+                    return Err(DbgError::Unparsed(self.pos));
+                }
+                names.push(&self.s[self.pos..self.pos + flen]);
+                self.pos += flen;
+                self.want(": ")?;
+                fields.push(self.value()?);
+                if self.eat(" }") {
+                    break;
+                }
+                self.want(", ")?;
+            }
+            if ident == "ThreadId" && names == ["opaque_id"] {
+                // P2: the reserved shape of TraceForge's `ThreadId`.
+                return match fields.as_slice() {
+                    [DbgVal::Int(n)] => u32::try_from(*n)
+                        .map(DbgVal::Thread)
+                        .map_err(|_| DbgError::Unparsed(self.pos)),
+                    _ => Err(DbgError::Unparsed(self.pos)),
+                };
+            }
+            return Ok(DbgVal::Named(ident.to_string(), fields));
+        }
+        if matches!(self.peek(), Some('<' | ':')) {
+            return Err(DbgError::Unparsed(self.pos));
+        }
+        Ok(DbgVal::Named(ident.to_string(), Vec::new()))
+    }
+
+    /// A derived-`Debug` string: the escapes `\0 \t \r \n \\ \" \' \u{…}`
+    /// (rustc renders every other non-printable character as `\u{…}`).
+    fn string(&mut self) -> Result<String, DbgError> {
+        self.pos += 1;
+        let mut out = String::new();
+        loop {
+            let at = self.pos;
+            let c = self.peek().ok_or(DbgError::Unparsed(at))?;
+            self.pos += c.len_utf8();
+            match c {
+                '"' => return Ok(out),
+                '\\' => {
+                    let e = self.peek().ok_or(DbgError::Unparsed(at))?;
+                    self.pos += e.len_utf8();
+                    match e {
+                        '0' => out.push('\0'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        'n' => out.push('\n'),
+                        '\\' => out.push('\\'),
+                        '"' => out.push('"'),
+                        '\'' => out.push('\''),
+                        'u' => {
+                            self.want("{").map_err(|_| DbgError::Unparsed(at))?;
+                            let hex = self
+                                .rest()
+                                .bytes()
+                                .take_while(u8::is_ascii_hexdigit)
+                                .count();
+                            if !(1..=6).contains(&hex) {
+                                return Err(DbgError::Unparsed(at));
+                            }
+                            let code = u32::from_str_radix(&self.s[self.pos..self.pos + hex], 16)
+                                .map_err(|_| DbgError::Unparsed(at))?;
+                            self.pos += hex;
+                            self.want("}").map_err(|_| DbgError::Unparsed(at))?;
+                            out.push(char::from_u32(code).ok_or(DbgError::Unparsed(at))?);
+                        }
+                        _ => return Err(DbgError::Unparsed(at)),
+                    }
+                }
+                c => out.push(c),
+            }
+        }
     }
 }
 
-/// A JSON string literal, `serde_json`'s escaping.
-fn json_string(s: &str) -> String {
-    serde_json::to_string(s).expect("conformance: a string always serialises")
+/// The canonical bytes of a parsed value (G1-1).
+fn render_dbg(v: &DbgVal, threads: &ThreadNames, out: &mut String) -> Result<(), DbgError> {
+    match v {
+        DbgVal::Int(i) => {
+            let i = i64::try_from(*i)
+                .map_err(|_| DbgError::Refused("an integer outside signed 64 bits"))?;
+            out.push_str(&i.to_string());
+        }
+        DbgVal::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        DbgVal::Str(s) => out.push_str(&json_string(s)),
+        DbgVal::Named(tag, fields) => {
+            out.push_str("{\"t\":");
+            out.push_str(&json_string(tag));
+            out.push_str(",\"f\":[");
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                render_dbg(f, threads, out)?;
+            }
+            out.push_str("]}");
+        }
+        DbgVal::List(items) => {
+            out.push('[');
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                render_dbg(x, threads, out)?;
+            }
+            out.push(']');
+        }
+        DbgVal::Set(items) => {
+            let mut enc = Vec::with_capacity(items.len());
+            for x in items {
+                let mut s = String::new();
+                render_dbg(x, threads, &mut s)?;
+                enc.push(s);
+            }
+            // Sorted by the encoded bytes; two equal encodings break P3.
+            enc.sort_unstable();
+            if enc.windows(2).any(|w| w[0] == w[1]) {
+                return Err(DbgError::Refused("a set with two equal encodings"));
+            }
+            out.push('[');
+            out.push_str(&enc.join(","));
+            out.push(']');
+        }
+        DbgVal::Thread(n) => match threads.get(n) {
+            Some(ThreadName::Named(name)) => out.push_str(&json_string(name)),
+            Some(ThreadName::Unnamed) => {
+                return Err(DbgError::Thread(format!("thread t{n} has no name")));
+            }
+            Some(ThreadName::Conflict(a, b)) => {
+                return Err(DbgError::Thread(format!(
+                    "thread t{n} is named `{a}` in one graph and `{b}` in another"
+                )));
+            }
+            None => {
+                return Err(DbgError::Thread(format!("t{n} is not a thread of the run")));
+            }
+        },
+    }
+    Ok(())
+}
+
+/// `G1`: a value's canonical bytes from its derived `Debug` rendering (G1-1);
+/// refused with the value's type and the offending text.
+pub(crate) fn encode_generic(v: &Val, threads: &ThreadNames) -> Result<String, ExportError> {
+    let text = format!("{:?}", &*v.val);
+    let mut p = DbgParser { s: &text, pos: 0 };
+    let parsed = p.value().and_then(|x| {
+        if p.pos == text.len() {
+            Ok(x)
+        } else {
+            Err(DbgError::Unparsed(p.pos))
+        }
+    });
+    let mut out = String::new();
+    let rendered = parsed.and_then(|x| render_dbg(&x, threads, &mut out));
+    match rendered {
+        Ok(()) => Ok(out),
+        Err(DbgError::Unparsed(at)) => Err(ExportError::Unparsed {
+            type_name: v.type_name.clone(),
+            rendering: text,
+            at,
+        }),
+        Err(DbgError::Refused(what)) => Err(ExportError::Refused {
+            type_name: v.type_name.clone(),
+            rendering: text,
+            what: what.to_string(),
+        }),
+        Err(DbgError::Thread(reason)) => Err(ExportError::Thread {
+            type_name: v.type_name.clone(),
+            reason,
+        }),
+    }
 }
 
 // ------------------------------------------------------- the line, shared --
@@ -239,48 +529,64 @@ fn sorted_names(visible: &[String]) -> Vec<String> {
 
 // --------------------------------------------------------------- exporter --
 
-/// The header fields the caller names (X3, ruling Q6): `program`, TraceForge's
-/// name for the program, and `size`, the JMC row's size string.
+/// The header fields the caller names (X3): `program` and `size`, printed by
+/// the join and never compared.
 #[derive(Clone, Debug)]
-pub(crate) struct ExportHeader {
-    pub(crate) program: String,
-    pub(crate) size: String,
+pub struct ExportHeader {
+    pub program: String,
+    pub size: String,
 }
 
 /// What an export wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExportStats {
+pub struct ExportStats {
     /// The summary lines written (the header not counted).
-    pub(crate) lines: usize,
-    /// The run's `orders_held`, which `lines` equals (X1).
-    pub(crate) orders_held: usize,
-    /// The specification's complete graphs.
-    pub(crate) spec_graphs: usize,
+    pub lines: usize,
+    /// The index's held orders, which `lines` equals (X1).
+    pub orders_held: usize,
+    /// The specification's explored graphs.
+    pub spec_graphs: usize,
 }
 
 /// Why an export was refused; no file is written (X4).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ExportError {
-    /// The configuration's index is not `Set` (ruling 2).
+pub enum ExportError {
+    /// The configuration's index is not `Set`.
     NotSet,
-    /// The configuration's `ConsType` has no `model` (X3, ruling Q7).
+    /// The configuration's `ConsType` has no format `model` (G1-4).
     Model(String),
-    /// A visible value of a type with no registered encoder (E5).
-    Unregistered { type_name: String },
-    /// A value with no canonical form (E4).
-    Encode(EncodeError),
+    /// A value's `Debug` rendering outside the derived grammar (G1-1).
+    Unparsed {
+        type_name: String,
+        rendering: String,
+        at: usize,
+    },
+    /// A value holding a form the format refuses (G1-1), named.
+    Refused {
+        type_name: String,
+        rendering: String,
+        what: String,
+    },
+    /// A `ThreadId` with no role name in the run (G1-1).
+    Thread { type_name: String, reason: String },
+    /// Two entries rendering one line: their `Debug` and `PartialEq` disagree (P3).
+    Collision { line: String },
+    /// The specification run did not exhaust.
+    NotExhausted(String),
     /// The program raised assertions (the format's specification side raises none).
     SpecErrors(usize),
-    /// The run of the program against itself reported (ruling Q5: 0 required).
-    NotReflexive { reports: usize },
     /// Writing the file failed.
     Io(String),
 }
 
-/// The `model` of a configuration's `ConsType` (X3, ruling Q7): one entry.
-pub(crate) fn model_of(c: ConsType) -> Result<&'static str, ExportError> {
+/// `G1-4`: the format's `model` of a `ConsType`: FIFO → `p2p`, Bag → `asyn`,
+/// Causal (and the deprecated CD) → `cd`; the others have none.
+#[allow(deprecated)]
+pub fn model_name(c: ConsType) -> Result<&'static str, ExportError> {
     match c {
         ConsType::FIFO => Ok("p2p"),
+        ConsType::Bag => Ok("asyn"),
+        ConsType::Causal | ConsType::CD => Ok("cd"),
         other => Err(ExportError::Model(format!("{other:?}"))),
     }
 }
@@ -297,12 +603,13 @@ fn header_line(h: &ExportHeader, names: &[String], model: &str) -> String {
     )
 }
 
-/// The line of one entry of the specification's index (X2).
+/// The line of one entry of the specification's index (X2), its values encoded
+/// by `enc`.
 fn line_of(
     sig: &Sig,
     ord: &OrdCounts,
     names: &[String],
-    enc: &Encoders,
+    enc: &dyn Fn(&Val) -> Result<String, ExportError>,
 ) -> Result<String, ExportError> {
     let mut statuses = Vec::with_capacity(names.len());
     let mut words = Vec::with_capacity(names.len());
@@ -314,8 +621,8 @@ fn line_of(
         let mut w = Vec::with_capacity(sig.word(n).len());
         for o in sig.word(n) {
             w.push(match o {
-                Obs::Send(v) => ObsText::Send(enc.encode(v)?),
-                Obs::Recv(Some(v)) => ObsText::Recv(Some(enc.encode(v)?)),
+                Obs::Send(v) => ObsText::Send(enc(v)?),
+                Obs::Recv(Some(v)) => ObsText::Recv(Some(enc(v)?)),
                 Obs::Recv(None) => ObsText::Recv(None),
             });
         }
@@ -346,53 +653,89 @@ fn write_replacing(path: &Path, text: &str) -> Result<(), ExportError> {
     })
 }
 
-/// The export (J3-2): `program` run by `stateful::run_with` as the
-/// specification and as the implementation under `cc` (whose index must be
-/// `Set`), then the file written from the specification's `SetIndex` entries
-/// after the run — the header, then one line per entry, in `entries()` order.
-/// Every refusal comes before the file is written.
-pub(crate) fn export(
+/// `G1`: the export (G1-3). `program` is enumerated once as a specification
+/// under `cc` (whose index must be `Set`) with this function's own completion
+/// sink, which fills a `SetIndex` exactly as the stateful engine's specification
+/// sink does (the same configuration with no bound, the same visible names,
+/// `CompactSummary::at_completion` inserted at every completion) and records the
+/// thread names. After the run every entry is encoded by its values' derived
+/// `Debug` rendering and the file is written: the header, then one line per
+/// entry in `entries()` order. Every refusal comes before the write.
+pub fn export<P>(
     cc: &ConfConfig,
-    program: &Arc<dyn Fn() + Send + Sync>,
+    program: P,
     header: &ExportHeader,
-    enc: &Encoders,
     path: &Path,
-) -> Result<ExportStats, ExportError> {
+) -> Result<ExportStats, ExportError>
+where
+    P: Fn() + Send + Sync + 'static,
+{
     if cc.index != IndexKind::Set {
         return Err(ExportError::NotSet);
     }
-    let model = model_of(cc.config.cons_type)?;
+    let model = model_name(cc.config.cons_type)?;
     let names = sorted_names(&cc.visible);
-    let out = stateful::run_with(cc, program, program, false);
-    if !out.spec_errors.is_empty() {
-        return Err(ExportError::SpecErrors(out.spec_errors.len()));
+    let program: Arc<dyn Fn() + Send + Sync> = Arc::new(program);
+    let mut config = cc.config.clone();
+    config.max_iterations = None;
+    let state = Rc::new(RefCell::new((SetIndex::new(), ThreadNames::new(), 0usize)));
+    let sink: CompletionSink = {
+        let state = Rc::clone(&state);
+        let visible = cc.visible.clone();
+        Box::new(move |g: &ExecutionGraph, _: &MustState| {
+            let s = CompactSummary::at_completion(g, &visible, "specification");
+            let mut st = state.borrow_mut();
+            st.0.insert(&s);
+            record_thread_names(g, &mut st.1);
+            st.2 += 1;
+            SinkVerdict::Continue
+        })
+    };
+    let run = stateful::enumerate(
+        stateful::EnumRun {
+            config,
+            visible: cc.visible.clone(),
+            mode: ConfMode::Enumerate,
+            sink,
+            cut: false,
+            stop_at_first_report: false,
+            gate_sink: None,
+            paper_events: false,
+        },
+        &program,
+    );
+    let errors = run.visible_errors.len()
+        + run
+            .diagnostics
+            .iter()
+            .filter(|d| d.reason == DiagnosticReason::InvisibleThread)
+            .count();
+    if errors > 0 {
+        return Err(ExportError::SpecErrors(errors));
     }
-    if out.counters.reports != 0 {
-        return Err(ExportError::NotReflexive {
-            reports: out.counters.reports,
-        });
+    if run.end != SearchEnd::StateSpaceExhausted {
+        return Err(ExportError::NotExhausted(format!("{:?}", run.end)));
     }
-    let index = out
-        .set_index
-        .as_ref()
-        .expect("conformance: `run_with` under `Set` returns its set index");
+    let st = state.borrow();
+    let (index, threads, graphs) = (&st.0, &st.1, st.2);
     let mut text = header_line(header, &names, model);
     text.push('\n');
+    let mut seen = HashSet::new();
     let mut lines = 0;
     for (_, sig, _, ord) in index.entries() {
-        text.push_str(&line_of(sig, ord, &names, enc)?);
+        let line = line_of(sig, ord, &names, &|v| encode_generic(v, threads))?;
+        if !seen.insert(line.clone()) {
+            return Err(ExportError::Collision { line });
+        }
+        text.push_str(&line);
         text.push('\n');
         lines += 1;
     }
-    assert_eq!(
-        lines, out.counters.orders_held,
-        "conformance: an export's lines are its index's entries (X1)"
-    );
     write_replacing(path, &text)?;
     Ok(ExportStats {
         lines,
-        orders_held: out.counters.orders_held,
-        spec_graphs: out.counters.spec_graphs,
+        orders_held: index.stats().entries,
+        spec_graphs: graphs,
     })
 }
 
@@ -492,8 +835,8 @@ pub struct JoinError(pub(crate) String);
 
 impl std::error::Error for JoinError {}
 
-/// A value's normal form (R2, rulings Q8 and Q9): `Err` names a kind J3 does
-/// not support, or a value version 1 forbids — two distinct messages.
+/// A value's normal form (R2, ruling Q8; G1-2 widened Q9): integers, strings,
+/// booleans, lists and `{t, f}` objects; `Err` names a value version 1 forbids.
 fn normal_value(v: &Value) -> Result<String, String> {
     match v {
         Value::Number(n) => match n.as_i64() {
@@ -519,18 +862,25 @@ fn normal_value(v: &Value) -> Result<String, String> {
             Ok(out)
         }
         Value::Null => Err(invalid("`null` other than ⊥")),
-        Value::String(_) => Err(unsupported("a string")),
-        Value::Bool(_) => Err(unsupported("a boolean")),
-        Value::Array(_) => Err(unsupported("a list")),
+        // `G1-2`: strings, booleans and lists, as JMC's reader (J3's Q9 superseded).
+        Value::String(s) => Ok(json_string(s)),
+        Value::Bool(b) => Ok(if *b { "true" } else { "false" }.to_string()),
+        Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&normal_value(x)?);
+            }
+            out.push(']');
+            Ok(out)
+        }
     }
 }
 
 fn invalid(what: &str) -> String {
     format!("{what} is invalid in format version 1")
-}
-
-fn unsupported(what: &str) -> String {
-    format!("{what} is not supported by J3")
 }
 
 /// An object's keys, which must be exactly the declared names.

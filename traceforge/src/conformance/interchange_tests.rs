@@ -20,11 +20,12 @@ use crate::conformance::compact::CompactSummary;
 use crate::conformance::config::{ConfBuilder, ConfConfig, Engine, IndexKind};
 use crate::conformance::ctx::{CompletionSink, ConfMode, SinkVerdict};
 use crate::conformance::grid::{
-    a3_a2_encoders, apps_fixtures, Fixture, Grant, GridConfig, GridEngine, Msg, Prog, Rep, Req,
+    apps_fixtures, Fixture, Grant, GridConfig, GridEngine, Msg, Prog, Rep, Req,
 };
 use crate::conformance::interchange::{
-    conf_join, export, model_of, normal_line, EncVal, Encoders, ExportError, ExportHeader,
-    ExportStats, JoinReport, MissClass, SummaryEncode, Verdict,
+    conf_join, encode_generic, export, model_name, normal_line, record_thread_names,
+    ExportError, ExportHeader, ExportStats, JoinReport, MissClass, ThreadName, ThreadNames,
+    Verdict,
 };
 use crate::conformance::morphism::Status;
 use crate::conformance::obs::Obs;
@@ -311,19 +312,29 @@ fn export_row(row: &Row, dir: &Path) -> (PathBuf, ExportStats) {
         size,
     };
     let path = dir.join(format!("{}.traceforge.jsonl", row.jmc));
-    let stats = export(&cc, &p, &header, &a3_a2_encoders(), &path)
+    let stats = ex(&cc, &p, &header, &path)
         .unwrap_or_else(|e| panic!("conformance: J3: export of {}: {e}", row.jmc));
     (path, stats)
 }
 
+/// `G1` stage B: the generic export of a `Prog` (J3's hand path is removed).
+fn ex(
+    cc: &ConfConfig,
+    p: &Prog,
+    h: &ExportHeader,
+    path: &Path,
+) -> Result<ExportStats, ExportError> {
+    let p = Arc::clone(p);
+    export(cc, move || p(), h, path)
+}
+
 // =========================================================================
-// T1, T2: the encoder (J3-1)
+// T1, T2: the encoder (J3-1; since G1 stage B the generic encoder, G1-1)
 // =========================================================================
 
-fn enc<T: SummaryEncode>(v: &T) -> String {
-    v.encode()
-        .expect("conformance: J3: an A3/A2 value encodes")
-        .render()
+fn enc<T: crate::msg::Message + Clone + 'static>(v: &T) -> String {
+    encode_generic(&crate::msg::Val::new(v.clone()), &ThreadNames::new())
+        .unwrap_or_else(|e| panic!("conformance: J3: an A3/A2 value encodes: {e}"))
 }
 
 /// **T1** (E1): the canonical bytes of each of the eight tags, each literal also
@@ -447,16 +458,17 @@ fn t2_the_encoders_laws() {
         "conformance: J3: the eight tags: {:?}",
         tags.keys()
     );
-    // E4
-    assert!(EncVal::int(i64::MAX).is_ok());
-    assert!(EncVal::int(i64::MIN).is_ok());
-    assert!(EncVal::int(u64::MAX).is_err(), "conformance: J3: E4");
+    // E4 (G1: the generic encoder's signed-64-bit bound)
+    let e4 = |v: crate::msg::Val| encode_generic(&v, &ThreadNames::new());
+    assert!(e4(crate::msg::Val::new(i64::MAX)).is_ok());
+    assert!(e4(crate::msg::Val::new(i64::MIN)).is_ok());
+    assert!(e4(crate::msg::Val::new(u64::MAX)).is_err(), "conformance: J3: E4");
     assert!(
-        EncVal::int(i64::MAX as u64 + 1).is_err(),
+        e4(crate::msg::Val::new(i64::MAX as u64 + 1)).is_err(),
         "conformance: J3: E4"
     );
     assert!(
-        Grant(usize::MAX, 0).encode().is_err(),
+        e4(crate::msg::Val::new(Grant(usize::MAX, 0))).is_err(),
         "conformance: J3: E4 through a type"
     );
 }
@@ -512,39 +524,36 @@ fn wide_program() -> Prog {
     })
 }
 
-/// A visible value of a type no encoder is registered for: `b` receives a `u64`.
-fn unregistered_program() -> Prog {
+/// A visible value the format refuses: `b` receives an `f64` (G1 stage B; J3's
+/// unregistered `u64` encodes under the generic path).
+fn refused_program() -> Prog {
     Arc::new(|| {
         let b = named("b", || {
-            let _: u64 = crate::recv_msg_block();
+            let _: f64 = crate::recv_msg_block();
         });
         let tb = b.thread().id();
-        named("a", move || crate::send_msg(tb, 7u64));
+        named("a", move || crate::send_msg(tb, 1.5f64));
     })
 }
 
-/// **T3** (E5, X4): an export whose visible word holds a `u64` (no encoder) is
-/// refused naming the type; with no file at the path none is created, with one
-/// it is left byte for byte; no `.tmp` either way. Failing direction: a fallback
-/// to `Debug` text; the file opened before the run.
+/// **T3** (E5, X4; G1 stage B): an export whose visible word holds a value the
+/// format refuses (an `f64`) is refused naming the type and the form; with no
+/// file at the path none is created, with one it is left byte for byte; no
+/// `.tmp` either way. Failing direction: the file opened before the run.
 #[test]
-fn t3_an_unregistered_type_refuses_the_export() {
+fn t3_a_refused_value_refuses_the_export() {
     let dir = scratch("t3");
     let path = dir.join("u.jsonl");
     let tmp = dir.join("u.jsonl.tmp");
     let cc = small_cc(&["a", "b"], ConsType::FIFO);
-    let r = export(
-        &cc,
-        &unregistered_program(),
-        &header("t3"),
-        &a3_a2_encoders(),
-        &path,
-    );
+    let r = ex(&cc, &refused_program(), &header("t3"), &path);
     match &r {
-        Err(ExportError::Unregistered { type_name }) => {
+        Err(ExportError::Refused {
+            type_name, what, ..
+        }) => {
             assert!(
-                type_name.contains("u64"),
-                "conformance: J3: E5 names {type_name}"
+                type_name.contains("f64") && what == "a float",
+                "conformance: J3: E5 names {type_name}: {what}"
             )
         }
         other => panic!("conformance: J3: E5: {other:?}"),
@@ -554,26 +563,14 @@ fn t3_an_unregistered_type_refuses_the_export() {
         "conformance: J3: X4: a file after a refusal"
     );
     std::fs::write(&path, "earlier\n").unwrap();
-    let r = export(
-        &cc,
-        &unregistered_program(),
-        &header("t3"),
-        &a3_a2_encoders(),
-        &path,
-    );
-    assert!(matches!(r, Err(ExportError::Unregistered { .. })));
+    let r = ex(&cc, &refused_program(), &header("t3"), &path);
+    assert!(matches!(r, Err(ExportError::Refused { .. })));
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         "earlier\n",
         "conformance: J3: X4"
     );
     assert!(!tmp.exists(), "conformance: J3: X4: a .tmp behind");
-    // the same program with `u64` registered nowhere but A3's types present: still refused
-    let only_a3 = Encoders::new().register::<Msg>().register::<Grant>();
-    assert!(matches!(
-        export(&cc, &unregistered_program(), &header("t3"), &only_a3, &path),
-        Err(ExportError::Unregistered { .. })
-    ));
 }
 
 /// **T4** (X2): the line writer end to end on two small programs — ⊥ and a
@@ -588,14 +585,7 @@ fn t4_the_line_writer() {
     // ⊥
     let path = dir.join("bottom.jsonl");
     let cc = small_cc(&["a", "b"], ConsType::FIFO);
-    let st = export(
-        &cc,
-        &bottom_program(),
-        &header("bottom"),
-        &a3_a2_encoders(),
-        &path,
-    )
-    .unwrap();
+    let st = ex(&cc, &bottom_program(), &header("bottom"), &path).unwrap();
     let (head, lines) = read_jsonl(&path);
     assert_eq!(visible_of(&head), ["a", "b"]);
     let got: BTreeSet<String> = lines.into_iter().collect();
@@ -610,14 +600,7 @@ fn t4_the_line_writer() {
     assert_eq!(st.lines, 2);
     // U16: a's 256 sends see none of b's events; b's j-th receive sees a's first j + 1
     let path = dir.join("wide.jsonl");
-    let st = export(
-        &cc,
-        &wide_program(),
-        &header("wide"),
-        &a3_a2_encoders(),
-        &path,
-    )
-    .unwrap();
+    let st = ex(&cc, &wide_program(), &header("wide"), &path).unwrap();
     let (_, lines) = read_jsonl(&path);
     assert_eq!((st.lines, lines.len()), (1, 1));
     let sends: Vec<String> = (0..256)
@@ -651,11 +634,10 @@ fn t4_the_line_writer() {
         named("a", || crate::assert(false));
     });
     let path = dir.join("assert.jsonl");
-    let r = export(
+    let r = ex(
         &small_cc(&["a"], ConsType::FIFO),
         &asserting,
         &header("assert"),
-        &a3_a2_encoders(),
         &path,
     );
     assert!(
@@ -666,8 +648,8 @@ fn t4_the_line_writer() {
 }
 
 /// **T5** (X3): the header — the names sorted and deduplicated from an unsorted
-/// list with a repeat; `FIFO` → `p2p`; every other `ConsType` refused by name
-/// (`model_of`, and an export under `Bag` leaves no file); `program`/`size` as
+/// list with a repeat; `FIFO` → `p2p` (G1-4: `Bag` → `asyn`; MO, WB, Mailbox
+/// refused by name, and an export under MO leaves no file); `program`/`size` as
 /// given; no `seed`, `iterations` or `n`; the key order JMC writes. Failing
 /// direction: the configuration's order kept.
 #[test]
@@ -676,53 +658,41 @@ fn t5_the_header() {
     let dir = scratch("t5");
     let path = dir.join("h.jsonl");
     let cc = small_cc(&["b", "a", "b"], ConsType::FIFO);
-    export(
-        &cc,
-        &bottom_program(),
-        &header("apps/x:impl"),
-        &a3_a2_encoders(),
-        &path,
-    )
-    .unwrap();
+    ex(&cc, &bottom_program(), &header("apps/x:impl"), &path).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     let first = text.lines().next().unwrap();
     assert_eq!(
         first,
         r#"{"format":1,"tool":"traceforge","program":"apps/x:impl","size":"k1","visible":["a","b"],"model":"p2p","enumeration":"complete","encoding":1}"#
     );
-    assert_eq!(model_of(ConsType::FIFO), Ok("p2p"));
-    for c in [
-        ConsType::MO,
-        ConsType::Bag,
-        ConsType::WB,
-        ConsType::CD,
-        ConsType::Causal,
-        ConsType::Mailbox,
-    ] {
-        match model_of(c) {
+    assert_eq!(model_name(ConsType::FIFO), Ok("p2p"));
+    for c in [ConsType::MO, ConsType::WB, ConsType::Mailbox] {
+        match model_name(c) {
             Err(ExportError::Model(name)) => assert_eq!(name, format!("{c:?}")),
             other => panic!("conformance: J3: {c:?}: {other:?}"),
         }
     }
-    let p2 = dir.join("bag.jsonl");
-    let r = export(
+    // `ConfBuilder` refuses MO, so the configuration is edited after the build:
+    // the export's own model check refuses it before any run
+    let p2 = dir.join("mo.jsonl");
+    let mut mo = small_cc(&["a", "b"], ConsType::FIFO);
+    mo.config.cons_type = ConsType::MO;
+    let r = ex(&mo, &bottom_program(), &header("mo"), &p2);
+    assert!(matches!(r, Err(ExportError::Model(_))) && !p2.exists());
+    let p3 = dir.join("bag.jsonl");
+    ex(
         &small_cc(&["a", "b"], ConsType::Bag),
         &bottom_program(),
         &header("bag"),
-        &a3_a2_encoders(),
-        &p2,
-    );
-    assert!(matches!(r, Err(ExportError::Model(_))) && !p2.exists());
+        &p3,
+    )
+    .unwrap();
+    let (bag_head, _) = read_jsonl(&p3);
+    assert_eq!(bag_head["model"], "asyn", "conformance: G1-4: Bag → asyn");
     let mut not_set = small_cc(&["a", "b"], ConsType::FIFO);
     not_set.index = IndexKind::Current;
     assert_eq!(
-        export(
-            &not_set,
-            &bottom_program(),
-            &header("x"),
-            &a3_a2_encoders(),
-            &p2
-        ),
+        ex(&not_set, &bottom_program(), &header("x"), &p2),
         Err(ExportError::NotSet)
     );
 }
@@ -767,17 +737,29 @@ fn independent_lines(f: &Fixture, program: &Prog) -> BTreeSet<String> {
     summaries.iter().map(|s| hand_line(s, &names)).collect()
 }
 
-/// A value by hand: the four types' encoders, by downcast.
+/// A value by hand (the oracle of T6 and G-T3): the four A3/A2 types' canonical
+/// bytes written here by downcast, independent of the exporter's encoder (G1
+/// stage B: J3's hand encoders are removed; their bytes are T1's literals).
 fn hand_value(v: &crate::msg::Val) -> String {
     let a = v.as_any_ref();
     if let Some(x) = a.downcast_ref::<Msg>() {
-        enc(x)
-    } else if let Some(x) = a.downcast_ref::<Grant>() {
-        enc(x)
+        match x {
+            Msg::Acq(c) => format!(r#"{{"t":"Acq","f":[{c}]}}"#),
+            Msg::Rel(c) => format!(r#"{{"t":"Rel","f":[{c}]}}"#),
+        }
+    } else if let Some(Grant(c, r)) = a.downcast_ref::<Grant>() {
+        format!(r#"{{"t":"Grant","f":[{c},{r}]}}"#)
     } else if let Some(x) = a.downcast_ref::<Req>() {
-        enc(x)
+        match x {
+            Req::Put { c, k, v } => format!(r#"{{"t":"Put","f":[{c},{k},{v}]}}"#),
+            Req::Get { c, k } => format!(r#"{{"t":"Get","f":[{c},{k}]}}"#),
+        }
     } else if let Some(x) = a.downcast_ref::<Rep>() {
-        enc(x)
+        match x {
+            Rep::Ack => r#"{"t":"Ack","f":[]}"#.to_owned(),
+            Rep::Val(v) => format!(r#"{{"t":"Val","f":[{v}]}}"#),
+            Rep::None => r#"{"t":"None","f":[]}"#.to_owned(),
+        }
     } else {
         panic!(
             "conformance: J3: a value of `{}` in an A3/A2 word",
@@ -895,13 +877,7 @@ fn t7_the_export_is_deterministic_and_complete_only() {
     std::fs::write(&path, "earlier\n").unwrap();
     let cc = small_cc(&["a", "b", "ghost"], ConsType::FIFO);
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        export(
-            &cc,
-            &bottom_program(),
-            &header("x4"),
-            &a3_a2_encoders(),
-            &path,
-        )
+        ex(&cc, &bottom_program(), &header("x4"), &path)
     }));
     assert!(
         r.is_err(),
@@ -918,13 +894,7 @@ fn t7_the_export_is_deterministic_and_complete_only() {
     );
     let fresh = dir.join("x4-none.jsonl");
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        export(
-            &cc,
-            &bottom_program(),
-            &header("x4"),
-            &a3_a2_encoders(),
-            &fresh,
-        )
+        ex(&cc, &bottom_program(), &header("x4"), &fresh)
     }));
     assert!(r.is_err());
     assert!(!fresh.exists() && !dir.join("x4-none.jsonl.tmp").exists());
@@ -1159,24 +1129,7 @@ fn t12_the_readers_refusals() {
             ),
             "invalid in format version 1",
         ),
-        (
-            "a string",
-            spec.clone(),
-            line("st.jsonl", &ok.replace(r#"[0]}}],"b""#, r#"["x"]}}],"b""#)),
-            "a string is not supported by J3",
-        ),
-        (
-            "a boolean",
-            spec.clone(),
-            line("bo.jsonl", &ok.replace(r#"[0]}}],"b""#, r#"[true]}}],"b""#)),
-            "a boolean is not supported by J3",
-        ),
-        (
-            "a list",
-            spec.clone(),
-            line("li.jsonl", &ok.replace(r#"[0]}}],"b""#, r#"[[0]]}}],"b""#)),
-            "a list is not supported by J3",
-        ),
+        // G1-2: a string, a boolean and a list are accepted now (G-T9).
         (
             "an integer above i64",
             spec.clone(),
@@ -1227,9 +1180,6 @@ fn t12_the_readers_refusals() {
         }
         seen_messages.insert(want.to_string());
     }
-    assert!(seen_messages
-        .iter()
-        .any(|m| m.contains("not supported by J3")));
     assert!(seen_messages
         .iter()
         .any(|m| m.contains("invalid in format version 1")));
@@ -1948,4 +1898,1029 @@ fn t16_the_command() {
         "conformance: J3: the command: {} invocations not as expected",
         failures.len()
     );
+}
+
+// =========================================================================
+// G1 (the tester's; `criteria/G1.md` G1-7, `log/dev/G1.derived.md` addendum A)
+// =========================================================================
+//
+// The generic path beside J3's hand path (stage A): the grammar, the
+// refusals, hand = generic, `ThreadId`, the preconditions, the shared main,
+// the models, the reader's extension; gates (1) and (2) on the 74 (ignored).
+
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
+use std::time::Instant;
+
+use crate::conformance::compact::SetIndex;
+use crate::msg::Val;
+use crate::program::{run_cli, Entry, Program};
+
+fn gen(v: Val) -> Result<String, ExportError> {
+    encode_generic(&v, &ThreadNames::new())
+}
+
+fn gen_ok<T: crate::msg::Message + 'static>(x: T) -> String {
+    let v = Val::new(x);
+    let text = format!("{:?}", &*v.val);
+    gen(v).unwrap_or_else(|e| panic!("conformance: G1: `{text}` refused: {e}"))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GUnit;
+
+#[derive(Clone, Debug, PartialEq)]
+struct GTup(i32, u8);
+
+#[derive(Clone, Debug, PartialEq)]
+struct GRec {
+    a: i64,
+    b: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum GE {
+    U,
+    T(String),
+    S { x: Vec<u8>, y: Option<u8> },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GW<T> {
+    v: T,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GSets {
+    o: std::collections::BTreeSet<u32>,
+    h: HashSet<String>,
+}
+
+/// **G-T1** (G1-1): the grammar on real `Debug` renderings, each expected by
+/// hand (addendum A3). Failing directions: MU1 (`\u{…}` decoded as code + 1),
+/// MU2 (`\0` read as `0`), MU5 (a set left in `Debug` order), MU12 (fields
+/// reversed).
+#[test]
+fn g1_t1_the_grammar() {
+    let cases: Vec<(String, &str)> = vec![
+        (gen_ok(GUnit), r#"{"t":"GUnit","f":[]}"#),
+        (gen_ok(GTup(-3, 7)), r#"{"t":"GTup","f":[-3,7]}"#),
+        (
+            gen_ok(GRec { a: i64::MIN, b: true }),
+            r#"{"t":"GRec","f":[-9223372036854775808,true]}"#,
+        ),
+        (
+            gen_ok(GRec { a: i64::MAX, b: false }),
+            r#"{"t":"GRec","f":[9223372036854775807,false]}"#,
+        ),
+        (gen_ok(GE::U), r#"{"t":"U","f":[]}"#),
+        (gen_ok(GE::T("x".to_owned())), r#"{"t":"T","f":["x"]}"#),
+        (
+            gen_ok(GE::S { x: vec![1, 2], y: None }),
+            r#"{"t":"S","f":[[1,2],{"t":"None","f":[]}]}"#,
+        ),
+        (
+            gen_ok(GE::S { x: vec![], y: Some(9) }),
+            r#"{"t":"S","f":[[],{"t":"Some","f":[9]}]}"#,
+        ),
+        (gen_ok(Some(9u8)), r#"{"t":"Some","f":[9]}"#),
+        (gen_ok(None::<u8>), r#"{"t":"None","f":[]}"#),
+        (gen_ok([1u8, 2, 3]), "[1,2,3]"),
+        (gen_ok(VecDeque::from(vec![3i16, 4])), "[3,4]"),
+        (gen_ok(Vec::<u8>::new()), "[]"),
+        (gen_ok(true), "true"),
+        (gen_ok(-5i8), "-5"),
+        (gen_ok(Box::new(GTup(1, 0))), r#"{"t":"GTup","f":[1,0]}"#),
+        (gen_ok(Arc::new(GE::U)), r#"{"t":"U","f":[]}"#),
+        (
+            gen_ok(GW { v: GRec { a: 1, b: true } }),
+            r#"{"t":"GW","f":[{"t":"GRec","f":[1,true]}]}"#,
+        ),
+        // sets: by the encoded bytes ("10" < "2"), not by `Ord`
+        (
+            gen_ok(GSets {
+                o: [2u32, 10].into_iter().collect(),
+                h: ["b", "a", "c"].iter().map(|s| s.to_string()).collect(),
+            }),
+            r#"{"t":"GSets","f":[[10,2],["a","b","c"]]}"#,
+        ),
+    ];
+    for (got, want) in &cases {
+        assert_eq!(got, want, "conformance: G1: grammar");
+    }
+    // strings: the expected bytes are serde_json's rendering of the original
+    let strings = [
+        "a\"b\\c\nd\te\rf\0g'h",
+        "\u{1}\u{7f}\u{200b}x",
+        "\u{301}x",
+        "x\u{301}",
+        "é\u{1F600}",
+        "",
+    ];
+    for s in strings {
+        let dbg = format!("{s:?}");
+        let want = serde_json::to_string(s).unwrap();
+        assert_eq!(
+            gen_ok(s.to_owned()),
+            want,
+            "conformance: G1: the string {dbg}"
+        );
+        assert_eq!(gen_ok(s), want, "conformance: G1: the &str {dbg}");
+    }
+    // pins: the escapes the grammar names are really exercised (rustc 1.98.1)
+    let d = format!("{:?}", "\u{1}\u{7f}\u{200b}x");
+    assert!(
+        d.contains("\\u{1}") && d.contains("\\u{7f}"),
+        "conformance: G1: pin: {d}"
+    );
+    let d0 = format!("{:?}", "a\"b\\c\nd\te\rf\0g'h");
+    assert!(
+        d0.contains("\\0") && d0.contains("\\\"") && d0.contains("\\\\") && d0.contains("\\n"),
+        "conformance: G1: pin: {d0}"
+    );
+    note!(
+        "G-T1\t{} cases\t\\u{{200b}} renders {:?}\tleading U+301 renders {:?}",
+        cases.len() + 2 * strings.len(),
+        format!("{:?}", "\u{200b}"),
+        format!("{:?}", "\u{301}x")
+    );
+}
+
+/// A value whose `Debug` is the given text verbatim (a hand-written `Debug`).
+#[derive(Clone, PartialEq)]
+struct Raw(&'static str);
+
+impl std::fmt::Debug for Raw {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// `finish_non_exhaustive`, as a hand `Debug` might use it.
+#[derive(Clone, PartialEq)]
+struct Hidden {
+    a: i32,
+    b: i32,
+}
+
+impl std::fmt::Debug for Hidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = self.b;
+        f.debug_struct("Hidden").field("a", &self.a).finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Holder {
+    k: u8,
+    m: HashMap<u8, u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Pair2(u8);
+
+/// Two values that render alike: `Debug` ignores the field `PartialEq` and
+/// `Hash` compare (P3).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Same(u8);
+
+impl std::fmt::Debug for Same {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = self.0;
+        f.write_str("Same")
+    }
+}
+
+/// The kind of a refusal: `Refused` with its `what`, `Unparsed`, or another.
+fn refusal(v: Val) -> String {
+    let text = format!("{:?}", &*v.val);
+    let ty = v.type_name.clone();
+    match gen(v) {
+        Ok(s) => panic!("conformance: G1: `{text}` accepted as {s}"),
+        Err(ExportError::Refused {
+            type_name,
+            rendering,
+            what,
+        }) => {
+            assert_eq!(type_name, ty, "conformance: G1: the type named");
+            assert_eq!(rendering, text, "conformance: G1: the text named");
+            format!("refused: {what}")
+        }
+        Err(ExportError::Unparsed {
+            type_name,
+            rendering,
+            at,
+        }) => {
+            assert_eq!(type_name, ty, "conformance: G1: the type named");
+            assert_eq!(rendering, text, "conformance: G1: the text named");
+            assert!(at <= text.len());
+            "unparsed".to_owned()
+        }
+        Err(e) => format!("other: {e:?}"),
+    }
+}
+
+/// **G-T2** (G1-1): the refusals, each naming the type and the text.
+/// Failing directions: MU3 (unknown escapes accepted), MU4 (a map read as a
+/// set, values dropped), MU6 (equal encodings in a set), MU7 (`..` skipped),
+/// MU8 (a char read as a string), MU9 (a tuple read as a list), MU10 (a float
+/// read as an integer), MU11 (the i64 bound removed).
+#[test]
+fn g1_t2_the_refusals() {
+    let mut one = HashMap::new();
+    one.insert(1u8, 2u8);
+    let cases: Vec<(&str, Val, &str)> = vec![
+        ("a map nested in a struct", Val::new(Holder { k: 1, m: one.clone() }), "refused: a map"),
+        ("a map", Val::new(one), "refused: a map"),
+        ("1.5", Val::new(1.5f64), "refused: a float"),
+        ("1e-7", Val::new(1e-7f64), "refused: a float"),
+        ("NaN", Val::new(f64::NAN), "refused: a float"),
+        ("inf", Val::new(f64::INFINITY), "refused: a float"),
+        ("-inf", Val::new(f64::NEG_INFINITY), "refused: a float"),
+        ("a float in a struct", Val::new(GW { v: 2.0f32 }), "refused: a float"),
+        ("a char", Val::new('x'), "refused: a char"),
+        ("a char in a struct", Val::new(GW { v: 'y' }), "refused: a char"),
+        ("a tuple", Val::new((1u8, 2u8)), "refused: an anonymous tuple"),
+        ("the unit", Val::new(()), "refused: an anonymous tuple"),
+        ("a tuple in a variant", Val::new(Some((1u8, 2u8))), "refused: an anonymous tuple"),
+        (
+            "finish_non_exhaustive",
+            Val::new(Hidden { a: 1, b: 2 }),
+            "refused: `..` (a non-exhaustive rendering)",
+        ),
+        (
+            "an empty finish_non_exhaustive",
+            Val::new(Raw("Hidden { .. }")),
+            "refused: `..` (a non-exhaustive rendering)",
+        ),
+        ("PhantomData", Val::new(std::marker::PhantomData::<u8>), "unparsed"),
+        ("a Duration", Val::new(std::time::Duration::from_millis(1500)), "refused: a float"),
+        ("a range", Val::new(0..5i32), "refused: a range"),
+        ("a hand Debug", Val::new(Raw("<x>")), "unparsed"),
+        ("a \\x escape", Val::new(Raw(r#"S("\x01")"#)), "unparsed"),
+        ("an empty \\u{}", Val::new(Raw(r#"S("\u{}")"#)), "unparsed"),
+        ("a surrogate", Val::new(Raw(r#"S("\u{d800}")"#)), "unparsed"),
+        ("above U+10FFFF", Val::new(Raw(r#"S("\u{110000}")"#)), "unparsed"),
+        ("seven hex digits", Val::new(Raw(r#"S("\u{0000041}")"#)), "unparsed"),
+        ("a path", Val::new(Raw("a::b")), "unparsed"),
+        ("u64::MAX", Val::new(u64::MAX), "refused: an integer outside signed 64 bits"),
+        ("i64::MAX + 1", Val::new(i64::MAX as u64 + 1), "refused: an integer outside signed 64 bits"),
+        ("u128::MAX", Val::new(u128::MAX), "refused: an integer outside signed 64 bits"),
+        ("i128::MIN", Val::new(i128::MIN), "refused: an integer outside signed 64 bits"),
+        (
+            "a set with two equal encodings",
+            Val::new([Same(1), Same(2)].into_iter().collect::<HashSet<Same>>()),
+            "refused: a set with two equal encodings",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (what, v, want) in cases {
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refusal(v)))
+            .unwrap_or_else(|p| {
+                p.downcast_ref::<String>()
+                    .cloned()
+                    .unwrap_or_else(|| "a panic".to_owned())
+            });
+        if got != want {
+            bad.push(format!("{what}: {got} (want {want})"));
+        }
+    }
+    // the control: a set of distinct encodings is accepted
+    assert_eq!(
+        gen_ok([Pair2(2), Pair2(1)].into_iter().collect::<HashSet<Pair2>>()),
+        r#"[{"t":"Pair2","f":[1]},{"t":"Pair2","f":[2]}]"#
+    );
+    assert!(bad.is_empty(), "conformance: G1: refusals:\n  {}", bad.join("\n  "));
+}
+
+/// **G-T3** (G1-6 gate (1), the value level): the generic encoder equals the
+/// hand encoders' bytes on T1's literals and on every `domain()` value — at stage
+/// A against `Encoders::encode` (52/52, record §2.3); since stage B against the
+/// test's own byte oracle `hand_value`, J3's encoders being removed. Failing
+/// direction: MU12 (a tagged value's fields reversed).
+#[test]
+fn g1_t3_hand_equals_generic() {
+    let mut vals: Vec<Val> = Vec::new();
+    for i in 0..3usize {
+        vals.push(Val::new(Msg::Acq(i)));
+        vals.push(Val::new(Msg::Rel(i)));
+        for j in 0..4usize {
+            vals.push(Val::new(Grant(i, j)));
+            vals.push(Val::new(crate::conformance::grid::a2_op(i, j)));
+            vals.push(Val::new(Rep::Val((10 * i + j) as i32)));
+        }
+    }
+    for k in 0..2usize {
+        for c in 0..3usize {
+            vals.push(Val::new(Req::Get { c, k }));
+        }
+    }
+    vals.push(Val::new(Rep::Ack));
+    vals.push(Val::new(Rep::None));
+    vals.push(Val::new(Req::Put { c: 1, k: 0, v: 11 }));
+    vals.push(Val::new(Grant(1, 0)));
+    let mut tags = BTreeSet::new();
+    for v in &vals {
+        let h = hand_value(v);
+        let g = encode_generic(v, &ThreadNames::new())
+            .unwrap_or_else(|e| panic!("conformance: G1: generic: {e}"));
+        assert_eq!(g, h, "conformance: G1: generic ≠ hand on {:?}", &*v.val);
+        let t: Value = serde_json::from_str(&g).unwrap();
+        tags.insert(t["t"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(tags.len(), 8, "conformance: G1: non-vacuity: the eight tags {tags:?}");
+    note!("G-T3\t{} values, 8 tags: equal", vals.len());
+}
+
+// ------------------------------------------------------------ ThreadId --
+
+#[derive(Clone, Debug, PartialEq)]
+struct Who(crate::ThreadId);
+
+fn tid(n: u32) -> crate::ThreadId {
+    crate::ThreadId::try_from(format!("t{n}"))
+        .unwrap_or_else(|_| panic!("conformance: G1: t{n} is no ThreadId"))
+}
+
+mod lookalike {
+    /// A user type with the reserved shape (P2).
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) struct ThreadId {
+        pub(super) opaque_id: u32,
+    }
+}
+
+/// `b` receives a `Who` from `a`, which names thread `who(…)` (chosen in main).
+fn who_program<F>(prefix: F, payload: fn(crate::ThreadId, Option<crate::ThreadId>) -> Who) -> Prog
+where
+    F: Fn() -> Option<crate::ThreadId> + Send + Sync + 'static,
+{
+    Arc::new(move || {
+        let extra = prefix();
+        let b = named("b", || {
+            let _: Who = crate::recv_msg_block();
+        });
+        let tb = b.thread().id();
+        named("a", move || {
+            crate::send_msg(tb, payload(thread::current().id(), extra));
+        });
+    })
+}
+
+/// **G-T6** (G1-1, P2): `ThreadId` becomes the thread's name. (a) unit level:
+/// a name, and the three refusals; (b) the F41 shape: the implementation
+/// spawns an invisible thread first, so `a`'s raw id differs (pinned by the
+/// stateful engine's report), and the two exports' bodies are equal; (c) one id
+/// named `x` or `y` by a `nondet()`; (d) an unnamed thread; (e) an id absent
+/// from the run. Failing directions: MU13 (an absent id rendered as its
+/// number), MU14 (the unnamed check removed), MU15 (the conflict check removed),
+/// MU20 (every id rendered as its number).
+#[test]
+fn g1_t6_thread_ids() {
+    // (a)
+    let mut names = ThreadNames::new();
+    names.insert(3, ThreadName::Named("c0".to_owned()));
+    names.insert(4, ThreadName::Unnamed);
+    names.insert(5, ThreadName::Conflict("x".to_owned(), "y".to_owned()));
+    assert_eq!(
+        encode_generic(&Val::new(tid(3)), &names).unwrap(),
+        r#""c0""#
+    );
+    assert_eq!(
+        encode_generic(&Val::new(Who(tid(3))), &names).unwrap(),
+        r#"{"t":"Who","f":["c0"]}"#
+    );
+    let reason = |n: u32| match encode_generic(&Val::new(Who(tid(n))), &names) {
+        Err(ExportError::Thread { type_name, reason }) => {
+            assert!(type_name.ends_with("Who"), "conformance: G1: {type_name}");
+            reason
+        }
+        other => panic!("conformance: G1: t{n}: {other:?}"),
+    };
+    assert!(
+        reason(4).contains("has no name"),
+        "conformance: G1: {}",
+        reason(4)
+    );
+    assert!(reason(5).contains("named `x` in one graph and `y` in another"));
+    assert!(reason(9).contains("is not a thread of the run"));
+    // P2: the lookalike is read as a thread identity
+    assert!(matches!(
+        encode_generic(&Val::new(lookalike::ThreadId { opaque_id: 99 }), &names),
+        Err(ExportError::Thread { .. })
+    ));
+    assert_eq!(
+        encode_generic(&Val::new(lookalike::ThreadId { opaque_id: 3 }), &names).unwrap(),
+        r#""c0""#,
+        "conformance: G1: P2's undetectable case"
+    );
+
+    // (b) the F41 shape
+    let spec = who_program(|| None, |me, _| Who(me));
+    let imp = who_program(
+        || {
+            let _ = thread::spawn(|| {});
+            None
+        },
+        |me, _| Who(me),
+    );
+    let cc = small_cc(&["a", "b"], ConsType::FIFO);
+    let typed = crate::conformance::stateful::run_with(&cc, &imp, &spec, false);
+    assert!(
+        typed.counters.reports > 0,
+        "conformance: G1: pin: the raw ids must differ (F41 shape)"
+    );
+    let dir = scratch("g1-t6");
+    let (ps, pi) = (dir.join("s.jsonl"), dir.join("i.jsonl"));
+    let (s2, i2) = (spec.clone(), imp.clone());
+    export(&cc, move || s2(), &header("t6s"), &ps).expect("conformance: G1: (b) spec");
+    export(&cc, move || i2(), &header("t6i"), &pi).expect("conformance: G1: (b) impl");
+    let (_, ls) = read_jsonl(&ps);
+    let (_, li) = read_jsonl(&pi);
+    assert_eq!(ls, li, "conformance: G1: the F41 shape exports equal bodies");
+    assert_eq!(ls.len(), 1);
+    assert!(
+        ls[0].contains(r#"{"s":{"t":"Who","f":["a"]}}"#),
+        "conformance: G1: {}",
+        ls[0]
+    );
+    assert!(matches!(join_ok(&ps, &pi).verdict, Verdict::Conforms));
+
+    // (c) one id, two names
+    let conflict = who_program(
+        || {
+            let nm = if crate::nondet() { "x" } else { "y" };
+            Some(named(nm, || {}).thread().id())
+        },
+        |_, extra| Who(extra.unwrap()),
+    );
+    // (d) an unnamed thread
+    let unnamed = who_program(
+        || Some(thread::spawn(|| {}).thread().id()),
+        |_, extra| Who(extra.unwrap()),
+    );
+    // (e) an id absent from the run
+    let absent = who_program(|| None, |_, _| Who(tid(99)));
+    for (what, p, want) in [
+        ("(c)", conflict, "in one graph and"),
+        ("(d)", unnamed, "has no name"),
+        ("(e)", absent, "t99 is not a thread of the run"),
+    ] {
+        let path = dir.join("r.jsonl");
+        let r = export(&cc, move || p(), &header("t6"), &path);
+        match r {
+            Err(ExportError::Thread { reason, .. }) => {
+                assert!(reason.contains(want), "conformance: G1: {what}: {reason}")
+            }
+            other => panic!("conformance: G1: {what}: {other:?}"),
+        }
+        assert!(!path.exists(), "conformance: G1: {what}: a file after a refusal");
+    }
+}
+
+// --------------------------------------------------------- preconditions --
+
+#[derive(Clone, Debug, PartialEq)]
+struct GMaps {
+    m: HashMap<u8, u8>,
+    s: HashSet<u8>,
+}
+
+/// Distinct values (by `PartialEq`) that render alike (P3a).
+#[derive(Clone, PartialEq)]
+struct Alike(u8);
+
+impl std::fmt::Debug for Alike {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let _ = self.0;
+        f.write_str("Alike")
+    }
+}
+
+/// Equal values (by `PartialEq`, which ignores `b`) that render differently
+/// (P3b).
+#[derive(Clone, Debug)]
+struct Loose {
+    a: u8,
+    b: u8,
+}
+
+impl PartialEq for Loose {
+    fn eq(&self, o: &Self) -> bool {
+        self.a == o.a
+    }
+}
+
+/// `a` sends `make(nondet())` to `b`.
+fn choice_program<M: crate::msg::Message + Clone + 'static>(make: fn(bool) -> M) -> Prog {
+    Arc::new(move || {
+        let b = named("b", || {
+            let _: M = crate::recv_msg_block();
+        });
+        let tb = b.thread().id();
+        named("a", move || crate::send_msg(tb, make(crate::nondet())));
+    })
+}
+
+/// **G-T-P** (G1-1 P1–P3): P1, a nested empty map encodes as `[]` (the stated
+/// consequence); P2 in G-T6; P3a, two distinct values rendering alike refuse
+/// the export (`Collision`); P3b, a `PartialEq` that ignores a rendered field
+/// makes the line depend on which branch Must explores first (the stated
+/// consequence). Failing direction: MU16 (the `Collision` check removed).
+#[test]
+fn g1_tp_the_preconditions() {
+    // P1
+    assert_eq!(
+        gen_ok(GMaps {
+            m: HashMap::new(),
+            s: HashSet::new()
+        }),
+        r#"{"t":"GMaps","f":[[],[]]}"#
+    );
+    let cc = small_cc(&["a", "b"], ConsType::FIFO);
+    let dir = scratch("g1-tp");
+    // P3a
+    let path = dir.join("c.jsonl");
+    let p = choice_program(|c| Alike(if c { 1 } else { 2 }));
+    match export(&cc, move || p(), &header("p3a"), &path) {
+        Err(ExportError::Collision { line }) => {
+            assert!(line.contains("Alike"), "conformance: G1: {line}")
+        }
+        other => panic!("conformance: G1: P3a: {other:?}"),
+    }
+    assert!(!path.exists(), "conformance: G1: P3a: a file after a refusal");
+    // P3b
+    let (p1, p2) = (dir.join("l1.jsonl"), dir.join("l2.jsonl"));
+    let a = choice_program(|c| Loose { a: 1, b: if c { 1 } else { 2 } });
+    let b = choice_program(|c| Loose { a: 1, b: if c { 2 } else { 1 } });
+    let s1 = export(&cc, move || a(), &header("p3b"), &p1).expect("conformance: G1: P3b");
+    let s2 = export(&cc, move || b(), &header("p3b"), &p2).expect("conformance: G1: P3b");
+    assert_eq!((s1.lines, s2.lines, s1.spec_graphs, s2.spec_graphs), (1, 1, 2, 2));
+    let (_, l1) = read_jsonl(&p1);
+    let (_, l2) = read_jsonl(&p2);
+    assert_ne!(
+        l1, l2,
+        "conformance: G1: P3b: the representative follows the exploration order"
+    );
+    note!("G-T-P\tP3b\t{}\t{}", l1[0], l2[0]);
+}
+
+// ------------------------------------------------------- the shared main --
+
+#[derive(Clone, Debug, PartialEq)]
+enum PcMsg {
+    Item(i32),
+}
+
+/// The template's program (producer–consumer, CIVL): the specification's
+/// channel is FIFO by construction, the implementation's takes the run's model.
+fn pc(k: usize, fifo_by_construction: bool) {
+    let (tx, rx) = if fifo_by_construction {
+        crate::channel::Builder::<PcMsg>::new()
+            .with_comm(crate::loc::CommunicationModel::LocalOrder)
+            .build()
+    } else {
+        crate::channel::Builder::<PcMsg>::new().build()
+    };
+    let c = named("consumer", move || {
+        for _ in 0..=k {
+            let PcMsg::Item(x) = rx.recv_msg_block();
+            if x == 0 {
+                return;
+            }
+        }
+    });
+    let p = named("producer", move || {
+        for x in 1..=k as i32 {
+            if crate::nondet() {
+                tx.send_msg(PcMsg::Item(x));
+            } else {
+                tx.send_msg(PcMsg::Item(0));
+                return;
+            }
+        }
+        tx.send_msg(PcMsg::Item(0));
+    });
+    c.join().unwrap();
+    p.join().unwrap();
+}
+
+fn cli(p: &Program, args: &[&str]) -> (String, u8) {
+    let a: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    run_cli(p, &a)
+}
+
+/// **G-T7** (G1-5): the shared main through `run_cli` on the template's
+/// program. Failing directions: MU17 (the program's arguments not passed),
+/// MU18 (`stateful` above one thread stays Stateful).
+#[test]
+fn g1_t7_the_shared_main() {
+    let k_of = |a: &[String]| -> usize { a.first().and_then(|s| s.parse().ok()).unwrap_or(2) };
+    let spec = move |a: &[String]| -> Entry {
+        let k = k_of(a);
+        Arc::new(move || pc(k, true))
+    };
+    let imp = move |a: &[String]| -> Entry {
+        let k = k_of(a);
+        Arc::new(move || pc(k, false))
+    };
+    let p = Program {
+        visible: &|_| vec!["consumer".to_owned(), "producer".to_owned()],
+        spec: &spec,
+        imp: &imp,
+    };
+    assert_eq!(cli(&p, &["count", "spec", "1"]), ("execs=2 blocked=0\n".to_owned(), 0));
+    assert_eq!(cli(&p, &["count", "spec", "3"]), ("execs=4 blocked=0\n".to_owned(), 0));
+    assert_eq!(
+        cli(&p, &["count", "impl", "--model", "bag", "2"]),
+        ("execs=8 blocked=0\n".to_owned(), 0)
+    );
+    let dir = scratch("g1-t7");
+    let f = dir.join("s.jsonl");
+    let fs = f.to_string_lossy().into_owned();
+    assert_eq!(
+        cli(&p, &["export", "spec", "--out", &fs, "2"]),
+        (format!("exported: 3 lines from 3 graphs to {fs}\n"), 0)
+    );
+    let (head, lines) = read_jsonl(&f);
+    assert_eq!(head["program"], "program:spec");
+    assert_eq!(head["size"], "2");
+    assert_eq!(head["model"], "p2p");
+    assert_eq!(visible_of(&head), vec!["consumer", "producer"]);
+    assert_eq!(lines.len(), 3);
+    for (args, text) in [
+        (vec!["conf", "2"], "(thm:stateful), and both"),
+        (vec!["conf", "--threads", "2", "2"], "(thm:stateful, the partitioned form)"),
+        (vec!["conf", "--engine", "stateless", "2"], "a sweep (thm:cfirst)"),
+        (
+            vec!["conf", "--engine", "stateless", "--threads", "2", "2"],
+            "(thm:cfirst, the partitioned form)",
+        ),
+    ] {
+        let (out, code) = cli(&p, &args);
+        assert_eq!(code, 0, "conformance: G1: {args:?}: {out}");
+        assert!(out.contains(text), "conformance: G1: {args:?} lacks `{text}`: {out}");
+    }
+    let (out, code) = cli(&p, &["conf", "--model", "bag", "2"]);
+    assert_eq!(code, 1, "conformance: G1: bag reports: {out}");
+    let (out, code) = cli(&p, &["online"]);
+    assert!(
+        code == 2 && out.contains("not implemented"),
+        "conformance: G1: {out}"
+    );
+    let (out, code) = cli(&p, &["frob"]);
+    assert!(code == 2 && out.contains("usage:"), "conformance: G1: {out}");
+}
+
+/// `k` clients `c0 … c{k-1}`, each sending `Item(i)` to an invisible server `s`
+/// that receives all `k`: the visible set depends on the program's argument.
+fn clients(k: usize) {
+    let srv = named("s", move || {
+        for _ in 0..k {
+            let _: PcMsg = crate::recv_msg_block();
+        }
+    });
+    let ts = srv.thread().id();
+    for i in 0..k {
+        named(&format!("c{i}"), move || crate::send_msg(ts, PcMsg::Item(i as i32)));
+    }
+}
+
+/// **G-T7b** (G1-5, `Program.visible` from the arguments; H's Q1): a program
+/// whose visible set is `c0 … c{k-1}`, run by `run_cli` at k = 1 and k = 2.
+/// Expected by hand: k = 1, one graph and one line over `["c0"]`; k = 2, the
+/// server's two receive orders give two graphs whose summaries are equal (the
+/// two clients' sends are porf-unrelated and only the clients are visible),
+/// so one line over `["c0","c1"]`; `count` gives `execs=1` and `execs=2`; `conf`
+/// conforms at both sizes. Failing direction: MU21 (the visible set computed
+/// from no arguments: at k = 1 the run declares `c1`, which is never spawned).
+#[test]
+fn g1_t7b_a_visible_set_from_the_arguments() {
+    let k_of = |a: &[String]| -> usize { a.first().and_then(|s| s.parse().ok()).unwrap_or(2) };
+    let vis = move |a: &[String]| -> Vec<String> { (0..k_of(a)).map(|i| format!("c{i}")).collect() };
+    let side = move |a: &[String]| -> Entry {
+        let k = k_of(a);
+        Arc::new(move || clients(k))
+    };
+    let p = Program {
+        visible: &vis,
+        spec: &side,
+        imp: &side,
+    };
+    let dir = scratch("g1-t7b");
+    for (k, names, graphs) in [("1", vec!["c0"], 1), ("2", vec!["c0", "c1"], 2)] {
+        assert_eq!(
+            cli(&p, &["count", "spec", k]),
+            (format!("execs={graphs} blocked=0\n"), 0),
+            "conformance: G1: count at k = {k}"
+        );
+        let f = dir.join(format!("k{k}.jsonl"));
+        let fs = f.to_string_lossy().into_owned();
+        assert_eq!(
+            cli(&p, &["export", "spec", "--out", &fs, k]),
+            (format!("exported: 1 lines from {graphs} graphs to {fs}\n"), 0),
+            "conformance: G1: export at k = {k}"
+        );
+        let (head, lines) = read_jsonl(&f);
+        assert_eq!(visible_of(&head), names, "conformance: G1: visible at k = {k}");
+        assert_eq!(lines.len(), 1);
+        let (out, code) = cli(&p, &["conf", k]);
+        assert_eq!(code, 0, "conformance: G1: conf at k = {k}: {out}");
+    }
+}
+
+/// `a` asserts `!(x && y)` over two `nondet()`s: one execution in four fails.
+fn asserting_pair() {
+    named("a", || {
+        let x = crate::nondet();
+        let y = crate::nondet();
+        crate::assert(!(x && y));
+    });
+}
+
+/// **G-T7c** (G1-5, `count` past an assertion failure; H's Q12, the owner's G3):
+/// `count` explores past a failed assertion as the plain-Must baseline does, so
+/// on `asserting_pair` it reports what `crate::verify` with
+/// `keep_going_after_error = true` reports on the same program: all four
+/// executions (derived as `execs=3 blocked=1`; measured `execs=4 blocked=0` —
+/// Must counts the execution that ends on its failed assertion as finished, so
+/// the test pins the total, four, and the equality). Failing direction: MU22
+/// (`count` without the setting: the failed assertion panics the run).
+#[test]
+fn g1_t7c_count_explores_past_a_failure() {
+    let entry = |_: &[String]| -> Entry { Arc::new(asserting_pair) };
+    let p = Program {
+        visible: &|_| vec!["a".to_owned()],
+        spec: &entry,
+        imp: &entry,
+    };
+    let reference = crate::verify(
+        Config::builder()
+            .with_cons_type(ConsType::FIFO)
+            .with_keep_going_after_error(true)
+            .with_verbose(0)
+            .build(),
+        asserting_pair,
+    );
+    assert_eq!(
+        reference.execs + reference.block,
+        4,
+        "conformance: G1: the reference explores all four executions"
+    );
+    for side in ["spec", "impl"] {
+        assert_eq!(
+            cli(&p, &["count", side]),
+            (
+                format!("execs={} blocked={}\n", reference.execs, reference.block),
+                0
+            ),
+            "conformance: G1: count {side} past the failure"
+        );
+    }
+}
+
+/// **G-T8** (G1-4): the models. Failing direction: MU19 (Bag → `p2p`).
+#[test]
+#[allow(deprecated)]
+fn g1_t8_the_models() {
+    assert_eq!(model_name(ConsType::FIFO), Ok("p2p"));
+    assert_eq!(model_name(ConsType::Bag), Ok("asyn"));
+    assert_eq!(model_name(ConsType::Causal), Ok("cd"));
+    assert_eq!(model_name(ConsType::CD), Ok("cd"));
+    for c in [ConsType::MO, ConsType::WB, ConsType::Mailbox] {
+        assert!(
+            matches!(model_name(c), Err(ExportError::Model(_))),
+            "conformance: G1: {c:?} has no model"
+        );
+    }
+}
+
+// ------------------------------------------------------------ the reader --
+
+/// A line over `a`, `b`: `a` sends the value, `b` receives it.
+fn vline(v: &str) -> String {
+    format!(
+        r#"{{"statuses":{{"a":"done","b":"done"}},"words":{{"a":[{{"s":{v}}}],"b":[{{"r":{v}}}]}},"counts":[0,1]}}"#
+    )
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Note {
+    s: String,
+    b: bool,
+    l: Vec<u8>,
+}
+
+/// **G-T9** (G1-2): the reader accepts strings (in `serde_json`'s escaping),
+/// booleans and lists; the generic writer's lines are already in the reader's
+/// normal form; floats, `null` and other objects stay invalid. Failing
+/// directions: MR1 (the reader renders a string with Rust's escaping), MR2 (the
+/// reader refuses lists again).
+#[test]
+fn g1_t9_the_readers_extension() {
+    let names = ["a".to_owned(), "b".to_owned()];
+    let n = |v: &str| normal_line(&vline(v), &names);
+    assert_eq!(n(r#""é""#), n(r#""é""#));
+    assert_eq!(n(r#""é""#).unwrap(), vline(r#""é""#));
+    assert_eq!(n(r#""a\"b\\c\n\u0001""#).unwrap(), vline(r#""a\"b\\c\n\u0001""#));
+    assert_eq!(n("true").unwrap(), vline("true"));
+    assert_eq!(n("[ [1, 2] , [] ]").unwrap(), vline("[[1,2],[]]"));
+    for bad in ["1.5", "[null]", r#"{"x":1}"#] {
+        let e = n(bad).unwrap_err();
+        assert!(e.contains("invalid in format version 1"), "conformance: G1: {bad}: {e}");
+    }
+    let dir = scratch("g1-t9");
+    let s = file(&dir, "s.jsonl", AB, &[vline(r#""é""#)]);
+    let i = file(&dir, "i.jsonl", AB, &[vline(r#""é""#)]);
+    assert!(matches!(join_ok(&s, &i).verdict, Verdict::Conforms));
+    // the generic writer's lines are normal
+    let cc = small_cc(&["a", "b"], ConsType::FIFO);
+    let p = choice_program(|c| {
+        if c {
+            Note {
+                s: "q\"\\\u{1}é\n".to_owned(),
+                b: true,
+                l: vec![1, 2],
+            }
+        } else {
+            Note {
+                s: String::new(),
+                b: false,
+                l: vec![],
+            }
+        }
+    });
+    let path = dir.join("n.jsonl");
+    let st = export(&cc, move || p(), &header("t9"), &path).expect("conformance: G1: t9");
+    assert_eq!(st.lines, 2);
+    let (_, lines) = read_jsonl(&path);
+    for l in &lines {
+        assert_eq!(normal_line(l, &names).unwrap(), *l, "conformance: G1: normal");
+    }
+    assert!(lines.iter().any(|l| l.contains(r#""q\"\\\u0001é\n""#)), "{lines:?}");
+    assert!(matches!(join_ok(&path, &path).verdict, Verdict::Conforms));
+}
+
+// ---------------------------------------------------------- gates 1, 2 --
+
+fn g1_dir(var: &str, default: &str) -> PathBuf {
+    let d = std::env::var_os(var)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join(default));
+    std::fs::create_dir_all(&d).expect("conformance: G1: a directory");
+    d
+}
+
+/// The export's index, rebuilt by the same `pub(crate)` calls (for the cost).
+fn index_of(p: &Prog, cc: &ConfConfig) -> (SetIndex, ThreadNames) {
+    let mut config = cc.config.clone();
+    config.max_iterations = None;
+    let state = Rc::new(RefCell::new((SetIndex::new(), ThreadNames::new())));
+    let sink: CompletionSink = {
+        let state = Rc::clone(&state);
+        let visible = cc.visible.clone();
+        Box::new(move |g: &ExecutionGraph, _: &crate::must::MustState| {
+            let s = CompactSummary::at_completion(g, &visible, "specification");
+            let mut st = state.borrow_mut();
+            st.0.insert(&s);
+            record_thread_names(g, &mut st.1);
+            SinkVerdict::Continue
+        })
+    };
+    let _ = enumerate(
+        EnumRun {
+            config,
+            visible: cc.visible.clone(),
+            mode: ConfMode::Enumerate,
+            sink,
+            cut: false,
+            stop_at_first_report: false,
+            gate_sink: None,
+            paper_events: false,
+        },
+        p,
+    );
+    let out = std::mem::replace(&mut *state.borrow_mut(), (SetIndex::new(), ThreadNames::new()));
+    out
+}
+
+/// **Gate (1)** (G1-6, all 74; ignored; stage B: the generic path only): each J3
+/// program exported through the generic `export` (to `G1_OUT`) has the bytes of
+/// J3's file of record (`J3_OUT`, read-only) — on the release build, the build
+/// that wrote them (the line order follows the build: `TypeId` in the frozen
+/// `Sig::hash128`); the cost: each export's wall, and the encoding of every
+/// observed value of the index and the write of the text, timed apart. Failing
+/// direction: a scratch `J3_OUT` copy with one byte changed is reported by row.
+#[test]
+#[ignore]
+fn g1_gate1_the_74_generic_exports_are_j3s_bytes() {
+    let gen_dir = g1_dir("G1_OUT", "g1-generic");
+    let record = out_dir();
+    let mut bad = Vec::new();
+    let (mut tg, mut teg, mut tw) = (0f64, 0f64, 0f64);
+    let mut values = 0usize;
+    note!("G1-gate1\trow\tlines\tgraphs\tgeneric_ms\tenc_generic_us\twrite_us\tvalues\tbytes");
+    for row in rows() {
+        let (head, _) = read_jsonl(&golden_dir().join(format!("{}.must.jsonl", row.jmc)));
+        let size = head["size"].as_str().unwrap().to_owned();
+        let (f, p, cc) = program_of(&row);
+        let header = ExportHeader {
+            program: format!("{}:{}", f.name, row.side()),
+            size,
+        };
+        let name = format!("{}.traceforge.jsonl", row.jmc);
+        let (gp, rp) = (gen_dir.join(&name), record.join(&name));
+        let t0 = Instant::now();
+        let gs = ex(&cc, &p, &header, &gp)
+            .unwrap_or_else(|e| panic!("conformance: G1: REFUSED {}: {e}", row.jmc));
+        let wg = t0.elapsed().as_secs_f64() * 1e3;
+        let (gb, rb) = (std::fs::read(&gp).unwrap(), std::fs::read(&rp).unwrap());
+        if gb != rb {
+            bad.push(format!("{}: generic ≠ record", row.jmc));
+        }
+        if gs.lines != gs.orders_held {
+            bad.push(format!("{}: stats {gs:?}", row.jmc));
+        }
+        // the cost, apart: encoding every observed value, and the write
+        let (index, threads) = index_of(&p, &cc);
+        let mut names = cc.visible.clone();
+        names.sort();
+        names.dedup();
+        let mut vals: Vec<&Val> = Vec::new();
+        for (_, sig, _, _) in index.entries() {
+            for n in &names {
+                for o in sig.word(n) {
+                    match o {
+                        Obs::Send(v) | Obs::Recv(Some(v)) => vals.push(v),
+                        Obs::Recv(None) => {}
+                    }
+                }
+            }
+        }
+        let t0 = Instant::now();
+        for v in &vals {
+            let _ = std::hint::black_box(encode_generic(v, &threads).unwrap());
+        }
+        let eg = t0.elapsed().as_secs_f64() * 1e6;
+        let wpath = gen_dir.join("write-probe.tmp");
+        let t0 = Instant::now();
+        std::fs::write(&wpath, &gb).unwrap();
+        let ww = t0.elapsed().as_secs_f64() * 1e6;
+        let _ = std::fs::remove_file(&wpath);
+        note!(
+            "G1-gate1\t{}\t{}\t{}\t{wg:.3}\t{eg:.1}\t{ww:.1}\t{}\t{}",
+            row.jmc,
+            gs.lines,
+            gs.spec_graphs,
+            vals.len(),
+            gb.len()
+        );
+        tg += wg;
+        teg += eg;
+        tw += ww;
+        values += vals.len();
+    }
+    note!(
+        "G1-gate1\tTOTAL\tgeneric {tg:.1} ms\tenc generic {:.3} ms\twrite {:.3} ms\tvalues {values}\tshare generic {:.3}%",
+        teg / 1e3,
+        tw / 1e3,
+        100.0 * (teg + tw) / 1e3 / tg
+    );
+    for b in &bad {
+        note!("G1-gate1\tDIFF\t{b}");
+    }
+    assert!(bad.is_empty(), "conformance: G1: gate (1): {} differences", bad.len());
+}
+
+/// **Gate (2)** (G1-6, all 74; ignored): the generic exports in `G1_OUT` equal
+/// JMC's `.must.jsonl` (`J3_GOLDEN`) as normalised line sets with equal
+/// `visible` (J3's P-EQ); 576 lines in all. Failing direction: a scratch golden
+/// copy with one value changed.
+#[test]
+#[ignore]
+fn g1_gate2_the_generic_exports_equal_jmcs() {
+    let gen_dir = g1_dir("G1_OUT", "g1-generic");
+    let mut bad = Vec::new();
+    let mut total = 0;
+    for row in rows() {
+        let (tv, tset, tn) = normal_set(&gen_dir.join(format!("{}.traceforge.jsonl", row.jmc)));
+        let (gv, gset, gn) = normal_set(&golden_dir().join(format!("{}.must.jsonl", row.jmc)));
+        total += tn;
+        let ok = tv == gv && tset == gset && tn == tset.len() && gn == gset.len();
+        if !ok {
+            bad.push(format!(
+                "{}: visible {tv:?}/{gv:?}, lines {tn}/{gn}, only TF {}, only JMC {}",
+                row.jmc,
+                tset.difference(&gset).count(),
+                gset.difference(&tset).count()
+            ));
+        }
+        note!("G1-gate2\t{}\t{tn}\t{gn}\t{}", row.jmc, if ok { "equal" } else { "DIFFERENT" });
+    }
+    for b in &bad {
+        note!("G1-gate2\tDIFF\t{b}");
+    }
+    assert!(bad.is_empty(), "conformance: G1: gate (2): {} differences", bad.len());
+    assert_eq!(total, 576, "conformance: G1: the 74 exports' lines");
 }

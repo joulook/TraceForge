@@ -6,6 +6,7 @@ pub mod channel;
 // `conformance`'s own "public surface" note for what is exported and why that
 // set.
 pub mod conformance;
+pub mod program;
 mod cons;
 pub mod coverage;
 pub use coverage::{CoverageInfo, ExecutionId};

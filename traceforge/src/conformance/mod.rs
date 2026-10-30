@@ -300,6 +300,10 @@ pub(crate) mod witness;
 //   `JoinError`: the library half of the `conf-join` command, which as a binary
 //   reaches only `pub` items; the report renders itself and gives the exit
 //   code, and its parts stay crate-internal.
+// - **the export of any Must program's summary** (`G1`) — `export`,
+//   `ExportHeader`, `ExportStats`, `ExportError`, `model_name`: the generic
+//   path over the values' derived `Debug` (no per-program encoder), which the
+//   shared main `crate::program` and a program's own `main` call.
 //
 // What is **not** exported, deliberately: `Gate`, `ReportKind`, `Report`,
 // `ConfCtx`, `Search`, `Cover`, `Wobs`, `Obs`, `Status`, `Offer` and every
@@ -345,7 +349,9 @@ pub use report::{
     StatefulCounters, TriageFailure, TriageOutcome, UnavailableKind, VisTrace,
 };
 pub use selector::{InnerOrder, Selector};
-pub use interchange::{conf_join, JoinError, JoinReport};
+pub use interchange::{
+    conf_join, export, model_name, ExportError, ExportHeader, ExportStats, JoinError, JoinReport,
+};
 
 use std::sync::Arc;
 
