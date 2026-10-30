@@ -264,6 +264,9 @@ pub(crate) mod obs;
 pub(crate) mod precheck;
 pub(crate) mod probe;
 pub(crate) mod prober;
+/// `H` H-0.1: one evaluation row's record, run on a program's entry points
+/// (a copy of the test-only `grid.rs`/`eval.rs` record code; `program.rs`'s `row`).
+pub(crate) mod record;
 pub(crate) mod report;
 pub(crate) mod search;
 pub(crate) mod selector;
@@ -486,12 +489,12 @@ pub(crate) mod adversarial;
 mod apparatus_tests;
 /// S7's benchmark: two-phase commit, and what conformance costs. **Test-only**;
 /// the measurements are `#[ignore]`d because they are a table for a human.
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod bench;
 #[cfg(test)]
 mod cfirst_tests;
 /// A guided demonstration of the draft's examples, one at a time. **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod demo;
 /// §11.6's differential harness: the tool against the oracle. **Test-only.**
 #[cfg(test)]
@@ -510,52 +513,54 @@ pub(crate) mod generator;
 /// P4-DIFF's grid (plan §6): the fixture registry, the per-configuration
 /// runner and the table writer (lead); the oracle and the tests are the
 /// tester's `grid_oracle.rs`/`grid_tests.rs`. **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod grid;
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod grid_oracle;
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod grid_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod mixed_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod flat_tests;
 /// P5-HARNESS's evaluation runner (lead) and the tester's fixtures and tests.
 /// **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod eval;
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod eval_tests;
 /// P5-APPS's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod apps_tests;
 /// P5-APPTAB's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod apptab_tests;
 /// P5-CFCFG's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod cfcfg_tests;
 /// P5-XBASE's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod xbase_tests;
 /// COMPACT-INDEX's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod compact_tests;
 /// SVERIFY-P I3's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod sverify_p_tests;
 /// P5-SYNTH's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod synth_tests;
 /// P5-CAMPAIGN's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod campaign_tests;
 /// P5-X5's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod x5_tests;
 /// J3's tests (tester). **Test-only.**
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod interchange_tests;
+#[cfg(test)]
+mod interchange_default_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
 /// truth the differential harness measures the tool against, it is the naive
 /// exponential algorithm the paper's algorithm exists to avoid, and nothing
@@ -564,7 +569,7 @@ mod interchange_tests;
 pub(crate) mod oracle;
 #[cfg(test)]
 mod oracle_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "fixture-tests"))]
 mod paper_examples;
 #[cfg(test)]
 mod refinement_suite;

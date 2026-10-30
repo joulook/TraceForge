@@ -48,6 +48,9 @@ symbolic = ["dep:z3"]
 print_stamps = []
 print_vals = []
 print_vals_custom = []
+# `H` (owner, 1 a): the fixture-based tests and their test-only modules
+# (grid.rs, eval.rs, demo.rs, bench.rs, …), kept in the tree, off by default.
+fixture-tests = []
 
 [[example]]
 name = "symbolic_echo"

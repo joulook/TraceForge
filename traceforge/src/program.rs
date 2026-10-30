@@ -11,6 +11,7 @@
 //! <bin> conf   [--engine stateful|stateless|gated|enumerator] [--threads N]
 //!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
 //! <bin> online …                                    (reserved; not implemented)
+//! <bin> row    --model … --seed N [--threshold N] -- ARGS   (with EVAL_ROW, EVAL_COMMIT)
 //! ```
 //!
 //! `ARGS` are everything after the options (or after `--`), passed verbatim to
@@ -20,12 +21,22 @@
 //! code); `conf` runs [`crate::conformance::verify`] and prints its verdict,
 //! exit 0 when it conforms, 1 when it reports, 2 otherwise (an inconclusive
 //! run or an error). A usage error exits 2.
+//!
+//! `row` (`H`, criteria `H.md` H-0.2) runs one evaluation row: it reads the
+//! row's JSON from `EVAL_ROW` (label, tier, rep, run kind, family, knobs, `k`,
+//! variant, twin key and the row's name, which is copied into the record and
+//! never resolved) and the commit from `EVAL_COMMIT`, runs the row's engine on
+//! the program's entry points built from `ARGS`, and prints `EVALROW\t` and the
+//! schema-8 record (after the split line on an `Explore` row); exit 0 with a
+//! record (also when the engine panicked, `end_class=panicked`), 2 without one.
+//! Only `--model`, `--seed` (required) and `--threshold` are options of `row`.
 
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use crate::conformance::config::IndexKind;
+use crate::conformance::record::{self, Subject};
 use crate::conformance::{self, ConfBuilder, ConfVerdict, Engine, ExportHeader};
 use crate::{Config, ConsType};
 
@@ -73,7 +84,9 @@ const USAGE: &str = "usage: <bin> count spec|impl [options] [ARGS…]\n       \
     <bin> conf [--engine stateful|stateless|gated|enumerator] [--threads N] \
     [--stop-at-first] [--distinct] [options] [ARGS…]\n\
     options: --model fifo|bag|causal, --seed N, --threshold N, --program S, --size S; \
-    `--` ends the options\n";
+    `--` ends the options\n       \
+    <bin> row --model fifo|bag|causal --seed N [--threshold N] -- ARGS   \
+    (EVAL_ROW, EVAL_COMMIT)\n";
 
 /// The options of every subcommand, and the program's own arguments.
 struct Opts {
@@ -162,6 +175,32 @@ fn config_of(o: &Opts) -> Config {
         b = b.with_thread_threshold(t);
     }
     b.build()
+}
+
+/// `row`'s configuration: the model, the seed and the thread threshold and
+/// nothing else, as the evaluation's fixtures built theirs (`H.derived.md`
+/// §2.2).
+fn row_config(o: &Opts, seed: u64) -> Config {
+    let mut b = Config::builder().with_cons_type(o.model).with_seed(seed);
+    if let Some(t) = o.threshold {
+        b = b.with_thread_threshold(t);
+    }
+    b.build()
+}
+
+/// The first option of `args` that `row` does not take, if any; `row`'s
+/// settings come from the row's label.
+fn row_foreign_option(args: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--" => return None,
+            "--model" | "--seed" | "--threshold" => i += 2,
+            a if a.starts_with("--") => return Some(a),
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn builder_of(p: &Program, o: &Opts) -> ConfBuilder {
@@ -288,6 +327,42 @@ fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
             }
         }
         "online" => (format!("{bin}: online: not implemented\n"), 2),
+        "row" => {
+            if let Some(a) = row_foreign_option(&args[1..]) {
+                return fail(format!(
+                    "row takes only --model, --seed and --threshold, not `{a}`"
+                ));
+            }
+            let o = match parse_opts(&args[1..]) {
+                Ok(o) => o,
+                Err(e) => return fail(e),
+            };
+            let Some(seed) = o.seed else {
+                return fail("row needs --seed N".to_string());
+            };
+            let Ok(json) = std::env::var("EVAL_ROW") else {
+                return fail("row needs the row's JSON in EVAL_ROW".to_string());
+            };
+            let commit = std::env::var("EVAL_COMMIT").unwrap_or_default();
+            let config = row_config(&o, seed);
+            let visible = (p.visible)(&o.args);
+            let implementation = (p.imp)(&o.args);
+            let specification = (p.spec)(&o.args);
+            let subject = |name: &str| Subject {
+                name: name.to_string(),
+                config,
+                visible,
+                implementation,
+                specification,
+            };
+            match record::run_row(&json, &commit, subject) {
+                Ok(lines) => (
+                    format!("{}{}", lines.xbase.unwrap_or_default(), lines.record),
+                    0,
+                ),
+                Err(e) => (format!("{bin}: row refused: {e}\n"), 2),
+            }
+        }
         other => fail(format!("unknown subcommand `{other}`")),
     }
 }
