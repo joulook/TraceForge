@@ -62,10 +62,12 @@ pub(crate) struct Subject {
 }
 
 /// What [`run_row`] returns: the `Explore` split line, if the row ran
-/// `Explore`, and the sentinel line with the record; both end in a newline.
+/// `Explore`, and the sentinel line with the record; both end in a newline;
+/// then `B`'s measurement block (K1).
 pub(crate) struct RowLines {
     pub(crate) xbase: Option<String>,
     pub(crate) record: String,
+    pub(crate) measurements: crate::conformance::measure::Measurements,
 }
 
 /// The row of `EVAL_ROW`'s JSON `json` on the subject built from it: the
@@ -109,9 +111,12 @@ pub(crate) fn run_row(
             *v = sys.clone();
         }
     }
+    let measurements =
+        crate::conformance::measure::of_row(&row, &end, spec.config.engine, spec.config.threads);
     Ok(RowLines {
         xbase: xbase_line(&end),
         record: format!("{SENTINEL}{}\n", csv_line(&record_of(&row))),
+        measurements,
     })
 }
 

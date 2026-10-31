@@ -17,7 +17,7 @@ use crate::conformance::config::{ConfBuilder, ConfConfig, Engine, IndexKind};
 use crate::conformance::interchange::{
     conf_join, encode_generic, normal_line, ExportHeader, ThreadNames, Verdict as JoinVerdict,
 };
-use crate::conformance::interchange_default_tests::{named, read_jsonl, scratch};
+use crate::conformance::interchange_default_tests::{named, read_jsonl, scratch, split_block};
 use crate::conformance::morphism::Status;
 use crate::conformance::obs::Obs;
 use crate::conformance::online::{self, End, Mode, OnlineOpts, OnlineOut, OnlineReport};
@@ -41,22 +41,22 @@ macro_rules! note {
 // =========================================================================
 
 #[derive(Clone, Debug, PartialEq)]
-enum M {
+pub(super) enum M {
     Tag(i32),
     Tok,
     Ch(char),
 }
 
 /// The visible threads, sorted.
-const VIS: [&str; 4] = ["alpha", "beta", "reader", "writer"];
+pub(super) const VIS: [&str; 4] = ["alpha", "beta", "reader", "writer"];
 
-fn vis() -> Vec<String> {
+pub(super) fn vis() -> Vec<String> {
     VIS.iter().map(|s| (*s).to_owned()).collect()
 }
 
 /// The specification and the implementation's variants (§4.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Var {
+pub(super) enum Var {
     Spec,
     Fixed,
     Bug,
@@ -69,7 +69,7 @@ enum Var {
     AssertS,
 }
 
-fn var_of(args: &[String]) -> Var {
+pub(super) fn var_of(args: &[String]) -> Var {
     match args.first().map(String::as_str) {
         Some("bug") => Var::Bug,
         Some("ch2") => Var::Ch2,
@@ -86,7 +86,7 @@ fn var_of(args: &[String]) -> Var {
 /// specification's K is FIFO by construction and its relay always forwards;
 /// the implementation's K takes the run's model, its relay has three branches
 /// (c3 forwards early under `bug`), and main draws one unused `nondet()`.
-fn body(var: Var) {
+pub(super) fn body(var: Var) {
     let spec = var == Var::Spec;
     let (tx, rx) = if spec {
         crate::channel::Builder::<M>::new()
@@ -149,31 +149,34 @@ fn body(var: Var) {
     }
 }
 
-type VisFn = Box<dyn Fn(&[String]) -> Vec<String>>;
-type EntryFn = Box<dyn Fn(&[String]) -> Entry>;
+pub(super) type VisFn = Box<dyn Fn(&[String]) -> Vec<String>>;
+pub(super) type EntryFn = Box<dyn Fn(&[String]) -> Entry>;
 
 /// A program's three functions, owned, for `Program`.
-struct Prog {
-    vis: VisFn,
-    spec: EntryFn,
-    imp: EntryFn,
+pub(super) struct Prog {
+    pub(super) vis: VisFn,
+    pub(super) spec: EntryFn,
+    pub(super) imp: EntryFn,
 }
 
 impl Prog {
-    fn program(&self) -> Program<'_> {
+    pub(super) fn program(&self) -> Program<'_> {
         Program {
             visible: &*self.vis,
             spec: &*self.spec,
             imp: &*self.imp,
         }
     }
-    fn cli(&self, args: &[&str]) -> (String, u8) {
+    pub(super) fn cli(&self, args: &[&str]) -> (String, u8) {
         let a: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
-        run_cli(&self.program(), &a)
+        // `B` (MEAS-0): `run_cli`'s text ends with the measurement block; C's
+        // tests compare the subcommand's own text, before the block.
+        let (text, code) = run_cli(&self.program(), &a);
+        (split_block(&text).0, code)
     }
 }
 
-fn o_prog() -> Prog {
+pub(super) fn o_prog() -> Prog {
     Prog {
         vis: Box::new(|_| vis()),
         spec: Box::new(|_| Arc::new(|| body(Var::Spec))),
@@ -184,18 +187,18 @@ fn o_prog() -> Prog {
     }
 }
 
-fn imp_of(var: Var) -> Arc<dyn Fn() + Send + Sync> {
+pub(super) fn imp_of(var: Var) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || body(var))
 }
 
-fn model_arg(m: ConsType) -> &'static str {
+pub(super) fn model_arg(m: ConsType) -> &'static str {
     match m {
         ConsType::Bag => "bag",
         _ => "fifo",
     }
 }
 
-fn variant_arg(var: Var) -> &'static str {
+pub(super) fn variant_arg(var: Var) -> &'static str {
     match var {
         Var::Spec | Var::Fixed => "fixed",
         Var::Bug => "bug",
@@ -208,7 +211,7 @@ fn variant_arg(var: Var) -> &'static str {
 }
 
 /// `config_of`'s configuration with `--model m --seed 0`.
-fn cfg(m: ConsType) -> Config {
+pub(super) fn cfg(m: ConsType) -> Config {
     Config::builder()
         .with_cons_type(m)
         .with_verbose(0)
@@ -220,7 +223,7 @@ fn cfg(m: ConsType) -> Config {
 // The independent references (derivation §4.4)
 // =========================================================================
 
-fn ref_cc(m: ConsType, stop: bool) -> ConfConfig {
+pub(super) fn ref_cc(m: ConsType, stop: bool) -> ConfConfig {
     ConfBuilder::new()
         .config(cfg(m))
         .cons_type(m)
@@ -234,31 +237,31 @@ fn ref_cc(m: ConsType, stop: bool) -> ConfConfig {
 
 /// The offline stateful run on the same pair, keeping every implementation
 /// graph (`stop` off) or stopping at the first report (`stop` on).
-fn reference(var: Var, m: ConsType, stop: bool) -> StatefulOutcome {
+pub(super) fn reference(var: Var, m: ConsType, stop: bool) -> StatefulOutcome {
     let spec: Arc<dyn Fn() + Send + Sync> = Arc::new(|| body(Var::Spec));
     stateful::run_with(&ref_cc(m, stop), &imp_of(var), &spec, !stop)
 }
 
 /// A graph's features, read from its typed summary (§4.4's κ).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-struct Kappa {
+pub(super) struct Kappa {
     /// The `Debug` of `writer`'s second value: `Tag(2)`, `Tag(3)`, `Ch('x')`.
-    second: String,
-    swapped: bool,
-    early: bool,
-    err: bool,
+    pub(super) second: String,
+    pub(super) swapped: bool,
+    pub(super) early: bool,
+    pub(super) err: bool,
     /// `beta` received `Tag(0)` (assert-s's c2).
-    c2: bool,
+    pub(super) c2: bool,
 }
 
-fn dbg_of(o: &Obs) -> String {
+pub(super) fn dbg_of(o: &Obs) -> String {
     match o {
         Obs::Send(v) | Obs::Recv(Some(v)) => format!("{:?}", &*v.val),
         Obs::Recv(None) => "⊥".to_owned(),
     }
 }
 
-fn kappa(g: &ExecutionGraph) -> Kappa {
+pub(super) fn kappa(g: &ExecutionGraph) -> Kappa {
     let cs = CompactSummary::at_completion(g, &vis(), "implementation");
     let w = cs.sig.word("writer");
     let r = cs.sig.word("reader");
@@ -276,7 +279,7 @@ fn kappa(g: &ExecutionGraph) -> Kappa {
     }
 }
 
-fn v_of(k: &Kappa) -> i32 {
+pub(super) fn v_of(k: &Kappa) -> i32 {
     match k.second.as_str() {
         "Tag(2)" => 2,
         "Tag(3)" => 3,
@@ -285,7 +288,7 @@ fn v_of(k: &Kappa) -> i32 {
 }
 
 /// The hand line L(V, π, β, ρ) (derivation §4.2).
-fn hand_line(v: i32, swapped: bool, early: bool, err: bool) -> String {
+pub(super) fn hand_line(v: i32, swapped: bool, early: bool, err: bool) -> String {
     let tag = |x: i32| format!(r#"{{"t":"Tag","f":[{x}]}}"#);
     let (r1, r2) = if swapped { (v, 1) } else { (1, v) };
     format!(
@@ -305,14 +308,14 @@ fn hand_line(v: i32, swapped: bool, early: bool, err: bool) -> String {
     )
 }
 
-fn line_k(k: &Kappa) -> String {
+pub(super) fn line_k(k: &Kappa) -> String {
     hand_line(v_of(k), k.swapped, k.early, k.err)
 }
 
 /// A graph's class against the specification lines `held` (values of V whose
 /// line L(V,ok,c,done) is in the file): 'F' found, 'S' signature miss, 'X'
 /// not found.
-fn class_of(k: &Kappa, held: &[i32]) -> char {
+pub(super) fn class_of(k: &Kappa, held: &[i32]) -> char {
     let v = v_of(k);
     if k.swapped || k.err || !held.contains(&v) {
         'S'
@@ -325,16 +328,16 @@ fn class_of(k: &Kappa, held: &[i32]) -> char {
 
 /// F, S, X, U, D and the distinct lines over the first `n` kept graphs.
 #[derive(Debug, PartialEq, Eq)]
-struct Counts {
-    f: usize,
-    s: usize,
-    x: usize,
-    u: usize,
-    d: usize,
-    lines: BTreeSet<String>,
+pub(super) struct Counts {
+    pub(super) f: usize,
+    pub(super) s: usize,
+    pub(super) x: usize,
+    pub(super) u: usize,
+    pub(super) d: usize,
+    pub(super) lines: BTreeSet<String>,
 }
 
-fn counts_over(ks: &[Kappa], held: &[i32]) -> Counts {
+pub(super) fn counts_over(ks: &[Kappa], held: &[i32]) -> Counts {
     let mut c = Counts {
         f: 0,
         s: 0,
@@ -364,7 +367,7 @@ fn counts_over(ks: &[Kappa], held: &[i32]) -> Counts {
     c
 }
 
-fn kept_kappas(var: Var, m: ConsType) -> Vec<Kappa> {
+pub(super) fn kept_kappas(var: Var, m: ConsType) -> Vec<Kappa> {
     reference(var, m, false)
         .kept_impl_graphs
         .iter()
@@ -373,7 +376,7 @@ fn kept_kappas(var: Var, m: ConsType) -> Vec<Kappa> {
 }
 
 /// The first miss by the offline engine: its iteration and its graph's κ.
-fn first_report(var: Var, m: ConsType) -> (usize, Kappa) {
+pub(super) fn first_report(var: Var, m: ConsType) -> (usize, Kappa) {
     let o = reference(var, m, true);
     assert_eq!(o.counters.reports, 1, "conformance: C: the reference stops at one report");
     (o.counters.impl_graphs, kappa(&o.reports[0].0))
@@ -397,7 +400,7 @@ const LABELS: [&str; 9] = [
 
 /// The specification file S (derivation §5): `export spec` through the shared
 /// main.
-fn spec_file(p: &Prog, dir: &Path) -> PathBuf {
+pub(super) fn spec_file(p: &Prog, dir: &Path) -> PathBuf {
     let s = dir.join("S.jsonl");
     let ss = s.to_string_lossy().into_owned();
     assert_eq!(
@@ -411,7 +414,7 @@ fn spec_file(p: &Prog, dir: &Path) -> PathBuf {
     s
 }
 
-fn spec_head(path: &Path, lines: usize) -> String {
+pub(super) fn spec_head(path: &Path, lines: usize) -> String {
     format!(
         "spec:       {} (program o, size k1, model p2p, tool traceforge; {lines} lines, {lines} \
          distinct summaries held, 0 duplicates)\n",
@@ -420,7 +423,7 @@ fn spec_head(path: &Path, lines: usize) -> String {
 }
 
 /// `online` through `run_cli` with `--seed 0`; `extra` before `--model`.
-fn run_online(p: &Prog, s: &Path, extra: &[&str], m: ConsType, var: Var) -> (String, u8) {
+pub(super) fn run_online(p: &Prog, s: &Path, extra: &[&str], m: ConsType, var: Var) -> (String, u8) {
     let ss = s.to_string_lossy().into_owned();
     let mut a: Vec<&str> = vec!["online", "--spec", ss.as_str()];
     a.extend_from_slice(extra);
@@ -429,7 +432,7 @@ fn run_online(p: &Prog, s: &Path, extra: &[&str], m: ConsType, var: Var) -> (Str
 }
 
 /// `(I, T)` from a `first miss:` line.
-fn first_miss_of(text: &str) -> Option<(usize, u64)> {
+pub(super) fn first_miss_of(text: &str) -> Option<(usize, u64)> {
     let l = text.lines().find(|l| l.starts_with("first miss: "))?;
     let rest = l.strip_prefix("first miss: iteration ")?;
     let (i, t) = rest.split_once(", ")?;
@@ -437,7 +440,7 @@ fn first_miss_of(text: &str) -> Option<(usize, u64)> {
     Some((i.parse().ok()?, t.parse().ok()?))
 }
 
-fn witness_of(text: &str) -> Option<String> {
+pub(super) fn witness_of(text: &str) -> Option<String> {
     text.lines()
         .find_map(|l| l.strip_prefix("witness:    "))
         .map(str::to_owned)

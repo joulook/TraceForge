@@ -546,6 +546,35 @@ pub struct ExportStats {
     pub orders_held: usize,
     /// The specification's explored graphs.
     pub spec_graphs: usize,
+    /// `B` (MEAS-1 K2): the run's executions, its phases in milliseconds
+    /// (`explore_ms` = the run's wall − `summarise_ms`; `export_ms` = encode +
+    /// write), the completion classes and the shape counters.
+    pub(crate) executions: usize,
+    pub(crate) explore_ms: u128,
+    pub(crate) summarise_ms: u128,
+    pub(crate) export_ms: u128,
+    pub(crate) graphs_complete: usize,
+    pub(crate) graphs_blocked: usize,
+    pub(crate) shape: crate::conformance::measure::Shape,
+}
+
+/// `B`'s test seams for [`export_with`] (MEAS-2); inert outside tests.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExportSeams {
+    /// Sleep this long inside the export phase (encode + write).
+    #[cfg(test)]
+    pub(crate) export_delay: Option<std::time::Duration>,
+}
+
+/// `B`'s test seams for [`conf_join_with`] (MEAS-2); inert outside tests.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct JoinSeams {
+    /// Sleep this long inside the index phase.
+    #[cfg(test)]
+    pub(crate) index_delay: Option<std::time::Duration>,
+    /// Sleep this long inside the lookup phase.
+    #[cfg(test)]
+    pub(crate) lookup_delay: Option<std::time::Duration>,
 }
 
 /// Why an export was refused; no file is written (X4).
@@ -670,6 +699,23 @@ pub fn export<P>(
 where
     P: Fn() + Send + Sync + 'static,
 {
+    export_with(cc, program, header, path, ExportSeams::default())
+}
+
+/// [`export`] with `B`'s test seams.
+pub(crate) fn export_with<P>(
+    cc: &ConfConfig,
+    program: P,
+    header: &ExportHeader,
+    path: &Path,
+    seams: ExportSeams,
+) -> Result<ExportStats, ExportError>
+where
+    P: Fn() + Send + Sync + 'static,
+{
+    use crate::conformance::measure::Shape;
+    use std::time::{Duration, Instant};
+    let _ = &seams;
     if cc.index != IndexKind::Set {
         return Err(ExportError::NotSet);
     }
@@ -679,18 +725,38 @@ where
     let mut config = cc.config.clone();
     config.max_iterations = None;
     let state = Rc::new(RefCell::new((SetIndex::new(), ThreadNames::new(), 0usize)));
+    // `B` (MEAS-1 K2): the summarise phase, the completion classes, the shape.
+    let probe = Rc::new(RefCell::new((
+        Duration::ZERO,
+        0usize,
+        0usize,
+        Shape::default(),
+    )));
     let sink: CompletionSink = {
         let state = Rc::clone(&state);
+        let probe = Rc::clone(&probe);
         let visible = cc.visible.clone();
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
+            let (events, messages) = Shape::graph_counts(g);
+            let blocked = g.check_blocked().is_some();
+            let t = Instant::now();
             let s = CompactSummary::at_completion(g, &visible, "specification");
             let mut st = state.borrow_mut();
             st.0.insert(&s);
             record_thread_names(g, &mut st.1);
             st.2 += 1;
+            let mut pr = probe.borrow_mut();
+            pr.0 += t.elapsed();
+            if blocked {
+                pr.2 += 1;
+            } else {
+                pr.1 += 1;
+            }
+            pr.3.add_graph_counts(events, messages);
             SinkVerdict::Continue
         })
     };
+    let run_started = Instant::now();
     let run = stateful::enumerate(
         stateful::EnumRun {
             config,
@@ -704,6 +770,7 @@ where
         },
         &program,
     );
+    let run_wall = run_started.elapsed();
     let errors = run.visible_errors.len()
         + run
             .diagnostics
@@ -718,6 +785,8 @@ where
     }
     let st = state.borrow();
     let (index, threads, graphs) = (&st.0, &st.1, st.2);
+    let (summarise, complete, blocked, mut shape) = probe.borrow().clone();
+    let export_started = Instant::now();
     let mut text = header_line(header, &names, model);
     text.push('\n');
     let mut seen = HashSet::new();
@@ -727,15 +796,31 @@ where
         if !seen.insert(line.clone()) {
             return Err(ExportError::Collision { line });
         }
+        let (v, b, m, p) = Shape::summary_counts(sig, ord, &names, line.len());
+        shape.add_summary_counts(v, b, m, p);
         text.push_str(&line);
         text.push('\n');
         lines += 1;
     }
+    // The export seam sits just before the write, so a timer that stops before
+    // the write would miss it (B's gate-3 finding).
+    #[cfg(test)]
+    if let Some(d) = seams.export_delay {
+        std::thread::sleep(d);
+    }
     write_replacing(path, &text)?;
+    let export_ms = export_started.elapsed().as_millis();
     Ok(ExportStats {
         lines,
         orders_held: index.stats().entries,
         spec_graphs: graphs,
+        executions: run.executions,
+        explore_ms: run_wall.saturating_sub(summarise).as_millis(),
+        summarise_ms: summarise.as_millis(),
+        export_ms,
+        graphs_complete: complete,
+        graphs_blocked: blocked,
+        shape,
     })
 }
 
@@ -816,6 +901,15 @@ pub struct JoinReport {
     pub(crate) verdict: Verdict,
     /// The uncovered implementation lines, normalised, in the file's order.
     pub(crate) uncovered: Vec<(MissClass, String)>,
+    /// `B` (MEAS-1 K3): the specification's read + inserts, the `covers`
+    /// loop, the whole call, in milliseconds; the two files' line counts; the
+    /// shape counters over the implementation's lines.
+    pub(crate) index_ms: u128,
+    pub(crate) lookup_ms: u128,
+    pub(crate) join_ms: u128,
+    pub(crate) spec_lines: usize,
+    pub(crate) impl_lines: usize,
+    pub(crate) shape: crate::conformance::measure::Shape,
 }
 
 impl JoinReport {
@@ -1124,7 +1218,21 @@ pub(crate) fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
 /// `visible` lists, a specification whose `enumeration` is not `complete`.
 /// `model` is printed, never compared (ruling Q3).
 pub fn conf_join(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
+    conf_join_with(spec, imp, JoinSeams::default())
+}
+
+/// [`conf_join`] with `B`'s test seams.
+pub(crate) fn conf_join_with(
+    spec: &Path,
+    imp: &Path,
+    seams: JoinSeams,
+) -> Result<JoinReport, JoinError> {
+    use std::time::{Duration, Instant};
+    let _ = &seams;
+    let join_started = Instant::now();
+    let t = Instant::now();
     let s = read_file(spec)?;
+    let mut index_wall: Duration = t.elapsed();
     let i = read_file(imp)?;
     if s.head.enumeration != Enumeration::Complete {
         return Err(JoinError(format!(
@@ -1139,9 +1247,20 @@ pub fn conf_join(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
             s.head.visible, i.head.visible
         )));
     }
+    let t = Instant::now();
+    #[cfg(test)]
+    if let Some(d) = seams.index_delay {
+        std::thread::sleep(d);
+    }
     let mut index = SetIndex::new();
     for (_, _, summary) in &s.lines {
         index.insert(summary);
+    }
+    index_wall += t.elapsed();
+    let t = Instant::now();
+    #[cfg(test)]
+    if let Some(d) = seams.lookup_delay {
+        std::thread::sleep(d);
     }
     let mut uncovered = Vec::new();
     for (_, key, summary) in &i.lines {
@@ -1153,6 +1272,18 @@ pub fn conf_join(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
         };
         uncovered.push((class, key.clone()));
     }
+    let lookup_wall = t.elapsed();
+    let mut shape = crate::conformance::measure::Shape::default();
+    let names = sorted_names(&i.head.visible);
+    for (_, key, summary) in &i.lines {
+        let (v, b, m, p) = crate::conformance::measure::Shape::summary_counts(
+            &summary.sig,
+            &summary.ord,
+            &names,
+            key.len(),
+        );
+        shape.add_summary_counts(v, b, m, p);
+    }
     let verdict = if !uncovered.is_empty() {
         Verdict::Violation
     } else if i.head.enumeration == Enumeration::Sampled {
@@ -1161,9 +1292,15 @@ pub fn conf_join(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
         Verdict::Conforms
     };
     Ok(JoinReport {
+        spec_lines: s.lines.len(),
+        impl_lines: i.lines.len(),
         spec: s.head,
         imp: i.head,
         verdict,
         uncovered,
+        index_ms: index_wall.as_millis(),
+        lookup_ms: lookup_wall.as_millis(),
+        join_ms: join_started.elapsed().as_millis(),
+        shape,
     })
 }

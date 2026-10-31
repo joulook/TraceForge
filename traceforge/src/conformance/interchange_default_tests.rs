@@ -110,6 +110,19 @@ pub(super) fn ab_line(ab: u32) -> String {
         r#"{{"statuses":{{"a":"done","b":"done"}},"words":{{"a":[{{"s":{{"t":"Acq","f":[0]}}}}],"b":[{{"r":{{"t":"Acq","f":[0]}}}}]}},"counts":[0,{ab}]}}"#
     )
 }
+/// `B` (MEAS-0): `run_cli`'s text split at the measurement block's marker
+/// line (`--- measurements` at a line start): the subcommand's own text, and
+/// the block from its marker to the end, if there is one.
+pub(super) fn split_block(text: &str) -> (String, Option<String>) {
+    const MARKER: &str = "--- measurements\n";
+    if text.starts_with(MARKER) {
+        return (String::new(), Some(text.to_owned()));
+    }
+    match text.find(&format!("\n{MARKER}")) {
+        Some(i) => (text[..=i].to_owned(), Some(text[i + 1..].to_owned())),
+        None => (text.to_owned(), None),
+    }
+}
 pub(super) fn join_ok(spec: &Path, imp: &Path) -> JoinReport {
     conf_join(spec, imp).unwrap_or_else(|e| panic!("conformance: J3: refused: {e}"))
 }
@@ -1008,7 +1021,10 @@ fn pc(k: usize, fifo_by_construction: bool) {
 }
 fn cli(p: &Program, args: &[&str]) -> (String, u8) {
     let a: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
-    run_cli(p, &a)
+    // `B` (MEAS-0): `run_cli`'s text ends with the measurement block; these
+    // tests compare the subcommand's own text, before it.
+    let (text, code) = run_cli(p, &a);
+    (split_block(&text).0, code)
 }
 /// **G-T7** (G1-5): the shared main through `run_cli` on the template's
 /// program. Failing directions: MU17 (the program's arguments not passed),
@@ -1555,6 +1571,8 @@ fn h_f_generic_engine_gating() {
         };
         for side in ["spec", "impl"] {
             let (out, code) = run_cli(&p, &["count".to_owned(), side.to_owned()]);
+            // `B`: the text before the measurement block.
+            let out = split_block(&out).0;
             assert_eq!(code, 0, "conformance: H: F: count {side}");
             let want = format!(
                 "execs={} blocked={}\n",

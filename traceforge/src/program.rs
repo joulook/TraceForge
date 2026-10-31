@@ -37,6 +37,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use crate::conformance::config::IndexKind;
+use crate::conformance::interchange::{self, ExportError};
+use crate::conformance::measure;
 use crate::conformance::online::{self, Mode, OnlineOpts, OnlineOut};
 use crate::conformance::record::{self, Subject};
 use crate::conformance::{self, ConfBuilder, ConfVerdict, Engine, ExportHeader};
@@ -66,19 +68,25 @@ pub fn main(p: Program) -> ExitCode {
         .and_then(|n| n.to_str())
         .unwrap_or("program")
         .to_string();
-    let (out, code) = run_named(&p, &bin, args.get(1..).unwrap_or(&[]));
+    let mut block = String::new();
+    let (out, code) = run_named(&p, &bin, args.get(1..).unwrap_or(&[]), &mut block);
     if code == 2 {
         eprint!("{out}");
     } else {
         print!("{out}");
     }
+    // `B` (MEAS-0.2): the measurement block, after the run's own output, on
+    // stdout whatever the exit code.
+    print!("{block}");
     ExitCode::from(code)
 }
 
 /// The same as [`main`] on given arguments (without the binary's name), for
 /// tests: the text it would print and the exit code.
 pub fn run_cli(p: &Program, args: &[String]) -> (String, u8) {
-    run_named(p, "program", args)
+    let mut block = String::new();
+    let (out, code) = run_named(p, "program", args, &mut block);
+    (format!("{out}{block}"), code)
 }
 
 const USAGE: &str = "usage: <bin> count spec|impl [options] [ARGS…]\n       \
@@ -241,7 +249,13 @@ fn side_entry(p: &Program, side: Option<&String>, args: &[String]) -> Result<Ent
     }
 }
 
-fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
+/// The subcommand's own text and exit code; `block` receives `B`'s
+/// measurement block when the subcommand ran (empty after a refusal before any
+/// run).
+fn run_named(p: &Program, bin: &str, args: &[String], block: &mut String) -> (String, u8) {
+    // `B` (MEAS-1): a block's `wall_ms` runs from here (the start of `main`'s
+    // work) to the block.
+    let started = std::time::Instant::now();
     let fail = |msg: String| (format!("{bin}: {msg}\n{USAGE}"), 2u8);
     let Some(cmd) = args.first() else {
         return fail("no subcommand".to_string());
@@ -261,7 +275,16 @@ fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
             // specification-side row (G3).
             let mut config = config_of(&o);
             config.keep_going_after_error = true;
+            let side = if args[1] == "spec" {
+                measure::Side::Spec
+            } else {
+                measure::Side::Impl
+            };
+            let explore_started = std::time::Instant::now();
             let stats = crate::verify(config, move || f());
+            let explore_ms = explore_started.elapsed().as_millis();
+            *block =
+                measure::of_count(&stats, side, explore_ms, started.elapsed().as_millis()).render();
             (
                 format!("execs={} blocked={}\n", stats.execs, stats.block),
                 0,
@@ -294,7 +317,23 @@ fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
                     .unwrap_or_else(|| format!("{bin}:{}", args[1])),
                 size: o.size.clone().unwrap_or_else(|| o.args.join(",")),
             };
-            match conformance::export(&cc, move || f(), &header, Path::new(&out)) {
+            let side = if args[1] == "spec" {
+                measure::Side::Spec
+            } else {
+                measure::Side::Impl
+            };
+            let r = interchange::export_with(
+                &cc,
+                move || f(),
+                &header,
+                Path::new(&out),
+                interchange::ExportSeams::default(),
+            );
+            // A refusal before the run (`NotSet`, `Model`) prints no block.
+            if !matches!(r, Err(ExportError::NotSet) | Err(ExportError::Model(_))) {
+                *block = measure::of_export(&r, side, started.elapsed().as_millis()).render();
+            }
+            match r {
                 Ok(s) => (
                     format!(
                         "exported: {} lines from {} graphs to {out}\n",
@@ -337,7 +376,17 @@ fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
             };
             let imp = (p.imp)(&o.args);
             let spec = (p.spec)(&o.args);
-            match conformance::verify(cc, move || imp(), move || spec()) {
+            let r = conformance::verify(cc, move || imp(), move || spec());
+            // `B` (MEAS-1 K6): the block from the outcome; the process wall and
+            // `VmHWM` are this side's.
+            let mut m = measure::of_verdict(&r);
+            m.n("wall_ms", started.elapsed().as_millis());
+            m.set(
+                "peak_rss_kb",
+                measure::opt(measure::peak_rss_kb().map(u128::from)),
+            );
+            *block = m.render();
+            match r {
                 Ok(v) => {
                     let code = match v {
                         ConfVerdict::Conforms(_) => 0,
@@ -396,7 +445,10 @@ fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
                 Path::new(&spec),
                 OnlineOpts::new(mode, o.budget, out),
             ) {
-                Ok(r) => (r.render(), r.exit_code()),
+                Ok(r) => {
+                    *block = measure::of_online(&r, started.elapsed().as_millis()).render();
+                    (r.render(), r.exit_code())
+                }
                 Err(e) => fail(format!("online refused: {e}")),
             }
         }
@@ -429,10 +481,13 @@ fn run_named(p: &Program, bin: &str, args: &[String]) -> (String, u8) {
                 specification,
             };
             match record::run_row(&json, &commit, subject) {
-                Ok(lines) => (
-                    format!("{}{}", lines.xbase.unwrap_or_default(), lines.record),
-                    0,
-                ),
+                Ok(lines) => {
+                    *block = lines.measurements.render();
+                    (
+                        format!("{}{}", lines.xbase.unwrap_or_default(), lines.record),
+                        0,
+                    )
+                }
                 Err(e) => (format!("{bin}: row refused: {e}\n"), 2),
             }
         }

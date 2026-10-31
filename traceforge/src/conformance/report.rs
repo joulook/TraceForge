@@ -3176,3 +3176,40 @@ impl crate::conformance::online::OnlineReport {
         out
     }
 }
+
+// ---------------------------------------------------------------------------
+// `B`: the rendering of the measurement block (`measure.rs`), JMC's form
+// (`MpLauncher.java`): the marker, then `key: value` lines; a mean with three
+// decimals; an unmeasured value empty.
+// ---------------------------------------------------------------------------
+
+impl crate::conformance::measure::Measurements {
+    /// The block, from its marker to its last line, each line ending in a newline.
+    pub(crate) fn render(&self) -> String {
+        use crate::conformance::measure::Cell;
+        use std::fmt::Write as _;
+        let mut out = String::from("--- measurements\n");
+        for (k, v) in self.ordered() {
+            let _ = match v {
+                Cell::N(n) => writeln!(out, "{k}: {n}"),
+                Cell::Mean(x) => writeln!(out, "{k}: {x:.3}"),
+                Cell::Empty => writeln!(out, "{k}: "),
+                Cell::Word(w) => writeln!(out, "{k}: {w}"),
+            };
+        }
+        out
+    }
+}
+
+impl interchange::JoinReport {
+    /// `B` (MEAS-1 K3): `conf-join`'s measurement block, `wall_ms` the
+    /// caller's (the process from `main` to the block).
+    pub fn measurements(&self, wall_ms: u128) -> String {
+        crate::conformance::measure::of_join(Some(self), wall_ms).render()
+    }
+
+    /// `B` (MEAS-0.2): the block after a refused file, `stop_reason: error`.
+    pub fn refused_measurements(wall_ms: u128) -> String {
+        crate::conformance::measure::of_join(None, wall_ms).render()
+    }
+}

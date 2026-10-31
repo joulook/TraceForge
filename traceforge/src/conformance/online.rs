@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::conformance::compact::{CompactSummary, Covers, SetIndex};
 use crate::conformance::ctx::{CompletionSink, ConfMode, DiagnosticReason, SinkVerdict};
@@ -29,6 +29,7 @@ use crate::conformance::interchange::{
     encode_generic, json_string, line_of, model_name, parse_line, read_file, record_thread_names,
     sorted_names, write_replacing, Enumeration, ExportHeader, FileHead, ThreadNames,
 };
+use crate::conformance::measure::Shape;
 use crate::conformance::report::SearchEnd;
 use crate::conformance::stateful;
 use crate::event::Event;
@@ -102,6 +103,16 @@ pub(crate) struct OnlineOpts {
     /// Test seam (M3): sleep this long in the indexing phase, before the clock.
     #[cfg(test)]
     pub(crate) index_delay: Option<std::time::Duration>,
+    /// `B` test seam (MEAS-2): sleep this long in each completion's summarise
+    /// phase.
+    #[cfg(test)]
+    pub(crate) summarise_delay: Option<Duration>,
+    /// `B` test seam (MEAS-2): sleep this long in each completion's lookup.
+    #[cfg(test)]
+    pub(crate) lookup_delay: Option<Duration>,
+    /// `B` test seam (MEAS-2): sleep this long in the `--out` write.
+    #[cfg(test)]
+    pub(crate) export_delay: Option<Duration>,
 }
 
 impl OnlineOpts {
@@ -114,6 +125,12 @@ impl OnlineOpts {
             fault_at: None,
             #[cfg(test)]
             index_delay: None,
+            #[cfg(test)]
+            summarise_delay: None,
+            #[cfg(test)]
+            lookup_delay: None,
+            #[cfg(test)]
+            export_delay: None,
         }
     }
 }
@@ -144,6 +161,22 @@ pub(crate) struct OnlineReport {
     pub(crate) failure: Option<String>,
     /// The `--out` file written, if any, and its line count.
     pub(crate) out_written: Option<(String, usize)>,
+    /// `B` (MEAS-1 K4): the phases, each the floor of its summed durations in
+    /// milliseconds; `explore_ms` = `enumerate`'s wall − summarise − lookup.
+    pub(crate) index_ms: u128,
+    pub(crate) explore_ms: u128,
+    pub(crate) summarise_ms: u128,
+    pub(crate) lookup_ms: u128,
+    pub(crate) export_ms: u128,
+    /// `enumerate`'s wall, in milliseconds.
+    pub(crate) enumerate_ms: u128,
+    /// The completions, by Must's rule (`check_blocked`).
+    pub(crate) graphs_complete: usize,
+    pub(crate) graphs_blocked: usize,
+    /// The distinct implementation lines (kept on every run, MEAS M2).
+    pub(crate) impl_lines: usize,
+    /// The shape counters over the completions and their summaries.
+    pub(crate) shape: Shape,
 }
 
 impl OnlineReport {
@@ -197,8 +230,28 @@ struct State {
     uncovered: HashSet<String>,
     first: Option<FirstMiss>,
     failure: Option<String>,
-    /// Every distinct implementation line, kept only with `--out`.
+    /// Every distinct implementation line: kept on every run (`B`, MEAS-1 K4,
+    /// for `summaries_distinct`), and written by `--out`.
     lines: Option<HashSet<String>>,
+    /// `B`: the summed phases, the completion classes, the shape counters.
+    summarise: Duration,
+    lookup: Duration,
+    complete: usize,
+    blocked: usize,
+    shape: Shape,
+}
+
+/// `B`: what one completion measured, computed without the lock (step (2)) and
+/// folded in by the locked update (step (3)).
+struct Probe {
+    blocked: bool,
+    events: u128,
+    messages: u128,
+    /// The summary's visible events, line bytes, largest and non-zero order
+    /// counts; `None` when the completion was not summarised (a failure).
+    summary: Option<(u128, u128, u128, u128)>,
+    summarise: Duration,
+    lookup: Duration,
 }
 
 /// One completion's result, computed without the lock, with the line's copy
@@ -228,7 +281,26 @@ impl State {
     /// counter increments, at most one insertion into each set, at most one
     /// first-miss assignment, a recorded failure; every value made in step (2)
     /// (`criteria/ONLINE.md` ONLINE-0.1, round 03 M1).
-    fn commit(&mut self, step: Step, iteration: usize, mode: Mode) -> SinkVerdict {
+    fn commit(
+        &mut self,
+        (step, probe): (Step, Probe),
+        iteration: usize,
+        mode: Mode,
+    ) -> SinkVerdict {
+        if probe.blocked {
+            self.blocked += 1;
+        } else {
+            self.complete += 1;
+        }
+        // MEAS-1 K4: the shape counters run over the summarised graphs only; a
+        // completion that failed (an assertion, a refused value) is counted in
+        // `graphs_*` but not in the shape (the tester's gate-3 finding).
+        if let Some((visible, bytes, max, pairs)) = probe.summary {
+            self.shape.add_graph_counts(probe.events, probe.messages);
+            self.shape.add_summary_counts(visible, bytes, max, pairs);
+        }
+        self.summarise += probe.summarise;
+        self.lookup += probe.lookup;
         match step {
             Step::Failed(msg) => {
                 self.failure = Some(msg);
@@ -288,32 +360,80 @@ fn step_of(
     index: &SetIndex,
     keep_lines: bool,
     started: Instant,
-) -> Step {
+    seams: &Seams,
+) -> (Step, Probe) {
+    let (events, messages) = Shape::graph_counts(g);
+    let mut probe = Probe {
+        blocked: g.check_blocked().is_some(),
+        events,
+        messages,
+        summary: None,
+        summarise: Duration::ZERO,
+        lookup: Duration::ZERO,
+    };
     if let Some(msg) = failed_assertion(g) {
-        return Step::Failed(msg);
+        return (Step::Failed(msg), probe);
     }
+    let t = Instant::now();
+    seams.summarise();
     let cs = CompactSummary::at_completion(g, visible, "implementation");
     record_thread_names(g, threads);
     let threads: &ThreadNames = threads;
     let text = match line_of(&cs.sig, &cs.ord, names, &|v| encode_generic(v, threads)) {
         Ok(t) => t,
-        Err(e) => return Step::Failed(e.to_string()),
+        Err(e) => {
+            probe.summarise = t.elapsed();
+            return (Step::Failed(e.to_string()), probe);
+        }
     };
     let (line, decoded) = parse_line(&text, names).unwrap_or_else(|e| {
         panic!("conformance: online: an encoded line does not parse back ({e}): {text}")
     });
+    probe.summarise = t.elapsed();
+    probe.summary = Some(Shape::summary_counts(&cs.sig, &cs.ord, names, line.len()));
     let out = keep_lines.then(|| line.clone());
-    let kind = match index.covers(&decoded).1 {
-        Covers::Found(_) => return Step::Found { out },
+    let t = Instant::now();
+    seams.lookup();
+    let answer = index.covers(&decoded).1;
+    probe.lookup = t.elapsed();
+    let kind = match answer {
+        Covers::Found(_) => return (Step::Found { out }, probe),
         Covers::NoBucket | Covers::NoSig => MissKind::NoSig,
         Covers::NotFound => MissKind::NotFound,
     };
-    Step::Miss {
+    let step = Step::Miss {
         first: line.clone(),
         uncovered: line,
         out,
         kind,
         wall_ms: started.elapsed().as_millis() as u64,
+    };
+    (step, probe)
+}
+
+/// `B`'s per-completion test seams, copied out of [`OnlineOpts`] for the
+/// worker; inert outside tests.
+#[derive(Clone, Copy, Default)]
+struct Seams {
+    #[cfg(test)]
+    summarise: Option<Duration>,
+    #[cfg(test)]
+    lookup: Option<Duration>,
+}
+
+impl Seams {
+    fn summarise(&self) {
+        #[cfg(test)]
+        if let Some(d) = self.summarise {
+            std::thread::sleep(d);
+        }
+    }
+
+    fn lookup(&self) {
+        #[cfg(test)]
+        if let Some(d) = self.lookup {
+            std::thread::sleep(d);
+        }
     }
 }
 
@@ -397,6 +517,8 @@ pub(crate) fn online(
     opts: OnlineOpts,
 ) -> Result<OnlineReport, OnlineError> {
     let names = sorted_names(visible);
+    // `B` (MEAS-1 K4): `index_ms` is the file read and the inserts.
+    let index_started = Instant::now();
     let file = read_file(spec_path).map_err(|e| OnlineError::Spec(e.0))?;
     if file.head.enumeration != Enumeration::Complete {
         return Err(OnlineError::NotComplete {
@@ -416,26 +538,38 @@ pub(crate) fn online(
         }
         None => None,
     };
+    // The index seam sits between the file read and the inserts (inside the
+    // indexing phase, before the clock), so a timer started after the read or
+    // after the inserts would miss it (B's gate-3 finding).
+    #[cfg(test)]
+    if let Some(d) = opts.index_delay {
+        std::thread::sleep(d);
+    }
     let mut index = SetIndex::new();
     for (_, _, summary) in &file.lines {
         index.insert(summary);
     }
     let held = index.stats().entries;
-    #[cfg(test)]
-    if let Some(d) = opts.index_delay {
-        std::thread::sleep(d);
-    }
+    let index_ms = index_started.elapsed().as_millis();
 
+    // `B`: the distinct implementation lines are kept on every run.
     let state = Arc::new(Mutex::new(State {
-        lines: opts.out.as_ref().map(|_| HashSet::new()),
+        lines: Some(HashSet::new()),
         ..State::default()
     }));
     let mut run_config = config.clone();
     run_config.max_iterations = opts.budget;
     let mode = opts.mode;
-    let keep_lines = opts.out.is_some();
+    let keep_lines = true;
     #[cfg(test)]
     let fault_at = opts.fault_at;
+    let seams = Seams {
+        #[cfg(test)]
+        summarise: opts.summarise_delay,
+        #[cfg(test)]
+        lookup: opts.lookup_delay,
+    };
+    let spawned = Instant::now();
     let worker = {
         let state = Arc::clone(&state);
         let visible = visible.to_vec();
@@ -464,6 +598,7 @@ pub(crate) fn online(
                         &index,
                         keep_lines,
                         started,
+                        &seams,
                     );
                     // (3) one locked update that cannot unwind.
                     lock(&sink_state).commit(step, iteration, mode)
@@ -481,21 +616,27 @@ pub(crate) fn online(
                     },
                     &imp,
                 );
+                let enumerate_wall = started.elapsed();
                 let errors = run.visible_errors.len()
                     + run
                         .diagnostics
                         .iter()
                         .filter(|d| d.reason == DiagnosticReason::InvisibleThread)
                         .count();
-                (run.end, errors)
+                (run.end, errors, enumerate_wall)
             })
             .expect("conformance: online: could not spawn the run thread")
     };
     let joined = worker.join();
     let mut st = lock(&state);
+    // On a panic the worker's clock is lost; the spawn-to-join wall stands in.
+    let enumerate_wall = match &joined {
+        Ok((_, _, w)) => *w,
+        Err(_) => spawned.elapsed(),
+    };
     let (end, failure) = match joined {
         Err(payload) => (End::Failed, Some(panic_text(payload))),
-        Ok((search_end, errors)) => {
+        Ok((search_end, errors, _)) => {
             if let Some(msg) = st.failure.take() {
                 (End::Failed, Some(msg))
             } else if errors > 0 {
@@ -536,6 +677,19 @@ pub(crate) fn online(
         end,
         failure,
         out_written: None,
+        index_ms,
+        explore_ms: enumerate_wall
+            .saturating_sub(st.summarise)
+            .saturating_sub(st.lookup)
+            .as_millis(),
+        summarise_ms: st.summarise.as_millis(),
+        lookup_ms: st.lookup.as_millis(),
+        export_ms: 0,
+        enumerate_ms: enumerate_wall.as_millis(),
+        graphs_complete: st.complete,
+        graphs_blocked: st.blocked,
+        impl_lines: st.lines.as_ref().map_or(0, HashSet::len),
+        shape: st.shape.clone(),
     };
     if let (Some(out), Some(model)) = (opts.out, model) {
         let enumeration = match report.end {
@@ -557,7 +711,15 @@ pub(crate) fn online(
             text.push_str(l);
             text.push('\n');
         }
-        match write_replacing(&out.path, &text) {
+        // `B` (MEAS-1 K4): `export_ms` is the write.
+        let export_started = Instant::now();
+        #[cfg(test)]
+        if let Some(d) = opts.export_delay {
+            std::thread::sleep(d);
+        }
+        let written = write_replacing(&out.path, &text);
+        report.export_ms = export_started.elapsed().as_millis();
+        match written {
             Ok(()) => report.out_written = Some((out.path.display().to_string(), lines.len())),
             Err(e) => {
                 report.end = End::Failed;
