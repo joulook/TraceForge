@@ -569,6 +569,8 @@ mod interchange_default_tests;
 mod online_tests;
 #[cfg(test)]
 mod meas_tests;
+#[cfg(test)]
+mod model_default_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
 /// truth the differential harness measures the tool against, it is the naive
 /// exponential algorithm the paper's algorithm exists to avoid, and nothing

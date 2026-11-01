@@ -12,7 +12,7 @@
 //!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
 //! <bin> online --spec FILE [--stop-at-first] [--out FILE [--program S] [--size S]]
 //!              [--budget N] [--model …] [ARGS…]
-//! <bin> row    --model … --seed N [--threshold N] -- ARGS   (with EVAL_ROW, EVAL_COMMIT)
+//! <bin> row    [--model …] --seed N [--threshold N] -- ARGS   (with EVAL_ROW, EVAL_COMMIT)
 //! ```
 //!
 //! `ARGS` are everything after the options (or after `--`), passed verbatim to
@@ -31,6 +31,10 @@
 //! schema-8 record (after the split line on an `Explore` row); exit 0 with a
 //! record (also when the engine panicked, `end_class=panicked`), 2 without one.
 //! Only `--model`, `--seed` (required) and `--threshold` are options of `row`.
+//!
+//! **The default model** (`MODEL-DEFAULT`): without `--model`, a run uses the
+//! program's own default, declared through [`main_with_model`]; [`main`] declares
+//! `fifo`. So leaving out `--model` never changes the meaning of a benchmark.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -61,6 +65,12 @@ pub struct Program<'a> {
 /// The program's `main`: reads `std::env::args`, runs the subcommand, prints
 /// its output (on stderr when it exits 2) and returns its exit code.
 pub fn main(p: Program) -> ExitCode {
+    main_with_model(p, ConsType::FIFO)
+}
+
+/// [`main`] for a program whose default model is `default_model`: the one its
+/// README names, used when a run leaves out `--model`.
+pub fn main_with_model(p: Program, default_model: ConsType) -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let bin = args
         .first()
@@ -69,7 +79,8 @@ pub fn main(p: Program) -> ExitCode {
         .unwrap_or("program")
         .to_string();
     let mut block = String::new();
-    let (out, code) = run_named(&p, &bin, args.get(1..).unwrap_or(&[]), &mut block);
+    let rest = args.get(1..).unwrap_or(&[]);
+    let (out, code) = run_named(&p, &bin, rest, default_model, &mut block);
     if code == 2 {
         eprint!("{out}");
     } else {
@@ -84,8 +95,13 @@ pub fn main(p: Program) -> ExitCode {
 /// The same as [`main`] on given arguments (without the binary's name), for
 /// tests: the text it would print and the exit code.
 pub fn run_cli(p: &Program, args: &[String]) -> (String, u8) {
+    run_cli_with_model(p, ConsType::FIFO, args)
+}
+
+/// [`run_cli`] for a program whose default model is `default_model`.
+pub fn run_cli_with_model(p: &Program, default_model: ConsType, args: &[String]) -> (String, u8) {
     let mut block = String::new();
-    let (out, code) = run_named(p, "program", args, &mut block);
+    let (out, code) = run_named(p, "program", args, default_model, &mut block);
     (format!("{out}{block}"), code)
 }
 
@@ -93,9 +109,10 @@ const USAGE: &str = "usage: <bin> count spec|impl [options] [ARGS…]\n       \
     <bin> export spec|impl --out FILE [options] [ARGS…]\n       \
     <bin> conf [--engine stateful|stateless|gated|enumerator] [--threads N] \
     [--stop-at-first] [--distinct] [options] [ARGS…]\n\
-    options: --model fifo|bag|causal, --seed N, --threshold N, --program S, --size S; \
+    options: --model fifo|bag|causal (default: the program's), --seed N, --threshold N, \
+    --program S, --size S; \
     `--` ends the options\n       \
-    <bin> row --model fifo|bag|causal --seed N [--threshold N] -- ARGS   \
+    <bin> row [--model fifo|bag|causal] --seed N [--threshold N] -- ARGS   \
     (EVAL_ROW, EVAL_COMMIT)\n       \
     <bin> online --spec FILE [--stop-at-first] [--out FILE [--program S] [--size S]] \
     [--budget N] [--model …] [--seed N] [--threshold N] [ARGS…]\n";
@@ -117,9 +134,9 @@ struct Opts {
     args: Vec<String>,
 }
 
-fn parse_opts(args: &[String]) -> Result<Opts, String> {
+fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> {
     let mut o = Opts {
-        model: ConsType::FIFO,
+        model: default_model,
         seed: None,
         threshold: None,
         engine: "stateful".to_string(),
@@ -252,7 +269,13 @@ fn side_entry(p: &Program, side: Option<&String>, args: &[String]) -> Result<Ent
 /// The subcommand's own text and exit code; `block` receives `B`'s
 /// measurement block when the subcommand ran (empty after a refusal before any
 /// run).
-fn run_named(p: &Program, bin: &str, args: &[String], block: &mut String) -> (String, u8) {
+fn run_named(
+    p: &Program,
+    bin: &str,
+    args: &[String],
+    default_model: ConsType,
+    block: &mut String,
+) -> (String, u8) {
     // `B` (MEAS-1): a block's `wall_ms` runs from here (the start of `main`'s
     // work) to the block.
     let started = std::time::Instant::now();
@@ -262,7 +285,7 @@ fn run_named(p: &Program, bin: &str, args: &[String], block: &mut String) -> (St
     };
     match cmd.as_str() {
         "count" => {
-            let o = match parse_opts(&args[2.min(args.len())..]) {
+            let o = match parse_opts(&args[2.min(args.len())..], default_model) {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
@@ -291,7 +314,7 @@ fn run_named(p: &Program, bin: &str, args: &[String], block: &mut String) -> (St
             )
         }
         "export" => {
-            let o = match parse_opts(&args[2.min(args.len())..]) {
+            let o = match parse_opts(&args[2.min(args.len())..], default_model) {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
@@ -345,7 +368,7 @@ fn run_named(p: &Program, bin: &str, args: &[String], block: &mut String) -> (St
             }
         }
         "conf" => {
-            let o = match parse_opts(&args[1..]) {
+            let o = match parse_opts(&args[1..], default_model) {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
@@ -412,7 +435,7 @@ fn run_named(p: &Program, bin: &str, args: &[String], block: &mut String) -> (St
             if let Some(a) = foreign_option(&args[1..], &valued, &["--stop-at-first"]) {
                 return fail(format!("online does not take `{a}`"));
             }
-            let o = match parse_opts(&args[1..]) {
+            let o = match parse_opts(&args[1..], default_model) {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
@@ -458,7 +481,7 @@ fn run_named(p: &Program, bin: &str, args: &[String], block: &mut String) -> (St
                     "row takes only --model, --seed and --threshold, not `{a}`"
                 ));
             }
-            let o = match parse_opts(&args[1..]) {
+            let o = match parse_opts(&args[1..], default_model) {
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
