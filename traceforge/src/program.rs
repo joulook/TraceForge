@@ -12,7 +12,7 @@
 //!              [ARGS…]
 //! <bin> conf   [--engine stateful|stateless|gated|enumerator] [--threads N]
 //!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
-//! <bin> online --spec FILE [--stop-at-first] [--out FILE [--program S] [--size S]]
+//! <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]]
 //!              [--budget N] [--model …] [ARGS…]
 //! <bin> row    [--model …] --seed N [--threshold N] -- ARGS   (with EVAL_ROW, EVAL_COMMIT)
 //! ```
@@ -49,6 +49,7 @@ use crate::conformance::export_p;
 use crate::conformance::interchange::{self, ExportError};
 use crate::conformance::measure;
 use crate::conformance::online::{self, Mode, OnlineOpts, OnlineOut};
+use crate::conformance::online_p;
 use crate::conformance::record::{self, Subject};
 use crate::conformance::{self, ConfBuilder, ConfVerdict, Engine, ExportHeader};
 use crate::{Config, ConsType};
@@ -119,7 +120,7 @@ const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS�
     `--` ends the options\n       \
     <bin> row [--model fifo|bag|causal] --seed N [--threshold N] -- ARGS   \
     (EVAL_ROW, EVAL_COMMIT)\n       \
-    <bin> online --spec FILE [--stop-at-first] [--out FILE [--program S] [--size S]] \
+    <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]] \
     [--budget N] [--model …] [--seed N] [--threshold N] [ARGS…]\n";
 
 /// The options of every subcommand, and the program's own arguments.
@@ -448,6 +449,7 @@ fn run_named(
         }
         "online" => {
             let valued = [
+                "--threads",
                 "--spec",
                 "--out",
                 "--program",
@@ -467,6 +469,13 @@ fn run_named(
             let Some(spec) = o.spec.clone() else {
                 return fail("online needs --spec FILE".to_string());
             };
+            if o.threads > 1 && (o.stop_at_first || o.budget.is_some()) {
+                return fail(
+                    "online above one thread is full mode and unbounded: it does not take \
+                     --stop-at-first or --budget"
+                        .to_string(),
+                );
+            }
             if o.out.is_none() && (o.program.is_some() || o.size.is_some()) {
                 return fail(
                     "--program and --size name the --out file's implementation".to_string(),
@@ -486,13 +495,25 @@ fn run_named(
             });
             let visible = (p.visible)(&o.args);
             let imp = (p.imp)(&o.args);
-            match online::online(
-                &config_of(&o),
-                &visible,
-                imp,
-                Path::new(&spec),
-                OnlineOpts::new(mode, o.budget, out),
-            ) {
+            let r = if o.threads > 1 {
+                online_p::online_partitioned(
+                    &config_of(&o),
+                    o.threads,
+                    &visible,
+                    imp,
+                    Path::new(&spec),
+                    out,
+                )
+            } else {
+                online::online(
+                    &config_of(&o),
+                    &visible,
+                    imp,
+                    Path::new(&spec),
+                    OnlineOpts::new(mode, o.budget, out),
+                )
+            };
+            match r {
                 Ok(r) => {
                     *block = measure::of_online(&r, started.elapsed().as_millis()).render();
                     (r.render(), r.exit_code())

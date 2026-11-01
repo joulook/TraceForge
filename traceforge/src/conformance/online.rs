@@ -67,7 +67,8 @@ pub(crate) enum MissKind {
 /// The first uncovered graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FirstMiss {
-    /// 1-based, counting every completion (blocked ones included).
+    /// 1-based, counting every completion (blocked ones included); 0 on the
+    /// partitioned path, which has no one order of completions.
     pub(crate) iteration: usize,
     /// Since the clock started (after the index was built).
     pub(crate) wall_ms: u64,
@@ -177,6 +178,8 @@ pub(crate) struct OnlineReport {
     pub(crate) impl_lines: usize,
     /// The shape counters over the completions and their summaries.
     pub(crate) shape: Shape,
+    /// `PAR-ONLINE`: the partitioned path, whose `first_miss_iteration` is empty.
+    pub(crate) parallel: bool,
 }
 
 impl OnlineReport {
@@ -445,7 +448,7 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
 /// The first `Block(Assert)` that is its thread's last paper event (the last
 /// label, or the one before a trailing `End`), on any thread: the label the
 /// engine installs at a failed assertion.
-fn failed_assertion(g: &ExecutionGraph) -> Option<String> {
+pub(crate) fn failed_assertion(g: &ExecutionGraph) -> Option<String> {
     for t in g.thread_ids() {
         let mut n = g.thread_size(t);
         if n == 0 {
@@ -466,7 +469,7 @@ fn failed_assertion(g: &ExecutionGraph) -> Option<String> {
 }
 
 /// The panic payload's text.
-fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_owned()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -479,7 +482,7 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 /// The `--out` header: the export's, with the run's `enumeration` and the
 /// three online fields after it (JMC's `SummaryExporter.OnlineFields`; 0 for
 /// none).
-fn out_header(
+pub(crate) fn out_header(
     h: &ExportHeader,
     names: &[String],
     model: &str,
@@ -690,6 +693,7 @@ pub(crate) fn online(
         graphs_blocked: st.blocked,
         impl_lines: st.lines.as_ref().map_or(0, HashSet::len),
         shape: st.shape.clone(),
+        parallel: false,
     };
     if let (Some(out), Some(model)) = (opts.out, model) {
         let enumeration = match report.end {

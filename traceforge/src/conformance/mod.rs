@@ -264,6 +264,7 @@ pub(crate) mod morphism;
 pub(crate) mod obs;
 /// `C`: the online check, two exploration modes (`criteria/ONLINE.md`).
 pub(crate) mod online;
+pub(crate) mod online_p;
 /// `B`: the measurement block (`criteria/MEAS.md`).
 pub(crate) mod measure;
 pub(crate) mod precheck;
@@ -576,6 +577,8 @@ mod model_default_tests;
 mod export_p_tests;
 #[cfg(test)]
 mod meas_keys_tests;
+#[cfg(test)]
+mod online_p_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
 /// truth the differential harness measures the tool against, it is the naive
 /// exponential algorithm the paper's algorithm exists to avoid, and nothing

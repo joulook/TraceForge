@@ -3149,7 +3149,11 @@ impl crate::conformance::online::OnlineReport {
         };
         let _ = writeln!(out, "mode:       {mode}");
         if let Some(m) = &self.first {
-            let _ = writeln!(out, "first miss: iteration {}, {} ms", m.iteration, m.wall_ms);
+            if self.parallel {
+                let _ = writeln!(out, "first miss: {} ms", m.wall_ms);
+            } else {
+                let _ = writeln!(out, "first miss: iteration {}, {} ms", m.iteration, m.wall_ms);
+            }
         }
         let _ = writeln!(
             out,
@@ -3164,7 +3168,11 @@ impl crate::conformance::online::OnlineReport {
                     "NotFound (the signature is held, no order is <= the query's)"
                 }
             };
-            let _ = writeln!(out, "at:         iteration {}, {answer}", m.iteration);
+            if self.parallel {
+                let _ = writeln!(out, "at:         {answer}");
+            } else {
+                let _ = writeln!(out, "at:         iteration {}, {answer}", m.iteration);
+            }
         }
         if self.end == End::Failed {
             let _ = writeln!(

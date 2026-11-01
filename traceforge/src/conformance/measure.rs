@@ -688,7 +688,11 @@ pub(crate) fn of_online(
         .first
         .as_ref()
         .map_or((0, 0), |f| (f.iteration as u128, u128::from(f.wall_ms)));
-    m.n("first_miss_iteration", iteration);
+    if r.parallel {
+        m.set("first_miss_iteration", Cell::Empty);
+    } else {
+        m.n("first_miss_iteration", iteration);
+    }
     m.n("first_miss_wall_ms", wall);
     m.n("uncovered_total", r.uncovered_total as u128);
     r.shape.fill(&mut m, true, true);

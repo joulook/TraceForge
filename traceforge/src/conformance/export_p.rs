@@ -176,7 +176,7 @@ fn line_of_graph(
 /// The header, then the lines in the order given, each dropped as it is
 /// written, to `<path>.tmp`, renamed into place: the path holds its earlier
 /// content or the whole export, and no `.tmp` stays behind (X4).
-fn write_lines<I>(path: &Path, header: &str, lines: I) -> Result<(), ExportError>
+pub(crate) fn write_lines<I>(path: &Path, header: &str, lines: I) -> Result<(), ExportError>
 where
     I: Iterator<Item = String>,
 {
