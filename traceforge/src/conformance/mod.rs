@@ -258,6 +258,7 @@ pub(crate) mod ctx;
 pub(crate) mod diagnose;
 pub(crate) mod flat;
 pub(crate) mod gated;
+pub(crate) mod export_p;
 pub(crate) mod interchange;
 pub(crate) mod morphism;
 pub(crate) mod obs;
@@ -571,6 +572,8 @@ mod online_tests;
 mod meas_tests;
 #[cfg(test)]
 mod model_default_tests;
+#[cfg(test)]
+mod export_p_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
 /// truth the differential harness measures the tool against, it is the naive
 /// exponential algorithm the paper's algorithm exists to avoid, and nothing

@@ -542,7 +542,8 @@ pub struct ExportHeader {
 pub struct ExportStats {
     /// The summary lines written (the header not counted).
     pub lines: usize,
-    /// The index's held orders, which `lines` equals (X1).
+    /// The distinct summaries held: the index's orders, which `lines` equals
+    /// (X1); on the partitioned path, where the line is the identity, the lines.
     pub orders_held: usize,
     /// The specification's explored graphs.
     pub spec_graphs: usize,
@@ -620,7 +621,7 @@ pub fn model_name(c: ConsType) -> Result<&'static str, ExportError> {
     }
 }
 
-fn header_line(h: &ExportHeader, names: &[String], model: &str) -> String {
+pub(crate) fn header_line(h: &ExportHeader, names: &[String], model: &str) -> String {
     let visible: Vec<String> = names.iter().map(|n| json_string(n)).collect();
     format!(
         "{{\"format\":1,\"tool\":\"traceforge\",\"program\":{},\"size\":{},\"visible\":[{}],\

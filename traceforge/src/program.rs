@@ -8,7 +8,8 @@
 //! ```text
 //! <bin> count  spec|impl [--threads N] [--model fifo|bag|causal] [--seed N] [--threshold N]
 //!              [ARGS…]
-//! <bin> export spec|impl --out FILE [--model …] [--program S] [--size S] [ARGS…]
+//! <bin> export spec|impl --out FILE [--threads N] [--model …] [--program S] [--size S]
+//!              [ARGS…]
 //! <bin> conf   [--engine stateful|stateless|gated|enumerator] [--threads N]
 //!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
 //! <bin> online --spec FILE [--stop-at-first] [--out FILE [--program S] [--size S]]
@@ -21,7 +22,8 @@
 //! way. `count` prints `execs=<c> blocked=<b>`, on the partitioned Must when
 //! `--threads` is above 1; `export` writes the summary file
 //! through [`crate::conformance::export`] (the generic encoder: no per-program
-//! code); `conf` runs [`crate::conformance::verify`] and prints its verdict,
+//! code), on the partitioned Must with its lines sorted when `--threads` is
+//! above 1; `conf` runs [`crate::conformance::verify`] and prints its verdict,
 //! exit 0 when it conforms, 1 when it reports, 2 otherwise (an inconclusive
 //! run or an error). A usage error exits 2.
 //!
@@ -43,6 +45,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use crate::conformance::config::IndexKind;
+use crate::conformance::export_p;
 use crate::conformance::interchange::{self, ExportError};
 use crate::conformance::measure;
 use crate::conformance::online::{self, Mode, OnlineOpts, OnlineOut};
@@ -108,7 +111,7 @@ pub fn run_cli_with_model(p: &Program, default_model: ConsType, args: &[String])
 }
 
 const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS…]\n       \
-    <bin> export spec|impl --out FILE [options] [ARGS…]\n       \
+    <bin> export spec|impl --out FILE [--threads N] [options] [ARGS…]\n       \
     <bin> conf [--engine stateful|stateless|gated|enumerator] [--threads N] \
     [--stop-at-first] [--distinct] [options] [ARGS…]\n\
     options: --model fifo|bag|causal (default: the program's), --seed N, --threshold N, \
@@ -337,8 +340,14 @@ fn run_named(
             let Some(out) = o.out.clone() else {
                 return fail("export needs --out FILE".to_string());
             };
+            let engine = if o.threads > 1 {
+                Engine::SverifyP
+            } else {
+                Engine::Stateful
+            };
             let cc = match builder_of(p, &o)
-                .engine(Engine::Stateful)
+                .engine(engine)
+                .threads(o.threads)
                 .index(IndexKind::Set)
                 .build()
             {
@@ -357,13 +366,17 @@ fn run_named(
             } else {
                 measure::Side::Impl
             };
-            let r = interchange::export_with(
-                &cc,
-                move || f(),
-                &header,
-                Path::new(&out),
-                interchange::ExportSeams::default(),
-            );
+            let r = if o.threads > 1 {
+                export_p::export_partitioned(&cc, move || f(), &header, Path::new(&out))
+            } else {
+                interchange::export_with(
+                    &cc,
+                    move || f(),
+                    &header,
+                    Path::new(&out),
+                    interchange::ExportSeams::default(),
+                )
+            };
             // A refusal before the run (`NotSet`, `Model`) prints no block.
             if !matches!(r, Err(ExportError::NotSet) | Err(ExportError::Model(_))) {
                 *block = measure::of_export(&r, side, started.elapsed().as_millis()).render();

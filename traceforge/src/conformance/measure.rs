@@ -255,6 +255,20 @@ impl Shape {
         self.max_porf_pairs = self.max_porf_pairs.max(pairs);
     }
 
+    /// Another shape's counters into this one, as if counted here.
+    pub(crate) fn merge(&mut self, o: &Shape) {
+        self.graphs += o.graphs;
+        self.sum_graph_events += o.sum_graph_events;
+        self.max_graph_events = self.max_graph_events.max(o.max_graph_events);
+        self.max_message_events = self.max_message_events.max(o.max_message_events);
+        self.summaries += o.summaries;
+        self.sum_visible_events += o.sum_visible_events;
+        self.max_visible_events = self.max_visible_events.max(o.max_visible_events);
+        self.max_summary_bytes = self.max_summary_bytes.max(o.max_summary_bytes);
+        self.max_porf_count = self.max_porf_count.max(o.max_porf_count);
+        self.max_porf_pairs = self.max_porf_pairs.max(o.max_porf_pairs);
+    }
+
     pub(crate) fn add_graph(&mut self, g: &ExecutionGraph) {
         let (e, m) = Self::graph_counts(g);
         self.add_graph_counts(e, m);
