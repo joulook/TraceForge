@@ -21,7 +21,7 @@ use crate::exec_graph::ExecutionGraph;
 
 /// The block's keys, in order (MEAS-0.1). The three specification keys are
 /// printed only by runs with a specification.
-pub(crate) const KEYS: [&str; 37] = [
+pub(crate) const KEYS: [&str; 41] = [
     "wall_ms",
     "explore_ms",
     "summarise_ms",
@@ -59,6 +59,10 @@ pub(crate) const KEYS: [&str; 37] = [
     "precheck_ms",
     "merge_ms",
     "uncovered_distinct",
+    "spec_graphs_explored",
+    "sweeps",
+    "cache_tests",
+    "cache_hits",
 ];
 
 /// The specification keys (MEAS-0.1).
@@ -458,6 +462,13 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
     m.set("impl_summaries", distinct);
     if matches!(engine, GridEngine::Stateful | GridEngine::SverifyP) {
         m.set("spec_summaries", num(row, "orders_held"));
+        m.set("spec_graphs_explored", num(row, "spec_graphs"));
+    }
+    if matches!(engine, GridEngine::CompleteFirst | GridEngine::CFirstP) {
+        m.set("spec_graphs_explored", num(row, "sweep_graphs"));
+        m.set("sweeps", num(row, "sweeps"));
+        m.set("cache_tests", num(row, "cache_tests"));
+        m.set("cache_hits", num(row, "cache_hits"));
     }
     let counts_graphs = matches!(
         engine,
@@ -529,6 +540,15 @@ fn row_stop(row: &Row, panicked: bool) -> Stop {
 
 // ------------------------------------------------------------------- K6 --
 
+/// The stateless engines' specification side: every sweep's graphs, repeats
+/// counted, and what the cache saved.
+fn sweep_keys(m: &mut Measurements, c: &crate::conformance::report::CFirstCounters) {
+    m.n("spec_graphs_explored", c.sweep_graphs as u128);
+    m.n("sweeps", c.sweeps as u128);
+    m.n("cache_tests", c.cache_tests as u128);
+    m.n("cache_hits", c.cache_hits as u128);
+}
+
 /// K6 (`conf`), and K1's `Verdict` route: the block from the `ConfOutcome`
 /// (MEAS-1 K6's table). `wall_ms` and `peak_rss_kb` are the caller's.
 pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
@@ -559,6 +579,7 @@ pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
                 m.set("impl_summaries", d);
                 m.n("spec_summaries", c.orders_held as u128);
                 m.set("first_miss_wall_ms", first(c.wall_ms_at_first_report));
+                m.n("spec_graphs_explored", c.spec_graphs as u128);
             }
             m.n("uncovered_total", o.report_count as u128);
             m.zero(&["precheck_ms", "merge_ms"]);
@@ -578,6 +599,7 @@ pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
                 m.set("impl_summaries", d);
                 m.n("spec_summaries", c.orders_held as u128);
                 m.set("first_miss_wall_ms", first(c.wall_ms_at_first_report));
+                m.n("spec_graphs_explored", c.spec_graphs as u128);
             }
             m.n("uncovered_total", o.report_count as u128);
             m.n("precheck_ms", 0);
@@ -591,6 +613,7 @@ pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
                 );
                 m.set("first_miss_wall_ms", first(c.wall_ms_at_first_report));
                 m.n("precheck_ms", c.precheck_wall_time_ms);
+                sweep_keys(&mut m, c);
             }
             m.n("uncovered_total", o.report_count as u128);
             m.n("merge_ms", 0);
@@ -611,6 +634,7 @@ pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
                 m.n("uncovered_total", p.uncovered_multiplicity as u128);
                 m.set("first_miss_wall_ms", first(c.wall_ms_at_first_report));
                 m.n("precheck_ms", c.precheck_wall_time_ms);
+                sweep_keys(&mut m, c);
             }
         }
         Engine::Gated => {

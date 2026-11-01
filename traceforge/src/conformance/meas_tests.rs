@@ -43,7 +43,7 @@ macro_rules! note {
 const MARKER: &str = "--- measurements";
 
 /// MEAS-0.1's keys, in order.
-const KEYS: [&str; 37] = [
+const KEYS: [&str; 41] = [
     "wall_ms",
     "explore_ms",
     "summarise_ms",
@@ -81,6 +81,10 @@ const KEYS: [&str; 37] = [
     "precheck_ms",
     "merge_ms",
     "uncovered_distinct",
+    "spec_graphs_explored",
+    "sweeps",
+    "cache_tests",
+    "cache_hits",
 ];
 
 /// Printed only on runs with a specification.
