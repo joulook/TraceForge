@@ -6,7 +6,8 @@
 //! program:
 //!
 //! ```text
-//! <bin> count  spec|impl [--model fifo|bag|causal] [--seed N] [--threshold N] [ARGS…]
+//! <bin> count  spec|impl [--threads N] [--model fifo|bag|causal] [--seed N] [--threshold N]
+//!              [ARGS…]
 //! <bin> export spec|impl --out FILE [--model …] [--program S] [--size S] [ARGS…]
 //! <bin> conf   [--engine stateful|stateless|gated|enumerator] [--threads N]
 //!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
@@ -17,7 +18,8 @@
 //!
 //! `ARGS` are everything after the options (or after `--`), passed verbatim to
 //! the program's entry points: a program's size and variant reach it only this
-//! way. `count` prints `execs=<c> blocked=<b>`; `export` writes the summary file
+//! way. `count` prints `execs=<c> blocked=<b>`, on the partitioned Must when
+//! `--threads` is above 1; `export` writes the summary file
 //! through [`crate::conformance::export`] (the generic encoder: no per-program
 //! code); `conf` runs [`crate::conformance::verify`] and prints its verdict,
 //! exit 0 when it conforms, 1 when it reports, 2 otherwise (an inconclusive
@@ -105,7 +107,7 @@ pub fn run_cli_with_model(p: &Program, default_model: ConsType, args: &[String])
     (format!("{out}{block}"), code)
 }
 
-const USAGE: &str = "usage: <bin> count spec|impl [options] [ARGS…]\n       \
+const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS…]\n       \
     <bin> export spec|impl --out FILE [options] [ARGS…]\n       \
     <bin> conf [--engine stateful|stateless|gated|enumerator] [--threads N] \
     [--stop-at-first] [--distinct] [options] [ARGS…]\n\
@@ -218,6 +220,20 @@ fn config_of(o: &Opts) -> Config {
     b.build()
 }
 
+/// `count`'s configuration. Plain Must explores past an assertion failure, as
+/// the plain-Must baseline (`Explore`) does, so `count spec` is the sequential
+/// specification-side row (G3); above one thread it is the partitioned Must, at
+/// the runner's default warmup, split and batch sizes, as the T3c `ExploreP` rows.
+fn count_config(o: &Opts) -> Config {
+    let mut config = config_of(o);
+    config.keep_going_after_error = true;
+    if o.threads > 1 {
+        config.partitioned_parallelization = true;
+        config.partitioned_num_threads = Some(o.threads);
+    }
+    config
+}
+
 /// `row`'s configuration: the model, the seed and the thread threshold and
 /// nothing else, as the evaluation's fixtures built theirs (`H.derived.md`
 /// §2.2).
@@ -293,11 +309,7 @@ fn run_named(
                 Ok(f) => f,
                 Err(e) => return fail(e),
             };
-            // Plain Must explores past an assertion failure, as the plain-Must
-            // baseline (`Explore`) does, so `count spec` is the sequential
-            // specification-side row (G3).
-            let mut config = config_of(&o);
-            config.keep_going_after_error = true;
+            let config = count_config(&o);
             let side = if args[1] == "spec" {
                 measure::Side::Spec
             } else {
@@ -517,3 +529,7 @@ fn run_named(
         other => fail(format!("unknown subcommand `{other}`")),
     }
 }
+
+#[cfg(test)]
+#[path = "program_count_tests.rs"]
+mod count_tests;
