@@ -1582,11 +1582,13 @@ fn index_of(p: &Prog, cc: &ConfConfig) -> (SetIndex, ThreadNames) {
 
 /// **Gate (1)** (G1-6, all 74; ignored; stage B: the generic path only): each J3
 /// program exported through the generic `export` (to `G1_OUT`) has the bytes of
-/// J3's file of record (`J3_OUT`, read-only) — on the release build, the build
-/// that wrote them (the line order follows the build: `TypeId` in the frozen
-/// `Sig::hash128`); the cost: each export's wall, and the encoding of every
-/// observed value of the index and the write of the text, timed apart. Failing
-/// direction: a scratch `J3_OUT` copy with one byte changed is reported by row.
+/// J3's file of record (`J3_OUT`, read-only) with its body in byte order: the
+/// record's header bytes, then its lines sorted. `SORTED-JOIN`: the records keep
+/// the order they were written in, and `export` now writes byte order, on any
+/// build; the record is a past gate's evidence and isn't rewritten. The cost:
+/// each export's wall, and the encoding of every observed value of the index and
+/// the write of the text, timed apart. Failing direction: a scratch `J3_OUT` copy
+/// with one byte changed is reported by row.
 #[test]
 #[ignore]
 fn g1_gate1_the_74_generic_exports_are_j3s_bytes() {
@@ -1611,8 +1613,14 @@ fn g1_gate1_the_74_generic_exports_are_j3s_bytes() {
             .unwrap_or_else(|e| panic!("conformance: G1: REFUSED {}: {e}", row.jmc));
         let wg = t0.elapsed().as_secs_f64() * 1e3;
         let (gb, rb) = (std::fs::read(&gp).unwrap(), std::fs::read(&rp).unwrap());
-        if gb != rb {
-            bad.push(format!("{}: generic ≠ record", row.jmc));
+        // The record's header bytes, then its body lines in byte order.
+        let mut lines: Vec<&[u8]> = rb.split_inclusive(|b| *b == b'\n').collect();
+        let body = lines.split_off(1);
+        let mut sorted = body;
+        sorted.sort_unstable();
+        lines.extend(sorted);
+        if gb != lines.concat() {
+            bad.push(format!("{}: generic ≠ record's header and sorted lines", row.jmc));
         }
         if gs.lines != gs.orders_held {
             bad.push(format!("{}: stats {gs:?}", row.jmc));

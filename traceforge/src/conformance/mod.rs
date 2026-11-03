@@ -359,7 +359,8 @@ pub use report::{
 };
 pub use selector::{InnerOrder, Selector};
 pub use interchange::{
-    conf_join, export, model_name, ExportError, ExportHeader, ExportStats, JoinError, JoinReport,
+    conf_join, conf_join_merge, export, model_name, ExportError, ExportHeader, ExportStats,
+    JoinError, JoinReport, MergeStats,
 };
 
 use std::sync::Arc;
@@ -567,6 +568,8 @@ mod x5_tests;
 mod interchange_tests;
 #[cfg(test)]
 mod interchange_default_tests;
+#[cfg(test)]
+mod merge_tests;
 #[cfg(test)]
 mod online_tests;
 #[cfg(test)]

@@ -3087,6 +3087,13 @@ impl interchange::JoinReport {
         let _ = writeln!(out, "spec: {}", render_file_head(&self.spec));
         let _ = writeln!(out, "impl: {}", render_file_head(&self.imp));
         let _ = writeln!(out, "verdict: {verdict}{label}");
+        if let Some(m) = &self.merge {
+            let _ = writeln!(
+                out,
+                "merge: spec_groups={} impl_lines={} max_group_lines={}",
+                m.spec_groups, self.impl_lines, m.max_group_lines
+            );
+        }
         let _ = writeln!(out, "uncovered: {}", self.uncovered.len());
         for (class, line) in &self.uncovered {
             let _ = writeln!(out, "{} {line}", class.name());

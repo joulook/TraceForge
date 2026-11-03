@@ -10,12 +10,19 @@ use std::process::ExitCode;
 
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `SORTED-JOIN`: `--merge` reads the two files as sorted streams.
+    let merge = args.iter().position(|a| a == "--merge").map(|i| args.remove(i)).is_some();
     let [spec, imp] = args.as_slice() else {
-        eprintln!("usage: conf-join spec.jsonl impl.jsonl");
+        eprintln!("usage: conf-join [--merge] spec.jsonl impl.jsonl");
         return ExitCode::from(2);
     };
-    match traceforge::conformance::conf_join(Path::new(spec), Path::new(imp)) {
+    let joined = if merge {
+        traceforge::conformance::conf_join_merge(Path::new(spec), Path::new(imp))
+    } else {
+        traceforge::conformance::conf_join(Path::new(spec), Path::new(imp))
+    };
+    match joined {
         Ok(report) => {
             print!("{}", report.render());
             print!("{}", report.measurements(started.elapsed().as_millis()));

@@ -519,7 +519,8 @@ fn pe7_block() {
     );
 }
 
-/// Check 8: `--threads 1` is the sequential export, its order not sorted.
+/// Check 8: `--threads 1` is the sequential export; since `SORTED-JOIN`
+/// (2026-11-02) both exporters write the lines in byte order.
 #[test]
 fn pe8_threads_one_is_sequential() {
     let d = dir("pe8");
@@ -544,10 +545,10 @@ fn pe8_threads_one_is_sequential() {
         "conformance: PE: --threads 1"
     );
     let ls = lines_of(&d.join("a"));
-    assert_ne!(
+    assert_eq!(
         ls,
         sorted(ls.clone()),
-        "conformance: PE: a sequential order that isn't sorted"
+        "conformance: PE: the sequential export is in byte order (SORTED-JOIN)"
     );
 }
 

@@ -690,7 +690,7 @@ pub(crate) fn write_replacing(path: &Path, text: &str) -> Result<(), ExportError
 /// `CompactSummary::at_completion` inserted at every completion) and records the
 /// thread names. After the run every entry is encoded by its values' derived
 /// `Debug` rendering and the file is written: the header, then one line per
-/// entry in `entries()` order. Every refusal comes before the write.
+/// entry in byte order. Every refusal comes before the write.
 pub fn export<P>(
     cc: &ConfConfig,
     program: P,
@@ -788,28 +788,30 @@ where
     let (index, threads, graphs) = (&st.0, &st.1, st.2);
     let (summarise, complete, blocked, mut shape) = probe.borrow().clone();
     let export_started = Instant::now();
-    let mut text = header_line(header, &names, model);
-    text.push('\n');
-    let mut seen = HashSet::new();
-    let mut lines = 0;
+    let text = header_line(header, &names, model);
+    let mut sorted: Vec<String> = Vec::with_capacity(index.stats().entries);
     for (_, sig, _, ord) in index.entries() {
         let line = line_of(sig, ord, &names, &|v| encode_generic(v, threads))?;
-        if !seen.insert(line.clone()) {
-            return Err(ExportError::Collision { line });
-        }
         let (v, b, m, p) = Shape::summary_counts(sig, ord, &names, line.len());
         shape.add_summary_counts(v, b, m, p);
-        text.push_str(&line);
-        text.push('\n');
-        lines += 1;
+        sorted.push(line);
     }
+    // `SORTED-JOIN`: the lines in byte order, as `export --threads N` writes
+    // them, so `conf-join --merge` can read either file as a sorted stream. Two
+    // entries rendering one line (P3's collision) are adjacent after the sort,
+    // so the refusal needs no set of the lines.
+    sorted.sort_unstable();
+    if let Some(w) = sorted.windows(2).find(|w| w[0] == w[1]) {
+        return Err(ExportError::Collision { line: w[0].clone() });
+    }
+    let lines = sorted.len();
     // The export seam sits just before the write, so a timer that stops before
     // the write would miss it (B's gate-3 finding).
     #[cfg(test)]
     if let Some(d) = seams.export_delay {
         std::thread::sleep(d);
     }
-    write_replacing(path, &text)?;
+    crate::conformance::export_p::write_lines(path, &text, sorted.into_iter())?;
     let export_ms = export_started.elapsed().as_millis();
     Ok(ExportStats {
         lines,
@@ -865,7 +867,7 @@ pub(crate) struct FileHead {
 }
 
 /// Why an implementation line is not covered (J4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum MissClass {
     /// No specification line has the shape (kinds, lengths, statuses).
     NoBucket,
@@ -911,6 +913,17 @@ pub struct JoinReport {
     pub(crate) spec_lines: usize,
     pub(crate) impl_lines: usize,
     pub(crate) shape: crate::conformance::measure::Shape,
+    /// `SORTED-JOIN`: the merge's counters (`None` for the in-memory join).
+    pub(crate) merge: Option<MergeStats>,
+}
+
+/// `SORTED-JOIN`: what the merge over two sorted files held at most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MergeStats {
+    /// Signature groups of the specification file.
+    pub spec_groups: usize,
+    /// The largest specification group's line count (the index held at most).
+    pub max_group_lines: usize,
 }
 
 impl JoinReport {
@@ -1303,5 +1316,291 @@ pub(crate) fn conf_join_with(
         lookup_ms: lookup_wall.as_millis(),
         join_ms: join_started.elapsed().as_millis(),
         shape,
+        merge: None,
+    })
+}
+
+// ------------------------------------------------------------ sorted merge --
+
+/// `SORTED-JOIN` (owner's decision, 2026-11-02): one summary file read as a
+/// stream of lines in byte order of their normal form (the order both
+/// exporters write), each line parsed and checked against the previous one:
+/// a repeat is the duplicate refusal, a descent the "not sorted" refusal.
+struct SortedReader {
+    path: PathBuf,
+    names: Vec<String>,
+    lines: std::io::Lines<std::io::BufReader<fs::File>>,
+    /// The number of the last line handed out (the header is line 1).
+    number: usize,
+    last_key: Option<String>,
+    /// Lines handed out so far (the file's summary count at EOF).
+    count: usize,
+}
+
+impl SortedReader {
+    fn open(path: &Path) -> Result<(FileHead, SortedReader), JoinError> {
+        use std::io::BufRead as _;
+        let at = |line: Option<usize>, what: String| {
+            JoinError(match line {
+                Some(n) => format!("{}: line {n}: {what}", path.display()),
+                None => format!("{}: {what}", path.display()),
+            })
+        };
+        let f = fs::File::open(path).map_err(|e| at(None, e.to_string()))?;
+        let mut lines = std::io::BufReader::new(f).lines();
+        let first = match lines.next() {
+            Some(Ok(l)) => l,
+            Some(Err(e)) => return Err(at(Some(1), e.to_string())),
+            None => return Err(at(None, "the file is empty".to_string())),
+        };
+        let head = header_of(&first).map_err(|e| at(Some(1), e))?;
+        let names = sorted_names(&head.visible);
+        Ok((
+            head,
+            SortedReader {
+                path: path.to_path_buf(),
+                names,
+                lines,
+                number: 1,
+                last_key: None,
+                count: 0,
+            },
+        ))
+    }
+
+    fn at(&self, what: String) -> JoinError {
+        JoinError(format!("{}: line {}: {what}", self.path.display(), self.number))
+    }
+
+    /// The next line: its number, its normal form and its summary; `None` at EOF.
+    fn next(&mut self) -> Result<Option<(usize, String, CompactSummary)>, JoinError> {
+        let Some(l) = self.lines.next() else {
+            return Ok(None);
+        };
+        self.number += 1;
+        let l = l.map_err(|e| self.at(e.to_string()))?;
+        let (key, summary) = parse_line(&l, &self.names).map_err(|e| self.at(e))?;
+        if let Some(prev) = &self.last_key {
+            match key.as_str().cmp(prev.as_str()) {
+                std::cmp::Ordering::Equal => {
+                    return Err(self.at(format!(
+                        "the line repeats line {} (each line is one distinct summary)",
+                        self.number - 1
+                    )));
+                }
+                std::cmp::Ordering::Less => {
+                    return Err(self.at(format!(
+                        "the file is not sorted: the line precedes line {} in byte order \
+                         (re-export it, or join without --merge)",
+                        self.number - 1
+                    )));
+                }
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+        self.last_key = Some(key.clone());
+        self.count += 1;
+        Ok(Some((self.number, key, summary)))
+    }
+}
+
+/// The signature part of a normal-form line: the text before its `"counts"`
+/// member (the statuses and the words), which `render_line` writes last and
+/// follows only with numbers, so the last occurrence of `,"counts":` is the
+/// member's (an earlier one can only come from a role named `counts`). Signature
+/// keys are prefix-free, as a key ends where the `words` object closes, so byte
+/// order of the lines and byte order of their keys agree: the merge's advance
+/// loop rests on this.
+fn sig_key(key: &str) -> &str {
+    match key.rfind(",\"counts\":") {
+        Some(i) => &key[..i],
+        None => key,
+    }
+}
+
+/// A group of specification lines of one signature, as the index the old join
+/// would hold for that signature alone.
+struct SpecGroup {
+    key: String,
+    index: SetIndex,
+    lines: usize,
+}
+
+/// `SORTED-JOIN`: `conf-join --merge spec.jsonl impl.jsonl`, the same verdict,
+/// classes and report as [`conf_join`], with both files read as sorted
+/// streams: one specification group (one signature's orders in a [`SetIndex`])
+/// is held at a time, and every implementation line is one probe against the
+/// group of its signature. Memory: the largest group, the read buffers and
+/// lookahead, the distinct shape hashes of the specification (16 bytes each
+/// plus the table's overhead), and each miss's class, hash and line (the
+/// report's output). A report comes only after both files are read to their
+/// end, whatever the verdict so far, so a pair with a malformed or repeated line
+/// anywhere is refused, as the in-memory join refuses it; an out-of-order line
+/// is this reader's own refusal. The first refusal met returns at once.
+pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
+    use std::time::{Duration, Instant};
+    let join_started = Instant::now();
+    let (shead, mut sr) = SortedReader::open(spec)?;
+    let (ihead, mut ir) = SortedReader::open(imp)?;
+    if shead.enumeration != Enumeration::Complete {
+        return Err(JoinError(format!(
+            "{}: the specification is `{}`, not `complete`",
+            spec.display(),
+            shead.enumeration.name()
+        )));
+    }
+    if shead.visible != ihead.visible {
+        return Err(JoinError(format!(
+            "the two files' `visible` lists differ: {:?} and {:?}",
+            shead.visible, ihead.visible
+        )));
+    }
+    let names = sorted_names(&ihead.visible);
+    let mut index_wall = Duration::ZERO;
+    let mut lookup_wall = Duration::ZERO;
+    let mut shapes: HashSet<crate::conformance::compact::SigHash> = HashSet::new();
+    let mut spec_groups = 0usize;
+    let mut max_group = 0usize;
+    // The specification's lookahead line and current group.
+    let t = Instant::now();
+    let mut ahead = sr.next()?;
+    index_wall += t.elapsed();
+    let mut group: Option<SpecGroup> = None;
+    // Loads the next group from the lookahead; `None` at EOF.
+    let load = |ahead: &mut Option<(usize, String, CompactSummary)>,
+                    sr: &mut SortedReader,
+                    shapes: &mut HashSet<crate::conformance::compact::SigHash>|
+     -> Result<Option<SpecGroup>, JoinError> {
+        let Some((_, key, summary)) = ahead.take() else {
+            return Ok(None);
+        };
+        let gk = sig_key(&key).to_owned();
+        let mut index = SetIndex::new();
+        shapes.insert(summary.hash);
+        index.insert(&summary);
+        let mut lines = 1usize;
+        loop {
+            match sr.next()? {
+                None => break,
+                Some((n, k, s)) => {
+                    if sig_key(&k) == gk {
+                        shapes.insert(s.hash);
+                        index.insert(&s);
+                        lines += 1;
+                    } else {
+                        *ahead = Some((n, k, s));
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Some(SpecGroup { key: gk, index, lines }))
+    };
+    // The misses in file order, their class decided at the end where it
+    // depends on the whole specification (no-bucket vs no-slot).
+    let mut misses: Vec<(Option<MissClass>, crate::conformance::compact::SigHash, String)> =
+        Vec::new();
+    let mut shape = crate::conformance::measure::Shape::default();
+    let mut impl_lines = 0usize;
+    loop {
+        let t = Instant::now();
+        let line = ir.next()?;
+        let Some((_, key, summary)) = line else {
+            lookup_wall += t.elapsed();
+            break;
+        };
+        impl_lines += 1;
+        let (v, b, m, p) = crate::conformance::measure::Shape::summary_counts(
+            &summary.sig,
+            &summary.ord,
+            &names,
+            key.len(),
+        );
+        shape.add_summary_counts(v, b, m, p);
+        let ik = sig_key(&key);
+        // Advance the specification to the first group whose key is >= ik (its
+        // loading time counts for the index phase, not the lookup phase).
+        let mut loaded = Duration::ZERO;
+        let mut found: Option<Covers> = None;
+        loop {
+            match &group {
+                Some(g) if g.key.as_str() < ik => {
+                    group = None;
+                }
+                Some(g) if g.key.as_str() == ik => {
+                    found = Some(g.index.covers(&summary).1);
+                    break;
+                }
+                Some(_) => break,
+                None => {
+                    let t2 = Instant::now();
+                    let next = load(&mut ahead, &mut sr, &mut shapes)?;
+                    let d = t2.elapsed();
+                    index_wall += d;
+                    loaded += d;
+                    match next {
+                        Some(g) => {
+                            spec_groups += 1;
+                            max_group = max_group.max(g.lines);
+                            group = Some(g);
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        match found {
+            Some(Covers::Found(_)) => {}
+            Some(Covers::NotFound) => misses.push((Some(MissClass::NotFound), summary.hash, key)),
+            // The group is built from this signature, so its own index holds it.
+            Some(Covers::NoBucket) | Some(Covers::NoSig) => {
+                unreachable!("conformance: a group's index holds its own signature")
+            }
+            // A missing group: the class is decided at the end.
+            None => misses.push((None, summary.hash, key)),
+        }
+        lookup_wall += t.elapsed().saturating_sub(loaded);
+    }
+    // Drain the specification: the remaining groups are read (their order and
+    // uniqueness checked, their shapes recorded) and dropped.
+    let t = Instant::now();
+    drop(group.take());
+    while let Some(g) = load(&mut ahead, &mut sr, &mut shapes)? {
+        spec_groups += 1;
+        max_group = max_group.max(g.lines);
+    }
+    index_wall += t.elapsed();
+    let uncovered: Vec<(MissClass, String)> = misses
+        .into_iter()
+        .map(|(c, h, key)| {
+            (
+                c.unwrap_or(if shapes.contains(&h) {
+                    MissClass::NoSlot
+                } else {
+                    MissClass::NoBucket
+                }),
+                key,
+            )
+        })
+        .collect();
+    let verdict = if !uncovered.is_empty() {
+        Verdict::Violation
+    } else if ihead.enumeration == Enumeration::Sampled {
+        Verdict::NoVerdict
+    } else {
+        Verdict::Conforms
+    };
+    Ok(JoinReport {
+        spec_lines: sr.count,
+        impl_lines,
+        spec: shead,
+        imp: ihead,
+        verdict,
+        uncovered,
+        index_ms: index_wall.as_millis(),
+        lookup_ms: lookup_wall.as_millis(),
+        join_ms: join_started.elapsed().as_millis(),
+        shape,
+        merge: Some(MergeStats { spec_groups, max_group_lines: max_group }),
     })
 }
