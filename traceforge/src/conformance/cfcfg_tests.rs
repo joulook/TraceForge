@@ -683,6 +683,7 @@ fn child_stdout(fx: &str, label: &str, dir: &Path) -> (String, Rec) {
         twin_key: String::new(),
         series: None,
     };
+    let started = std::time::Instant::now();
     let out = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
@@ -701,6 +702,9 @@ fn child_stdout(fx: &str, label: &str, dir: &Path) -> (String, Rec) {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let bound = started.elapsed().as_secs() as usize + 1;
+    assert!(progress_lines(&text).len() <= bound);
+    assert!(progress_lines(&String::from_utf8_lossy(&out.stderr)).len() <= bound);
     let s = crate::conformance::eval::SENTINEL;
     let i = text
         .find(s)
@@ -716,12 +720,8 @@ fn child_stdout(fx: &str, label: &str, dir: &Path) -> (String, Rec) {
     (text, rec)
 }
 
-/// C5 (F3), child processes on `apps/a1/correct/spec/n2r2` (64 outer
-/// executions, 16 sweeps of 18–205 Spec graphs): under `w=inf/quiet=true` the
-/// captured stdout holds exactly the outer run's progress lines — the line at
-/// 1…10, 20, …, 60 executions (15 lines; derived from `must.rs`'s default
-/// schedule), the sweeps' none — and under the eleven-field label
-/// (`quiet=false`) strictly more; the counters equal between the two.
+/// ENG-PROGRESS: quiet and default sweeps both obey the process spacing bound,
+/// and the compatibility flag preserves all deterministic counters.
 #[test]
 #[ignore]
 fn c05_quiet_silences_the_sweeps_only() {
@@ -739,26 +739,11 @@ fn c05_quiet_silences_the_sweeps_only() {
         pq.len(),
         pq
     );
-    let outer: Vec<u64> = pq
-        .iter()
-        .filter_map(|l| {
-            l.split("so far: ")
-                .nth(1)?
-                .split_whitespace()
-                .next()?
-                .parse()
-                .ok()
-        })
-        .collect();
-    let want: Vec<u64> = (1..=10).chain([20, 30, 40, 50, 60]).collect();
-    assert_eq!(
-        outer, want,
-        "conformance: the quiet run's lines are the outer run's"
-    );
     assert!(
-        pl.len() > pq.len(),
-        "conformance: the loud run prints the sweeps' lines"
+        !pl.is_empty() && !pq.is_empty(),
+        "conformance: the outer reporter remains enabled"
     );
+    assert!(n(&rl, "sweeps") > 0 && n(&rq, "sweeps") > 0);
     for c in [
         "executions",
         "reports",

@@ -51,9 +51,7 @@ pub enum Engine {
     /// see the precheck's exploration (when it runs; here unbounded, on the
     /// specification — the other engines likewise show their observers a
     /// specification exploration first) and the outer run, never a sweep. A
-    /// sweep still prints to stdout — progress lines by default
-    /// (`progress_report = 0` is the 1, 2, …, 9, 10, 20, … schedule) and
-    /// graphs under `verbose` — with counters that restart per sweep.
+    /// sweep prints graphs under `verbose`, but never progress lines.
     CompleteFirst,
     /// GVerify (paper §8.6, `P4-GATED`): complete-first plus a gate after
     /// every visible event — the carried witness re-tested by `cone`, then by
@@ -79,7 +77,7 @@ pub enum Engine {
     /// CVerify-P (`SVERIFY-P` P-S): the complete-first engine's outer run on
     /// the partitioned parallel Must, each miss's sweep inline on the worker
     /// that missed, the witness cache shared (the set cache, appendable).
-    /// Reads `threads`, `witness_cache`, `quiet_sweeps`, `sweep_record`,
+    /// Reads `threads`, `witness_cache`, `sweep_record`,
     /// `stop_at_first_report`, `all_reports`, `impl_distinct` and
     /// `paper_events`; refuses `max_iterations`, `parallel`,
     /// `completion_cover(Flat)` and `early_error_cut`; ignores `index`
@@ -305,7 +303,7 @@ pub struct ConfConfig {
     /// `P5-CFCFG` F1: the witness cache's capacity (complete-first only; the
     /// gated checker's cache is always unbounded).
     pub(crate) witness_cache: Capacity,
-    /// `P5-CFCFG` F3: silence the sweeps' progress lines (complete-first only).
+    /// Retained for API compatibility; sweeps never print progress lines.
     pub(crate) quiet_sweeps: bool,
     /// `MIN-ENGINES` E3: count the paper's `L` in the stateful and
     /// complete-first engines' implementation runs (off: their records say
@@ -597,10 +595,8 @@ impl ConfBuilder {
         self
     }
 
-    /// `P5-CFCFG` F3: silence the complete-first sweeps' progress lines (the
-    /// sweep's `Config` gets `progress_report = usize::MAX`). Default `false`.
-    /// The outer run's lines are untouched. Read by [`Engine::CompleteFirst`]
-    /// only.
+    /// Retained for API compatibility, with no effect on progress lines.
+    /// Every specification sweep is silent regardless of this value. Default `false`.
     pub fn quiet_sweeps(mut self, on: bool) -> Self {
         self.quiet_sweeps = on;
         self

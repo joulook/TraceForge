@@ -64,6 +64,7 @@ where
     let mut seed = config.seed;
     let mut rng = Pcg64Mcg::seed_from_u64(config.seed);
 
+    let progress_enabled = config.progress_report != usize::MAX;
     let must = Rc::new(RefCell::new(Must::new(config, false)));
 
     // Create a single ContinuationPool for the entire test run so that
@@ -76,8 +77,8 @@ where
             crate::explore_with_pool(&must, &f);
 
             let progress_desc = format!("Executions attempted so far: {}", i);
-            if Must::should_report(i) {
-                println!("{}", progress_desc);
+            if progress_enabled && Must::should_report(i) {
+                crate::print_progress(&progress_desc, false, false);
             }
             seed = rng.next_u64();
         }

@@ -935,12 +935,11 @@ fn vm_hwm_kb() -> Option<u64> {
     line.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// [`sweep`] with the quiet flag (`P5-CFCFG` F3): under `quiet` the sweep's
-/// `Config` gets `progress_report = usize::MAX`, so no progress line can be
-/// printed at any count ≥ 1 (E-CF-10: `must.rs` would print one at count 0 on
-/// an inconsistent first ending, which incremental consistency makes
-/// unreachable); nothing else differs. The gated checker calls [`sweep`], which
-/// passes `false`.
+/// [`sweep`] with the quiet flag (`P5-CFCFG` F3), kept for compatibility:
+/// since `ENG-PROGRESS` every sweep's `Config` gets `progress_report =
+/// usize::MAX`, whatever `quiet` says, and `must.rs` prints no progress line
+/// under it at any count; nothing else differs. The gated checker calls
+/// [`sweep`], which passes `false`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sweep_with(
     config: &Config,
@@ -950,13 +949,11 @@ pub(crate) fn sweep_with(
     limit: Option<usize>,
     keep_graphs: bool,
     mode: ConfMode,
-    quiet: bool,
+    _quiet: bool,
 ) -> Swept {
     let mut spec_config = config.clone();
     spec_config.max_iterations = None;
-    if quiet {
-        spec_config.progress_report = usize::MAX;
-    }
+    spec_config.progress_report = usize::MAX;
     // `P4-CFIRST-CODE` round 01 m4: a sweep is a whole exploration nested
     // inside one outer execution, so it gets no observers (a fresh, empty
     // `callbacks`) and no trace/dot outputs — the user's observers and files

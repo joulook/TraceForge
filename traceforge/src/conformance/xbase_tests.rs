@@ -465,10 +465,8 @@ fn temp(name: &str) -> PathBuf {
 /// the non-blocking leader conf n2: exactly one `xbase: execs=<n> block=<n>
 /// max_graph_events=<n>` line on stdout, not containing the sentinel, whose
 /// `execs + block` equals the stored row's `executions`; the progress lines
-/// are exactly Must's **default adaptive schedule**, which `progress_report =
-/// 0` selects (`must.rs`, `should_report`: 1–9, 10–90, 100–900, …), the same
-/// lines the outer conformance run prints (F1 as of rev 1.10; gate 3's T1
-/// corrected the earlier "no progress lines"); the row's
+/// follow Must's default count schedule, subject to the process spacing bound;
+/// the row's
 /// `engine` `Explore`, `cache`/`carry` `n/a`, `stack_mib` 32,
 /// `end_class` `ok`, `outer_graphs(execs+block)` `Some(sum)`.
 #[test]
@@ -481,7 +479,9 @@ fn c04_the_split_line_through_the_child() {
         ("2pc/leader/split/n3", (0, 882)),
         ("2pc/leader/conf/n2", (6, 0)),
     ] {
+        let started = std::time::Instant::now();
         let (text, r) = child_row(name, &base.join(name.replace('/', "_")));
+        let bound = started.elapsed().as_secs() as usize + 1;
         let lines: Vec<&str> = text.lines().filter(|l| l.contains("xbase:")).collect();
         note!("c04 {name}: {lines:?} executions {}", r["executions"]);
         if lines.len() != 1 {
@@ -527,9 +527,13 @@ fn c04_the_split_line_through_the_child() {
             })
             .collect();
         note!("c04 {name}: {} progress lines", progress.len());
-        if progress != schedule {
+        if progress.is_empty()
+            || progress.len() > bound
+            || !progress.iter().all(|n| schedule.contains(n))
+            || !progress.windows(2).all(|p| p[0] < p[1])
+        {
             bad.push(format!(
-                "{name}: progress {progress:?}, the default schedule {schedule:?}"
+                "{name}: progress {progress:?}, bound {bound}, schedule {schedule:?}"
             ));
         }
         for (c, v) in [

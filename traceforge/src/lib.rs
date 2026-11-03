@@ -26,6 +26,11 @@ pub mod loc;
 pub mod monitor_types;
 pub mod msg;
 mod must;
+
+#[cfg(test)]
+mod progress_tests;
+#[cfg(test)]
+mod progress_tester_tests;
 mod predicate;
 mod replay;
 mod revisit;
@@ -80,6 +85,55 @@ use std::any::type_name;
 
 fn type_of<T>(_: &T) -> &'static str {
     type_name::<T>()
+}
+
+// Each stream keeps its last print for the entire process, across runs and workers.
+static PROGRESS: std::sync::Mutex<[Option<std::time::Duration>; 2]> =
+    std::sync::Mutex::new([None, None]);
+
+#[cfg(test)]
+static PROGRESS_CLOCK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+#[cfg(test)]
+static PROGRESS_CLOCK_STEP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn progress_now() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = PROGRESS_CLOCK.load(SeqCst);
+        if now != u64::MAX {
+            if PROGRESS_CLOCK_STEP.load(SeqCst) {
+                PROGRESS_CLOCK.fetch_add(1_000, SeqCst);
+            }
+            return std::time::Duration::from_millis(now);
+        }
+    }
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+fn print_progress(text: &str, stderr: bool, flush: bool) {
+    let mut last = PROGRESS.lock().unwrap_or_else(|e| e.into_inner());
+    let now = progress_now();
+    let stream = usize::from(stderr);
+    if last[stream].is_some_and(|t| now.saturating_sub(t).as_millis() < 1_000) {
+        return;
+    }
+    // Hold the lock through printing, so admission and the actual write stay ordered.
+    if stderr {
+        eprintln!("{}", text);
+        if flush {
+            let _ = std::io::stderr().flush();
+        }
+    } else {
+        println!("{}", text);
+        if flush {
+            let _ = std::io::stdout().flush();
+        }
+    }
+    last[stream] = Some(now);
 }
 
 /// Filter pattern for thread names when computing filtered origination vectors.
@@ -379,13 +433,14 @@ impl ConfigBuilder {
         self
     }
 
-    /// Prints a progress report message after every "n" executions.
-    /// This is useful, when you are waiting for models with large numbers of executions.
+    /// Selects a progress report after every `n` executions.
+    /// Eligible lines print at most once per second per stream, shared by all
+    /// reporters for the lifetime of the process.
     ///
     /// Note that if you do not specify this option, you will get the default behavior,
     /// an adaptive progress report that prints after 1, 2, 3, ..., 10, 20, 30, ... 100, 200, 300, etc.
     ///
-    /// To completely disable such output, use with_progress_report(u32::MAX)
+    /// To completely disable progress output, use `with_progress_report(usize::MAX)`.
     pub fn with_progress_report(mut self, n: usize) -> Self {
         self.0.progress_report = n;
         self

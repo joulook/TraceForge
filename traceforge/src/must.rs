@@ -2310,6 +2310,27 @@ impl Must {
         let num_execs = self.telemetry.read_counter(EXECS.to_owned()).unwrap_or(0);
         let num_blocked = self.telemetry.read_counter(BLOCKED.to_owned()).unwrap_or(0);
         let num_total = num_execs + num_blocked;
+        self.report_progress(num_execs, num_blocked, elapsed);
+
+        if let Some(n) = self.config.max_iterations {
+            if n <= num_total {
+                println!("Stopping exploration because max_iterations was reached.");
+                return true; // done
+            }
+        }
+
+        false // not done
+    }
+
+    pub(crate) fn report_progress(
+        &self,
+        num_execs: u64,
+        num_blocked: u64,
+        elapsed: std::time::Duration,
+    ) {
+        let num_total = num_execs + num_blocked;
+        #[cfg(test)]
+        crate::progress_tests::observe_ending(self, num_total);
         let speed: String = if elapsed.as_secs() < 5 {
             "".to_string()
         } else {
@@ -2320,34 +2341,17 @@ impl Must {
             num_total, num_execs, num_blocked, speed
         );
 
+        if self.config.progress_report == usize::MAX {
+            return;
+        }
         if self.config.progress_report > 0 {
             if num_total.is_multiple_of(self.config.progress_report as u64) {
-                // Although it might be nice to use \r (carriage return) here to
-                // repeatedly rewrite the same line with new progress reports, this
-                // will eat up the last log line, and if the program is printing anything
-                // else at all (very likely) then the goal of rewriting the same
-                // line is defeated anyway.
-                println!("{}", progress_desc);
-                let _ = std::io::stdout().flush();
-                eprintln!("{}", progress_desc);
-                let _ = std::io::stderr().flush();
+                crate::print_progress(&progress_desc, false, true);
+                crate::print_progress(&progress_desc, true, true);
             }
-        } else {
-            // Implement P-style progress report, which reports
-            // after 1, 2, 3, .... 10, 20, 30, ... 100, 200, 300, etc.
-            if Self::should_report(num_total) {
-                println!("{}", progress_desc);
-            }
+        } else if Self::should_report(num_total) {
+            crate::print_progress(&progress_desc, false, false);
         }
-
-        if let Some(n) = self.config.max_iterations {
-            if n <= num_total {
-                println!("Stopping exploration because max_iterations was reached.");
-                return true; // done
-            }
-        }
-
-        false // not done
     }
 
     pub(crate) fn should_report(n: u64) -> bool {

@@ -273,14 +273,12 @@ pub(crate) fn sweep_inline(
     visible: &[String],
     specification: &Arc<dyn Fn() + Send + Sync>,
     cs: CompactSummary,
-    quiet: bool,
+    _quiet: bool,
     watch: Option<Box<dyn FnMut() -> bool>>,
 ) -> (Swept, bool) {
     let mut spec_config = config.clone();
     spec_config.max_iterations = None;
-    if quiet {
-        spec_config.progress_report = usize::MAX;
-    }
+    spec_config.progress_report = usize::MAX;
     // As `cfirst::sweep_with`: no observers and no trace/dot outputs on a
     // sweep.
     spec_config.callbacks = Arc::new(std::sync::Mutex::new(Vec::new()));
