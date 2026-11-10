@@ -3095,8 +3095,39 @@ impl interchange::JoinReport {
             );
         }
         let _ = writeln!(out, "uncovered: {}", self.uncovered.len());
-        for (class, line) in &self.uncovered {
+        // `DECIDE`: the counters, then under each uncovered line its
+        // classification and, for a violation, the witness.
+        if let Some(d) = &self.decide {
+            let _ = writeln!(
+                out,
+                "decide: uncovered={} violations={} false_alarms={} unresolved={} \
+                 max_group={} states={} budget={} decide_ms={}",
+                self.uncovered.len(),
+                d.violations,
+                d.false_alarms,
+                d.unresolved,
+                d.max_group,
+                d.states,
+                d.budget,
+                d.ms
+            );
+        }
+        for (j, (class, line)) in self.uncovered.iter().enumerate() {
             let _ = writeln!(out, "{} {line}", class.name());
+            if let Some(e) = self.decide.as_ref().and_then(|d| d.entries.get(j)) {
+                let x = &e.decision;
+                let _ = writeln!(
+                    out,
+                    "  decide: {} k={} k_min={} states={}",
+                    x.outcome.word(),
+                    x.group,
+                    x.effective,
+                    x.states
+                );
+                if let Some(w) = &e.witness {
+                    let _ = writeln!(out, "  witness: {w}");
+                }
+            }
         }
         out
     }
@@ -3220,7 +3251,20 @@ impl interchange::JoinReport {
     /// `B` (MEAS-1 K3): `conf-join`'s measurement block, `wall_ms` the
     /// caller's (the process from `main` to the block).
     pub fn measurements(&self, wall_ms: u128) -> String {
-        crate::conformance::measure::of_join(Some(self), wall_ms).render()
+        use std::fmt::Write as _;
+        let mut out = crate::conformance::measure::of_join(Some(self), wall_ms).render();
+        // `DECIDE`: its keys after the block's last key, only with `--decide`
+        // (the block's keys and their order are unchanged).
+        if let Some(d) = &self.decide {
+            let _ = writeln!(out, "decide_uncovered: {}", self.uncovered.len());
+            let _ = writeln!(out, "decide_violations: {}", d.violations);
+            let _ = writeln!(out, "decide_false_alarms: {}", d.false_alarms);
+            let _ = writeln!(out, "decide_unresolved: {}", d.unresolved);
+            let _ = writeln!(out, "decide_max_group: {}", d.max_group);
+            let _ = writeln!(out, "decide_states: {}", d.states);
+            let _ = writeln!(out, "decide_ms: {}", d.ms);
+        }
+        out
     }
 
     /// `B` (MEAS-0.2): the block after a refused file, `stop_reason: error`.

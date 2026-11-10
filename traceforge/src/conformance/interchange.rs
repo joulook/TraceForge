@@ -915,6 +915,123 @@ pub struct JoinReport {
     pub(crate) shape: crate::conformance::measure::Shape,
     /// `SORTED-JOIN`: the merge's counters (`None` for the in-memory join).
     pub(crate) merge: Option<MergeStats>,
+    /// `DECIDE`: the post-pass's classifications (`None` without `--decide`).
+    pub(crate) decide: Option<DecideReport>,
+}
+
+/// `DECIDE`: one uncovered line's classification and its witness, rendered.
+#[derive(Clone, Debug)]
+pub(crate) struct DecideEntry {
+    pub(crate) decision: crate::conformance::decide::Decision,
+    /// For a violation: the labelled word (`<role>:<observation>` in the
+    /// witness's order), then the statuses.
+    pub(crate) witness: Option<String>,
+}
+
+/// `DECIDE`: the classifications of the uncovered lines, `entries` in the
+/// order of `JoinReport::uncovered`, and the counters.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DecideReport {
+    pub(crate) entries: Vec<DecideEntry>,
+    pub(crate) violations: usize,
+    pub(crate) false_alarms: usize,
+    pub(crate) unresolved: usize,
+    /// The largest `k` (specification orders of the candidate's signature).
+    pub(crate) max_group: usize,
+    /// Search states over all candidates.
+    pub(crate) states: u64,
+    pub(crate) budget: u64,
+    pub(crate) ms: u128,
+}
+
+impl DecideReport {
+    fn new(budget: u64) -> Self {
+        DecideReport { budget, ..DecideReport::default() }
+    }
+
+    fn push(&mut self, e: DecideEntry) {
+        use crate::conformance::decide::Outcome;
+        match e.decision.outcome {
+            Outcome::Violation(_) => self.violations += 1,
+            Outcome::FalseAlarm => self.false_alarms += 1,
+            Outcome::Unresolved => self.unresolved += 1,
+        }
+        self.max_group = self.max_group.max(e.decision.group);
+        self.states += e.decision.states;
+        self.entries.push(e);
+    }
+}
+
+/// `DECIDE`: an order's count vector, widened.
+fn ord_u16(o: &OrdCounts) -> Vec<u16> {
+    match o {
+        OrdCounts::U8(v) => v.iter().map(|c| u16::from(*c)).collect(),
+        OrdCounts::U16(v) => v.clone(),
+    }
+}
+
+/// `DECIDE`: classifies the uncovered line `key` (a normal form over the
+/// sorted `names`) against `group`, the count vectors of the specification's
+/// lines of its signature (empty for `no-bucket` and `no-slot`).
+fn decide_entry(
+    key: &str,
+    names: &[String],
+    group: &[Vec<u16>],
+    budget: u64,
+) -> Result<DecideEntry, JoinError> {
+    use crate::conformance::decide::{decide, Outcome};
+    let bad = |what: &str| JoinError(format!("decide: a normal-form line: {what}: {key}"));
+    let v: Value = serde_json::from_str(key).map_err(|_| bad("not JSON"))?;
+    let (Some(Value::Object(sm)), Some(Value::Object(wm)), Some(Value::Array(cs))) =
+        (v.get("statuses"), v.get("words"), v.get("counts"))
+    else {
+        return Err(bad("no statuses, words or counts"));
+    };
+    let mut statuses = Vec::with_capacity(names.len());
+    let mut obs: Vec<Vec<String>> = Vec::with_capacity(names.len());
+    for n in names {
+        statuses.push(sm.get(n).and_then(Value::as_str).ok_or_else(|| bad("a status"))?);
+        let Some(Value::Array(w)) = wm.get(n) else {
+            return Err(bad("a word"));
+        };
+        let mut texts = Vec::with_capacity(w.len());
+        for o in w {
+            let Some((k, x)) = o.as_object().and_then(|m| m.iter().next()) else {
+                return Err(bad("an observation"));
+            };
+            let x = if x.is_null() {
+                "null".to_string()
+            } else {
+                normal_value(x).map_err(|e| bad(&e))?
+            };
+            texts.push(format!("{{{}:{x}}}", json_string(k)));
+        }
+        obs.push(texts);
+    }
+    let counts: Vec<u16> = cs
+        .iter()
+        .map(|c| c.as_u64().map(|c| c as u16).ok_or_else(|| bad("a count")))
+        .collect::<Result<_, _>>()?;
+    let lens: Vec<usize> = obs.iter().map(Vec::len).collect();
+    let decision = decide(&lens, &counts, group, budget);
+    let witness = match &decision.outcome {
+        Outcome::Violation(w) => {
+            let mut out = String::new();
+            for (j, &(t, i)) in w.iter().enumerate() {
+                if j > 0 {
+                    out.push(' ');
+                }
+                let _ = write!(out, "{}:{}", names[t], obs[t][i]);
+            }
+            out.push_str(" ; statuses:");
+            for (n, st) in names.iter().zip(&statuses) {
+                let _ = write!(out, " {n}={st}");
+            }
+            Some(out)
+        }
+        Outcome::FalseAlarm | Outcome::Unresolved => None,
+    };
+    Ok(DecideEntry { decision, witness })
 }
 
 /// `SORTED-JOIN`: what the merge over two sorted files held at most.
@@ -1235,11 +1352,27 @@ pub fn conf_join(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
     conf_join_with(spec, imp, JoinSeams::default())
 }
 
+/// `DECIDE`: [`conf_join`], then every uncovered line classified (violation,
+/// false alarm, unresolved) under the state budget `budget` per line. The
+/// verdict and the exit code are [`conf_join`]'s.
+pub fn conf_join_decide(spec: &Path, imp: &Path, budget: u64) -> Result<JoinReport, JoinError> {
+    conf_join_inner(spec, imp, JoinSeams::default(), Some(budget))
+}
+
 /// [`conf_join`] with `B`'s test seams.
 pub(crate) fn conf_join_with(
     spec: &Path,
     imp: &Path,
     seams: JoinSeams,
+) -> Result<JoinReport, JoinError> {
+    conf_join_inner(spec, imp, seams, None)
+}
+
+fn conf_join_inner(
+    spec: &Path,
+    imp: &Path,
+    seams: JoinSeams,
+    decide: Option<u64>,
 ) -> Result<JoinReport, JoinError> {
     use std::time::{Duration, Instant};
     let _ = &seams;
@@ -1305,7 +1438,7 @@ pub(crate) fn conf_join_with(
     } else {
         Verdict::Conforms
     };
-    Ok(JoinReport {
+    let mut report = JoinReport {
         spec_lines: s.lines.len(),
         impl_lines: i.lines.len(),
         spec: s.head,
@@ -1317,7 +1450,37 @@ pub(crate) fn conf_join_with(
         join_ms: join_started.elapsed().as_millis(),
         shape,
         merge: None,
-    })
+        decide: None,
+    };
+    // `DECIDE`: after the join, outside its timings; the specification's
+    // orders of the `not-found` lines' signatures only.
+    if let Some(budget) = decide {
+        let t = Instant::now();
+        let wanted: HashSet<&str> = report
+            .uncovered
+            .iter()
+            .filter(|(c, _)| *c == MissClass::NotFound)
+            .map(|(_, k)| sig_key(k))
+            .collect();
+        let mut groups: HashMap<&str, Vec<Vec<u16>>> = HashMap::new();
+        for (_, key, summary) in &s.lines {
+            let g = sig_key(key);
+            if wanted.contains(g) {
+                groups.entry(g).or_default().push(ord_u16(&summary.ord));
+            }
+        }
+        let mut d = DecideReport::new(budget);
+        for (class, key) in &report.uncovered {
+            let group = match class {
+                MissClass::NotFound => groups.get(sig_key(key)).map_or(&[][..], Vec::as_slice),
+                MissClass::NoBucket | MissClass::NoSlot => &[],
+            };
+            d.push(decide_entry(key, &names, group, budget)?);
+        }
+        d.ms = t.elapsed().as_millis();
+        report.decide = Some(d);
+    }
+    Ok(report)
 }
 
 // ------------------------------------------------------------ sorted merge --
@@ -1424,6 +1587,8 @@ struct SpecGroup {
     key: String,
     index: SetIndex,
     lines: usize,
+    /// `DECIDE`: the lines' count vectors (empty without `--decide`).
+    orders: Vec<Vec<u16>>,
 }
 
 /// `SORTED-JOIN`: `conf-join --merge spec.jsonl impl.jsonl`, the same verdict,
@@ -1438,7 +1603,29 @@ struct SpecGroup {
 /// anywhere is refused, as the in-memory join refuses it; an out-of-order line
 /// is this reader's own refusal. The first refusal met returns at once.
 pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
+    conf_join_merge_inner(spec, imp, None)
+}
+
+/// `DECIDE`: [`conf_join_merge`] with every uncovered line classified as by
+/// [`conf_join_decide`], each against the group in hand when it misses (the
+/// decision's time is excluded from the lookup and join timings).
+pub fn conf_join_merge_decide(
+    spec: &Path,
+    imp: &Path,
+    budget: u64,
+) -> Result<JoinReport, JoinError> {
+    conf_join_merge_inner(spec, imp, Some(budget))
+}
+
+fn conf_join_merge_inner(
+    spec: &Path,
+    imp: &Path,
+    decide: Option<u64>,
+) -> Result<JoinReport, JoinError> {
     use std::time::{Duration, Instant};
+    let keep = decide.is_some();
+    let mut decided = decide.map(DecideReport::new);
+    let mut decide_wall = Duration::ZERO;
     let join_started = Instant::now();
     let (shead, mut sr) = SortedReader::open(spec)?;
     let (ihead, mut ir) = SortedReader::open(imp)?;
@@ -1466,18 +1653,27 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
     let mut ahead = sr.next()?;
     index_wall += t.elapsed();
     let mut group: Option<SpecGroup> = None;
-    // Loads the next group from the lookahead; `None` at EOF.
+    // Loads the next group from the lookahead; `None` at EOF. `DECIDE`: the
+    // time spent keeping the group's count vectors is added to `prep` (it is
+    // charged to `decide_ms`, not to the index phase).
     let load = |ahead: &mut Option<(usize, String, CompactSummary)>,
                     sr: &mut SortedReader,
-                    shapes: &mut HashSet<crate::conformance::compact::SigHash>|
+                    shapes: &mut HashSet<crate::conformance::compact::SigHash>,
+                    prep: &mut Duration|
      -> Result<Option<SpecGroup>, JoinError> {
         let Some((_, key, summary)) = ahead.take() else {
             return Ok(None);
         };
         let gk = sig_key(&key).to_owned();
         let mut index = SetIndex::new();
+        let mut orders = Vec::new();
         shapes.insert(summary.hash);
         index.insert(&summary);
+        if keep {
+            let t = Instant::now();
+            orders.push(ord_u16(&summary.ord));
+            *prep += t.elapsed();
+        }
         let mut lines = 1usize;
         loop {
             match sr.next()? {
@@ -1486,6 +1682,11 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
                     if sig_key(&k) == gk {
                         shapes.insert(s.hash);
                         index.insert(&s);
+                        if keep {
+                            let t = Instant::now();
+                            orders.push(ord_u16(&s.ord));
+                            *prep += t.elapsed();
+                        }
                         lines += 1;
                     } else {
                         *ahead = Some((n, k, s));
@@ -1494,7 +1695,7 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
                 }
             }
         }
-        Ok(Some(SpecGroup { key: gk, index, lines }))
+        Ok(Some(SpecGroup { key: gk, index, lines, orders }))
     };
     // The misses in file order, their class decided at the end where it
     // depends on the whole specification (no-bucket vs no-slot).
@@ -1534,10 +1735,12 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
                 Some(_) => break,
                 None => {
                     let t2 = Instant::now();
-                    let next = load(&mut ahead, &mut sr, &mut shapes)?;
+                    let mut prep = Duration::ZERO;
+                    let next = load(&mut ahead, &mut sr, &mut shapes, &mut prep)?;
                     let d = t2.elapsed();
-                    index_wall += d;
+                    index_wall += d.saturating_sub(prep);
                     loaded += d;
+                    decide_wall += prep;
                     match next {
                         Some(g) => {
                             spec_groups += 1;
@@ -1547,6 +1750,21 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
                         None => break,
                     }
                 }
+            }
+        }
+        // `DECIDE`: a miss is decided here, against the group in hand (none
+        // for a missing group: `k = 0`).
+        let mut decided_ms = Duration::ZERO;
+        if let (Some(d), Some(budget)) = (decided.as_mut(), decide) {
+            if !matches!(found, Some(Covers::Found(_))) {
+                let t2 = Instant::now();
+                let group = match (&found, &group) {
+                    (Some(Covers::NotFound), Some(g)) => g.orders.as_slice(),
+                    _ => &[],
+                };
+                d.push(decide_entry(&key, &names, group, budget)?);
+                decided_ms = t2.elapsed();
+                decide_wall += decided_ms;
             }
         }
         match found {
@@ -1559,17 +1777,19 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
             // A missing group: the class is decided at the end.
             None => misses.push((None, summary.hash, key)),
         }
-        lookup_wall += t.elapsed().saturating_sub(loaded);
+        lookup_wall += t.elapsed().saturating_sub(loaded + decided_ms);
     }
     // Drain the specification: the remaining groups are read (their order and
     // uniqueness checked, their shapes recorded) and dropped.
     let t = Instant::now();
     drop(group.take());
-    while let Some(g) = load(&mut ahead, &mut sr, &mut shapes)? {
+    let mut prep = Duration::ZERO;
+    while let Some(g) = load(&mut ahead, &mut sr, &mut shapes, &mut prep)? {
         spec_groups += 1;
         max_group = max_group.max(g.lines);
     }
-    index_wall += t.elapsed();
+    index_wall += t.elapsed().saturating_sub(prep);
+    decide_wall += prep;
     let uncovered: Vec<(MissClass, String)> = misses
         .into_iter()
         .map(|(c, h, key)| {
@@ -1599,8 +1819,12 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
         uncovered,
         index_ms: index_wall.as_millis(),
         lookup_ms: lookup_wall.as_millis(),
-        join_ms: join_started.elapsed().as_millis(),
+        join_ms: join_started.elapsed().saturating_sub(decide_wall).as_millis(),
         shape,
         merge: Some(MergeStats { spec_groups, max_group_lines: max_group }),
+        decide: decided.map(|mut d| {
+            d.ms = decide_wall.as_millis();
+            d
+        }),
     })
 }
