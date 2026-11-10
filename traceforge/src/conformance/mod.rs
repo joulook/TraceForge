@@ -585,7 +585,7 @@ mod export_p_tests;
 mod meas_keys_tests;
 #[cfg(test)]
 mod online_p_tests;
-/// `DECIDE`'s tests.
+/// DECIDE: tests.
 #[cfg(test)]
 mod decide_tests;
 /// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground

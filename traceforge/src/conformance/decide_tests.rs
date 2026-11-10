@@ -408,7 +408,6 @@ fn decide_matches_brute_force_on_random_instances() {
             Outcome::Unresolved => panic!("conformance: decide: unresolved on a small instance"),
         }
     }
-    eprintln!("decide random: {cases} cases, {violations} violations, {false_alarms} false alarms");
     assert_eq!(cases, 600, "conformance: decide: enough uncovered cases");
     assert!(
         false_alarms >= 10 && violations >= 10,
@@ -418,14 +417,18 @@ fn decide_matches_brute_force_on_random_instances() {
 
 // ------------------------------------------------------------ conf-join --
 
-const HEAD4: &str = r#"{"format":1,"tool":"traceforge","program":"req","size":"2","visible":["a","b","ra","rb"],"model":"p2p","enumeration":"complete","encoding":1}"#;
+const HEAD4: &str = concat!(
+    r#"{"format":1,"tool":"traceforge","program":"req","size":"2","visible":["a","b","ra","rb"],"#,
+    r#""model":"p2p","enumeration":"complete","encoding":1}"#
+);
 
 fn line4(counts: &[u16]) -> String {
     let cs: Vec<String> = counts.iter().map(u16::to_string).collect();
     format!(
         concat!(
             r#"{{"statuses":{{"a":"done","b":"done","ra":"done","rb":"done"}},"#,
-            r#""words":{{"a":[{{"s":"A"}}],"b":[{{"s":"B"}}],"ra":[{{"r":"A"}}],"rb":[{{"r":"B"}}]}},"#,
+            r#""words":{{"a":[{{"s":"A"}}],"b":[{{"s":"B"}}],"#,
+            r#""ra":[{{"r":"A"}}],"rb":[{{"r":"B"}}]}},"#,
             r#""counts":[{}]}}"#
         ),
         cs.join(",")
@@ -473,10 +476,11 @@ fn decide_conf_join_both_paths() {
         );
         let text = r.render();
         assert!(
-            text.contains(
-                r#"  witness: a:{"s":"A"} ra:{"r":"A"} b:{"s":"B"} rb:{"r":"B"} ; statuses: a=done b=done ra=done rb=done"#
-            ),
-            "{text}"
+            text.contains(concat!(
+                r#"  witness: a:{"s":"A"} ra:{"r":"A"} b:{"s":"B"} rb:{"r":"B"} ; "#,
+                "statuses: a=done b=done ra=done rb=done"
+            )),
+            "conformance: decide: {text}"
         );
         assert!(r.measurements(0).contains("decide_violations: 1\n"));
         let r = run(&first.0, &first.1);
@@ -489,7 +493,7 @@ fn decide_conf_join_both_paths() {
         assert_eq!((d.violations, d.false_alarms, d.max_group), (0, 1, 2));
         assert!(
             r.render().contains("  decide: false-alarm k=2 k_min=2"),
-            "{}",
+            "conformance: decide: {}",
             r.render()
         );
         // A signature the specification lacks (no-slot) is k = 0: a violation.

@@ -3095,7 +3095,7 @@ impl interchange::JoinReport {
             );
         }
         let _ = writeln!(out, "uncovered: {}", self.uncovered.len());
-        // `DECIDE`: the counters, then under each uncovered line its
+        // DECIDE: the counters, then under each uncovered line its
         // classification and, for a violation, the witness.
         if let Some(d) = &self.decide {
             let _ = writeln!(
@@ -3253,7 +3253,7 @@ impl interchange::JoinReport {
     pub fn measurements(&self, wall_ms: u128) -> String {
         use std::fmt::Write as _;
         let mut out = crate::conformance::measure::of_join(Some(self), wall_ms).render();
-        // `DECIDE`: its keys after the block's last key, only with `--decide`
+        // DECIDE: its keys after the block's last key, only with `--decide`
         // (the block's keys and their order are unchanged).
         if let Some(d) = &self.decide {
             let _ = writeln!(out, "decide_uncovered: {}", self.uncovered.len());
