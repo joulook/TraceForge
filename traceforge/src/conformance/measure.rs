@@ -862,9 +862,11 @@ pub(crate) fn of_join(
     m.n("impl_summaries", r.impl_lines as u128);
     m.n("summaries_distinct", r.impl_lines as u128);
     m.n("uncovered_distinct", r.uncovered.len() as u128);
+    // `JOIN-TOTAL`: Σ `n` over the uncovered lines, empty where one has none.
+    m.set("uncovered_total", r.uncovered_total.map_or(Cell::Empty, Cell::N));
     m.stop(Stop::Exhausted);
     // The lines' counters; the graph counters and the mean stay empty (a file
-    // has no graphs, and its lines carry no multiplicity).
+    // has no graphs, and TraceForge's lines carry no multiplicity).
     let mut lines = Measurements::new(true);
     r.shape.fill(&mut lines, false, true);
     for k in [

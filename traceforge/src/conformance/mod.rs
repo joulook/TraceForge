@@ -1041,3 +1041,5 @@ fn run(
 mod threshold_tests;
 #[cfg(test)]
 mod threshold_tester_tests;
+#[cfg(test)]
+mod join_total_tests;

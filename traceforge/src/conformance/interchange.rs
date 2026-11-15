@@ -909,6 +909,9 @@ pub struct JoinReport {
     pub(crate) verdict: Verdict,
     /// The uncovered implementation lines, normalised, in the file's order.
     pub(crate) uncovered: Vec<(MissClass, String)>,
+    /// `JOIN-TOTAL`: Σ `n` over the uncovered implementation lines (0 with
+    /// none); `None` when one of them carries no `n` (TraceForge omits it).
+    pub(crate) uncovered_total: Option<u128>,
     /// `B` (MEAS-1 K3): the specification's read + inserts, the `covers`
     /// loop, the whole call, in milliseconds; the two files' line counts; the
     /// shape counters over the implementation's lines.
@@ -1015,11 +1018,25 @@ fn exact_keys(
 
 /// One summary line (R2, R3): its normal form, which is also the duplicate
 /// key, and its summary for the index. `names` are the header's, sorted.
-pub(crate) fn parse_line(text: &str, names: &[String]) -> Result<(String, CompactSummary), String> {
+pub(crate) fn parse_line(
+    text: &str,
+    names: &[String],
+) -> Result<(String, CompactSummary), String> {
+    parse_line_n(text, names).map(|(key, summary, _)| (key, summary))
+}
+
+/// [`parse_line`] and the line's `n` (`JOIN-TOTAL`): `Some` for an integer in
+/// 1 ..= `u64::MAX`, `None` for no `n` or any other value. `n` is information
+/// only: it is outside the normal form and never refuses a line.
+pub(crate) fn parse_line_n(
+    text: &str,
+    names: &[String],
+) -> Result<(String, CompactSummary, Option<u64>), String> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("not JSON: {e}"))?;
     let Value::Object(m) = v else {
         return Err("the line is not a JSON object".to_string());
     };
+    let n = m.get("n").and_then(Value::as_u64).filter(|&n| n >= 1);
     if let Some(k) = m
         .keys()
         .find(|k| !matches!(k.as_str(), "statuses" | "words" | "counts" | "n"))
@@ -1138,7 +1155,13 @@ pub(crate) fn parse_line(text: &str, names: &[String]) -> Result<(String, Compac
         sig_est: 32 * total + 16 * t,
         ord,
     };
-    Ok((key, summary))
+    Ok((key, summary, n))
+}
+
+/// `JOIN-TOTAL`: the sum with one more uncovered line's `n`; `None` from the
+/// first line that carries none.
+fn add_n(total: Option<u128>, n: Option<u64>) -> Option<u128> {
+    Some(total? + u128::from(n?))
 }
 
 /// A line's normal form (ruling Q8), for the test that JMC's lines are already
@@ -1201,7 +1224,13 @@ fn header_of(text: &str) -> Result<FileHead, String> {
 pub(crate) struct ReadFile {
     pub(crate) head: FileHead,
     pub(crate) lines: Vec<(usize, String, CompactSummary)>,
+    /// `JOIN-TOTAL`: each line's `n`, in line order.
+    pub(crate) ns: Vec<Option<u64>>,
 }
+
+/// One line of a sorted file: its number, its normal form, its summary and
+/// its `n`.
+type ReadLine = (usize, String, CompactSummary, Option<u64>);
 
 pub(crate) fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
     let at = |line: Option<usize>, what: String| {
@@ -1219,9 +1248,10 @@ pub(crate) fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
     let names = sorted_names(&head.visible);
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut lines = Vec::new();
+    let mut ns = Vec::new();
     for (i, l) in raw.enumerate() {
         let number = i + 2;
-        let (key, summary) = parse_line(l, &names).map_err(|e| at(Some(number), e))?;
+        let (key, summary, n) = parse_line_n(l, &names).map_err(|e| at(Some(number), e))?;
         if let Some(earlier) = seen.insert(key.clone(), number) {
             return Err(at(
                 Some(number),
@@ -1229,8 +1259,9 @@ pub(crate) fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
             ));
         }
         lines.push((number, key, summary));
+        ns.push(n);
     }
-    Ok(ReadFile { head, lines })
+    Ok(ReadFile { head, lines, ns })
 }
 
 /// `conf-join spec.jsonl impl.jsonl` (J3-3): the specification's lines into a
@@ -1284,7 +1315,8 @@ pub(crate) fn conf_join_with(
         std::thread::sleep(d);
     }
     let mut uncovered = Vec::new();
-    for (_, key, summary) in &i.lines {
+    let mut uncovered_total = Some(0);
+    for ((_, key, summary), n) in i.lines.iter().zip(&i.ns) {
         let class = match index.covers(summary).1 {
             Covers::Found(_) => continue,
             Covers::NoBucket => MissClass::NoBucket,
@@ -1292,6 +1324,7 @@ pub(crate) fn conf_join_with(
             Covers::NotFound => MissClass::NotFound,
         };
         uncovered.push((class, key.clone()));
+        uncovered_total = add_n(uncovered_total, *n);
     }
     let lookup_wall = t.elapsed();
     let mut shape = crate::conformance::measure::Shape::default();
@@ -1319,6 +1352,7 @@ pub(crate) fn conf_join_with(
         imp: i.head,
         verdict,
         uncovered,
+        uncovered_total,
         index_ms: index_wall.as_millis(),
         lookup_ms: lookup_wall.as_millis(),
         join_ms: join_started.elapsed().as_millis(),
@@ -1379,14 +1413,15 @@ impl SortedReader {
         JoinError(format!("{}: line {}: {what}", self.path.display(), self.number))
     }
 
-    /// The next line: its number, its normal form and its summary; `None` at EOF.
-    fn next(&mut self) -> Result<Option<(usize, String, CompactSummary)>, JoinError> {
+    /// The next line: its number, its normal form, its summary and its `n`;
+    /// `None` at EOF.
+    fn next(&mut self) -> Result<Option<ReadLine>, JoinError> {
         let Some(l) = self.lines.next() else {
             return Ok(None);
         };
         self.number += 1;
         let l = l.map_err(|e| self.at(e.to_string()))?;
-        let (key, summary) = parse_line(&l, &self.names).map_err(|e| self.at(e))?;
+        let (key, summary, n) = parse_line_n(&l, &self.names).map_err(|e| self.at(e))?;
         if let Some(prev) = &self.last_key {
             match key.as_str().cmp(prev.as_str()) {
                 std::cmp::Ordering::Equal => {
@@ -1407,7 +1442,7 @@ impl SortedReader {
         }
         self.last_key = Some(key.clone());
         self.count += 1;
-        Ok(Some((self.number, key, summary)))
+        Ok(Some((self.number, key, summary, n)))
     }
 }
 
@@ -1474,11 +1509,11 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
     index_wall += t.elapsed();
     let mut group: Option<SpecGroup> = None;
     // Loads the next group from the lookahead; `None` at EOF.
-    let load = |ahead: &mut Option<(usize, String, CompactSummary)>,
+    let load = |ahead: &mut Option<ReadLine>,
                     sr: &mut SortedReader,
                     shapes: &mut HashSet<crate::conformance::compact::SigHash>|
      -> Result<Option<SpecGroup>, JoinError> {
-        let Some((_, key, summary)) = ahead.take() else {
+        let Some((_, key, summary, _)) = ahead.take() else {
             return Ok(None);
         };
         let gk = sig_key(&key).to_owned();
@@ -1489,13 +1524,13 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
         loop {
             match sr.next()? {
                 None => break,
-                Some((n, k, s)) => {
+                Some((n, k, s, sn)) => {
                     if sig_key(&k) == gk {
                         shapes.insert(s.hash);
                         index.insert(&s);
                         lines += 1;
                     } else {
-                        *ahead = Some((n, k, s));
+                        *ahead = Some((n, k, s, sn));
                         break;
                     }
                 }
@@ -1507,12 +1542,13 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
     // depends on the whole specification (no-bucket vs no-slot).
     let mut misses: Vec<(Option<MissClass>, crate::conformance::compact::SigHash, String)> =
         Vec::new();
+    let mut uncovered_total = Some(0);
     let mut shape = crate::conformance::measure::Shape::default();
     let mut impl_lines = 0usize;
     loop {
         let t = Instant::now();
         let line = ir.next()?;
-        let Some((_, key, summary)) = line else {
+        let Some((_, key, summary, n)) = line else {
             lookup_wall += t.elapsed();
             break;
         };
@@ -1558,13 +1594,19 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
         }
         match found {
             Some(Covers::Found(_)) => {}
-            Some(Covers::NotFound) => misses.push((Some(MissClass::NotFound), summary.hash, key)),
+            Some(Covers::NotFound) => {
+                misses.push((Some(MissClass::NotFound), summary.hash, key));
+                uncovered_total = add_n(uncovered_total, n);
+            }
             // The group is built from this signature, so its own index holds it.
             Some(Covers::NoBucket) | Some(Covers::NoSig) => {
                 unreachable!("conformance: a group's index holds its own signature")
             }
             // A missing group: the class is decided at the end.
-            None => misses.push((None, summary.hash, key)),
+            None => {
+                misses.push((None, summary.hash, key));
+                uncovered_total = add_n(uncovered_total, n);
+            }
         }
         lookup_wall += t.elapsed().saturating_sub(loaded);
     }
@@ -1604,6 +1646,7 @@ pub fn conf_join_merge(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError>
         imp: ihead,
         verdict,
         uncovered,
+        uncovered_total,
         index_ms: index_wall.as_millis(),
         lookup_ms: lookup_wall.as_millis(),
         join_ms: join_started.elapsed().as_millis(),
