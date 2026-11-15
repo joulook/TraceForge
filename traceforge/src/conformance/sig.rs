@@ -273,17 +273,158 @@ impl Sig {
     }
 }
 
-/// A map keyed by signature, resolved exactly: `Sig::hash128 → [(Sig, T)]`,
-/// grouped by **full** `Sig` inside a bucket (`MIN-ENGINES` E4: the key was
-/// a projection of the shape).
-///
-/// This is what makes §8.3's cost claim survive the projection: on `ex:naive`
-/// a lookup costs one signature comparison per bucket member and no
-/// containment test, because every graph with the same signature shares one
-/// slot. The stateful index of Part 3 is `SigBuckets<BTreeSet<VisOrder>>`.
+#[cfg(test)]
+thread_local! {
+    static TEST_KEY: std::cell::Cell<Option<fn(&Sig) -> u64>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn with_test_key(key: fn(&Sig) -> u64, run: impl FnOnce()) {
+    struct Reset(Option<fn(&Sig) -> u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_KEY.with(|key| key.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_KEY.with(|slot| slot.replace(Some(key))));
+    run();
+}
+
+// The fixed EI-0.2 set: i8–i128, u8–u128, isize, usize, bool, char, String,
+// and Option<T>, Vec<T>, (T, U), (T, U, V) of those scalars, without nesting.
+// Floats, &str, (), DecVal and every other user type are deliberately excluded.
+// TypeId selects a concrete downcast; neither rendering nor type_name is read.
+type ValueHash = fn(&dyn std::any::Any, &mut DefaultHasher);
+
+fn value_hashers() -> &'static HashMap<std::any::TypeId, ValueHash> {
+    use std::any::{Any, TypeId};
+    static HASHERS: std::sync::OnceLock<HashMap<TypeId, ValueHash>> =
+        std::sync::OnceLock::new();
+    fn add<T: Hash + 'static>(map: &mut HashMap<TypeId, ValueHash>) {
+        fn hash<T: Hash + 'static>(value: &dyn Any, h: &mut DefaultHasher) {
+            value.downcast_ref::<T>().expect("conformance: typed value hash").hash(h);
+        }
+        map.insert(TypeId::of::<T>(), hash::<T>);
+    }
+    macro_rules! scalars {
+        ($m:ident, $($arg:tt)*) => {
+            $m!($($arg)*; i8, i16, i32, i64, i128, isize,
+                u8, u16, u32, u64, u128, usize, bool, char, String);
+        };
+    }
+    macro_rules! thirds {
+        ($map:ident, $t:ty, $u:ty; $($v:ty),*) => {
+            $(add::<($t, $u, $v)>(&mut $map);)*
+        };
+    }
+    macro_rules! seconds {
+        ($map:ident, $t:ty; $($u:ty),*) => {
+            $(add::<($t, $u)>(&mut $map);
+              scalars!(thirds, $map, $t, $u);)*
+        };
+    }
+    macro_rules! firsts {
+        ($map:ident; $($t:ty),*) => {
+            $(add::<$t>(&mut $map);
+              add::<Option<$t>>(&mut $map);
+              add::<Vec<$t>>(&mut $map);
+              scalars!(seconds, $map, $t);)*
+        };
+    }
+    HASHERS.get_or_init(|| {
+        let mut map = HashMap::new();
+        scalars!(firsts, map);
+        map
+    })
+}
+
+impl Sig {
+    /// Equality-compatible second-level key, using fixed-key DefaultHasher.
+    /// Hashes i8–i128, u8–u128, isize, usize, bool, char, String, and Option<T>,
+    /// Vec<T>, (T, U), (T, U, V) of those scalars only (no nested containers).
+    /// Floats, &str, (), DecVal and all other types are outside this fixed set.
+    /// Unsupported values contribute only a constant. The shape hash and all
+    /// slot/order identities remain unchanged; byte estimates exclude the maps.
+    pub(crate) fn value_key(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(key) = TEST_KEY.with(|key| key.get()) {
+            return key(self);
+        }
+        let mut h = DefaultHasher::new();
+        self.hash128().hash(&mut h);
+        for word in self.words.values() {
+            for obs in word {
+                let (kind, value) = match obs {
+                    Obs::Send(v) => (0u8, Some(v)),
+                    Obs::Recv(Some(v)) => (1, Some(v)),
+                    Obs::Recv(None) => (2, None),
+                };
+                kind.hash(&mut h);
+                if let Some(value) = value {
+                    let any = value.as_any_ref();
+                    any.type_id().hash(&mut h);
+                    if let Some(hash) = value_hashers().get(&any.type_id()) {
+                        hash(any, &mut h);
+                    } else {
+                        0u8.hash(&mut h);
+                    }
+                }
+            }
+        }
+        h.finish()
+    }
+}
+
+/// Slot indices in creation order, without an allocation for a singleton.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum SlotChain {
+    #[default]
+    Empty,
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl SlotChain {
+    pub(crate) fn push(&mut self, slot: usize) {
+        match self {
+            Self::Empty => *self = Self::One(slot),
+            Self::One(first) => *self = Self::Many(vec![*first, slot]),
+            Self::Many(slots) => slots.push(slot),
+        }
+    }
+
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Self::Empty => &[],
+            Self::One(slot) => std::slice::from_ref(slot),
+            Self::Many(slots) => slots,
+        }
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, usize> {
+        self.as_slice().iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a SlotChain {
+    type Item = &'a usize;
+    type IntoIter = std::slice::Iter<'a, usize>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+/// A map keyed by shape, then value key, resolved by full `Sig` equality.
+/// Chains contain slot indices in creation order; unsupported values retain
+/// the linear scan. The auxiliary maps do not change payload byte estimates.
+/// The stateful index of Part 3 is `SigBuckets<BTreeSet<VisOrder>>`.
 #[derive(Clone, Debug)]
 pub(crate) struct SigBuckets<T> {
     buckets: HashMap<u128, Vec<(Sig, T)>>,
+    chains: HashMap<u128, HashMap<u64, SlotChain>>,
     len: usize,
 }
 
@@ -291,6 +432,7 @@ impl<T> Default for SigBuckets<T> {
     fn default() -> Self {
         Self {
             buckets: HashMap::new(),
+            chains: HashMap::new(),
             len: 0,
         }
     }
@@ -303,10 +445,13 @@ impl<T> SigBuckets<T> {
 
     /// The slot whose `Sig` equals `sig`, created with `make()` if absent.
     pub(crate) fn entry(&mut self, sig: Sig, make: impl FnOnce() -> T) -> &mut T {
+        let chain = self.chains.entry(sig.hash128()).or_default()
+            .entry(sig.value_key()).or_default();
         let bucket = self.buckets.entry(sig.hash128()).or_default();
-        let at = match bucket.iter().position(|(s, _)| *s == sig) {
+        let at = match chain.iter().copied().find(|&i| bucket[i].0 == sig) {
             Some(i) => i,
             None => {
+                chain.push(bucket.len());
                 bucket.push((sig, make()));
                 self.len += 1;
                 bucket.len() - 1
@@ -317,10 +462,9 @@ impl<T> SigBuckets<T> {
 
     /// The slot whose `Sig` equals `sig`, if any.
     pub(crate) fn get(&self, sig: &Sig) -> Option<&T> {
-        self.buckets
-            .get(&sig.hash128())
-            .and_then(|b| b.iter().find(|(s, _)| s == sig))
-            .map(|(_, t)| t)
+        let bucket = self.buckets.get(&sig.hash128())?;
+        self.chains.get(&sig.hash128())?.get(&sig.value_key())?.iter()
+            .map(|&i| &bucket[i]).find(|(s, _)| s == sig).map(|(_, t)| t)
     }
 
     /// Distinct signatures held.
@@ -532,3 +676,7 @@ pub(crate) fn cone_from(g1_wobs: &Wobs, ord1: &VisOrder, m: &Summary, visible: &
         }
     })
 }
+
+#[cfg(test)]
+#[path = "index_key_tests.rs"]
+mod index_key_tests;

@@ -1423,9 +1423,8 @@ fn forged(base: &CompactSummary) -> CompactSummary {
 /// never a panic — at a memo probe after an admission and after a bucket hit
 /// (`(Miss, None)`), and at a bucket query (`(None, NoSig)`: no `≤` test and,
 /// P1, no slot). Stored, it gets its own slot, and each summary then answers
-/// only from its own slot. `MIN-ENGINES` E4: the rendering hint (P3) is gone;
-/// each resolution scans the bucket's slots in creation order, one `Sig` test
-/// per slot up to the hit, and no alias arises.
+/// only from its own slot. ENG-INDEX: each key selects its own chain;
+/// unused keys cost zero comparisons, singleton hits cost one, and no alias arises.
 #[test]
 fn m8_a_forged_equal_hash_different_sig_is_a_signature_miss() {
     let base = real_summary(MECH_CELL);
@@ -1492,8 +1491,8 @@ fn m8_a_forged_equal_hash_different_sig_is_a_signature_miss() {
             s.sig_tests,
             s.sig_aliases
         ),
-        (1, 1, 1, 1, 0),
-        "conformance: one bucket, one slot; one Sig test; the query created nothing"
+        (1, 1, 1, 0, 0),
+        "conformance: one bucket, one slot; zero Sig tests; the query created nothing"
     );
     assert_eq!(
         ix.insert(&bad),
@@ -1518,13 +1517,10 @@ fn m8_a_forged_equal_hash_different_sig_is_a_signature_miss() {
         base.sig_est + bad.sig_est,
         "conformance: the two occupied slots"
     );
-    // `MIN-ENGINES` E4 (the tester's re-pin at gate 3; 4 through the P3 hint
-    // before): no hint, the creation-order scan — insert base 0; covers bad 1
-    // (slot 0, miss); insert bad 1 (slot 0, miss; new slot 1); covers base 1
-    // (slot 0); covers bad 2 (slot 0, then slot 1) = 5; no alias.
+    // ENG-INDEX: unused keys cost zero; each singleton hit costs one.
     assert_eq!(
         (s.sig_tests, s.sig_aliases),
-        (5, 0),
+        (2, 0),
         "conformance: Sig == comparisons"
     );
 }
@@ -1846,11 +1842,9 @@ fn m10_d1_two_signatures_of_one_shape_in_sverify_s() {
             s.sig_tests,
             s.sig_bytes_est
         ),
-        // `MIN-ENGINES` E4 (the tester's re-pin at gate 3): `sig_tests` 3 → 4,
-        // no hint — the second insertion scans slot 0 (1), the query of slot
-        // 0's graph costs 1 and of slot 1's 2 (the hint answered it at 1).
-        (0, 1, 2, 2, 2, 2, 0, 2, 6, 4, 256),
-        "conformance: D1-self, SVerify-S compact (E4: no hint, the plain scan)"
+        // ENG-INDEX: two singleton hits; insertions cost zero.
+        (0, 1, 2, 2, 2, 2, 0, 2, 6, 2, 256),
+        "conformance: D1-self, SVerify-S compact (ENG-INDEX)"
     );
     assert_eq!(cur.reports.len(), 0);
     assert_eq!(
@@ -1883,10 +1877,8 @@ fn m10_d1_two_signatures_of_one_shape_in_sverify_s() {
             s.sig_tests,
             s.sig_bytes_est
         ),
-        // `MIN-ENGINES` E4 (the tester's re-pin at gate 3): `sig_tests` 4 →
-        // 4 + G(1)'s slot, no hint — the second insertion 1, G(1)'s query its
-        // slot + 1 (the hint answered it at 1), G(3)'s query both slots (2).
-        (1, 1, 2, 2, 2, 1, 3, 4 + g1_slot, 256),
+        // ENG-INDEX: one singleton hit; insertions and the miss cost zero.
+        (1, 1, 2, 2, 2, 1, 3, 1, 256),
         "conformance: D1-miss, SVerify-S compact (G(1)'s slot at {g1_slot}; P1: no slot for Sig(3))"
     );
     let c = &cmp.counters;
@@ -1947,9 +1939,9 @@ fn cfirst_current(f: &Fixture, cap: Capacity) -> crate::conformance::cfirst::CFi
 
 /// m11 (P2-derived §1.3, §1.4.3, §8; P2-frozen §4–§5): complete-first on two
 /// signatures of one shape. `P(1,2)` against `P(1,3)` at `w=inf`: a failing
-/// sweep for `G(3)` (a report), whose signature still gets an id and an empty
-/// slot; `sig_tests` 2 or 3 by the implementation order. `P(1,2)` against
-/// itself: two slots, four `Sig` tests. `P₃(1,2,1)` at `Bounded(1)`: the
+/// sweep for `G(3)` (a report), whose signature gets no slot. ENG-INDEX:
+/// unused keys cost zero, including both insertions of `P(1,2)` against
+/// itself. `P₃(1,2,1)` at `Bounded(1)`: the
 /// emptied slot keeps its id, so a re-admission counts — equal to the current
 /// engine's — and the counters follow the implementation order's row.
 /// The implementation order is read from the stateful engine's kept graphs
@@ -1981,7 +1973,7 @@ fn m11_d1_two_signatures_of_one_shape_in_complete_first() {
             s.sig_tests,
             s.impl_distinct_summaries
         ),
-        (1, 2, 1, 1, 1, 1, if g1_first { 1 } else { 0 }, Some(2)),
+        (1, 2, 1, 1, 1, 1, 0, Some(2)),
         "conformance: D1-miss complete-first (G(1) first: {g1_first})"
     );
     let cur = cfirst_current(&f, Capacity::Unbounded);
@@ -2012,7 +2004,7 @@ fn m11_d1_two_signatures_of_one_shape_in_complete_first() {
             s.sig_tests,
             s.memo_entries
         ),
-        (0, 2, 2, 2, 1, 2, 2),
+        (0, 2, 2, 2, 1, 0, 2),
         "conformance: D1-self complete-first"
     );
     // P₃(1,2,1) at Bounded(1).
@@ -2028,11 +2020,12 @@ fn m11_d1_two_signatures_of_one_shape_in_complete_first() {
         .iter()
         .map(|g| if &g.sig == one { 1 } else { 2 })
         .collect();
+    // ENG-INDEX: only repeated signatures compare, including emptied slots.
     // (sweeps, admissions, evictions, memo_clears, readmissions, memo_hits, sig_tests)
     let want = match order.as_slice() {
-        [1, 2, 1] => (3, 3, 2, 2, 1, 0, 4),
-        [1, 1, 2] => (2, 2, 1, 1, 0, 1, 3),
-        [2, 1, 1] => (2, 2, 1, 1, 0, 1, 3),
+        [1, 2, 1] => (3, 3, 2, 2, 1, 0, 2),
+        [1, 1, 2] => (2, 2, 1, 1, 0, 1, 1),
+        [2, 1, 1] => (2, 2, 1, 1, 0, 1, 1),
         other => panic!("conformance: an impossible order {other:?}"),
     };
     let o = cfirst_compact(&f, Capacity::Bounded(1));
@@ -2308,8 +2301,8 @@ fn m15_p1_a_query_creates_no_bucket_and_no_slot() {
             s.sig_tests,
             s.containment_tests
         ),
-        (1, 1, 1, 2, 0),
-        "conformance: one Sig test per query, no slot"
+        (1, 1, 1, 0, 0),
+        "conformance: zero Sig tests per unused key, no slot"
     );
     let mut c = CompactCache::new(Capacity::Unbounded, true, true);
     assert!(c.admit(&base, &base));
@@ -3718,6 +3711,48 @@ fn i2_compare(spec: &[CompactSummary], imp: &[CompactSummary]) -> (Vec<String>, 
         if a != b {
             bad.push(format!("insertion {i}: set {a:?} reference {b:?}"));
         }
+    }
+    // ENG-INDEX: an independent linear oracle, built from the input history,
+    // never from either index's keys, representatives or held orders.
+    let mut linear: Vec<(&Sig, Vec<(&OrdCounts, u64)>)> = Vec::new();
+    let mut seq = 0;
+    for s in spec {
+        let at = linear.iter().position(|(sig, _)| *sig == &s.sig)
+            .unwrap_or_else(|| {
+                linear.push((&s.sig, Vec::new()));
+                linear.len() - 1
+            });
+        if !linear[at].1.iter().any(|(ord, _)| *ord == &s.ord) {
+            linear[at].1.push((&s.ord, seq));
+            seq += 1;
+        }
+    }
+    for q in imp.iter().chain(spec.iter()) {
+        let slot = linear.iter().position(|(sig, _)| *sig == &q.sig);
+        let missing = if spec.iter().any(|s| s.hash == q.hash) {
+            Covers::NoSig
+        } else {
+            Covers::NoBucket
+        };
+        let mut want_set = (None, missing);
+        let mut want_compact = want_set;
+        if let Some(i) = slot {
+            let orders = &linear[i].1;
+            let covering = orders.iter().find(|(ord, _)| ord.le(&q.ord));
+            let exact = orders.iter().find(|(ord, _)| *ord == &q.ord);
+            want_compact = (Some(i as u32), covering.map_or(Covers::NotFound,
+                |(_, seq)| Covers::Found(*seq)));
+            want_set = (Some(i as u32), exact.or(covering).map_or(Covers::NotFound,
+                |(_, seq)| Covers::Found(*seq)));
+        }
+        assert_eq!(set.covers(q), want_set, "conformance: linear set oracle");
+        assert_eq!(rf.covers(q), want_compact, "conformance: linear compact oracle");
+    }
+    // Restore query counters: the original differential accounting starts here.
+    let (mut set, mut rf) = (SetIndex::new(), CompactIndex::new(false));
+    for s in spec {
+        set.insert(s);
+        rf.insert(s);
     }
     let st = set.stats();
     if (st.containment_tests, st.coordinates_compared, st.exact_hits) != (0, 0, 0) {
@@ -5952,21 +5987,8 @@ fn e4_into_bucket(base: &CompactSummary, other: &str) -> CompactSummary {
     }
 }
 
-/// E4-6 (d): no rendering hint. A source check: `render_hash` has one body,
-/// `None`, and `compact.rs` names `print_vals` only in comments, so there is
-/// no feature-gated variant and the hint maps stay empty under both feature
-/// sets. Then a built three-slot bucket — one shape hash with three
-/// signatures: `MECH_CELL`'s, and forged with 2pc n2's and A3 fifo k2q2's —
-/// in `CompactIndex` and in `SetIndex`:
-/// - inserting the slot-k signature costs k `Sig` tests;
-/// - a query of slot k's signature costs k + 1, on every repeat (the hint
-///   answered a repeat at 1);
-/// - a signature with no slot (A1 correct n2r2's) costs 3 and is `NoSig`;
-/// - `PN`'s pair (equal `Sig`, different renderings) is one slot, and its
-///   second insertion is a duplicate at one test;
-/// - `sig_aliases` stays 0.
-/// Fails before E4 under `print_vals` (the default features): the repeated
-/// queries, and `PN`'s alias.
+/// ENG-INDEX: no rendering hint; distinct value keys cost zero on insertion
+/// and misses, and one on hits. Equal noisy values still share one slot.
 #[test]
 fn e4_d_no_rendering_hint() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -5975,13 +5997,7 @@ fn e4_d_no_rendering_hint() {
     let code: Vec<&str> = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
     let code = code.join("\n");
     assert!(!code.contains("print_vals"), "conformance: a `print_vals` gate in compact.rs");
-    assert_eq!(code.matches("fn render_hash(").count(), 1, "conformance: one `render_hash`");
-    let body = e4_window(&code, "fn render_hash(", "\n}");
-    assert_eq!(
-        body[body.find('{').expect("conformance: a body") + 1..].trim(),
-        "None",
-        "conformance: `render_hash`'s body"
-    );
+    assert!(!code.contains("fn render_hash("));
     let base = real_summary(MECH_CELL);
     let slots = [
         base.clone(),
@@ -6005,7 +6021,7 @@ fn e4_d_no_rendering_hint() {
         let t = ix.stats().sig_tests;
         let (id, ins) = ix.insert(s);
         let cost = ix.stats().sig_tests - t;
-        if id as usize != k || !matches!(ins, Inserted::Stored(_)) || cost != k {
+        if id as usize != k || !matches!(ins, Inserted::Stored(_)) || cost != 0 {
             bad.push(format!("compact insert {k}: ({id}, {ins:?}) at {cost} tests"));
         }
     }
@@ -6014,7 +6030,7 @@ fn e4_d_no_rendering_hint() {
             let t = ix.stats().sig_tests;
             let got = ix.covers(&slots[k]);
             let cost = ix.stats().sig_tests - t;
-            if got.0 != Some(k as u32) || !matches!(got.1, Covers::Found(_)) || cost != k + 1 {
+            if got.0 != Some(k as u32) || !matches!(got.1, Covers::Found(_)) || cost != 1 {
                 bad.push(format!("compact query {round}/{k}: {got:?} at {cost} tests"));
             }
         }
@@ -6022,7 +6038,7 @@ fn e4_d_no_rendering_hint() {
     let t = ix.stats().sig_tests;
     let got = ix.covers(&stranger);
     let cost = ix.stats().sig_tests - t;
-    if got != (None, Covers::NoSig) || cost != 3 {
+    if got != (None, Covers::NoSig) || cost != 0 {
         bad.push(format!("compact stranger: {got:?} at {cost} tests"));
     }
     if ix.stats().sig_aliases != 0 {
@@ -6042,7 +6058,7 @@ fn e4_d_no_rendering_hint() {
         let t = set.stats().sig_tests;
         let (id, ins) = set.insert(s);
         let cost = set.stats().sig_tests - t;
-        if id as usize != k || !matches!(ins, Inserted::Stored(_)) || cost != k {
+        if id as usize != k || !matches!(ins, Inserted::Stored(_)) || cost != 0 {
             bad.push(format!("set insert {k}: ({id}, {ins:?}) at {cost} tests"));
         }
     }
@@ -6051,7 +6067,7 @@ fn e4_d_no_rendering_hint() {
             let t = set.stats().sig_tests;
             let got = set.covers(&slots[k]);
             let cost = set.stats().sig_tests - t;
-            if got.0 != Some(k as u32) || !matches!(got.1, Covers::Found(_)) || cost != k + 1 {
+            if got.0 != Some(k as u32) || !matches!(got.1, Covers::Found(_)) || cost != 1 {
                 bad.push(format!("set query {round}/{k}: {got:?} at {cost} tests"));
             }
         }
@@ -6059,7 +6075,7 @@ fn e4_d_no_rendering_hint() {
     let t = set.stats().sig_tests;
     let got = set.covers(&stranger);
     let cost = set.stats().sig_tests - t;
-    if got != (None, Covers::NoSig) || cost != 3 {
+    if got != (None, Covers::NoSig) || cost != 0 {
         bad.push(format!("set stranger: {got:?} at {cost} tests"));
     }
     if set.stats().sig_aliases != 0 {
@@ -7505,3 +7521,7 @@ fn e9_d_the_public_route() {
     }
     assert!(bad.is_empty(), "conformance: E9-6 (d): {bad:#?}");
 }
+
+#[cfg(test)]
+#[path = "index_tester_tests.rs"]
+mod index_tester_tests;

@@ -29,14 +29,11 @@
 //! signature miss, never an answer. A 128-bit collision between two shapes
 //! only puts them in one bucket, where `Sig ==` still separates them.
 //!
-//! **The rendering hint** (P3, P2-frozen §7) — gone since `MIN-ENGINES` E4.
-//! Each bucket mapped a 64-bit hash of a signature's `Debug` rendering to slot
-//! indices (under the `print_vals` feature only); resolution tried the hinted
-//! slots first and then the others, all by `Sig ==`, so the hint ordered
-//! candidates and decided nothing, and a slot found only by the second pass
-//! was an alias, counted. Now `render_hash` is `None` under both feature
-//! sets, the hint maps stay empty, resolution is the plain creation-order
-//! scan, `sig_aliases` is 0 and `sig_tests` counts to the hit's position + 1.
+//! **The value key** (ENG-INDEX) selects a creation-ordered chain within
+//! each shape bucket. Only that chain is compared by `Sig ==`; collisions
+//! remain separate slots. Unsupported values contribute a constant, preserving
+//! the scan for those types. `sig_tests` counts comparisons actually started;
+//! `sig_aliases` remains zero. Byte estimates exclude these auxiliary maps.
 //!
 //! **Signature ids** (P1, P2; P2-frozen §7). Only an insertion creates a slot,
 //! with a run-wide `sig_id` (allocation checked); a query never creates one.
@@ -87,7 +84,7 @@ use std::hash::Hash;
 use crate::conformance::config::{BucketKind, Capacity};
 use crate::conformance::morphism::{statuses, CompleteExecution};
 use crate::conformance::obs::{wobs, Wobs};
-use crate::conformance::sig::Sig;
+use crate::conformance::sig::{Sig, SlotChain};
 use crate::exec_graph::ExecutionGraph;
 
 /// The bucket key: a 128-bit hash of the signature's shape (P2-frozen §1).
@@ -100,13 +97,9 @@ pub(crate) type SigId = u32;
 /// counts)` (P2-frozen §1, §7).
 pub(crate) type MemoKey = (SigId, OrdCounts);
 
-/// P3 (P2-frozen §7) had here, under `print_vals`, a 64-bit hash of the
-/// signature's `Debug` rendering as a hint ordering the slot search.
-/// `MIN-ENGINES` E4: no hint — `None` under both feature sets, so the hint
-/// maps stay empty and the slot search is the plain creation-order scan
-/// (`sig_aliases` is 0; `sig_tests` counts to the hit's position + 1).
-fn render_hash(_sig: &Sig) -> Option<u64> {
-    None
+/// Equality-compatible key, independent of rendering and feature flags.
+fn slot_key(sig: &Sig) -> u64 {
+    sig.value_key()
 }
 
 /// The visible order of a complete graph as counts (frozen §3.2).
@@ -626,8 +619,8 @@ pub(crate) struct Bucket {
     pub(crate) slots: Vec<SigSlot>,
     /// Slots holding at least one order.
     occupied: usize,
-    /// P3: rendering hash → slot indices (creations, then aliases).
-    hint: HashMap<u64, Vec<usize>>,
+    /// Value key → slot indices in creation order.
+    chains: HashMap<u64, SlotChain>,
 }
 
 /// The index's own counters (frozen §7, P2-frozen §1–§3); the engines add
@@ -647,10 +640,9 @@ pub struct CompactStats {
     /// Every slot created: signatures inserted at least once (P1).
     pub signatures_seen: usize,
     /// `Sig ==` comparisons started in slot resolution (insertions and
-    /// queries; the hinted slots and the rest, P3).
+    /// queries; only the selected key chain).
     pub sig_tests: usize,
-    /// Slots found only by the scan after the hinted ones: equal signatures
-    /// with different renderings, each then recorded in the hint (P3).
+    /// Legacy rendering aliases; always zero.
     pub sig_aliases: usize,
     /// Insertions that stored an order.
     pub admitted: usize,
@@ -771,43 +763,20 @@ impl CompactIndex {
         self.buckets.iter()
     }
 
-    /// P3 (P2-frozen §7): the slot of `sig` in `bucket` by `Sig ==`, the
-    /// hinted slots of its rendering hash `r` first, then the others in slot
-    /// order; a slot found by the second pass is an alias, appended to `r`'s
-    /// list. Every comparison counts in `sig_tests`. Creates nothing.
+    /// Compare only the selected key's chain, in slot creation order.
     fn find_in(
         stats: &mut CompactStats,
         bucket: &mut Bucket,
         sig: &Sig,
-        r: Option<u64>,
+        r: u64,
     ) -> Option<usize> {
-        let hinted: &[usize] = match r {
-            Some(r) => bucket.hint.get(&r).map_or(&[][..], Vec::as_slice),
-            None => &[],
-        };
-        for &i in hinted {
+        for &i in bucket.chains.get(&r).into_iter().flatten() {
             stats.sig_tests += 1;
             if bucket.slots[i].sig == *sig {
                 return Some(i);
             }
         }
-        let mut found = None;
-        for (i, slot) in bucket.slots.iter().enumerate() {
-            if hinted.contains(&i) {
-                continue;
-            }
-            stats.sig_tests += 1;
-            if slot.sig == *sig {
-                found = Some(i);
-                break;
-            }
-        }
-        let i = found?;
-        if let Some(r) = r {
-            bucket.hint.entry(r).or_default().push(i);
-            stats.sig_aliases += 1;
-        }
-        Some(i)
+        None
     }
 
     /// P1: a query's resolution, never creating — whether the shape's bucket
@@ -816,14 +785,14 @@ impl CompactIndex {
         let Some(bucket) = self.buckets.get_mut(&s.hash) else {
             return (false, None);
         };
-        let r = render_hash(&s.sig);
+        let r = slot_key(&s.sig);
         (true, Self::find_in(&mut self.stats, bucket, &s.sig, r))
     }
 
     /// An insertion's resolution: the signature's slot, created (bucket and
     /// slot, with a fresh checked id, P2) when absent.
     fn slot_for_insert(&mut self, s: &CompactSummary) -> usize {
-        let r = render_hash(&s.sig);
+        let r = slot_key(&s.sig);
         let bucket = self.buckets.entry(s.hash).or_default();
         if let Some(i) = Self::find_in(&mut self.stats, bucket, &s.sig, r) {
             return i;
@@ -841,9 +810,7 @@ impl CompactIndex {
             trie: None,
         });
         let i = bucket.slots.len() - 1;
-        if let Some(r) = r {
-            bucket.hint.entry(r).or_default().push(i);
-        }
+        bucket.chains.entry(r).or_default().push(i);
         self.stats.signatures_seen += 1;
         i
     }
@@ -1327,61 +1294,32 @@ struct SetSlot {
     counts: Option<Vec<u32>>,
 }
 
-/// One shape's bucket in the set index: its slots in creation order and the
-/// P3 hint (rendering hash → slot indices, creations then aliases). The hint
-/// is a `RefCell` so that the read-only query records an alias, as the
-/// reference's `covers(&mut self)` does (I2-3).
+/// One shape's slots and value-key chains, both in creation order.
 #[derive(Clone, Debug, Default)]
 struct SetBucket {
     slots: Vec<SetSlot>,
     /// `MIN-ENGINES` E7b: the slots holding at least one order (a slot emptied
     /// by the stateless cache's eviction stays, P1, but is not occupied).
     occupied: usize,
-    hint: std::cell::RefCell<HashMap<u64, Vec<usize>>>,
+    chains: HashMap<u64, SlotChain>,
 }
 
 impl SetBucket {
-    /// The slot of `sig` by `Sig ==`: the hinted slots of its rendering hash
-    /// `r` first, in list order, then the others in slot order; a slot found
-    /// by the second pass is an alias, appended to `r`'s list and counted.
-    /// `CompactIndex::find_in`'s rule, through `&self` (`tests` and
-    /// `aliases` are the index's `Cell`s). Creates nothing.
+    /// Compare only the selected key's chain, counting each `Sig ==`.
     fn find(
         &self,
         sig: &Sig,
-        r: Option<u64>,
+        r: u64,
         tests: &std::cell::Cell<usize>,
-        aliases: &std::cell::Cell<usize>,
+        _aliases: &std::cell::Cell<usize>,
     ) -> Option<usize> {
-        let hint = self.hint.borrow();
-        let hinted: &[usize] = match r {
-            Some(r) => hint.get(&r).map_or(&[][..], Vec::as_slice),
-            None => &[],
-        };
-        for &i in hinted {
+        for &i in self.chains.get(&r).into_iter().flatten() {
             tests.set(tests.get() + 1);
             if self.slots[i].sig == *sig {
                 return Some(i);
             }
         }
-        let mut found = None;
-        for (i, slot) in self.slots.iter().enumerate() {
-            if hinted.contains(&i) {
-                continue;
-            }
-            tests.set(tests.get() + 1);
-            if slot.sig == *sig {
-                found = Some(i);
-                break;
-            }
-        }
-        let i = found?;
-        drop(hint);
-        if let Some(r) = r {
-            self.hint.borrow_mut().entry(r).or_default().push(i);
-            aliases.set(aliases.get() + 1);
-        }
-        Some(i)
+        None
     }
 }
 
@@ -1403,10 +1341,9 @@ pub struct SetStats {
     /// Every slot created: signatures inserted at least once.
     pub signatures_seen: usize,
     /// `Sig ==` comparisons started in slot resolution (insertions and
-    /// queries; the hinted slots and the rest).
+    /// queries; only the selected key chain).
     pub sig_tests: usize,
-    /// Slots found only by the scan after the hinted ones: equal signatures
-    /// with different renderings, each then recorded in the hint.
+    /// Legacy rendering aliases; always zero.
     pub sig_aliases: usize,
     /// Insertions that stored an order.
     pub admitted: usize,
@@ -1470,7 +1407,7 @@ impl SetStats {
 
 /// The set index (`SVERIFY-P` I2): the compact summaries of one side as a
 /// hash set per signature — the shape bucket by `hash`, the slot by `Sig ==`
-/// through the P3 hint exactly as [`CompactIndex`] resolves it, the orders of
+/// through the value-key chain exactly as [`CompactIndex`] resolves it, the orders of
 /// a slot held once in an `IndexMap<OrdCounts, u64>` (I2b-1) that answers an
 /// exact duplicate and the exact-hit probe by hash with no `cmp` — and the
 /// admission-ordered scan of [`CompactIndex`]'s query, through `&self`. No
@@ -1611,7 +1548,7 @@ impl SetIndex {
     /// An insertion's resolution: the signature's slot, created (bucket and
     /// slot, with a fresh checked id) when absent — `slot_for_insert`'s rule.
     fn slot_for_insert(&mut self, s: &CompactSummary) -> usize {
-        let r = render_hash(&s.sig);
+        let r = slot_key(&s.sig);
         let bucket = self.buckets.entry(s.hash).or_default();
         if let Some(i) = bucket.find(&s.sig, r, &self.sig_tests, &self.sig_aliases) {
             return i;
@@ -1623,7 +1560,7 @@ impl SetIndex {
     /// which is moved into the slot created when absent (no clone) and
     /// dropped when the slot exists.
     fn slot_for_owned(&mut self, hash: SigHash, sig: Sig, sig_est: usize) -> usize {
-        let r = render_hash(&sig);
+        let r = slot_key(&sig);
         let bucket = self.buckets.entry(hash).or_default();
         if let Some(i) = bucket.find(&sig, r, &self.sig_tests, &self.sig_aliases) {
             return i;
@@ -1632,8 +1569,8 @@ impl SetIndex {
     }
 
     /// The slot's creation, shared by the two resolutions: a fresh checked
-    /// id, the hint entry when `r` is `Some`, `signatures_seen` + 1.
-    fn new_slot(&mut self, hash: SigHash, sig: Sig, sig_est: usize, r: Option<u64>) -> usize {
+    /// id, the value-key chain entry, `signatures_seen` + 1.
+    fn new_slot(&mut self, hash: SigHash, sig: Sig, sig_est: usize, r: u64) -> usize {
         let sig_id = self.next_sig_id;
         self.next_sig_id = sig_id
             .checked_add(1)
@@ -1651,9 +1588,7 @@ impl SetIndex {
             counts: count.then(Vec::new),
         });
         let i = bucket.slots.len() - 1;
-        if let Some(r) = r {
-            bucket.hint.borrow_mut().entry(r).or_default().push(i);
-        }
+        bucket.chains.entry(r).or_default().push(i);
         self.stats.signatures_seen += 1;
         i
     }
@@ -1772,7 +1707,7 @@ impl SetIndex {
         let Some(bucket) = self.buckets.get(&s.hash) else {
             return (None, Covers::NoBucket);
         };
-        let r = render_hash(&s.sig);
+        let r = slot_key(&s.sig);
         let Some(si) = bucket.find(&s.sig, r, &self.sig_tests, &self.sig_aliases) else {
             return (None, Covers::NoSig);
         };
@@ -1827,7 +1762,7 @@ impl SetIndex {
     /// within the bucket) and the order store (per `SigId` the slot's map,
     /// `shrink_to_fit` so that the entries vector's unused capacity is
     /// returned — the map's headers move, the orders' heap buffers do not).
-    /// The query counters and the hints are dropped; `stats()` before the
+    /// The query counters are dropped; chains move with the slots; `stats()` before the
     /// freeze is the index's record. A set that counts multiplicities loses
     /// them here (the store answers queries; it does not count).
     pub(crate) fn freeze(self) -> (SigTable, OrderStore) {
@@ -1836,7 +1771,9 @@ impl SetIndex {
             (0..n).map(|_| indexmap::IndexMap::new()).collect();
         let mut table: HashMap<SigHash, Vec<(SigId, Sig)>> =
             HashMap::with_capacity(self.buckets.len());
+        let mut chains = HashMap::new();
         for (hash, bucket) in self.buckets {
+            chains.insert(hash, bucket.chains);
             let mut slots = Vec::with_capacity(bucket.slots.len());
             for slot in bucket.slots {
                 let SetSlot {
@@ -1851,7 +1788,7 @@ impl SetIndex {
             }
             table.insert(hash, slots);
         }
-        (SigTable { buckets: table }, OrderStore { orders })
+        (SigTable { buckets: table, chains }, OrderStore { orders })
     }
 }
 
@@ -1900,12 +1837,11 @@ pub(crate) enum SigLookup {
 /// `SVERIFY-P` I3-5: the frozen index's signatures — per shape bucket its
 /// slots' `(SigId, Sig)` in creation order. `Clone`, and `Send` but not
 /// `Sync` (a `Sig` holds `Box<dyn Message>`), so each querying worker owns a
-/// clone. Resolution is the creation-order scan by `Sig ==` (`render_hash`
-/// is `None` since `MIN-ENGINES` E4, so the set index's hints were always
-/// empty and the scan was its only pass).
+/// clone. Resolution compares only the selected value-key chain.
 #[derive(Clone, Debug)]
 pub(crate) struct SigTable {
     buckets: HashMap<SigHash, Vec<(SigId, Sig)>>,
+    chains: HashMap<SigHash, HashMap<u64, SlotChain>>,
 }
 
 impl SigTable {
@@ -1915,7 +1851,8 @@ impl SigTable {
         let Some(slots) = self.buckets.get(&hash) else {
             return SigLookup::NoBucket;
         };
-        for (id, held) in slots {
+        for &i in self.chains[&hash].get(&sig.value_key()).into_iter().flatten() {
+            let (id, held) = &slots[i];
             *tests += 1;
             if held == sig {
                 return SigLookup::Found(*id);
@@ -2049,6 +1986,7 @@ pub(crate) struct SharedCache {
 /// A worker's view of the signatures: its table, synced from the log.
 pub(crate) struct WorkerTable {
     buckets: HashMap<SigHash, Vec<(SigId, Sig)>>,
+    chains: HashMap<SigHash, HashMap<u64, SlotChain>>,
     /// The log entries this table holds (the next index to sync from).
     synced: usize,
     pub(crate) syncs: usize,
@@ -2109,19 +2047,20 @@ impl WorkerTable {
     pub(crate) fn new() -> Self {
         Self {
             buckets: HashMap::new(),
+            chains: HashMap::new(),
             synced: 0,
             syncs: 0,
             sig_tests: 0,
         }
     }
 
-    /// Resolve by the creation-order scan on `Sig ==` (no hint: `render_hash`
-    /// is `None` since `MIN-ENGINES` E4).
+    /// Resolve within the value-key chain, preserving creation order.
     fn resolve(&mut self, hash: SigHash, sig: &Sig) -> SigLookup {
         let Some(slots) = self.buckets.get(&hash) else {
             return SigLookup::NoBucket;
         };
-        for (id, held) in slots {
+        for &i in self.chains[&hash].get(&sig.value_key()).into_iter().flatten() {
+            let (id, held) = &slots[i];
             self.sig_tests += 1;
             if held == sig {
                 return SigLookup::Found(*id);
@@ -2131,7 +2070,10 @@ impl WorkerTable {
     }
 
     fn add(&mut self, hash: SigHash, id: SigId, sig: Sig) {
-        self.buckets.entry(hash).or_default().push((id, sig));
+        let slots = self.buckets.entry(hash).or_default();
+        self.chains.entry(hash).or_default().entry(sig.value_key()).or_default()
+            .push(slots.len());
+        slots.push((id, sig));
     }
 }
 
@@ -2472,3 +2414,11 @@ pub(crate) static PUBLICATION_GATE: TestGate = TestGate::new();
 /// `UnadmittedAfterCancel` with nothing published.
 #[cfg(test)]
 pub(crate) static PRE_ADMIT_GATE: TestGate = TestGate::new();
+
+#[cfg(test)]
+#[path = "index_tests.rs"]
+mod index_tests;
+
+#[cfg(test)]
+#[path = "index_promotion_tests.rs"]
+mod index_promotion_tests;
