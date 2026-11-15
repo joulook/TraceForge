@@ -31,6 +31,10 @@ mod must;
 mod progress_tests;
 #[cfg(test)]
 mod progress_tester_tests;
+#[cfg(test)]
+mod largeprint_tests;
+#[cfg(test)]
+mod largeprint_tester_tests;
 mod predicate;
 mod replay;
 mod revisit;
@@ -292,6 +296,10 @@ impl<'de> Deserialize<'de> for ConsType {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// TraceForge configuration options.
 ///
 /// Use the [`ConfigBuilder`] class to construct a `Config` struct.
@@ -300,6 +308,8 @@ pub struct Config {
     pub(crate) stack_size: usize,
     pub(crate) progress_report: usize,
     pub(crate) thread_threshold: u32,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) dump_large_graph: bool,
     pub(crate) warnings_as_errors: bool,
     pub(crate) keep_going_after_error: bool,
     pub(crate) mode: ExplorationMode,
@@ -379,6 +389,7 @@ impl ConfigBuilder {
             stack_size: 0x8000,
             progress_report: 0,
             thread_threshold: 1000,
+            dump_large_graph: false,
             warnings_as_errors: false,
             keep_going_after_error: false,
             mode: ExplorationMode::Verification,
@@ -469,6 +480,12 @@ impl ConfigBuilder {
     /// That is, if a thread has more than `s` many events, a warning is printed on the console
     pub fn with_thread_threshold(mut self, s: u32) -> Self {
         self.0.thread_threshold = s;
+        self
+    }
+
+    /// Print the graph when a thread exceeds the thread threshold. Off by default.
+    pub fn with_dump_large_graph(mut self, b: bool) -> Self {
+        self.0.dump_large_graph = b;
         self
     }
 

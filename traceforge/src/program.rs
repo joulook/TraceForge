@@ -14,7 +14,8 @@
 //!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
 //! <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]]
 //!              [--budget N] [--model …] [ARGS…]
-//! <bin> row    [--model …] --seed N [--threshold N] -- ARGS   (with EVAL_ROW, EVAL_COMMIT)
+//! <bin> row    [--model …] --seed N [--threshold N] [--dump-large-graph] -- ARGS
+//!              (with EVAL_ROW, EVAL_COMMIT)
 //! ```
 //!
 //! `ARGS` are everything after the options (or after `--`), passed verbatim to
@@ -34,7 +35,8 @@
 //! the program's entry points built from `ARGS`, and prints `EVALROW\t` and the
 //! schema-8 record (after the split line on an `Explore` row); exit 0 with a
 //! record (also when the engine panicked, `end_class=panicked`), 2 without one.
-//! Only `--model`, `--seed` (required) and `--threshold` are options of `row`.
+//! The `row` options are `--model`, `--seed` (required), `--threshold`,
+//! and `--dump-large-graph`.
 //!
 //! **The default model** (`MODEL-DEFAULT`): without `--model`, a run uses the
 //! program's own default, declared through [`main_with_model`]; [`main`] declares
@@ -116,18 +118,19 @@ const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS�
     <bin> conf [--engine stateful|stateless|gated|enumerator] [--threads N] \
     [--stop-at-first] [--distinct] [options] [ARGS…]\n\
     options: --model fifo|bag|causal (default: the program's), --seed N, --threshold N, \
-    --program S, --size S; \
+    --dump-large-graph, --program S, --size S; \
     `--` ends the options\n       \
-    <bin> row [--model fifo|bag|causal] --seed N [--threshold N] -- ARGS   \
+    <bin> row [--model fifo|bag|causal] --seed N [--threshold N] [--dump-large-graph] -- ARGS   \
     (EVAL_ROW, EVAL_COMMIT)\n       \
     <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]] \
-    [--budget N] [--model …] [--seed N] [--threshold N] [ARGS…]\n";
+    [--budget N] [--model …] [--seed N] [--threshold N] [--dump-large-graph] [ARGS…]\n";
 
 /// The options of every subcommand, and the program's own arguments.
 struct Opts {
     model: ConsType,
     seed: Option<u64>,
     threshold: Option<u32>,
+    dump_large_graph: bool,
     engine: String,
     threads: usize,
     stop_at_first: bool,
@@ -145,6 +148,7 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
         model: default_model,
         seed: None,
         threshold: None,
+        dump_large_graph: false,
         engine: "stateful".to_string(),
         threads: 1,
         stop_at_first: false,
@@ -182,6 +186,7 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
             "--threshold" => {
                 o.threshold = Some(value()?.parse().map_err(|_| "--threshold needs a number")?)
             }
+            "--dump-large-graph" => o.dump_large_graph = true,
             "--engine" => o.engine = value()?,
             "--threads" => {
                 o.threads = value()?.parse().map_err(|_| "--threads needs a number")?;
@@ -221,7 +226,7 @@ fn config_of(o: &Opts) -> Config {
     if let Some(t) = o.threshold {
         b = b.with_thread_threshold(t);
     }
-    b.build()
+    b.with_dump_large_graph(o.dump_large_graph).build()
 }
 
 /// `count`'s configuration. Plain Must explores past an assertion failure, as
@@ -238,15 +243,13 @@ fn count_config(o: &Opts) -> Config {
     config
 }
 
-/// `row`'s configuration: the model, the seed and the thread threshold and
-/// nothing else, as the evaluation's fixtures built theirs (`H.derived.md`
-/// §2.2).
+/// `row`'s model, seed, thread threshold and optional large-graph diagnostic.
 fn row_config(o: &Opts, seed: u64) -> Config {
     let mut b = Config::builder().with_cons_type(o.model).with_seed(seed);
     if let Some(t) = o.threshold {
         b = b.with_thread_threshold(t);
     }
-    b.build()
+    b.with_dump_large_graph(o.dump_large_graph).build()
 }
 
 /// The first option of `args` that a subcommand does not take, if any:
@@ -268,7 +271,9 @@ fn foreign_option<'a>(args: &'a [String], valued: &[&str], flags: &[&str]) -> Op
 /// The first option of `args` that `row` does not take, if any; `row`'s
 /// settings come from the row's label.
 fn row_foreign_option(args: &[String]) -> Option<&str> {
-    foreign_option(args, &["--model", "--seed", "--threshold"], &[])
+    foreign_option(
+        args, &["--model", "--seed", "--threshold"], &["--dump-large-graph"],
+    )
 }
 
 fn builder_of(p: &Program, o: &Opts) -> ConfBuilder {
@@ -460,7 +465,8 @@ fn run_named(
                 "--seed",
                 "--threshold",
             ];
-            if let Some(a) = foreign_option(&args[1..], &valued, &["--stop-at-first"]) {
+            let flags = ["--stop-at-first", "--dump-large-graph"];
+            if let Some(a) = foreign_option(&args[1..], &valued, &flags) {
                 return fail(format!("online does not take `{a}`"));
             }
             let o = match parse_opts(&args[1..], default_model) {
@@ -525,7 +531,7 @@ fn run_named(
         "row" => {
             if let Some(a) = row_foreign_option(&args[1..]) {
                 return fail(format!(
-                    "row takes only --model, --seed and --threshold, not `{a}`"
+                    "row takes only --model, --seed, --threshold and --dump-large-graph, not `{a}`"
                 ));
             }
             let o = match parse_opts(&args[1..], default_model) {

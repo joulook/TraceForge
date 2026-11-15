@@ -2962,6 +2962,8 @@ impl Must {
     fn add_to_graph(&mut self, lab: LabelEnum) -> Event {
         let tid = lab.thread();
         let tindex = self.current.graph.thread_size(tid);
+        #[cfg(test)]
+        crate::largeprint_tests::before_label(self);
         if tindex > self.config.thread_threshold as usize {
             if self.threshold.is_none() {
                 let thread = self.current.graph.thread_name(tid)
@@ -2979,13 +2981,16 @@ impl Must {
                 self.threshold.clone().unwrap(),
             ));
             if self.warn_limit > 0 {
+                #[cfg(test)]
+                crate::largeprint_tests::crossing(self);
                 self.warn(&format!(
                     "Large thread size {} events)! Is the test bounded?",
                     tindex
                 ));
-                // debug
-                eprintln!("Printing the large graph:");
-                println!("{}", self.print_graph(None));
+                if self.config.dump_large_graph {
+                    eprintln!("Printing the large graph:");
+                    println!("{}", self.print_graph(None));
+                }
             }
             self.stop();
         }
@@ -3963,6 +3968,24 @@ mod tests {
 #[cfg(test)]
 mod threshold_tests {
     use super::*;
+
+    #[test]
+    fn el_budget_child() {
+        if std::env::var_os("EL_BUDGET").is_none() { return; }
+        let must = Rc::new(RefCell::new(Must::new(
+            Config::builder().with_thread_threshold(2).with_dump_large_graph(true).build(),
+            false,
+        )));
+        let program = Arc::new(|| {
+            for _ in 0..10 { let _: bool = crate::nondet(); }
+        });
+        for _ in 0..2 {
+            crate::explore(&must, &program);
+            assert!(must.borrow().stats().threshold.is_some());
+            assert_eq!(must.borrow().warn_limit, 0);
+            must.borrow_mut().reset_for_reuse();
+        }
+    }
 
     #[test]
     fn et_warning_budget_does_not_disable_threshold() {
