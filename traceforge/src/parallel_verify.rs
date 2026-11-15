@@ -53,6 +53,7 @@ impl Default for PartitionHooks {
 pub(crate) struct CancelToken {
     flag: AtomicBool,
     threshold: Mutex<Option<crate::ThresholdStop>>,
+    threshold_cancel: Option<Box<dyn Fn(&CancelToken) + Send + Sync>>,
     /// The admitted spawns, guarded by the lock that linearizes the stop.
     admission: Mutex<u64>,
 }
@@ -62,8 +63,17 @@ impl CancelToken {
         Self {
             flag: AtomicBool::new(false),
             threshold: Mutex::new(None),
+            threshold_cancel: None,
             admission: Mutex::new(0),
         }
+    }
+
+    /// Wrap threshold cancellation in an engine's additional admission lock.
+    /// Installed before the token is shared; other runners keep `new`'s bare stop.
+    pub(crate) fn with_threshold_cancel(
+        cancel: impl Fn(&CancelToken) + Send + Sync + 'static,
+    ) -> Self {
+        Self { threshold_cancel: Some(Box::new(cancel)), ..Self::new() }
     }
 
     /// Set the flag; the spawns admitted before this call.
@@ -88,7 +98,12 @@ impl CancelToken {
         if first.is_none() {
             *first = Some(reason);
         }
-        self.cancel();
+        // Lock order for CFirstP: threshold -> cache admission -> spawn admission.
+        if let Some(cancel) = &self.threshold_cancel {
+            cancel(self);
+        } else {
+            self.cancel();
+        }
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {

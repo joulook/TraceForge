@@ -4712,7 +4712,7 @@ fn ps_r21_the_watchs_four_cases() {
 /// - **every call in that region is allowlisted** (before the closure: `Box::new`, `FnMut` (the
 ///   type), `Arc::clone`, `clone`, `admission_version`; inside it: `admission_version` once, `with`,
 ///   `borrow_mut`, `as_mut`, `expect`, `watch`): a helper of any name fails it;
-/// - `sweep_inline`'s sink calls the watch once per completion;
+/// - `sweep_inline_with_cancel`'s sink calls the watch once per completion;
 /// - `SharedCache::watch`'s body loads nothing (no `admission_version`, no `.load(`);
 /// - **the crate-wide census of the identifier `admission_version`** in non-test code is exactly:
 ///   two calls `.admission_version()` (both in `cfirst_p.rs`, the two above); in `compact.rs` the
@@ -4734,7 +4734,8 @@ fn ps_r21_r03_m1_one_counter_load_per_completion() {
     let fast = "let current = shared.cache.admission_version();\n";
     let body = "        if current == *seen {\n            return Watch::NotMoved;\n        }\n";
     let sink_call = "                if w() {\n";
-    let sweep_inline = "pub(crate) fn sweep_inline(";
+    // ENG-THRESHOLD (2026-11-15, re-pin): `sweep_inline_with_cancel` is the production body.
+    let sweep_inline = "pub(crate) fn sweep_inline_with_cancel(";
     let entries = "    /// Every published signature with its hash, by `SigId`.";
     assert_eq!(
         [call, fast, sink_call, sweep_inline].map(|s| cfp.matches(s).count()),
@@ -4930,8 +4931,12 @@ fn ps_one_load_failures(files: &BTreeMap<String, String>) -> Vec<String> {
             bad.push(format!("a call in the closure not allowlisted: {c}"));
         }
     }
-    let s0 = cfp.find("pub(crate) fn sweep_inline(").expect("conformance: sweep_inline");
-    let s1 = s0 + cfp[s0..].find("let run = enumerate(").expect("conformance: its run");
+    // ENG-THRESHOLD (2026-11-15, re-pin): `enumerate_with_cancel` bounds the same sink.
+    let s0 = cfp.find("pub(crate) fn sweep_inline_with_cancel(")
+        .expect("conformance: sweep_inline_with_cancel");
+    let s1 = s0 + cfp[s0..]
+        .find("let run = crate::conformance::stateful::enumerate_with_cancel(")
+        .expect("conformance: its run");
     // the watch's calls (` w()`: not `.borrow()`)
     let calls = cfp[s0..s1].matches(" w()").count();
     if calls != 1 {
@@ -5187,8 +5192,9 @@ fn ps_7_the_sweep_runs_on_the_worker_source() {
     if at("is_cancelled()") > at("CompactSummary::at_completion") {
         bad.push("the sink builds a summary before it reads the token".to_owned());
     }
-    if !(at("let saved = Must::current();") < at("sweep_inline(")
-        && at("sweep_inline(") < at("Must::set_current(saved")
+    // ENG-THRESHOLD (2026-11-15, re-pin): the worker calls `sweep_inline_with_cancel`.
+    if !(at("let saved = Must::current();") < at("sweep_inline_with_cancel(")
+        && at("sweep_inline_with_cancel(") < at("Must::set_current(saved")
         && at("Must::set_current(saved") < at("resume_unwind(payload)"))
     {
         bad.push("the save, the sweep, the restore and the re-raise are not in that order".to_owned());
@@ -5198,12 +5204,65 @@ fn ps_7_the_sweep_runs_on_the_worker_source() {
         bad.push("a caught sweep panic does not cancel the token under the admission lock".to_owned());
     }
     // gate 4 round 01 M1 (rev 1.5, ruling 13's linearization): every cancel under the admission
-    // lock, and the admission reads the live token
+    // lock, and the admission reads the live token. ENG-THRESHOLD B1 also follows the
+    // indirect stop through the shared token; counting local `.cancel()` alone missed it.
     let cancels = code.matches(".cancel()").count();
-    let locked = code.matches("under_admission(|| shared.cancel.cancel())").count();
+    let locked = code.matches("under_admission(|| shared.cancel.cancel())").count()
+        + code.matches("under_admission(|| token.cancel())").count();
     if cancels == 0 || cancels != locked {
         bad.push(format!("{cancels} cancels, {locked} of them under the admission lock"));
     }
+    let compact = |s: &str| s.split_whitespace().collect::<String>();
+    let wiring = &code[code.find("let cache = Arc::new(SharedCache::new(").unwrap()
+        ..code.find("acc: Mutex::new(Acc {").unwrap()];
+    assert_eq!(compact(wiring), compact(r#"
+        let cache = Arc::new(SharedCache::new(cc.witness_cache));
+        let cancel = Arc::new(CancelToken::with_threshold_cancel({
+            let cache = Arc::clone(&cache);
+            move |token| { cache.under_admission(|| token.cancel()); }
+        }));
+        let shared = Arc::new(Shared {
+            cache,
+    "#), "conformance: threshold cancellation must use the same cache as admission");
+    assert_eq!(code.matches("CancelToken::").count(), 1, "conformance: one shared token");
+    assert!(sink.contains("Some(Arc::clone(&shared.cancel))"),
+        "conformance: the sweep receives the shared token");
+    let token = code_lines("parallel_verify.rs").into_iter()
+        .map(|(_, l)| l).collect::<Vec<_>>().join("\n");
+    assert_eq!(token.matches(".cancel()").count(), 1, "conformance: only the unwrapped fallback");
+    assert_eq!(token.matches("flag.store(").count(), 1, "conformance: one cancellation store");
+    let must = code_lines("must.rs").into_iter()
+        .map(|(_, l)| l).collect::<Vec<_>>().join("\n");
+    assert_eq!(must.matches(".cancel()").count(), 0, "conformance: Must must use stop_threshold");
+    assert_eq!(must.matches(".stop_threshold(").count(), 3,
+        "conformance: three threshold crossings");
+    assert_eq!(must.matches("cancel.stop_threshold(self.threshold.clone().unwrap())").count(), 3,
+        "conformance: every crossing forwards its threshold reason");
+    let stop = &token[token.find("pub(crate) fn stop_threshold(").unwrap()
+        ..token.find("pub(crate) fn is_cancelled(").unwrap()];
+    // Escape the quoted production message so S5 does not scan it as a test panic.
+    assert_eq!(compact(stop), compact("
+        pub(crate) fn stop_threshold(&self, reason: crate::ThresholdStop) {
+            let mut first = self.threshold.lock().expect(\"partitioned threshold\");
+            if first.is_none() {
+                *first = Some(reason);
+            }
+            if let Some(cancel) = &self.threshold_cancel {
+                cancel(self);
+            } else {
+                self.cancel();
+            }
+        }
+    "), "conformance: every threshold stop must use its installed cancellation wrapper");
+    let constructor = &token[token.find("pub(crate) fn with_threshold_cancel(").unwrap()
+        ..token.find("pub(crate) fn cancel(").unwrap()];
+    assert_eq!(compact(constructor), compact(r#"
+        pub(crate) fn with_threshold_cancel(
+            cancel: impl Fn(&CancelToken) + Send + Sync + 'static,
+        ) -> Self {
+            Self { threshold_cancel: Some(Box::new(cancel)), ..Self::new() }
+        }
+    "#), "conformance: the wrapper must be installed before sharing the token");
     if !sink.contains(".admit(&mut w.table, ws, probed, || shared.cancel.is_cancelled())") {
         bad.push("the admission does not read the live token".to_owned());
     }

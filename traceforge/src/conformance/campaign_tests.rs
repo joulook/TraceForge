@@ -2344,10 +2344,11 @@ fn c03_earlier_blocks_are_byte_identical_to_gate_4() {
     // J3 (2026-10-29, tester re-pin, gate 3): to `df1a8cb6…`; G1 stage B (2026-10-30,
     // tester re-pin): J3's hunk removed, `grid.rs` byte-equal to c0a6002's (`4b3aac66…`),
     // so the prefix is the Q14 prefix again and `J3_HUNKS` is gone.
+    // ENG-THRESHOLD (2026-11-15, re-pin): to `84ed3d5316508ae0040dec6e42fb35d8`.
     let prefix = lines[..camp - 2].concat();
     assert_eq!(
         md5_hex(prefix.as_bytes()),
-        "4653dceb140fcdfb15d3ad9c752125ac",
+        "84ed3d5316508ae0040dec6e42fb35d8",
         "conformance: everything before the P5-CAMPAIGN block (D19 + P5-CFCFG + P5-XBASE + COMPACT-INDEX + phase 2 prefix)"
     );
     let undo = |t: String, new: &str, old: &str| {
@@ -3729,7 +3730,107 @@ fn explore_p_columns(row: &mut Row, r: &ExplorePRun) {
             "    );\n"
         ),
     )];
+    // ENG-THRESHOLD: seven hunks, one context line each, from cc03d9f to 74356ff.
+    // Only borrow the non-Copy ends; undo to the Q14 prefix before its chain.
+    const THRESHOLD_HUNKS: [(&str, &str); 7] = [
+        (
+            concat!(
+                "            push_d(&mut row, \"diagnostics\", o.diagnostics.len());\n",
+                "            push(&mut row, \"end\", &o.end);\n",
+                "            push_d(&mut row, \"skipped_gates\", o.skipped_gates);\n",
+            ),
+            concat!(
+                "            push_d(&mut row, \"diagnostics\", o.diagnostics.len());\n",
+                "            push(&mut row, \"end\", o.end);\n",
+                "            push_d(&mut row, \"skipped_gates\", o.skipped_gates);\n",
+            ),
+        ),
+        (
+            concat!(
+                "            push_d(&mut row, \"reports\", o.counters.reports);\n",
+                "            push(&mut row, \"impl_end\", &o.impl_end);\n",
+                "            push(&mut row, \"spec_end\", &o.spec_end);\n",
+                "            push_d(&mut row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+            concat!(
+                "            push_d(&mut row, \"reports\", o.counters.reports);\n",
+                "            push(&mut row, \"impl_end\", o.impl_end);\n",
+                "            push(&mut row, \"spec_end\", o.spec_end);\n",
+                "            push_d(&mut row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+        ),
+        (
+            concat!(
+                "            push_d(&mut row, \"cut_reports_list\", o.cut_reports.len());\n",
+                "            push(&mut row, \"impl_end\", &o.impl_end);\n",
+                "            push_d(&mut row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+            concat!(
+                "            push_d(&mut row, \"cut_reports_list\", o.cut_reports.len());\n",
+                "            push(&mut row, \"impl_end\", o.impl_end);\n",
+                "            push_d(&mut row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+        ),
+        (
+            concat!(
+                "            );\n",
+                "            push(&mut row, \"impl_end\", &o.impl_end);\n",
+                "            push_d(&mut row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+            concat!(
+                "            );\n",
+                "            push(&mut row, \"impl_end\", o.impl_end);\n",
+                "            push_d(&mut row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+        ),
+        (
+            concat!(
+                "                push_d(&mut row, \"notes\", o.notes.len());\n",
+                "                push(&mut row, \"end\", &o.end);\n",
+                "                push_d(&mut row, \"seed\", o.seed);\n",
+            ),
+            concat!(
+                "                push_d(&mut row, \"notes\", o.notes.len());\n",
+                "                push(&mut row, \"end\", o.end);\n",
+                "                push_d(&mut row, \"seed\", o.seed);\n",
+            ),
+        ),
+        (
+            concat!(
+                "    push_d(row, \"reports\", c.reports);\n",
+                "    push(row, \"impl_end\", &o.impl_end);\n",
+                "    push_d(row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+            concat!(
+                "    push_d(row, \"reports\", c.reports);\n",
+                "    push(row, \"impl_end\", o.impl_end);\n",
+                "    push_d(row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+        ),
+        (
+            concat!(
+                "    push_d(row, \"reports\", c.reports);\n",
+                "    push(row, \"impl_end\", &o.impl_end);\n",
+                "    push(row, \"spec_end\", &o.spec_end);\n",
+                "    push_d(row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+            concat!(
+                "    push_d(row, \"reports\", c.reports);\n",
+                "    push(row, \"impl_end\", o.impl_end);\n",
+                "    push(row, \"spec_end\", o.spec_end);\n",
+                "    push_d(row, \"spec_errors\", o.spec_errors.len());\n",
+            ),
+        ),
+    ];
     let mut t = prefix.clone();
+    for (new, old) in THRESHOLD_HUNKS {
+        t = undo(t, new, old);
+    }
+    assert_eq!(
+        md5_hex(t.as_bytes()),
+        "4653dceb140fcdfb15d3ad9c752125ac",
+        "conformance: the prefix without ENG-THRESHOLD = the Q14 prefix"
+    );
     for (new, old) in Q14_HUNKS {
         t = undo(t, new, old);
     }

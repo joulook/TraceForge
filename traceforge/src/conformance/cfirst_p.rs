@@ -232,7 +232,7 @@ struct FirstReport {
 
 /// What the run shares across its workers.
 struct Shared {
-    cache: SharedCache,
+    cache: Arc<SharedCache>,
     acc: Mutex<Acc>,
     first: Mutex<FirstReport>,
     reports: Mutex<Vec<(ExecutionGraph, ReplaySnapshot)>>,
@@ -412,9 +412,13 @@ pub(crate) fn run_with(
     // One instant: the outer run's wall and the first-report clock (I4's
     // ruling 6, carried over).
     let started = Instant::now();
-    let cancel = Arc::new(CancelToken::new());
+    let cache = Arc::new(SharedCache::new(cc.witness_cache));
+    let cancel = Arc::new(CancelToken::with_threshold_cancel({
+        let cache = Arc::clone(&cache);
+        move |token| { cache.under_admission(|| token.cancel()); }
+    }));
     let shared = Arc::new(Shared {
-        cache: SharedCache::new(cc.witness_cache),
+        cache,
         acc: Mutex::new(Acc {
             seen: cc.impl_distinct.then(SetIndex::new),
             // Gate 3, D-2: the merged report set counts multiplicities, as

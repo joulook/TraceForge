@@ -626,3 +626,103 @@ fn et_baseline_row_threshold() {
         }
     }
 }
+
+/// B1: hold an admission after its false token read. The threshold wrapper must publish
+/// the stop only after that admission's signature and order. Channels also release the
+/// held admission on a bare-cancel mutant, so the failing direction does not deadlock.
+#[test]
+fn et_threshold_cancel_serializes_with_cache_publication() {
+    use super::compact::{Admission, SharedCache, WorkerTable};
+    use super::config::Capacity;
+    use crate::parallel_verify::CancelToken;
+    use std::sync::{mpsc, Mutex};
+
+    let summaries = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let got = std::rc::Rc::clone(&summaries);
+    let program: Prog = Arc::new(|| {});
+    let run = enumerate(
+        EnumRun {
+            config: Config::default(),
+            visible: vec![],
+            mode: ConfMode::Enumerate,
+            sink: Box::new(move |g, _| {
+                got.borrow_mut().push(CompactSummary::at_completion(g, &[], "test"));
+                SinkVerdict::Continue
+            }),
+            cut: false,
+            stop_at_first_report: false,
+            gate_sink: None,
+            paper_events: false,
+        },
+        &program,
+    );
+    assert_eq!(run.end, SearchEnd::StateSpaceExhausted,
+        "conformance: the summary run completes");
+    let summary = summaries.borrow_mut().pop().expect("conformance: a complete summary");
+    let cache = Arc::new(SharedCache::new(Capacity::Unbounded));
+    let at_cancel = Arc::new(Mutex::new(None));
+    let (event_tx, event_rx) = mpsc::channel();
+    let token = Arc::new(CancelToken::with_threshold_cancel({
+        let cache = Arc::clone(&cache);
+        let at_cancel = Arc::clone(&at_cancel);
+        let event_tx = event_tx.clone();
+        move |token| {
+            event_tx.send(false).unwrap();
+            cache.under_admission(|| {
+                token.cancel();
+                *at_cancel.lock().unwrap() = Some((cache.len(), cache.signatures().len()));
+            });
+        }
+    }));
+    let (read_tx, read_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let admitting = {
+        let cache = Arc::clone(&cache);
+        let token = Arc::clone(&token);
+        let summary = summary.clone();
+        std::thread::spawn(move || {
+            cache.admit(&mut WorkerTable::new(), &summary, &summary, || {
+                let cancelled = token.is_cancelled();
+                read_tx.send(cancelled).unwrap();
+                release_rx.recv().unwrap();
+                cancelled
+            })
+        })
+    };
+    assert!(!read_rx.recv().unwrap(), "conformance: admission reads a live token");
+    let reason = crate::ThresholdStop { thread: "sweep".into(), limit: 16 };
+    let stopping = {
+        let token = Arc::clone(&token);
+        let reason = reason.clone();
+        std::thread::spawn(move || {
+            token.stop_threshold(reason);
+            event_tx.send(true).unwrap();
+        })
+    };
+    // The wrapper entered, or a mutant completed its bare cancel. The admission is
+    // still held in both cases. Release before asserting so either path can join.
+    let completed_while_held = event_rx.recv().unwrap();
+    let cancelled_while_held = token.is_cancelled();
+    release_tx.send(()).unwrap();
+    let admitted = admitting.join().unwrap();
+    stopping.join().unwrap();
+    assert!(!completed_while_held, "conformance: threshold cancel bypassed the cache lock");
+    assert!(!cancelled_while_held, "conformance: cancel took effect before publication");
+    assert_eq!(admitted, Admission::Admitted, "conformance: held admission publishes");
+    assert_eq!(*at_cancel.lock().unwrap(), Some((1, 1)),
+        "conformance: publication precedes cancellation");
+    assert!(token.is_cancelled(), "conformance: threshold cancels the token");
+    assert_eq!(token.threshold(), Some(reason.clone()),
+        "conformance: the first threshold reason is recorded");
+    assert_eq!(token.admit(|| panic!("conformance: spawn after threshold")), None::<()>,
+        "conformance: no spawn after threshold");
+    assert_eq!(
+        cache.admit(&mut WorkerTable::new(), &summary, &summary, || token.is_cancelled()),
+        Admission::UnadmittedAfterCancel,
+        "conformance: no cache admission after threshold",
+    );
+    assert_eq!((cache.len(), cache.signatures().len()), (1, 1),
+        "conformance: no publication after threshold");
+    token.stop_threshold(crate::ThresholdStop { thread: "later".into(), limit: 32 });
+    assert_eq!(token.threshold(), Some(reason), "conformance: the first reason wins");
+}

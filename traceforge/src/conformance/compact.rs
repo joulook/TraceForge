@@ -2158,8 +2158,12 @@ impl SharedCache {
     }
 
     /// Run `f` under the admission lock: the engine makes **every** cancel of
-    /// its token through this (gate 4 round 01, M1), so a cancel and an
-    /// admission are linearized by this one lock — an admission that read
+    /// its token through this, including its token's threshold wrapper
+    /// (ENG-THRESHOLD B1). Threshold stops hold the threshold mutex first;
+    /// `f` may take the token's spawn-admission mutex, never its threshold
+    /// mutex or execute an exploration. An admission only reads the atomic
+    /// flag, so it cannot reverse that order or cross a threshold here.
+    /// A cancel and an admission are linearized by this lock — an admission that read
     /// the token as not cancelled inside the lock publishes before any cancel
     /// can take effect, and one after a cancel sees it and stores nothing.
     pub(crate) fn under_admission<R>(&self, f: impl FnOnce() -> R) -> R {
