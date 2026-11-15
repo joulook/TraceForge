@@ -51,7 +51,7 @@ use crate::conformance::report::{
     UncoveredSummary,
 };
 use crate::conformance::sig::Sig;
-use crate::conformance::stateful::{enumerate, EnumRun};
+use crate::conformance::stateful::EnumRun;
 use crate::event::Event;
 use crate::exec_graph::ExecutionGraph;
 use crate::must::{Must, MustState};
@@ -268,13 +268,14 @@ fn label_count(graph: &ExecutionGraph) -> usize {
 /// `true` stops the sweep at once, and the second result says it was
 /// abandoned (no witness, no report: the caller handles it before
 /// `classify`).
-pub(crate) fn sweep_inline(
+pub(crate) fn sweep_inline_with_cancel(
     config: &Config,
     visible: &[String],
     specification: &Arc<dyn Fn() + Send + Sync>,
     cs: CompactSummary,
     _quiet: bool,
     watch: Option<Box<dyn FnMut() -> bool>>,
+    threshold_cancel: Option<Arc<CancelToken>>,
 ) -> (Swept, bool) {
     let mut spec_config = config.clone();
     spec_config.max_iterations = None;
@@ -322,7 +323,7 @@ pub(crate) fn sweep_inline(
             SinkVerdict::Continue
         }) as CompletionSink
     };
-    let run = enumerate(
+    let run = crate::conformance::stateful::enumerate_with_cancel(
         EnumRun {
             config: spec_config,
             visible: visible_v,
@@ -334,6 +335,7 @@ pub(crate) fn sweep_inline(
             paper_events: false,
         },
         specification,
+        threshold_cancel,
     );
     let witness_summary = found_summary.borrow_mut().take();
     let query = query.borrow_mut().take();
@@ -628,7 +630,9 @@ pub(crate) fn run_with(
         counters,
         reports,
         uncovered,
-        impl_end: if stopped {
+        impl_end: if let Some(reason) = run.stats.threshold.clone() {
+            SearchEnd::Threshold(reason)
+        } else if stopped {
             SearchEnd::StoppedAtFirstReport
         } else {
             SearchEnd::StateSpaceExhausted
@@ -736,13 +740,14 @@ fn sink_for(
             })
         };
         let swept = catch_unwind(AssertUnwindSafe(|| {
-            sweep_inline(
+            sweep_inline_with_cancel(
                 &config,
                 &visible,
                 &specification,
                 cs.clone(),
                 quiet,
                 Some(watch),
+                Some(Arc::clone(&shared.cancel)),
             )
         }));
         Must::set_current(saved.clone());
@@ -809,6 +814,7 @@ fn sink_for(
                     w.tally.sweeps_abandoned += 1;
                     SinkVerdict::Continue
                 }
+                Some(SweepEnd::Threshold(reason)) => SinkVerdict::Threshold(reason),
                 Some(SweepEnd::Aborted) => {
                     // Ruling 5: the first abort's errors, the token cancelled.
                     w.tally.sweeps_aborted += 1;
@@ -942,6 +948,9 @@ pub(crate) fn run(
         )
     };
     let mut out = run_with(&cc, &implementation, &specification);
+    if let SearchEnd::Threshold(reason) = out.impl_end.clone() {
+        return Err(ConfError::Threshold(reason));
+    }
     out.counters.base.precheck_ran = precheck_ran;
     out.counters.base.precheck_wall_time_ms = precheck_wall_time_ms;
 
@@ -1015,4 +1024,16 @@ pub(crate) fn run(
         flat_counters: None,
         flat_eligibility: None,
     }))
+}
+
+#[cfg(test)]
+pub(crate) fn sweep_inline(
+    config: &Config,
+    visible: &[String],
+    specification: &Arc<dyn Fn() + Send + Sync>,
+    cs: CompactSummary,
+    quiet: bool,
+    watch: Option<Box<dyn FnMut() -> bool>>,
+) -> (Swept, bool) {
+    sweep_inline_with_cancel(config, visible, specification, cs, quiet, watch, None)
 }

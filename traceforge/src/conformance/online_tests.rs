@@ -269,6 +269,7 @@ pub(super) fn kappa(g: &ExecutionGraph) -> Kappa {
     let beta_from_alpha = match &cs.ord {
         OrdCounts::U8(c) => u16::from(c[3]),
         OrdCounts::U16(c) => c[3],
+        OrdCounts::U32(c) => u16::try_from(c[3]).unwrap(),
     };
     Kappa {
         second: dbg_of(&w[1]),
@@ -865,7 +866,10 @@ fn o5_failures_and_the_budget() {
         );
         let r = online::online(&cfg(ConsType::FIFO), &vis(), imp_of(var), &s, opts(Mode::Full, None, None))
             .expect("conformance: C: O5: not refused");
-        assert_eq!((r.iterations, r.end), (pos, End::Failed), "conformance: C: O5: {var:?}: stopped at p");
+        assert_eq!(
+            (r.iterations, r.end.clone()), (pos, End::Failed),
+            "conformance: C: O5: {var:?}: stopped at p"
+        );
         invariants(&r);
         note!("O5\t{var:?}\tp={pos}");
     }
@@ -922,7 +926,7 @@ fn o5a_an_assertion_with_revisits_left() {
         let r = online::online(&cfg(ConsType::FIFO), &vis(), imp_of(var), &s, opts(Mode::Full, None, None))
             .expect("conformance: C: O5a: not refused");
         assert_eq!(
-            (r.iterations, r.lookups, r.found, r.end),
+            (r.iterations, r.lookups, r.found, r.end.clone()),
             (pos, pos - 1, pos - 1, End::Failed),
             "conformance: C: O5a: {var:?}: stopped at the failed completion"
         );
@@ -958,7 +962,7 @@ fn o5p_a_panic() {
         .expect("conformance: C: O5p: not refused");
     invariants(&r);
     assert_eq!(
-        (r.iterations, r.lookups, r.found, r.end, r.exit_code()),
+        (r.iterations, r.lookups, r.found, r.end.clone(), r.exit_code()),
         (3, 2, 2, End::Failed, 1),
         "conformance: C: O5p: k = 3"
     );
@@ -989,7 +993,8 @@ fn o5p_a_panic() {
         .expect("conformance: C: O5p: not refused");
     invariants(&r);
     assert_eq!(
-        (r.iterations, r.lookups, r.found, r.signature_misses, r.not_found, r.uncovered_total, r.uncovered_distinct, r.end),
+        (r.iterations, r.lookups, r.found, r.signature_misses, r.not_found,
+            r.uncovered_total, r.uncovered_distinct, r.end.clone()),
         (20, 19, c19.f, c19.s, c19.x, c19.u, c19.d, End::Failed),
         "conformance: C: O5p: k = 20: the state of the first 19 completions"
     );

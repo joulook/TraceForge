@@ -89,6 +89,7 @@ pub(crate) enum Cell {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stop {
     Exhausted,
+    Threshold,
     Budget,
     FirstMiss,
     Error,
@@ -98,6 +99,7 @@ impl Stop {
     pub(crate) fn word(self) -> &'static str {
         match self {
             Stop::Exhausted => "exhausted",
+            Stop::Threshold => "threshold",
             Stop::Budget => "budget",
             Stop::FirstMiss => "first-miss",
             Stop::Error => "error",
@@ -228,6 +230,10 @@ impl Shape {
                 c.iter().filter(|&&x| x != 0).count(),
             ),
             OrdCounts::U16(c) => (
+                c.iter().map(|&x| u128::from(x)).max().unwrap_or(0),
+                c.iter().filter(|&&x| x != 0).count(),
+            ),
+            OrdCounts::U32(c) => (
                 c.iter().map(|&x| u128::from(x)).max().unwrap_or(0),
                 c.iter().filter(|&&x| x != 0).count(),
             ),
@@ -376,8 +382,10 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
             "merge_ms",
         ]);
         m.set("mean_visible_events", Cell::Mean(0.0));
+        let mut threshold = false;
         match raw {
             Some(GridRaw::Explore(s)) => {
+                threshold = s.threshold.is_some();
                 m.n("graphs_complete", s.execs as u128);
                 m.n("graphs_blocked", s.block as u128);
                 m.n("impl_complete", s.execs as u128);
@@ -386,6 +394,7 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
                 m.n("max_graph_events", s.max_graph_events as u128);
             }
             Some(GridRaw::ExploreP(r)) => {
+                threshold = r.spec.stats.threshold.is_some() || r.imp.stats.threshold.is_some();
                 for (k, c) in [
                     ("graphs_complete", "impl_complete"),
                     ("graphs_blocked", "impl_blocked"),
@@ -407,6 +416,8 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
         }
         m.stop(if panicked {
             Stop::Error
+        } else if threshold {
+            Stop::Threshold
         } else {
             Stop::Exhausted
         });
@@ -519,8 +530,15 @@ fn row_stop(row: &Row, panicked: bool) -> Stop {
     let impl_end = cell(row, "impl_end")
         .or_else(|| cell(row, "end"))
         .unwrap_or("");
-    if panicked
-        || errors > 0
+    if panicked {
+        return Stop::Error;
+    }
+    if impl_end.starts_with("Threshold")
+        || cell(row, "spec_end").is_some_and(|s| s.starts_with("Threshold"))
+    {
+        return Stop::Threshold;
+    }
+    if errors > 0
         || cell(row, "verdict") == Some("Err")
         || cell(row, "aborted") == Some("true")
         || impl_end == "SpecNotAssertionSafe"
@@ -555,6 +573,10 @@ pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
     let mut m = Measurements::new(true);
     m.zero(&["export_ms", "join_ms"]);
     let o: &ConfOutcome = match v {
+        Err(ConfError::Threshold(_)) => {
+            m.stop(Stop::Threshold);
+            return m;
+        }
         Err(_) => {
             m.stop(Stop::Error);
             return m;
@@ -563,6 +585,7 @@ pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
     };
     m.n("iterations", o.counters.executions as u128);
     m.stop(match o.end {
+        crate::conformance::report::SearchEnd::Threshold(_) => Stop::Threshold,
         crate::conformance::report::SearchEnd::StoppedAtFirstReport => Stop::FirstMiss,
         crate::conformance::report::SearchEnd::StateSpaceExhausted => Stop::Exhausted,
         crate::conformance::report::SearchEnd::MaxIterations(_) => Stop::Budget,
@@ -678,6 +701,7 @@ pub(crate) fn of_online(
     m.n("spec_summaries", r.held as u128);
     m.n("iterations", r.iterations as u128);
     m.stop(match r.end {
+        End::Threshold(_) => Stop::Threshold,
         End::Failed => Stop::Error,
         End::FirstMiss => Stop::FirstMiss,
         End::Exhausted => Stop::Exhausted,
@@ -732,6 +756,10 @@ pub(crate) fn of_export(
     m.n("wall_ms", wall_ms);
     m.set("peak_rss_kb", opt(peak_rss_kb().map(u128::from)));
     let s = match r {
+        Err(crate::conformance::interchange::ExportError::Threshold(_)) => {
+            m.stop(Stop::Threshold);
+            return m;
+        }
         Err(_) => {
             m.stop(Stop::Error);
             return m;
@@ -865,7 +893,7 @@ pub(crate) fn of_count(
     m.n("graphs_blocked", stats.block as u128);
     m.n("iterations", (stats.execs + stats.block) as u128);
     m.n("max_graph_events", stats.max_graph_events as u128);
-    m.stop(Stop::Exhausted);
+    m.stop(if stats.threshold.is_some() { Stop::Threshold } else { Stop::Exhausted });
     m.zero(&[
         "summarise_ms",
         "index_ms",

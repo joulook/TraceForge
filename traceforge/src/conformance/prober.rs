@@ -13,6 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::conformance::morphism::CompleteExecution;
+use crate::conformance::obs::ObsError;
 use crate::conformance::probe::{NondetValue, Offer};
 use crate::event::Event;
 use crate::exec_graph::ExecutionGraph;
@@ -130,7 +131,8 @@ where
     );
     let offers = must.borrow_mut().probe_take_offers();
     let graph = must.borrow_mut().take_graph();
-    Probed { offers, graph }
+    let threshold = must.borrow().threshold_stop();
+    Probed { offers, graph, threshold }
 }
 
 /// What one probe produced: the offers, and the graph the probe left behind.
@@ -147,6 +149,7 @@ where
 /// witnessed complete, and reported *done*. A caller cannot fabricate the
 /// pairing because only `probe_from` builds one of these.
 pub(crate) struct Probed {
+    pub(crate) threshold: Option<crate::ThresholdStop>,
     offers: Vec<Offer>,
     graph: ExecutionGraph,
 }
@@ -168,7 +171,7 @@ impl Probed {
     /// answer to F33 — `Done`'s own `next_Spec(G) = ∅` conjunct, computed
     /// once, here, rather than a second time by different means.
     pub(crate) fn complete(&self) -> Option<CompleteExecution<'_>> {
-        if !self.offers.is_empty() {
+        if self.threshold.is_some() || !self.offers.is_empty() {
             return None;
         }
         CompleteExecution::try_finished(&self.graph)
@@ -209,7 +212,7 @@ pub(crate) fn recv_sources(config: Config, graph: &ExecutionGraph, offer: &Offer
 /// A send is the only offer this is complete for, because a send carries no
 /// decision: §5.2's install is "the parked label, plus the decision as a
 /// frontier-event operation", and a send has none. A receive needs its source
-/// ([`install_recv`]) and a nondet needs its value ([`install_nondet`]).
+/// ([`install_recv_checked`]) and a nondet needs its value ([`install_nondet_checked`]).
 ///
 /// **Both are refused rather than accepted-and-defaulted**, and the reason is
 /// worth stating. A nondet label carries the value the *probe* rolled, and
@@ -220,7 +223,9 @@ pub(crate) fn recv_sources(config: Config, graph: &ExecutionGraph, offer: &Offer
 /// option" failure F35 describes, because it presents as flakiness rather
 /// than as a readable bug. Found by the developer's adversarial pass (O-3),
 /// before any search existed to make the mistake.
-pub(crate) fn install(config: Config, graph: ExecutionGraph, offer: &Offer) -> ExecutionGraph {
+pub(crate) fn install_checked(
+    config: Config, graph: ExecutionGraph, offer: &Offer,
+) -> Result<ExecutionGraph, ObsError> {
     assert_eq!(
         offer.kind(),
         "send",
@@ -235,19 +240,19 @@ pub(crate) fn install(config: Config, graph: ExecutionGraph, offer: &Offer) -> E
     );
     let mut must = Must::with_initial_graph(config, graph);
     must.probe_install(offer.label().clone());
-    must.take_graph()
+    installed(&mut must)
 }
 
 /// Extend a graph with a receive offer, reading from `rf`.
 ///
 /// `None` is the receive reading nothing, which only a non-blocking receive
 /// may do.
-pub(crate) fn install_recv(
+pub(crate) fn install_recv_checked(
     config: Config,
     graph: ExecutionGraph,
     offer: &Offer,
     rf: Option<Event>,
-) -> ExecutionGraph {
+) -> Result<ExecutionGraph, ObsError> {
     // The decision must be one the offer actually made available, and the two
     // ways it can fail to be are both silent — developer finding O-4, the same
     // species as O-3 and with a worse failure mode.
@@ -285,7 +290,7 @@ pub(crate) fn install_recv(
     let mut must = Must::with_initial_graph(config, graph);
     let pos = must.probe_install(offer.label().clone());
     must.probe_set_rf(pos, rf);
-    must.take_graph()
+    installed(&mut must)
 }
 
 /// Extend a graph with a nondeterministic offer, taking `value`.
@@ -300,16 +305,44 @@ pub(crate) fn install_recv(
 /// `value` must be one of [`Offer::nondet_values`]; installing anything else
 /// panics, since a value outside a `Choice`'s range is one the program could
 /// never have produced.
-pub(crate) fn install_nondet(
+pub(crate) fn install_nondet_checked(
     config: Config,
     graph: ExecutionGraph,
     offer: &Offer,
     value: NondetValue,
-) -> ExecutionGraph {
+) -> Result<ExecutionGraph, ObsError> {
     let mut must = Must::with_initial_graph(config, graph);
     let pos = must.probe_install(offer.label().clone());
     must.probe_set_value(pos, value);
-    must.take_graph()
+    installed(&mut must)
+}
+
+fn installed(must: &mut Must) -> Result<ExecutionGraph, ObsError> {
+    if let Some(reason) = must.threshold_stop() {
+        return Err(ObsError::Threshold(reason));
+    }
+    Ok(must.take_graph())
+}
+
+#[cfg(test)]
+pub(crate) fn install(config: Config, graph: ExecutionGraph, offer: &Offer) -> ExecutionGraph {
+    install_checked(config, graph, offer).expect("conformance: threshold during test installation")
+}
+
+#[cfg(test)]
+pub(crate) fn install_recv(
+    config: Config, graph: ExecutionGraph, offer: &Offer, rf: Option<Event>,
+) -> ExecutionGraph {
+    install_recv_checked(config, graph, offer, rf)
+        .expect("conformance: threshold during test installation")
+}
+
+#[cfg(test)]
+pub(crate) fn install_nondet(
+    config: Config, graph: ExecutionGraph, offer: &Offer, value: NondetValue,
+) -> ExecutionGraph {
+    install_nondet_checked(config, graph, offer, value)
+        .expect("conformance: threshold during test installation")
 }
 
 #[cfg(test)]

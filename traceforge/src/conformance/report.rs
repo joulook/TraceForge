@@ -765,8 +765,10 @@ impl ConfNote {
 /// is indistinguishable from an exhausted one) or by setting
 /// `config.max_iterations` from the gate (which would destroy the distinction
 /// between a bound the *user* set and one the *gate* set).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SearchEnd {
+    /// A thread exceeded the configured event threshold.
+    Threshold(crate::ThresholdStop),
     /// `try_revisit` found nothing left. **This, and only this, is "the
     /// search completed".**
     StateSpaceExhausted,
@@ -801,6 +803,8 @@ pub enum NotACertificate {
     StoppedAtFirstReport,
     /// The outer loop terminated on a user-set iteration bound.
     BoundedRun { max_iterations: u64 },
+    /// A thread exceeded the configured event threshold.
+    Threshold(crate::ThresholdStop),
     /// Nothing recorded how the run ended.
     EndUnknown,
     /// There is at least one report, so this is not silence at all.
@@ -1457,7 +1461,7 @@ impl ConfOutcome {
         &self.notes
     }
     pub fn end(&self) -> SearchEnd {
-        self.end
+        self.end.clone()
     }
     pub fn spec_err_freedom(&self) -> SpecErrFreedom {
         self.spec_errfree
@@ -1484,6 +1488,9 @@ impl ConfOutcome {
                 out.push(NotACertificate::BoundedRun { max_iterations: n })
             }
             SearchEnd::StoppedAtFirstReport => out.push(NotACertificate::StoppedAtFirstReport),
+            SearchEnd::Threshold(ref reason) => {
+                out.push(NotACertificate::Threshold(reason.clone()))
+            }
             SearchEnd::Unknown => out.push(NotACertificate::EndUnknown),
             // `run` returns `Err(ConfError::SpecNotAssertionSafe)` before it
             // builds a `ConfOutcome`, so this end never reaches one (gate-1
@@ -1848,6 +1855,8 @@ impl fmt::Debug for ConfVerdict {
 /// and lost its origin (F-C).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfError {
+    /// Exploration stopped without producing a conformance verdict.
+    Threshold(crate::ThresholdStop),
     /// §5.4: the specification is not error-free, so the problem statement's
     /// assumption does not hold and no conformance verdict means anything.
     SpecNotErrorFree { detail: String },
@@ -1918,6 +1927,7 @@ impl std::error::Error for ConfError {}
 impl fmt::Display for ConfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConfError::Threshold(reason) => write!(f, "{reason}; no verdict was produced"),
             ConfError::SpecNotErrorFree { detail } => write!(
                 f,
                 "conformance: the specification is not error-free, so the conformance \
@@ -2265,6 +2275,7 @@ impl fmt::Display for NotACertificate {
                  bounded run: it stopped when it had counted enough endings, not when it \
                  had seen them all"
             ),
+            NotACertificate::Threshold(reason) => write!(f, "{reason}; the run is partial"),
             NotACertificate::EndUnknown => write!(
                 f,
                 "nothing recorded how the outer loop ended, so \"the search completed\" is \
@@ -2612,6 +2623,7 @@ fn render_flat(f: &mut fmt::Formatter<'_>, o: &ConfOutcome) -> fmt::Result {
 /// lost — not about a loop the user or the gate stopped.
 fn render_truncation(f: &mut fmt::Formatter<'_>, o: &ConfOutcome) -> fmt::Result {
     match o.end {
+        SearchEnd::Threshold(ref reason) => writeln!(f, "{reason}; the run is partial."),
         SearchEnd::StateSpaceExhausted => Ok(()),
         // `P4-GATED` G5/G6 (gate-4 round 01 m5): first-failure mode implies the
         // stop, so the sentence must not claim the user set the knob.
@@ -3011,6 +3023,7 @@ impl fmt::Display for interchange::ExportError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use interchange::ExportError as E;
         match self {
+            E::Threshold(reason) => write!(f, "{reason}; export is incomplete"),
             E::NotSet => write!(f, "the export runs under `index(Set)` only"),
             E::Model(c) => write!(f, "the consistency model {c} has no format `model`"),
             E::Unparsed { type_name, rendering, at } => write!(
@@ -3180,6 +3193,9 @@ impl crate::conformance::online::OnlineReport {
             } else {
                 let _ = writeln!(out, "at:         iteration {}, {answer}", m.iteration);
             }
+        }
+        if let End::Threshold(reason) = &self.end {
+            let _ = writeln!(out, "{reason}");
         }
         if self.end == End::Failed {
             let _ = writeln!(

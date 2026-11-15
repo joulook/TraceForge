@@ -132,6 +132,11 @@ pub(crate) fn run(
 ) -> Result<ConfVerdict, ConfError> {
     let started = Instant::now();
     let out = run_with(&cc, &implementation, &specification, false);
+    for end in [out.spec_end.clone(), out.impl_end.clone()] {
+        if let SearchEnd::Threshold(reason) = end {
+            return Err(ConfError::Threshold(reason));
+        }
+    }
 
     // T4: the index run was the §5.4 check.
     if let Some((thread, pos, visible)) = out.spec_errors.first() {
@@ -320,7 +325,8 @@ pub(crate) fn run_with(
         }
     }
     assert!(
-        spec_run.end == SearchEnd::StateSpaceExhausted,
+        spec_run.end == SearchEnd::StateSpaceExhausted
+            || matches!(spec_run.end, SearchEnd::Threshold(_)),
         "conformance: the stateful engine's enumeration of the specification ended {:?}, \
          not StateSpaceExhausted; the index would be incomplete",
         spec_run.end
@@ -340,7 +346,7 @@ pub(crate) fn run_with(
             .filter(|d| d.reason == DiagnosticReason::InvisibleThread)
             .map(|d| (d.thread.clone(), d.pos, false)),
     );
-    if !spec_errors.is_empty() {
+    if !spec_errors.is_empty() || matches!(spec_run.end, SearchEnd::Threshold(_)) {
         let mut st = std::mem::take(&mut *state.borrow_mut());
         if let Some(ci) = st.compact.as_ref() {
             st.counters.compact = Some(ci.stats().clone());
@@ -620,6 +626,14 @@ pub(crate) struct EnumRun {
 /// One enumerating run of `program` (T1): the oracle's `Collect` mechanism in
 /// production code, with `sink` at every completion.
 pub(crate) fn enumerate(run: EnumRun, program: &Arc<dyn Fn() + Send + Sync>) -> Enumerated {
+    enumerate_with_cancel(run, program, None)
+}
+
+pub(crate) fn enumerate_with_cancel(
+    run: EnumRun,
+    program: &Arc<dyn Fn() + Send + Sync>,
+    threshold_cancel: Option<Arc<crate::parallel_verify::CancelToken>>,
+) -> Enumerated {
     let EnumRun {
         config,
         visible,
@@ -637,6 +651,7 @@ pub(crate) fn enumerate(run: EnumRun, program: &Arc<dyn Fn() + Send + Sync>) -> 
     let program = Arc::clone(program);
     let program = Arc::new(move || program());
     let must = Rc::new(RefCell::new(Must::new(config.clone(), false)));
+    must.borrow_mut().threshold_cancel = threshold_cancel;
     let mut ctx = ConfCtx::gate_disabled(config, visible, mode);
     ctx.set_sink(sink);
     ctx.set_paper_events(paper_events);

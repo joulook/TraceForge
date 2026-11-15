@@ -14,8 +14,8 @@
 //! pairs are po on both sides of any equal-`Sig` comparison and are not
 //! stored. Layout: `n · (T − 1)` counts, event-major (threads in sorted
 //! declared-name order, the `BTreeMap` order of `Sig`), `u8` unless some
-//! thread has more than 255 visible events, then `u16` throughout; a thread
-//! beyond `u16::MAX` visible events is refused (gate 4 B2).
+//! thread has more than 255 visible events, then `u16` through 65 535 and
+//! `u32` beyond that. A thread beyond `u32::MAX` visible events is refused.
 //!
 //! **The bucket key** (phase 2 D1, P2-frozen §1) is a 128-bit hash of the
 //! signature's **shape** (`Sig::hash128`, `sig.rs`: per thread the observation
@@ -107,6 +107,7 @@ fn slot_key(sig: &Sig) -> u64 {
 pub(crate) enum OrdCounts {
     U8(Vec<u8>),
     U16(Vec<u16>),
+    U32(Vec<u32>),
 }
 
 /// `a ≤ b` with some coordinate strictly less is `Less`; `a ≥ b` with some
@@ -157,6 +158,15 @@ fn le_counts<T: Ord>(a: &[T], b: &[T], coords: &mut usize) -> bool {
 }
 
 impl OrdCounts {
+    pub(crate) fn check_visible_len(name: &str, count: u64) {
+        assert!(
+            count <= u64::from(u32::MAX),
+            "conformance: the visible thread `{name}` has {count} visible events; \
+             the compact summary's counts are u32, at most {}",
+            u32::MAX
+        );
+    }
+
     /// The counts of a complete graph from its `Wobs` rows: the declared
     /// names in sorted order, each row's events in program order; for event
     /// `e` of thread `t` and each other thread `t'` in that order, the number
@@ -167,21 +177,12 @@ impl OrdCounts {
         names.dedup();
         let rows: Vec<&[(crate::event::Event, crate::conformance::obs::Obs)]> =
             names.iter().map(|n| wobs.of(n)).collect();
-        // Gate 4 B2: a count is bounded by its thread's visible length, so a
-        // thread beyond `u16::MAX` visible events is refused here, in every
-        // profile, before any count could wrap.
         for (name, row) in names.iter().zip(&rows) {
-            assert!(
-                row.len() <= u16::MAX as usize,
-                "conformance: the visible thread `{name}` has {} visible events; the compact \
-                 summary's counts are u16 (COMPACT-INDEX §5.1 item 2), at most {}",
-                row.len(),
-                u16::MAX
-            );
+            Self::check_visible_len(name, row.len() as u64);
         }
-        let wide = rows.iter().any(|r| r.len() > 255);
+        let longest = rows.iter().map(|r| r.len()).max().unwrap_or(0);
         let t = rows.len();
-        let mut counts: Vec<u16> =
+        let mut counts: Vec<u32> =
             Vec::with_capacity(rows.iter().map(|r| r.len()).sum::<usize>() * t.saturating_sub(1));
         for (ti, row) in rows.iter().enumerate() {
             for (e, _) in row.iter() {
@@ -189,7 +190,7 @@ impl OrdCounts {
                     if tj == ti {
                         continue;
                     }
-                    let mut c: u16 = 0;
+                    let mut c: u32 = 0;
                     for (a, _) in other.iter() {
                         if graph.in_porf(*a, *e) {
                             c += 1;
@@ -209,8 +210,10 @@ impl OrdCounts {
                 }
             }
         }
-        if wide {
-            OrdCounts::U16(counts)
+        if longest > u16::MAX as usize {
+            OrdCounts::U32(counts)
+        } else if longest > u8::MAX as usize {
+            OrdCounts::U16(counts.into_iter().map(|c| c as u16).collect())
         } else {
             OrdCounts::U8(counts.into_iter().map(|c| c as u8).collect())
         }
@@ -222,6 +225,7 @@ impl OrdCounts {
         match (self, other) {
             (OrdCounts::U8(a), OrdCounts::U8(b)) => cmp_counts(a, b),
             (OrdCounts::U16(a), OrdCounts::U16(b)) => cmp_counts(a, b),
+            (OrdCounts::U32(a), OrdCounts::U32(b)) => cmp_counts(a, b),
             _ => panic!("conformance: OrdCounts of different widths compared"),
         }
     }
@@ -232,6 +236,7 @@ impl OrdCounts {
         match (self, other) {
             (OrdCounts::U8(a), OrdCounts::U8(b)) => le_counts(a, b, coords),
             (OrdCounts::U16(a), OrdCounts::U16(b)) => le_counts(a, b, coords),
+            (OrdCounts::U32(a), OrdCounts::U32(b)) => le_counts(a, b, coords),
             _ => panic!("conformance: OrdCounts of different widths compared"),
         }
     }
@@ -247,6 +252,7 @@ impl OrdCounts {
         match self {
             OrdCounts::U8(v) => v.len(),
             OrdCounts::U16(v) => v.len() * 2,
+            OrdCounts::U32(v) => v.len() * 4,
         }
     }
 
@@ -255,18 +261,20 @@ impl OrdCounts {
         match self {
             OrdCounts::U8(v) => v.len(),
             OrdCounts::U16(v) => v.len(),
+            OrdCounts::U32(v) => v.len(),
         }
     }
 
     pub(crate) fn is_wide(&self) -> bool {
-        matches!(self, OrdCounts::U16(_))
+        matches!(self, OrdCounts::U16(_) | OrdCounts::U32(_))
     }
 
     /// The count at coordinate `i`.
-    pub(crate) fn at(&self, i: usize) -> u16 {
+    pub(crate) fn at(&self, i: usize) -> u32 {
         match self {
-            OrdCounts::U8(v) => u16::from(v[i]),
-            OrdCounts::U16(v) => v[i],
+            OrdCounts::U8(v) => u32::from(v[i]),
+            OrdCounts::U16(v) => u32::from(v[i]),
+            OrdCounts::U32(v) => v[i],
         }
     }
 }
@@ -423,7 +431,7 @@ impl Inverted {
         let (w, bit) = (p / 64, 1u64 << (p % 64));
         self.live[w] |= bit;
         for (i, row) in self.ex.iter_mut().enumerate() {
-            let c = usize::from(ord.at(i));
+            let c = ord.at(i) as usize;
             while row.len() < c {
                 row.push(vec![0; self.words]);
             }
@@ -441,7 +449,7 @@ impl Inverted {
         let (w, bit) = (p / 64, 1u64 << (p % 64));
         self.live[w] &= !bit;
         for (i, row) in self.ex.iter_mut().enumerate() {
-            for bits in &mut row[..usize::from(ord.at(i))] {
+            for bits in &mut row[..ord.at(i) as usize] {
                 bits[w] &= !bit;
             }
         }
@@ -454,7 +462,7 @@ impl Inverted {
     fn query(&self, q: &OrdCounts, words: &mut usize) -> Option<u64> {
         let mut excluded = vec![0u64; self.words];
         for (i, row) in self.ex.iter().enumerate() {
-            if let Some(bits) = row.get(usize::from(q.at(i))) {
+            if let Some(bits) = row.get(q.at(i) as usize) {
                 for (x, b) in excluded.iter_mut().zip(bits) {
                     *x |= b;
                 }
@@ -485,7 +493,7 @@ struct Trie {
 
 #[derive(Clone, Debug)]
 struct TrieNode {
-    children: Vec<(u16, usize)>,
+    children: Vec<(u32, usize)>,
     min_seq: u64,
 }
 
@@ -520,7 +528,7 @@ impl Trie {
         }
     }
 
-    fn child(&self, node: usize, v: u16) -> Result<usize, usize> {
+    fn child(&self, node: usize, v: u32) -> Result<usize, usize> {
         self.nodes[node]
             .children
             .binary_search_by_key(&v, |&(k, _)| k)

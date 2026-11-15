@@ -74,8 +74,9 @@ use crate::must::MustState;
 use crate::Config;
 
 /// How one sweep ended (C3's decision table; criterion 11).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SweepEnd {
+    Threshold(crate::ThresholdStop),
     /// Stopped at a covering graph, which was admitted to `W`.
     Witness,
     /// Enumerated all of `Graphs(Spec)` and found none: a report.
@@ -130,6 +131,9 @@ fn covers_compact(spec: &CompactSummary, query: &CompactSummary) -> bool {
 /// no graph and exhaustion is a failing sweep; under a limit, no graph and a
 /// stop is `Budgeted`; anything else panics.
 pub(crate) fn classify(swept: &Swept, limited: bool) -> SweepEnd {
+    if let SearchEnd::Threshold(reason) = &swept.run.end {
+        return SweepEnd::Threshold(reason.clone());
+    }
     if !swept.run.visible_errors.is_empty()
         || swept
             .run
@@ -142,7 +146,7 @@ pub(crate) fn classify(swept: &Swept, limited: bool) -> SweepEnd {
     // `MIN-ENGINES` E7a: a stored witness is a graph (the pair-set and cone
     // tests) or a compact summary (the compact test).
     let stored = swept.witness.is_some() || swept.witness_summary.is_some();
-    match (stored, swept.run.end, swept.budgeted) {
+    match (stored, swept.run.end.clone(), swept.budgeted) {
         (true, SearchEnd::StoppedAtFirstReport, false) => SweepEnd::Witness,
         (false, SearchEnd::StateSpaceExhausted, false) => SweepEnd::Exhausted,
         (false, SearchEnd::StoppedAtFirstReport, true) if limited => SweepEnd::Budgeted,
@@ -313,6 +317,11 @@ pub(crate) fn run(
         }
     }
     let mut out = run_with(&cc, &implementation, &specification, false);
+    for end in [out.impl_end.clone()] {
+        if let SearchEnd::Threshold(reason) = end {
+            return Err(ConfError::Threshold(reason));
+        }
+    }
     out.counters.precheck_ran = precheck_ran;
     out.counters.precheck_wall_time_ms = precheck_wall_time_ms;
 
@@ -575,9 +584,15 @@ pub(crate) fn run_with(
                 // method `admit_from_sweep` (`P4-APPARATUS` 15); ⊥ is the
                 // uncovered completion.
                 let flat_started = Instant::now();
-                let (witness, delta) = flat::flat_cover(fctx, g).unwrap_or_else(|e| {
-                    panic!("conformance: the specification program is not a valid input: {e}")
-                });
+                let (witness, delta) = match flat::flat_cover(fctx, g) {
+                    Ok(found) => found,
+                    Err(crate::conformance::obs::ObsError::Threshold(reason)) => {
+                        return SinkVerdict::Threshold(reason);
+                    }
+                    Err(e) => panic!(
+                        "conformance: the specification program is not a valid input: {e}"
+                    ),
+                };
                 let mut st = state.borrow_mut();
                 st.sweep_time += flat_started.elapsed();
                 st.counters
@@ -673,6 +688,7 @@ pub(crate) fn run_with(
                 return SinkVerdict::Stop;
             }
             match (swept.witness, swept.witness_summary, end) {
+                (_, _, SweepEnd::Threshold(reason)) => return SinkVerdict::Threshold(reason),
                 (witness, witness_summary, SweepEnd::Witness) => {
                     // ln:cfound — the stopping witness joins W. The graph is
                     // the sweep's completion-gate capture, one thread later,

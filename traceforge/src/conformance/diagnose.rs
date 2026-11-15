@@ -38,7 +38,9 @@ use crate::conformance::config::Engine;
 use crate::conformance::morphism::{follows, matches, statuses, statuses_agree, CompleteExecution};
 use crate::conformance::obs::{wobs, ObsError, Wobs};
 use crate::conformance::probe::Offer;
-use crate::conformance::prober::{install, install_nondet, install_recv, probe_from, Probed};
+use crate::conformance::prober::{
+    install_checked, install_nondet_checked, install_recv_checked, probe_from, Probed,
+};
 use crate::conformance::report::{
     self, Diagnostics, Obligation, ReportCause, ReportGate, VisTrace,
 };
@@ -462,6 +464,9 @@ impl Recompute {
         *fuel -= 1;
 
         let probed = self.probe(graph);
+        if let Some(reason) = &probed.threshold {
+            return Err(ObsError::Threshold(reason.clone()));
+        }
 
         // Criterion 9: the same scan as `Search::spec_visit`, same error.
         if let Some(e) = spec_assertion(probed.graph()) {
@@ -584,7 +589,9 @@ impl Recompute {
                     offer.pos()
                 );
                 for value in self.inner_order.values(values) {
-                    let extended = install_nondet(self.config.clone(), graph.clone(), offer, value);
+                    let extended = install_nondet_checked(
+                        self.config.clone(), graph.clone(), offer, value,
+                    )?;
                     try_one!(extended, false);
                 }
             }
@@ -597,12 +604,14 @@ impl Recompute {
                     offer.pos()
                 );
                 for rf in options {
-                    let extended = install_recv(self.config.clone(), graph.clone(), offer, rf);
+                    let extended = install_recv_checked(
+                        self.config.clone(), graph.clone(), offer, rf,
+                    )?;
                     try_one!(extended, true);
                 }
             }
             LabelEnum::SendMsg(_) => {
-                let extended = install(self.config.clone(), graph.clone(), offer);
+                let extended = install_checked(self.config.clone(), graph.clone(), offer)?;
                 try_one!(extended, true);
             }
             // The same `unreachable!` `search.rs` carries, for the same
@@ -655,7 +664,9 @@ impl Recompute {
                     offer.pos()
                 );
                 for rf in options {
-                    let extended = install_recv(self.config.clone(), graph.clone(), offer, rf);
+                    let extended = install_recv_checked(
+                        self.config.clone(), graph.clone(), offer, rf,
+                    )?;
                     if check(&extended, seen)? {
                         return Ok(true);
                     }
@@ -673,11 +684,13 @@ impl Recompute {
                         offer.pos()
                     )
                 };
-                let extended = install_nondet(self.config.clone(), graph.clone(), offer, v);
+                let extended = install_nondet_checked(
+                    self.config.clone(), graph.clone(), offer, v,
+                )?;
                 check(&extended, seen)
             }
             LabelEnum::SendMsg(_) => {
-                let extended = install(self.config.clone(), graph.clone(), offer);
+                let extended = install_checked(self.config.clone(), graph.clone(), offer)?;
                 check(&extended, seen)
             }
             other => {

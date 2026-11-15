@@ -48,8 +48,9 @@ pub(crate) enum Mode {
 }
 
 /// How the run ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum End {
+    Threshold(crate::ThresholdStop),
     Exhausted,
     Budget,
     FirstMiss,
@@ -186,7 +187,9 @@ impl OnlineReport {
     /// `reports` if a miss was seen; `conforms` if the run ended by exhaustion
     /// without a failure; `partial` otherwise.
     pub(crate) fn verdict(&self) -> Verdict {
-        if self.first.is_some() {
+        if matches!(self.end, End::Threshold(_)) {
+            Verdict::Partial
+        } else if self.first.is_some() {
             Verdict::Reports
         } else if self.end == End::Exhausted {
             Verdict::Conforms
@@ -642,6 +645,8 @@ pub(crate) fn online(
         Ok((search_end, errors, _)) => {
             if let Some(msg) = st.failure.take() {
                 (End::Failed, Some(msg))
+            } else if let SearchEnd::Threshold(reason) = search_end {
+                (End::Threshold(reason), None)
             } else if errors > 0 {
                 (
                     End::Failed,
@@ -652,6 +657,7 @@ pub(crate) fn online(
                 )
             } else {
                 match search_end {
+                    SearchEnd::Threshold(reason) => (End::Threshold(reason), None),
                     SearchEnd::StateSpaceExhausted => (End::Exhausted, None),
                     SearchEnd::MaxIterations(_) => (End::Budget, None),
                     SearchEnd::StoppedAtFirstReport => (End::FirstMiss, None),
@@ -699,7 +705,7 @@ pub(crate) fn online(
         let enumeration = match report.end {
             End::Exhausted => Enumeration::Complete,
             End::Budget => Enumeration::Bounded,
-            End::FirstMiss | End::Failed => Enumeration::Aborted,
+            End::FirstMiss | End::Failed | End::Threshold(_) => Enumeration::Aborted,
         };
         let mut lines: Vec<String> = st.lines.take().unwrap_or_default().into_iter().collect();
         lines.sort();

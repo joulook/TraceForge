@@ -56,6 +56,7 @@ struct ExecutionPoolWorker {
     pool_can_drain: Arc<Mutex<bool>>,
     pool_exec_stats: Arc<Mutex<Stats>>,
     must_conf: Config,
+    threshold: Arc<crate::parallel_verify::CancelToken>,
     /// In order to make max_iterations work right with parallel exploration
     /// we have to count executions as they start, not as they are finished,
     /// otherwise we end up overshooting while draining the queue of
@@ -77,6 +78,7 @@ impl ExecutionPoolWorker {
         pool_exec_stats: Arc<Mutex<Stats>>,
         must_conf: &Config,
         exec_counter: Arc<Mutex<u64>>,
+        threshold: Arc<crate::parallel_verify::CancelToken>,
     ) -> Self {
         debug!("Created Worker [{}]", &thread_idx);
 
@@ -89,6 +91,7 @@ impl ExecutionPoolWorker {
             pool_can_drain,
             pool_exec_stats,
             must_conf: must_conf.clone(),
+            threshold,
             exec_counter,
         }
     }
@@ -110,6 +113,7 @@ impl ExecutionPoolWorker {
         let pool_exec_stats = self.pool_exec_stats.clone();
         let must_conf = self.must_conf.clone();
         let exec_counter = self.exec_counter.clone();
+        let threshold = self.threshold.clone();
 
         let thread_handle = std::thread::Builder::new()
             .name(format!("exec-pool-{}", &self.thread_idx))
@@ -124,6 +128,7 @@ impl ExecutionPoolWorker {
                     exec_func,
                     must_conf,
                     exec_counter,
+                    threshold,
                 )
             })
             .expect("Should spawn() ExecutionPool worker thread.");
@@ -151,6 +156,7 @@ fn worker_loop<F>(
     exec_func: Arc<F>,
     must_conf: Config,
     exec_counter: Arc<Mutex<u64>>,
+    threshold: Arc<crate::parallel_verify::CancelToken>,
 ) where
     F: Fn() + Send + Sync + 'static,
 {
@@ -160,6 +166,7 @@ fn worker_loop<F>(
 
     // Create a new TraceForge instance for each worker.
     let mut exec_must = Must::new(must_conf, false);
+    exec_must.threshold_cancel = Some(Arc::clone(&threshold));
     exec_must.set_parallel_queues((shared_queue.clone(), loop_block_cond.clone()));
     let must_wrap = Rc::new(RefCell::new(exec_must));
 
@@ -167,6 +174,9 @@ fn worker_loop<F>(
 
     // Until the Worker is signalled to Shutdown...
     loop {
+        if threshold.threshold().is_some() {
+            break;
+        }
         if *worker_state.lock().expect("Lock worker_state mutex")
             == ExecutionPoolWorkerState::Shutdown
         {
@@ -239,6 +249,9 @@ fn worker_loop<F>(
         // completes, mark can_drain as true.
         //
         CONTINUATION_POOL.set(&continuation_pool, || loop {
+            if threshold.threshold().is_some() {
+                break;
+            }
             if let Some(limit) = max_iterations {
                 let exec_c = {
                     let mut exec_c = exec_counter.lock().expect("Couldn't unlock exec_counter");
@@ -314,6 +327,7 @@ pub struct ExecutionPool {
     can_drain: Arc<Mutex<bool>>,
     exec_stats: Arc<Mutex<Stats>>,
     is_shutdown: bool,
+    threshold: Arc<crate::parallel_verify::CancelToken>,
 }
 
 impl ExecutionPool {
@@ -344,6 +358,7 @@ impl ExecutionPool {
         let exec_stats = Arc::new(Mutex::new(Stats::default()));
         let can_drain = Arc::new(Mutex::new(false));
         let exec_counter = Arc::new(Mutex::new(0));
+        let threshold = Arc::new(crate::parallel_verify::CancelToken::new());
 
         let worker_count: usize = if let Some(rpw) = must_conf.parallel_workers {
             rpw
@@ -365,6 +380,7 @@ impl ExecutionPool {
                     exec_stats.clone(),
                     must_conf,
                     exec_counter.clone(),
+                    Arc::clone(&threshold),
                 )
             })
             .collect();
@@ -376,6 +392,7 @@ impl ExecutionPool {
             exec_stats,
             can_drain,
             is_shutdown: false,
+            threshold,
         }
     }
 
@@ -431,6 +448,9 @@ impl ExecutionPool {
             // Add the delay once here rather than at every branch/continue.
             sleep(Duration::from_millis(250));
 
+            if self.threshold.threshold().is_some() {
+                break;
+            }
             let can_drain = *self.can_drain.lock().expect("can_drain mutex lock");
 
             if !can_drain {
@@ -514,4 +534,24 @@ impl ExecutionPool {
 
         threads_joined == self.worker_vec.len()
     } // shutdown_now()
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    #[test]
+    fn et_legacy_pool_cancels_at_threshold() {
+        let conf = Config::builder().with_parallel(true).with_parallel_workers(2)
+            .with_thread_threshold(16).build();
+        let mut pool = ExecutionPool::new(&conf);
+        let stats = pool.explore(&Arc::new(|| {
+            let (tx, _rx) = crate::channel::Builder::<i32>::new().build();
+            for i in 0..40 { tx.send_msg(i); }
+        }));
+        assert!(pool.threshold.is_cancelled());
+        assert!(pool.threshold.threshold().is_some());
+        assert_eq!(stats.threshold.unwrap().limit, 16);
+        assert_eq!((stats.execs, stats.block), (0, 0));
+    }
 }

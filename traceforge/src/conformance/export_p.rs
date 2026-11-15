@@ -374,7 +374,10 @@ where
     let run_started = Instant::now();
     // Returns only when every task ran its queue to the end, or returned at its
     // poll after the cancel; a panic is re-raised by the runner after cleanup.
-    verify_partitioned_rayon_with(config, program, hooks);
+    let run = verify_partitioned_rayon_with(config, program, hooks);
+    if let Some(reason) = run.stats.threshold {
+        return Err(ExportError::Threshold(reason));
+    }
     let explore_ms = run_started.elapsed().as_millis();
 
     // Taken out under the locks, not unwrapped: the pool's threads drop their

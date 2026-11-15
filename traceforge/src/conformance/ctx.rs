@@ -152,8 +152,9 @@ impl ConfMode {
 
 /// What a completion sink tells the `Enumerate` run to do next (`P4-STATEFUL`
 /// T3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SinkVerdict {
+    Threshold(crate::ThresholdStop),
     Continue,
     /// Request the run to stop at this completion (`stop_at_first_report`).
     Stop,
@@ -190,8 +191,9 @@ pub(crate) struct GateAt {
 }
 
 /// `P4-GATED` G1: what the gate sink tells the run to do next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum GateVerdict {
+    Threshold(crate::ThresholdStop),
     Continue,
     /// First-failure mode: report the gated partial graph at this gate and
     /// stop the whole search. A prune, with the report pushed first.
@@ -992,17 +994,20 @@ impl ConfCtx {
         self.stop_requested
     }
 
-    /// Record why the outer loop stopped. First writer wins: the run ends
-    /// once, and a later overwrite would be a second opinion about a fact that
-    /// was already observed.
+    /// Record why the outer loop stopped. First writer wins, except that a
+    /// whole-run threshold supersedes an earlier partitioned chunk's bound.
     pub(crate) fn record_end(&mut self, end: SearchEnd) {
-        if self.end == SearchEnd::Unknown {
+        // A partitioned chunk's iteration bound is not the whole run's end.
+        if self.end == SearchEnd::Unknown
+            || (matches!(end, SearchEnd::Threshold(_))
+                && !matches!(self.end, SearchEnd::Threshold(_)))
+        {
             self.end = end;
         }
     }
 
     pub(crate) fn end(&self) -> SearchEnd {
-        self.end
+        self.end.clone()
     }
 
     pub(crate) fn reports(&self) -> &[Report] {
@@ -1557,8 +1562,14 @@ impl ConfCtx {
         // `pruned` test above and never reaches the sink (`P4-CFIRST` C5).
         if gate == Gate::Completion {
             if let Some(sink) = self.sink.as_mut() {
-                if sink(g1, state) == SinkVerdict::Stop {
-                    self.stop_requested = true;
+                match sink(g1, state) {
+                    SinkVerdict::Stop => self.stop_requested = true,
+                    SinkVerdict::Continue => {}
+                    SinkVerdict::Threshold(reason) => {
+                        self.record_end(SearchEnd::Threshold(reason));
+                        self.stop_requested = true;
+                        return GateOutcome::Continue;
+                    }
                 }
             }
         }
@@ -1570,6 +1581,11 @@ impl ConfCtx {
         if gate != Gate::Completion {
             if let (Some(sink), Some(site)) = (self.gate_sink.as_mut(), site.as_ref()) {
                 match sink(gate, site, g1, state) {
+                    GateVerdict::Threshold(reason) => {
+                        self.record_end(SearchEnd::Threshold(reason));
+                        self.stop_requested = true;
+                        return GateOutcome::Continue;
+                    }
                     GateVerdict::Continue => {}
                     GateVerdict::Report => {
                         let events: usize =
@@ -1736,6 +1752,11 @@ impl ConfCtx {
             // the outer run asked to stop, every later gate inert; no report,
             // no prune (`Continue`, since a `Prune` at a fresh gate would
             // `block_exec`). `run` returns `Err` on it.
+            Err(ObsError::Threshold(reason)) => {
+                self.record_end(SearchEnd::Threshold(reason));
+                self.stop_requested = true;
+                GateOutcome::Continue
+            }
             Err(ObsError::SpecNotAssertionSafe { thread, pos }) => {
                 // `SVERIFY-P` I1: §8's guard on this gate's graph, before the
                 // abort makes the execution's later gates inert; a late spawn

@@ -154,6 +154,7 @@ fn order_address(ord: &OrdCounts) -> usize {
     match ord {
         OrdCounts::U8(v) => v.as_ptr() as usize,
         OrdCounts::U16(v) => v.as_ptr() as usize,
+        OrdCounts::U32(v) => v.as_ptr() as usize,
     }
 }
 
@@ -277,6 +278,7 @@ struct Frozen {
 
 /// One phase's result.
 struct PhaseResult {
+    threshold: Option<crate::ThresholdStop>,
     merged: SetIndex,
     seen: Option<SetIndex>,
     tasks: usize,
@@ -619,6 +621,7 @@ fn phase(
         None => (FirstReport::default(), false),
     };
     PhaseResult {
+        threshold: run.stats.threshold.clone(),
         merged,
         seen,
         tasks: run.tasks_spawned + 1,
@@ -744,7 +747,7 @@ pub(crate) fn run_with(
         spec.tally.flushes >= spec.tasks,
         "conformance: sverify-p flushes at least once per task"
     );
-    if !spec_errors.is_empty() {
+    if !spec_errors.is_empty() || spec.threshold.is_some() {
         counters.phase_peaks = peaks && resets_ok;
         counters.vmhwm_kb_max = hwm_max([hwm_before, spec_hwm, vm_hwm_kb()]);
         if !counters.phase_peaks {
@@ -755,7 +758,8 @@ pub(crate) fn run_with(
         return SverifyPOutcome {
             counters,
             uncovered: Vec::new(),
-            spec_end: SearchEnd::StateSpaceExhausted,
+            spec_end: spec.threshold.clone().map(SearchEnd::Threshold)
+                .unwrap_or(SearchEnd::StateSpaceExhausted),
             impl_end: SearchEnd::Unknown,
             spec_errors,
             impl_notes: Vec::new(),
@@ -870,7 +874,9 @@ pub(crate) fn run_with(
         0
     };
     counters.spawned_at_stop = imp.first.spawned_at_stop.unwrap_or(0);
-    let impl_end = if imp.stopped {
+    let impl_end = if let Some(reason) = imp.threshold.clone() {
+        SearchEnd::Threshold(reason)
+    } else if imp.stopped {
         SearchEnd::StoppedAtFirstReport
     } else {
         SearchEnd::StateSpaceExhausted
@@ -898,7 +904,8 @@ pub(crate) fn run_with(
     SverifyPOutcome {
         counters,
         uncovered,
-        spec_end: SearchEnd::StateSpaceExhausted,
+        spec_end: spec.threshold.clone().map(SearchEnd::Threshold)
+                .unwrap_or(SearchEnd::StateSpaceExhausted),
         impl_end,
         spec_errors,
         impl_notes: imp.diagnostics,
@@ -942,6 +949,11 @@ pub(crate) fn run(
         });
     }
     let out = run_with(&cc, &implementation, &specification);
+    for end in [out.spec_end.clone(), out.impl_end.clone()] {
+        if let SearchEnd::Threshold(reason) = end {
+            return Err(ConfError::Threshold(reason));
+        }
+    }
 
     if let Some((thread, pos, visible)) = out.spec_errors.first() {
         // The same text as the stateful engine's (stateful.rs, `run`), so the

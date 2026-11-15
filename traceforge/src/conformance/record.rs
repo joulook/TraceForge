@@ -1037,7 +1037,7 @@ pub(crate) fn row_of(r: &GridResult) -> Row {
             push_d(&mut row, "reports", o.reports.len());
             push_d(&mut row, "exhaustions", o.exhaustions.len());
             push_d(&mut row, "diagnostics", o.diagnostics.len());
-            push(&mut row, "end", o.end);
+            push(&mut row, "end", &o.end);
             push_d(&mut row, "skipped_gates", o.skipped_gates);
             push_d(&mut row, "inert_gates", o.inert_gates);
             push_d(&mut row, "seed", o.seed);
@@ -1126,8 +1126,8 @@ pub(crate) fn row_of(r: &GridResult) -> Row {
         GridRaw::Stateful(o) => {
             // `MIN-ENGINES` E6: the count, kept or not.
             push_d(&mut row, "reports", o.counters.reports);
-            push(&mut row, "impl_end", o.impl_end);
-            push(&mut row, "spec_end", o.spec_end);
+            push(&mut row, "impl_end", &o.impl_end);
+            push(&mut row, "spec_end", &o.spec_end);
             push_d(&mut row, "spec_errors", o.spec_errors.len());
             push_d(&mut row, "impl_notes", o.impl_notes.len());
             push_d(&mut row, "executions", o.executions);
@@ -1175,7 +1175,7 @@ pub(crate) fn row_of(r: &GridResult) -> Row {
             // `MIN-ENGINES` E6: the completion count, kept or not.
             push_d(&mut row, "reports", o.counters.reports);
             push_d(&mut row, "cut_reports_list", o.cut_reports.len());
-            push(&mut row, "impl_end", o.impl_end);
+            push(&mut row, "impl_end", &o.impl_end);
             push_d(&mut row, "spec_errors", o.spec_errors.len());
             push_d(&mut row, "aborted", o.aborted);
             push_d(&mut row, "impl_notes", o.impl_notes.len());
@@ -1258,7 +1258,7 @@ pub(crate) fn row_of(r: &GridResult) -> Row {
                 "reports_at_completion",
                 o.reports.len() - gate_reports,
             );
-            push(&mut row, "impl_end", o.impl_end);
+            push(&mut row, "impl_end", &o.impl_end);
             push_d(&mut row, "spec_errors", o.spec_errors.len());
             push_d(&mut row, "aborted", o.aborted);
             push(&mut row, "abort_gate_at", o.abort_gate_at.is_some());
@@ -1361,7 +1361,7 @@ pub(crate) fn row_of(r: &GridResult) -> Row {
                 push_d(&mut row, "reports", o.report_count());
                 push_d(&mut row, "exhaustions", o.exhaustions.len());
                 push_d(&mut row, "notes", o.notes.len());
-                push(&mut row, "end", o.end);
+                push(&mut row, "end", &o.end);
                 push_d(&mut row, "seed", o.seed);
                 push(&mut row, "rendered_engine", o.engine);
                 push(&mut row, "spec_errfree", o.spec_errfree);
@@ -1423,7 +1423,7 @@ fn cfirst_p_columns(row: &mut Row, r: &CFirstPRun, c: &crate::conformance::repor
     };
     push_d(row, "verdict", class);
     push_d(row, "reports", c.reports);
-    push(row, "impl_end", o.impl_end);
+    push(row, "impl_end", &o.impl_end);
     push_d(row, "spec_errors", o.spec_errors.len());
     push_d(row, "aborted", o.aborted);
     push_d(row, "impl_notes", o.impl_notes.len());
@@ -1525,8 +1525,8 @@ fn sverify_p_columns(row: &mut Row, r: &SverifyPRun) {
     };
     push_d(row, "verdict", class);
     push_d(row, "reports", c.reports);
-    push(row, "impl_end", o.impl_end);
-    push(row, "spec_end", o.spec_end);
+    push(row, "impl_end", &o.impl_end);
+    push(row, "spec_end", &o.spec_end);
     push_d(row, "spec_errors", o.spec_errors.len());
     push_d(row, "impl_notes", o.impl_notes.len());
     push_d(row, "executions", o.executions);

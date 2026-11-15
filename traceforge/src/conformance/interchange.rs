@@ -477,7 +477,7 @@ fn render_line(
     names: &[String],
     statuses: &[Status],
     words: &[Vec<ObsText>],
-    counts: &[u16],
+    counts: &[u32],
 ) -> String {
     let mut out = String::from("{\"statuses\":{");
     for (i, (n, s)) in names.iter().zip(statuses).enumerate() {
@@ -581,6 +581,7 @@ pub(crate) struct JoinSeams {
 /// Why an export was refused; no file is written (X4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExportError {
+    Threshold(crate::ThresholdStop),
     /// The configuration's index is not `Set`.
     NotSet,
     /// The configuration's `ConsType` has no format `model` (G1-4).
@@ -658,9 +659,10 @@ pub(crate) fn line_of(
         }
         words.push(w);
     }
-    let counts: Vec<u16> = match ord {
-        OrdCounts::U8(c) => c.iter().map(|&x| u16::from(x)).collect(),
-        OrdCounts::U16(c) => c.clone(),
+    let counts: Vec<u32> = match ord {
+        OrdCounts::U8(c) => c.iter().map(|&x| u32::from(x)).collect(),
+        OrdCounts::U16(c) => c.iter().map(|&x| u32::from(x)).collect(),
+        OrdCounts::U32(c) => c.clone(),
     };
     Ok(render_line(names, &statuses, &words, &counts))
 }
@@ -778,6 +780,9 @@ where
             .iter()
             .filter(|d| d.reason == DiagnosticReason::InvisibleThread)
             .count();
+    if let SearchEnd::Threshold(reason) = run.end.clone() {
+        return Err(ExportError::Threshold(reason));
+    }
     if errors > 0 {
         return Err(ExportError::SpecErrors(errors));
     }
@@ -1043,10 +1048,10 @@ pub(crate) fn parse_line(text: &str, names: &[String]) -> Result<(String, Compac
         let Value::Array(obs) = &wm[n] else {
             return Err(format!("the word of `{n}` is not an array"));
         };
-        if obs.len() > u16::MAX as usize {
+        if obs.len() as u64 > u64::from(u32::MAX) {
             return Err(format!(
-                "the word of `{n}` has more than {} events",
-                u16::MAX
+                "the visible thread `{n}` has {} visible events; counts support at most {}",
+                obs.len(), u32::MAX
             ));
         }
         let mut w = Vec::with_capacity(obs.len());
@@ -1096,17 +1101,19 @@ pub(crate) fn parse_line(text: &str, names: &[String]) -> Result<(String, Compac
                         names[tj]
                     ));
                 }
-                counts.push(c as u16);
+                counts.push(c as u32);
             }
         }
     }
 
     let key = render_line(names, &statuses, &words, &counts);
 
-    // The summary (R3): `U16` iff some word exceeds 255 events, as `OrdCounts::of`.
-    let wide = words.iter().any(|w| w.len() > 255);
-    let ord = if wide {
-        OrdCounts::U16(counts)
+    // The summary uses the longest word's width, as `OrdCounts::of`.
+    let longest = words.iter().map(Vec::len).max().unwrap_or(0);
+    let ord = if longest > u16::MAX as usize {
+        OrdCounts::U32(counts)
+    } else if longest > u8::MAX as usize {
+        OrdCounts::U16(counts.into_iter().map(|c| c as u16).collect())
     } else {
         OrdCounts::U8(counts.into_iter().map(|c| c as u8).collect())
     };

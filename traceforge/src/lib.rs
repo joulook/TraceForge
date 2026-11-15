@@ -140,9 +140,25 @@ fn print_progress(text: &str, stderr: bool, flush: bool) {
 /// Threads whose names contain this string will be excluded from the count.
 pub const FILTERED_THREAD_NAME_PATTERN: &str = "traceforge";
 
+/// The thread and configured limit that ended an exploration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThresholdStop {
+    pub thread: String,
+    pub limit: u32,
+}
+
+impl std::fmt::Display for ThresholdStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "threshold: thread `{}` passed limit {}",
+            self.thread.escape_debug(), self.limit)
+    }
+}
+
 /// TraceForge exploration statistics.
 #[derive(Default, Clone, Debug)]
 pub struct Stats {
+    /// Present when exploration stopped at the thread threshold.
+    pub threshold: Option<ThresholdStop>,
     /// Number of complete executions explored
     pub execs: usize,
     /// Number of blocked executions explored
@@ -155,6 +171,9 @@ pub struct Stats {
 
 impl Stats {
     pub(crate) fn add(&mut self, rhs: &Stats) {
+        if self.threshold.is_none() {
+            self.threshold = rhs.threshold.clone();
+        }
         self.execs += rhs.execs;
         self.block += rhs.block;
         self.coverage.merge(&rhs.coverage);

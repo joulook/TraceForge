@@ -264,6 +264,7 @@ fn resolve(graph: &ExecutionGraph, name: &str) -> Result<Option<ThreadId>, ObsEr
 /// Something the extractor cannot answer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ObsError {
+    Threshold(crate::ThresholdStop),
     /// Two threads carry the same declared visible name.
     AmbiguousName { name: String },
     /// A declared visible name has no thread in a graph where every declared
@@ -281,6 +282,7 @@ pub(crate) enum ObsError {
 impl std::fmt::Display for ObsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ObsError::Threshold(reason) => write!(f, "{reason}"),
             ObsError::AmbiguousName { name } => write!(
                 f,
                 "two threads are named `{name}`; a declared visible name must \

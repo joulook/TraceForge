@@ -1013,7 +1013,7 @@ fn st(r: &GridResult) -> St {
         GridRaw::Enumerator(o) => St {
             reports: o.reports.len(),
             exhaustions: o.exhaustions.len(),
-            end: o.end,
+            end: o.end.clone(),
             failure: o
                 .spec_error
                 .as_ref()
@@ -1022,20 +1022,20 @@ fn st(r: &GridResult) -> St {
         GridRaw::Stateful(o) => St {
             reports: o.reports.len(),
             exhaustions: 0,
-            end: o.impl_end,
+            end: o.impl_end.clone(),
             failure: (!o.spec_errors.is_empty()).then(|| format!("{:?}", o.spec_errors)),
         },
         GridRaw::CompleteFirst(o) => St {
             reports: o.reports.len(),
             exhaustions: 0,
-            end: o.impl_end,
+            end: o.impl_end.clone(),
             failure: (o.aborted || !o.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", o.aborted, o.spec_errors)),
         },
         GridRaw::Gated(o) => St {
             reports: o.reports.len(),
             exhaustions: 0,
-            end: o.impl_end,
+            end: o.impl_end.clone(),
             failure: (o.aborted || !o.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", o.aborted, o.spec_errors)),
         },
@@ -1045,7 +1045,7 @@ fn st(r: &GridResult) -> St {
         GridRaw::SverifyP(r) => St {
             reports: r.outcome.counters.uncovered_multiplicity,
             exhaustions: 0,
-            end: r.outcome.impl_end,
+            end: r.outcome.impl_end.clone(),
             failure: (!r.outcome.spec_errors.is_empty())
                 .then(|| format!("{:?}", r.outcome.spec_errors)),
         },
@@ -1055,7 +1055,7 @@ fn st(r: &GridResult) -> St {
         GridRaw::CFirstP(r) => St {
             reports: r.outcome.counters.base.reports,
             exhaustions: 0,
-            end: r.outcome.impl_end,
+            end: r.outcome.impl_end.clone(),
             failure: (r.outcome.aborted || !r.outcome.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", r.outcome.aborted, r.outcome.spec_errors)),
         },
@@ -1123,7 +1123,7 @@ fn oracle(f: &Fixture) -> Oracle {
         o.spec_errors
     );
     assert_eq!(
-        (o.impl_end, o.spec_end),
+        (o.impl_end.clone(), o.spec_end.clone()),
         (
             SearchEnd::StateSpaceExhausted,
             SearchEnd::StateSpaceExhausted
@@ -1412,7 +1412,7 @@ fn check_fixture(f: &Fixture, e: Exp, selectors: &[Selector]) -> (Vec<String>, V
             if x.exhaustions != 0 || x.end != SearchEnd::StateSpaceExhausted {
                 fail.push(format!(
                     "{label}: exhaustions {} end {:?}",
-                    x.exhaustions, x.end
+                    x.exhaustions, x.end.clone()
                 ));
             }
             if (x.reports > 0) != (e.unc > 0) {

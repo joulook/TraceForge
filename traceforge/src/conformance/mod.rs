@@ -917,6 +917,10 @@ fn run(
         },
     );
 
+    if let report::SearchEnd::Threshold(reason) = raw.end.clone() {
+        return Err(ConfError::Threshold(reason));
+    }
+
     // `P4-ENUMERATOR` criterion 9: the inner search found the specification
     // not assertion-safe. The run was abandoned at that gate; nothing it
     // recorded is a verdict, so this leaves before the diagnostics loop and
@@ -1032,3 +1036,8 @@ fn run(
         flat_eligibility: None,
     }))
 }
+
+#[cfg(test)]
+mod threshold_tests;
+#[cfg(test)]
+mod threshold_tester_tests;

@@ -107,6 +107,10 @@ pub(crate) fn run(
         .conf_ctx()
         .expect("conformance: the precheck context was taken and not put back");
 
+    if let crate::conformance::report::SearchEnd::Threshold(reason) = ctx.end() {
+        return Err(ConfError::Threshold(reason));
+    }
+
     // Both halves of §4.4's split count here. The precheck's question is "can
     // any specification execution fail an assertion?", and an **invisible**
     // thread's failure is still a specification graph containing `err` — the

@@ -35,7 +35,11 @@ use crate::conformance::canon::{CanonSet, CanonicalGraph};
 use crate::conformance::morphism::{follows, matches, statuses, statuses_agree, CompleteExecution};
 use crate::conformance::obs::{check_annotation, wobs, ObsError, Wobs};
 use crate::conformance::probe::Offer;
-use crate::conformance::prober::{install, install_nondet, install_recv, probe_from, Probed};
+use crate::conformance::prober::{
+    install_checked, install_nondet_checked, install_recv_checked, probe_from, Probed,
+};
+#[cfg(test)]
+use crate::conformance::prober::{install, install_nondet, install_recv};
 use crate::conformance::report::CoverCounters;
 use crate::conformance::selector::InnerOrder;
 use crate::event::Event;
@@ -527,6 +531,9 @@ impl Search {
         // next, and — because the prober applies no Φ — whether it can do
         // anything at all, which is `Done`'s `next_Spec(G) = ∅` conjunct.
         let probed = self.probe(graph);
+        if let Some(reason) = &probed.threshold {
+            return Err(ObsError::Threshold(reason.clone()));
+        }
 
         // Criterion 9, **scan first**: a `Block(Assert)` in a probe's output
         // means the specification is not assertion-safe. It aborts the run,
@@ -653,7 +660,9 @@ impl Search {
                     offer.pos()
                 );
                 for value in self.inner_order.values(values) {
-                    let extended = install_nondet(self.config.clone(), graph.clone(), offer, value);
+                    let extended = install_nondet_checked(
+                        self.config.clone(), graph.clone(), offer, value,
+                    )?;
                     try_one!(extended, false);
                 }
             }
@@ -674,13 +683,15 @@ impl Search {
                     offer.pos()
                 );
                 for rf in options {
-                    let extended = install_recv(self.config.clone(), graph.clone(), offer, rf);
+                    let extended = install_recv_checked(
+                        self.config.clone(), graph.clone(), offer, rf,
+                    )?;
                     try_one!(extended, true);
                 }
             }
             // A send carries no decision, so the extension is the whole of it.
             LabelEnum::SendMsg(_) => {
-                let extended = install(self.config.clone(), graph.clone(), offer);
+                let extended = install_checked(self.config.clone(), graph.clone(), offer)?;
                 try_one!(extended, true);
             }
             other => {
@@ -767,7 +778,9 @@ impl Search {
                     offer.pos()
                 );
                 for rf in options {
-                    let extended = install_recv(self.config.clone(), graph.clone(), offer, rf);
+                    let extended = install_recv_checked(
+                        self.config.clone(), graph.clone(), offer, rf,
+                    )?;
                     if self.follows(outer, &extended)? {
                         return Ok(true);
                     }
@@ -789,11 +802,13 @@ impl Search {
                     .first()
                     .copied()
                     .expect("conformance: a nondet offer with no values is not a choice point");
-                let extended = install_nondet(self.config.clone(), graph.clone(), offer, v);
+                let extended = install_nondet_checked(
+                    self.config.clone(), graph.clone(), offer, v,
+                )?;
                 self.follows(outer, &extended)
             }
             LabelEnum::SendMsg(_) => {
-                let extended = install(self.config.clone(), graph.clone(), offer);
+                let extended = install_checked(self.config.clone(), graph.clone(), offer)?;
                 self.follows(outer, &extended)
             }
             // Matching `branch`, which calls this case `unreachable!`. The two

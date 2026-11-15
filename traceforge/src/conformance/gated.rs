@@ -200,6 +200,11 @@ pub(crate) fn run(
         }
     }
     let mut out = run_with(&cc, &implementation, &specification, false);
+    for end in [out.impl_end.clone()] {
+        if let SearchEnd::Threshold(reason) = end {
+            return Err(ConfError::Threshold(reason));
+        }
+    }
     out.counters.precheck_ran = precheck_ran;
     out.counters.precheck_wall_time_ms = precheck_wall_time_ms;
 
@@ -444,8 +449,9 @@ pub(crate) fn run_with(
                     st.kept_spec.push(swept.kept.clone());
                 }
                 let end = classify(&swept, limit.is_some());
-                st.sweep_ends.push(end);
+                st.sweep_ends.push(end.clone());
                 match end {
+                    SweepEnd::Threshold(reason) => GateVerdict::Threshold(reason),
                     SweepEnd::Aborted => {
                         st.counters.gate_sweeps_aborted += 1;
                         st.spec_errors = spec_errors_of(&swept.run);
@@ -596,9 +602,15 @@ pub(crate) fn run_with(
                 // the uncovered completion.
                 drop(st);
                 let flat_started = Instant::now();
-                let (witness, delta) = flat::flat_cover(fctx, g).unwrap_or_else(|e| {
-                    panic!("conformance: the specification program is not a valid input: {e}")
-                });
+                let (witness, delta) = match flat::flat_cover(fctx, g) {
+                    Ok(found) => found,
+                    Err(crate::conformance::obs::ObsError::Threshold(reason)) => {
+                        return SinkVerdict::Threshold(reason);
+                    }
+                    Err(e) => panic!(
+                        "conformance: the specification program is not a valid input: {e}"
+                    ),
+                };
                 let mut st = state.borrow_mut();
                 st.sweep_time += flat_started.elapsed();
                 st.counters
@@ -658,8 +670,9 @@ pub(crate) fn run_with(
                 st.kept_spec.push(swept.kept.clone());
             }
             let end = classify(&swept, false);
-            st.sweep_ends.push(end);
+            st.sweep_ends.push(end.clone());
             match end {
+                SweepEnd::Threshold(reason) => SinkVerdict::Threshold(reason),
                 SweepEnd::Aborted => {
                     st.counters.completion_sweeps_aborted += 1;
                     st.spec_errors = spec_errors_of(&swept.run);

@@ -1578,46 +1578,20 @@ fn sends_graph(n: usize) -> (ExecutionGraph, Vec<String>) {
     (v.pop().unwrap(), vis)
 }
 
-/// m9 (gate 4 B2, frozen §3.2, §5.1 item 2): the `u16` bound. A visible
-/// thread of exactly `u16::MAX` = 65 535 visible events is accepted (`U16`,
-/// its counts against `b` all 0, no wrap); one of 65 536 is refused before
-/// any count is accumulated, in every profile, naming the thread and the
-/// count — through `OrdCounts::of` and through `CompactSummary::of`.
-/// Under the grid's own `CONF_THREAD_THRESHOLD` = 65 536 such a thread
-/// never completes (Begin + 65 536 sends + End needs index 65 537, and the
-/// search stops there), so the refusal is reachable only through a
-/// configuration with a higher threshold; this test raises it to 1 << 17.
+/// ET-1.3: the former u16 refusal now accepts 65 536 visible events.
 #[test]
-fn m9_the_u16_bound_refuses_65536_visible_events() {
-    let max = u16::MAX as usize;
-    let (g, vis) = sends_graph(max);
-    let w = wobs(&g, &vis).unwrap();
-    assert_eq!(w.of("a").len(), max, "conformance: a's visible word");
-    let c = OrdCounts::of(&g, &w, &vis);
-    assert!(c.is_wide(), "conformance: u16");
-    assert_eq!(c.len(), max, "conformance: n · (T − 1)");
-    let OrdCounts::U16(v) = &c else {
-        unreachable!()
-    };
-    assert!(v.iter().all(|&x| x == 0), "conformance: a against b");
-    let (g, vis) = sends_graph(max + 1);
-    let w = wobs(&g, &vis).unwrap();
-    assert_eq!(w.of("a").len(), max + 1, "conformance: a's visible word");
-    let want = format!("the visible thread `a` has {} visible events", max + 1);
-    for (site, got) in [
-        ("OrdCounts::of", panic_text(|| OrdCounts::of(&g, &w, &vis))),
-        (
-            "CompactSummary::of",
-            panic_text(|| {
-                CompactSummary::of(CompleteExecution::try_finished(&g).unwrap(), w.clone(), &vis)
-            }),
-        ),
-    ] {
-        let m = got.unwrap_or_else(|| panic!("conformance: {site}: 65 536 accepted"));
-        assert!(
-            m.contains(&want) && m.contains("65535"),
-            "conformance: {site}: another panic: {m}"
-        );
+fn m9_the_u16_bound_accepts_65536_visible_events() {
+    for n in [65535, 65536] {
+        let (g, vis) = sends_graph(n);
+        let w = wobs(&g, &vis).unwrap();
+        let c = OrdCounts::of(&g, &w, &vis);
+        assert_eq!(c.len(), n);
+        assert_eq!(matches!(c, OrdCounts::U32(_)), n == 65536);
+        let summary = CompactSummary::of(
+            CompleteExecution::try_finished(&g).unwrap(), w, &vis,
+        ).unwrap();
+        assert_eq!(summary.ord, c);
+        assert!((0..n).all(|i| c.at(i) == 0));
     }
 }
 
@@ -3055,6 +3029,7 @@ fn i1_sverify_s_uncovered_multiset() {
         let counts = match OrdCounts::of(g, &w, &f.visible) {
             OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
             OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            OrdCounts::U32(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
         };
         let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, &f.visible)
             .expect("conformance: a summary");
@@ -3149,6 +3124,7 @@ fn e1_record() {
         let counts = match OrdCounts::of(g, &w, &f.visible) {
             OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
             OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            OrdCounts::U32(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
         };
         let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, &f.visible)
             .expect("conformance: a summary");
@@ -3435,6 +3411,7 @@ fn e1_record() {
                     let counts = match OrdCounts::of(g, &w, &vis) {
                         OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
                         OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            OrdCounts::U32(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
                     };
                     let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, &vis)
                         .expect("conformance: a summary");
@@ -4877,6 +4854,7 @@ fn e1_line(g: &ExecutionGraph, visible: &[String]) -> String {
     let counts = match OrdCounts::of(g, &w, visible) {
         OrdCounts::U8(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
         OrdCounts::U16(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
+            OrdCounts::U32(v) => v.iter().map(|x| x.to_string()).collect::<Vec<_>>(),
     };
     let s = Summary::of(CompleteExecution::try_finished(g).unwrap(), w, visible)
         .expect("conformance: a summary");

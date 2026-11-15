@@ -140,7 +140,7 @@ fn conformance_sources() -> Vec<(String, String)> {
 /// The test modules. They are `#[cfg(test)]`, so nothing they print is in a
 /// user's output at all, which is why they are out of criterion 1's domain
 /// rather than allowlisted within it.
-const TEST_ONLY_FILES: [&str; 14] = [
+const TEST_ONLY_FILES: [&str; 15] = [
     "adversarial.rs",
     "bench.rs",
     "differential.rs",
@@ -158,6 +158,7 @@ const TEST_ONLY_FILES: [&str; 14] = [
     "s5_harden.rs",
     "s5_tests.rs",
     "testing.rs",
+    "threshold_tests.rs",
 ];
 
 // ===========================================================================

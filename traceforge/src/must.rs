@@ -131,6 +131,8 @@ pub(crate) struct Must {
     monitors: BTreeMap<ThreadId, MonitorInfo>,
     rng: Pcg64Mcg,
     stop: bool,
+    threshold: Option<crate::ThresholdStop>,
+    pub(crate) threshold_cancel: Option<Arc<crate::parallel_verify::CancelToken>>,
     warn_limit: usize,
     pqueue: Option<ExecutionGraphEnqueuePair>,
     pub telemetry: Telemetry,
@@ -262,6 +264,8 @@ impl Must {
             monitors: BTreeMap::new(),
             rng: Pcg64Mcg::seed_from_u64(seed),
             stop: false,
+            threshold: None,
+            threshold_cancel: None,
             warn_limit: 1,
             pqueue: None,
             telemetry,
@@ -587,6 +591,7 @@ impl Must {
         self.monitors.clear();
         self.published_values.clear();
         self.stop = false;
+        self.threshold = None;
         self.warn_limit = 1;
         self.config.seed = seed;
         self.rng = Pcg64Mcg::seed_from_u64(seed);
@@ -738,6 +743,7 @@ impl Must {
         self.current = MustState::new();
         self.monitors.clear();
         self.stop = false;
+        self.threshold = None;
         self.published_values.clear();
         self.started_at = Instant::now();
         self.choice_occurrence_counters.clear();
@@ -1907,12 +1913,18 @@ impl Must {
     /// live on `self`. Taking it also means a gate cannot re-enter itself —
     /// during the call `self.conf` is `None`, so any nested hook is inert.
     fn conf_gate(&mut self, gate: crate::conformance::ctx::Gate) {
+        if self.threshold.is_some() {
+            return;
+        }
         self.conf_gate_at(gate, None)
     }
 
     /// `conf_gate` with the installed position, for the gated checker's gate
     /// sink (`P4-GATED` G1): the fresh gates pass the event they installed.
     fn conf_gate_at(&mut self, gate: crate::conformance::ctx::Gate, at: Option<Event>) {
+        if self.threshold_stop().is_some() {
+            return;
+        }
         use crate::conformance::ctx::{Gate, GateAt, GateOutcome};
         // `MIN-ENGINES` E2-1: a growing gate returns at entry in the three
         // plain-scheduled modes (`ConfMode::plain_scheduling`) — no box take,
@@ -1939,6 +1951,13 @@ impl Must {
         // borrowed here and cloned only on the reporting path, so a run that
         // reports nothing pays nothing for it (S5, blocked item **H**).
         let outcome = ctx.gate_at(gate, site, &self.current.graph, &self.current);
+        if let crate::conformance::report::SearchEnd::Threshold(reason) = ctx.end() {
+            self.threshold = Some(reason);
+            self.stop();
+            if let Some(cancel) = &self.threshold_cancel {
+                cancel.stop_threshold(self.threshold.clone().unwrap());
+            }
+        }
         self.conf = Some(ctx);
         if outcome == GateOutcome::Prune {
             self.conf_prune();
@@ -2146,6 +2165,8 @@ impl Must {
 
     fn is_stopped(&self) -> bool {
         self.stop
+            || self.threshold.is_some()
+            || self.threshold_cancel.as_ref().is_some_and(|c| c.threshold().is_some())
     }
 
     /// Check if the execution is blocked. Return None if it's not blocked, or Some(Block)
@@ -2162,6 +2183,13 @@ impl Must {
     /// the ability to call into Must model code (the monitor on_stop) while
     /// not holding a reference to entire Must object.
     pub(crate) fn complete_execution(must: &Rc<RefCell<Must>>) -> bool {
+        let threshold = must.borrow().threshold_stop();
+        if let Some(reason) = threshold {
+            must.borrow_mut().conf_record_end(
+                crate::conformance::report::SearchEnd::Threshold(reason),
+            );
+            return true;
+        }
         // §4.1's completion gate — the draft's `e = ⊥` case, and the **only**
         // gate that may pass `outer_complete = true` (§5.5, owner ruling
         // 2026-09-12).
@@ -2183,6 +2211,13 @@ impl Must {
         // `call_on_stop_on_monitors`.
         must.borrow_mut()
             .conf_gate(crate::conformance::ctx::Gate::Completion);
+        let threshold = must.borrow().threshold_stop();
+        if let Some(reason) = threshold {
+            must.borrow_mut().conf_record_end(
+                crate::conformance::report::SearchEnd::Threshold(reason),
+            );
+            return true;
+        }
         let maybe_block = must.borrow_mut().check_blocked();
         let exceeded_max_executions = must.borrow_mut().record_ending_telemetry(&maybe_block);
 
@@ -2927,19 +2962,31 @@ impl Must {
     fn add_to_graph(&mut self, lab: LabelEnum) -> Event {
         let tid = lab.thread();
         let tindex = self.current.graph.thread_size(tid);
-        if tindex > self.config.thread_threshold as usize && self.warn_limit > 0 {
-            self.warn(&format!(
-                "Large thread size {} events)! Is the test bounded?",
-                tindex
+        if tindex > self.config.thread_threshold as usize {
+            if self.threshold.is_none() {
+                let thread = self.current.graph.thread_name(tid)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| tid.to_string());
+                self.threshold = Some(crate::ThresholdStop {
+                    thread,
+                    limit: self.config.thread_threshold,
+                });
+                if let Some(cancel) = &self.threshold_cancel {
+                    cancel.stop_threshold(self.threshold.clone().unwrap());
+                }
+            }
+            self.conf_record_end(crate::conformance::report::SearchEnd::Threshold(
+                self.threshold.clone().unwrap(),
             ));
-            // debug
-            eprintln!("Printing the large graph:");
-            println!("{}", self.print_graph(None));
-            // when a graph becomes too big, we can stop the search and return.
-            // TODO: In principle, we should allow the exploration to proceed on the other threads.
-            // TODO: We should implement this by adding a Block(TooBigThread) at the end of the
-            // large thread but allowing other threads to proceed.
-            // TODO: Needs scoping and work
+            if self.warn_limit > 0 {
+                self.warn(&format!(
+                    "Large thread size {} events)! Is the test bounded?",
+                    tindex
+                ));
+                // debug
+                eprintln!("Printing the large graph:");
+                println!("{}", self.print_graph(None));
+            }
             self.stop();
         }
         let pos = self.current.graph.add_label(lab);
@@ -3023,6 +3070,11 @@ impl Must {
     }
 
     pub(crate) fn try_revisit(&mut self) -> bool {
+        if self.threshold.is_some()
+            || self.threshold_cancel.as_ref().is_some_and(|c| c.threshold().is_some())
+        {
+            return false;
+        }
         loop {
             // `P4-GATED` G1: a gate report or abort at `RevisitApply` must end
             // the run here — `complete_execution`'s own stop test has already
@@ -3134,6 +3186,9 @@ impl Must {
     /// edge, and step (4) fails. Recorded as obligation **O-skip** in
     /// `backlog/algorithm-issues.md` so it has a name to be found by.
     fn conf_revisit_gate(&mut self, rev: &RevisitEnum) -> bool {
+        if self.threshold_stop().is_some() {
+            return false;
+        }
         // `MIN-ENGINES` E2-1: the revisit-apply gate returns at entry in the
         // three plain-scheduled modes — before the label match (and the §9
         // backstop in it), the box take and the carry clone.
@@ -3188,6 +3243,13 @@ impl Must {
                 );
                 if outcome == crate::conformance::ctx::GateOutcome::Prune {
                     ctx.abandon_revisit();
+                }
+                if let crate::conformance::report::SearchEnd::Threshold(reason) = ctx.end() {
+                    self.threshold = Some(reason);
+                    self.stop();
+                    if let Some(cancel) = &self.threshold_cancel {
+                        cancel.stop_threshold(self.threshold.clone().unwrap());
+                    }
                 }
                 self.conf = Some(ctx);
                 return outcome == crate::conformance::ctx::GateOutcome::Prune;
@@ -3432,8 +3494,15 @@ impl Must {
         }
     }
 
+    pub(crate) fn threshold_stop(&self) -> Option<crate::ThresholdStop> {
+        self.threshold.clone().or_else(|| {
+            self.threshold_cancel.as_ref().and_then(|c| c.threshold())
+        })
+    }
+
     pub(crate) fn stats(&self) -> Stats {
         Stats {
+            threshold: self.threshold_stop(),
             execs: self.telemetry.read_counter(EXECS.into()).unwrap_or(0) as usize,
             block: self.telemetry.read_counter(BLOCKED.into()).unwrap_or(0) as usize,
             coverage: self.telemetry.coverage.export_aggregate().into(),
@@ -3888,5 +3957,29 @@ mod tests {
 
         // Try to replay with the wrong thread.
         must.try_consume(&send_at_1);
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+
+    #[test]
+    fn et_warning_budget_does_not_disable_threshold() {
+        let must = Rc::new(RefCell::new(Must::new(
+            Config::builder().with_thread_threshold(2).build(), false,
+        )));
+        let program = Arc::new(|| {
+            let (tx, _rx) = crate::channel::Builder::<i32>::new().build();
+            for i in 0..10 { tx.send_msg(i); }
+        });
+        for _ in 0..2 {
+            must.borrow_mut().warn_limit = 0;
+            crate::explore(&must, &program);
+            let stats = must.borrow().stats();
+            assert_eq!((stats.execs, stats.block), (0, 0));
+            assert_eq!(stats.threshold.unwrap().limit, 2);
+            must.borrow_mut().reset_for_reuse();
+        }
     }
 }

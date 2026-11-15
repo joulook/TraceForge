@@ -292,6 +292,7 @@ fn buf_addr(ord: &OrdCounts) -> usize {
     match ord {
         OrdCounts::U8(v) => v.as_ptr() as usize,
         OrdCounts::U16(v) => v.as_ptr() as usize,
+        OrdCounts::U32(v) => v.as_ptr() as usize,
     }
 }
 

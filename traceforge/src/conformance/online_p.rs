@@ -480,7 +480,7 @@ pub(crate) fn online_partitioned_with(
                 crate::conformance::assert_config_in_scope(&user_config, "online");
                 // A task's or the root's panic is re-raised by the runner after
                 // its cleanup, and reaches the join below.
-                verify_partitioned_rayon_with(run_config, move || imp(), hooks);
+                verify_partitioned_rayon_with(run_config, move || imp(), hooks).stats.threshold
             })
             .expect("conformance: online: could not spawn the run thread")
     };
@@ -501,7 +501,9 @@ pub(crate) fn online_partitioned_with(
         .take();
     let (end, failure) = match joined {
         Err(payload) => (End::Failed, Some(panic_text(payload))),
-        Ok(()) => {
+        Ok(_) if failure.is_some() => (End::Failed, failure),
+        Ok(Some(reason)) => (End::Threshold(reason), None),
+        Ok(None) => {
             if let Some(msg) = failure {
                 (End::Failed, Some(msg))
             } else if acc.errors > 0 {
@@ -554,7 +556,7 @@ pub(crate) fn online_partitioned_with(
         let enumeration = match report.end {
             End::Exhausted => Enumeration::Complete,
             End::Budget => Enumeration::Bounded,
-            End::FirstMiss | End::Failed => Enumeration::Aborted,
+            End::FirstMiss | End::Failed | End::Threshold(_) => Enumeration::Aborted,
         };
         let export_started = Instant::now();
         let mut lines: Vec<String> = merged.lines.into_iter().collect();

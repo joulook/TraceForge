@@ -33,7 +33,9 @@ use crate::conformance::morphism::{
 };
 use crate::conformance::obs::{resolve_visible, wobs, ObsError, Wobs};
 use crate::conformance::probe::Offer;
-use crate::conformance::prober::{install, install_nondet, install_recv, probe_from, Probed};
+use crate::conformance::prober::{
+    install_checked, install_nondet_checked, install_recv_checked, probe_from, Probed,
+};
 use crate::conformance::report::FlatCounters;
 use crate::conformance::search::spec_assertion;
 use crate::conformance::sig::VPosMap;
@@ -234,6 +236,9 @@ fn visit(
     c.max_depth = c.max_depth.max(depth);
     let spec = Arc::clone(&ctx.spec);
     let probed: Probed = probe_from(ctx.config.clone(), graph, move || spec());
+    if let Some(reason) = &probed.threshold {
+        return Err(ObsError::Threshold(reason.clone()));
+    }
     if let Some(e) = spec_assertion(probed.graph()) {
         panic!(
             "conformance: FlatCover reached a specification assertion failure, which the \
@@ -265,7 +270,9 @@ fn visit(
                 // `ln:fnd`: every value, in the recorded order.
                 for v in offer.nondet_values() {
                     c.nd_branches += 1;
-                    let g = install_nondet(ctx.config.clone(), probed.graph().clone(), offer, v);
+                    let g = install_nondet_checked(
+                        ctx.config.clone(), probed.graph().clone(), offer, v,
+                    )?;
                     if let Some(w) = visit(ctx, outer, g, i, depth + 1, c)? {
                         return Ok(Some(w));
                     }
@@ -274,7 +281,7 @@ fn visit(
             }
             LabelEnum::SendMsg(_) => {
                 // `ln:fsend`: install, test following, the branch dies on failure.
-                let g = install(ctx.config.clone(), probed.graph().clone(), offer);
+                let g = install_checked(ctx.config.clone(), probed.graph().clone(), offer)?;
                 if follows_outer(ctx, outer, &g)? {
                     visit(ctx, outer, g, i, depth + 1, c)
                 } else {
@@ -313,7 +320,7 @@ fn visit(
         let mut passed = false;
         for rf in options {
             c.source_branches += 1;
-            let g = install_recv(ctx.config.clone(), probed.graph().clone(), offer, rf);
+            let g = install_recv_checked(ctx.config.clone(), probed.graph().clone(), offer, rf)?;
             if !follows_outer(ctx, outer, &g)? {
                 continue;
             }

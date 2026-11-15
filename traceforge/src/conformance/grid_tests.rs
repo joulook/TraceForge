@@ -247,7 +247,7 @@ fn status(r: &GridResult) -> Status {
         GridRaw::Enumerator(o) => Status {
             reports: o.reports.len(),
             exhaustions: o.exhaustions.len(),
-            end: o.end,
+            end: o.end.clone(),
             failure: o
                 .spec_error
                 .as_ref()
@@ -256,20 +256,20 @@ fn status(r: &GridResult) -> Status {
         GridRaw::Stateful(o) => Status {
             reports: o.reports.len(),
             exhaustions: 0,
-            end: o.impl_end,
+            end: o.impl_end.clone(),
             failure: (!o.spec_errors.is_empty()).then(|| format!("{:?}", o.spec_errors)),
         },
         GridRaw::CompleteFirst(o) => Status {
             reports: o.reports.len(),
             exhaustions: 0,
-            end: o.impl_end,
+            end: o.impl_end.clone(),
             failure: (o.aborted || !o.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", o.aborted, o.spec_errors)),
         },
         GridRaw::Gated(o) => Status {
             reports: o.reports.len(),
             exhaustions: 0,
-            end: o.impl_end,
+            end: o.impl_end.clone(),
             failure: (o.aborted || !o.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", o.aborted, o.spec_errors)),
         },
@@ -279,7 +279,7 @@ fn status(r: &GridResult) -> Status {
         GridRaw::SverifyP(r) => Status {
             reports: r.outcome.counters.uncovered_multiplicity,
             exhaustions: 0,
-            end: r.outcome.impl_end,
+            end: r.outcome.impl_end.clone(),
             failure: (!r.outcome.spec_errors.is_empty())
                 .then(|| format!("{:?}", r.outcome.spec_errors)),
         },
@@ -289,7 +289,7 @@ fn status(r: &GridResult) -> Status {
         GridRaw::CFirstP(r) => Status {
             reports: r.outcome.counters.base.reports,
             exhaustions: 0,
-            end: r.outcome.impl_end,
+            end: r.outcome.impl_end.clone(),
             failure: (r.outcome.aborted || !r.outcome.spec_errors.is_empty())
                 .then(|| format!("aborted={} {:?}", r.outcome.aborted, r.outcome.spec_errors)),
         },
@@ -312,7 +312,7 @@ fn status(r: &GridResult) -> Status {
                 Status {
                     reports: o.reports.len(),
                     exhaustions: o.exhaustions.len(),
-                    end: o.end,
+                    end: o.end.clone(),
                     failure: None,
                 }
             }
@@ -355,7 +355,7 @@ enum Bin {
 
 fn bin(s: &Status) -> Bin {
     assert_ne!(
-        s.end,
+        s.end.clone(),
         SearchEnd::Unknown,
         "conformance: X5 a: a run ended `Unknown`"
     );
@@ -367,7 +367,7 @@ fn bin(s: &Status) -> Bin {
         }
     } else if s.reports == 0
         && matches!(
-            s.end,
+            s.end.clone(),
             SearchEnd::MaxIterations(_) | SearchEnd::StoppedAtFirstReport
         )
     {
@@ -487,7 +487,7 @@ fn compute_pair(f: Fixture, configs: &[GridConfig]) -> Pair {
         };
     }
     assert_eq!(
-        (o.impl_end, o.spec_end),
+        (o.impl_end.clone(), o.spec_end.clone()),
         (
             SearchEnd::StateSpaceExhausted,
             SearchEnd::StateSpaceExhausted
@@ -841,7 +841,7 @@ fn check_c02(
                         SearchEnd::StateSpaceExhausted
                     };
                     if s.end != want_end {
-                        failures.push(format!("{label}: end {:?}", s.end));
+                        failures.push(format!("{label}: end {:?}", s.end.clone()));
                     }
                 }
                 Kind::DecidingStop => {
@@ -849,16 +849,16 @@ fn check_c02(
                     {
                         f81.push(format!(
                             "{} {:?} reports={} end={:?}",
-                            p.fixture.name, r.config.selector, s.reports, s.end
+                            p.fixture.name, r.config.selector, s.reports, s.end.clone()
                         ));
                     }
                     if !violation && s.end != SearchEnd::StateSpaceExhausted {
-                        failures.push(format!("{label}: conforming, end {:?}", s.end));
+                        failures.push(format!("{label}: conforming, end {:?}", s.end.clone()));
                     }
                 }
                 Kind::Enumerating | Kind::Deciding => {
                     if s.end != SearchEnd::StateSpaceExhausted {
-                        failures.push(format!("{label}: end {:?}", s.end));
+                        failures.push(format!("{label}: end {:?}", s.end.clone()));
                     }
                 }
             }
@@ -1521,8 +1521,8 @@ fn check_x3(g: &[Pair], twins_per_pair: usize) -> Vec<String> {
             let ex = |o: &crate::conformance::Outcome| -> Vec<String> {
                 o.exhaustions.iter().map(|x| format!("{x:?}")).collect()
             };
-            if (ex(a), a.end, a.skipped_gates, a.inert_gates)
-                != (ex(b), b.end, b.skipped_gates, b.inert_gates)
+            if (ex(a), a.end.clone(), a.skipped_gates, a.inert_gates)
+                != (ex(b), b.end.clone(), b.skipped_gates, b.inert_gates)
             {
                 failures.push(format!("{label}: exhaustions/end/skipped/inert differ"));
             }
@@ -2025,7 +2025,7 @@ fn l6_the_sweeping_engines_ignore_the_search_budget() {
                         // `MIN-ENGINES` E9 re-pin: the first-report wall and memory.
                         c.wall_ms_at_first_report = None;
                         c.vmhwm_kb_at_first_report = None;
-                        format!("{c:?} {:?}", o.impl_end)
+                        format!("{c:?} {:?}", o.impl_end.clone())
                     }
                     GridRaw::CompleteFirst(o) => {
                         let mut c = o.counters.clone();
@@ -2035,14 +2035,14 @@ fn l6_the_sweeping_engines_ignore_the_search_budget() {
                         // P5-CFCFG re-pin: F2's first-report wall and memory.
                         c.wall_ms_at_first_report = None;
                         c.vmhwm_kb_at_first_report = None;
-                        format!("{c:?} {:?}", o.impl_end)
+                        format!("{c:?} {:?}", o.impl_end.clone())
                     }
                     GridRaw::Gated(o) => {
                         let mut c = o.counters.clone();
                         c.outer_wall_time_ms = 0;
                         c.sweep_wall_time_ms = 0;
                         c.precheck_wall_time_ms = 0;
-                        format!("{c:?} {:?}", o.impl_end)
+                        format!("{c:?} {:?}", o.impl_end.clone())
                     }
                     _ => unreachable!("conformance: a sweeping engine"),
                 };
@@ -2352,7 +2352,7 @@ fn naive_rows(k: usize, enc: u8, s: Selector) -> Vec<Row> {
             "conformance: c06 {tag} memo={memo}: one report"
         );
         assert_eq!(
-            o.end,
+            o.end.clone(),
             SearchEnd::StoppedAtFirstReport,
             "conformance: c06 {tag}"
         );
@@ -2427,7 +2427,7 @@ fn naive_rows(k: usize, enc: u8, s: Selector) -> Vec<Row> {
             c.impl_graphs,
             o.executions,
             o.reports.len(),
-            o.impl_end
+            o.impl_end.clone()
         ),
         (
             sizes,

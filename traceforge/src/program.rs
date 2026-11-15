@@ -325,7 +325,8 @@ fn run_named(
             *block =
                 measure::of_count(&stats, side, explore_ms, started.elapsed().as_millis()).render();
             (
-                format!("execs={} blocked={}\n", stats.execs, stats.block),
+                format!("execs={} blocked={}\n{}", stats.execs, stats.block,
+                    stats.threshold.as_ref().map(|r| format!("{r}\n")).unwrap_or_default()),
                 0,
             )
         }

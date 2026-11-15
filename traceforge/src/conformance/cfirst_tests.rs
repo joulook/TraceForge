@@ -361,6 +361,7 @@ fn assert_identities(o: &CFirstOutcome, visible: &[String], kept: bool, what: &s
                 );
                 rep += 1;
             }
+            SweepEnd::Threshold(_) => panic!("conformance: unexpected threshold"),
             SweepEnd::Aborted => panic!("conformance: {what}: an aborted sweep"),
             SweepEnd::Budgeted => panic!(
                 "conformance: {what}: a budgeted sweep; the complete-first engine never budgets one"

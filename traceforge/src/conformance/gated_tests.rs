@@ -2918,6 +2918,7 @@ fn l2_the_contexts_gate_report_matches_the_sinks() {
         let gate_sink: GateSink = {
             let seen = std::rc::Rc::clone(&seen);
             let config = config.clone();
+            let verdict = verdict.clone();
             Box::new(
                 move |gate: Gate, _site: &GateAt, g: &ExecutionGraph, st: &MustState| {
                     if Some(gate) != at {
@@ -2925,7 +2926,7 @@ fn l2_the_contexts_gate_report_matches_the_sinks() {
                     }
                     seen.borrow_mut()
                         .push((g.to_string(), replay_snapshot(g, st, &config, None)));
-                    verdict
+                    verdict.clone()
                 },
             )
         };

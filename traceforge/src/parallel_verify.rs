@@ -48,10 +48,11 @@ impl Default for PartitionHooks {
 /// `total_spawned` at the runner's return — the lock is the stop's
 /// linearization point. A spawn admitted before the cancel may still start
 /// after it and reads the flag at its loop's head. The warmup and the two
-/// loop heads read `is_cancelled`. The legacy entry passes a token nobody
-/// cancels.
+/// loop heads read `is_cancelled`. The legacy entry cancels this token only
+/// at a thread threshold.
 pub(crate) struct CancelToken {
     flag: AtomicBool,
+    threshold: Mutex<Option<crate::ThresholdStop>>,
     /// The admitted spawns, guarded by the lock that linearizes the stop.
     admission: Mutex<u64>,
 }
@@ -60,6 +61,7 @@ impl CancelToken {
     pub(crate) fn new() -> Self {
         Self {
             flag: AtomicBool::new(false),
+            threshold: Mutex::new(None),
             admission: Mutex::new(0),
         }
     }
@@ -72,6 +74,21 @@ impl CancelToken {
             .expect("partitioned runner: the admission lock");
         self.flag.store(true, Ordering::SeqCst);
         *admitted
+    }
+
+    pub(crate) fn threshold(&self) -> Option<crate::ThresholdStop> {
+        if !self.flag.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.threshold.lock().expect("partitioned threshold").clone()
+    }
+
+    pub(crate) fn stop_threshold(&self, reason: crate::ThresholdStop) {
+        let mut first = self.threshold.lock().expect("partitioned threshold");
+        if first.is_none() {
+            *first = Some(reason);
+        }
+        self.cancel();
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -323,6 +340,7 @@ where
     // `SVERIFY-P` I3-3: the root's hook, before its first execution and
     // before the warmup's `max_iterations` write below.
     (hooks.on_must)(&mut must.borrow_mut());
+    must.borrow_mut().threshold_cancel = Some(Arc::clone(&hooks.cancel));
     Must::set_current(Some(must.clone()));
 
     // Run the warmup executions. This populates the execution graph
@@ -503,6 +521,7 @@ fn rayon_queue_task<'scope, F>(
     });
     // Clear accumulated state from previous task on this thread
     must.borrow_mut().reset_for_reuse();
+    must.borrow_mut().threshold_cancel = Some(Arc::clone(&hooks.cancel));
     Must::set_current(Some(must.clone()));
 
     // Reuse cached pool to avoid mmap/munmap overhead between explore() calls.
@@ -606,7 +625,7 @@ fn rayon_queue_task<'scope, F>(
 
     let worker_stats = must.borrow().stats();
     let total_execs = worker_stats.execs + worker_stats.block;
-    if total_execs > 0 {
+    if total_execs > 0 || worker_stats.threshold.is_some() {
         let label = format!("rt{}", task_id);
         println!(
             "  {}: {} execs, max_graph_events={}",
