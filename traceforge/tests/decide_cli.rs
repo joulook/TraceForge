@@ -341,3 +341,161 @@ fn decide_disabled_matches_pinned_base_bytes() {
         }
     }
 }
+
+// Generated long words exercise U32 storage without a checked-in large fixture.
+fn long_row(len: usize, count: u32) -> Value {
+    let mut counts = vec![0u32; len];
+    counts.push(count);
+    json!({"statuses":{"A":"done","B":"done"},
+        "words":{"A":vec![json!({"s":"A"}); len],"B":[{"s":"B"}]},
+        "counts":counts,"n":7})
+}
+
+fn stable_output(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).expect("conformance: UTF-8 output")
+        .lines()
+        .map(|l| {
+            let key = l.split(':').next().unwrap_or("");
+            if key == "wall_ms" || key == "peak_rss_kb" {
+                format!("{key}: <measured>")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn count_refusal(f: &Fixture, merge: bool, spec: &[Value], imp: &[Value], line: &str) {
+    let out = f.run(merge, &["--decide"], spec, imp);
+    assert_eq!(out.status.code(), Some(2), "conformance: count refusal exit");
+    let err = String::from_utf8(out.stderr.clone()).expect("conformance: UTF-8 diagnostic");
+    assert!(err.starts_with("conf-join: refused: decide:"), "conformance: {err}");
+    assert!(err.contains("count 65536 exceeds 65535"), "conformance: {err}");
+    assert!(err.contains(line), "conformance: diagnostic identifies line");
+    if line == "a normal-form line:" {
+        let v = &imp[0];
+        let key = format!(
+            "{{\"statuses\":{},\"words\":{},\"counts\":{}}}",
+            v["statuses"], v["words"], v["counts"]
+        );
+        assert!(err.ends_with(&format!(": {key}\n")), "conformance: offending line");
+    }
+    let ordinary = f.run(merge, &[], &[json!({})], imp);
+    assert_eq!(ordinary.status.code(), Some(2), "conformance: ordinary refusal");
+    assert_eq!(
+        stable_output(&out.stdout), stable_output(&ordinary.stdout),
+        "conformance: usual refused stdout and measurement block"
+    );
+}
+
+// Mutant: accept U32 specification counts with `Ok(c as u16)`.
+#[test]
+fn decide_refuses_used_specification_count_in_both_modes() {
+    let f = Fixture::new("used-spec-count");
+    let spec = [long_row(65536, 65536)];
+    let imp = [long_row(65536, 0)];
+    for merge in [false, true] {
+        let plain = stdout(&f.run(merge, &[], &spec, &imp), 1);
+        assert!(plain.contains("uncovered_total: 7\n"), "conformance: total retained");
+        count_refusal(&f, merge, &spec, &imp, "s.jsonl: line 2:");
+    }
+}
+
+// Mutants: restore `c as u16`; reject 65535 too (change checked bound to >=).
+#[test]
+fn decide_candidate_count_boundary_in_both_modes() {
+    let f = Fixture::new("candidate-count-boundary");
+    for merge in [false, true] {
+        let imp = [long_row(65535, 65535)];
+        let text = stdout(&f.run(merge, &["--decide"], &[], &imp), 1);
+        assert!(text.contains("decide_violations: 1\n"), "conformance: 65535 decided");
+        assert!(text.contains("  witness:"), "conformance: boundary witness");
+        let imp = [long_row(65536, 65536)];
+        stdout(&f.run(merge, &[], &[], &imp), 1);
+        count_refusal(&f, merge, &[], &imp, "a normal-form line:");
+        let mut spec = long_row(65536, 0);
+        spec["counts"][0] = json!(1);
+        count_refusal(&f, merge, &[spec], &imp, "a normal-form line:");
+    }
+}
+
+// Mutants: eagerly reject every U32 group; reject covered implementation counts.
+#[test]
+fn decide_unused_large_counts_are_not_refused_in_both_modes() {
+    let f = Fixture::new("unused-counts");
+    let large = long_row(65536, 65536);
+    for merge in [false, true] {
+        stdout(&f.run(merge, &[], &[large.clone()], &[large.clone()]), 0);
+        let text = stdout(
+            &f.run(merge, &["--decide"], &[large.clone()], &[large.clone()]), 0,
+        );
+        assert!(text.contains("decide_uncovered: 0\n"), "conformance: covered large row");
+        // These groups straddle the small miss, exercising both load and drain.
+        let mut before = large.clone();
+        before["statuses"]["A"] = json!("blocked");
+        let mut after = large.clone();
+        after["statuses"]["A"] = json!("err");
+        let spec = [before, after, row([0, 1, 0, 1])];
+        let imp = [row([0, 0, 0, 1])];
+        let text = stdout(&f.run(merge, &["--decide"], &spec, &imp), 1);
+        assert!(text.contains("decide_violations: 1\n"), "conformance: unused groups");
+    }
+}
+
+// Mutants: reject all U32 storage; cap can_add at self.lens[t].min(65535).
+#[test]
+fn decide_long_words_with_small_used_counts_are_decided() {
+    let f = Fixture::new("long-small-counts");
+    for merge in [false, true] {
+        let spec = [long_row(65537, 65535)];
+        let imp = [long_row(65537, 65534)];
+        let text = stdout(&f.run(merge, &["--decide"], &spec, &imp), 1);
+        assert!(text.contains("decide_violations: 1\n"), "conformance: small used counts");
+        assert!(text.contains("uncovered_total: 7\n"), "conformance: decided total retained");
+        let witness = text.lines().find(|l| l.starts_with("  witness:"))
+            .expect("conformance: long witness");
+        assert_eq!(witness.matches("A:").count(), 65537, "conformance: all A positions");
+        assert_eq!(witness.matches("B:").count(), 1, "conformance: all B positions");
+    }
+}
+
+// Mutant: remove `uncovered_total = add_n(uncovered_total, n)` from the merge miss.
+// The lead supplies a binary built from 1c4354d and the fixed clock/RSS shim.
+#[test]
+#[ignore = "requires MERGE_ENGINE_FIXES_BIN (1c4354d) and DECIDE_METRICS_SHIM"]
+fn merge_decide_disabled_matches_engine_fixes_bytes() {
+    let base = std::env::var("MERGE_ENGINE_FIXES_BIN")
+        .expect("conformance: archived 1c4354d binary");
+    let shim = std::env::var("DECIDE_METRICS_SHIM")
+        .expect("conformance: fixed clock and RSS inputs");
+    let f = Fixture::new("engine-fixes-bytes");
+    for merge in [false, true] {
+        for (spec, imp, code) in [
+            (vec![long_row(65536, 65536)], vec![long_row(65536, 65536)], 0),
+            (vec![long_row(65536, 65536)], vec![long_row(65536, 0)], 1),
+            (vec![], vec![long_row(65536, 65536)], 1),
+            (vec![json!({})], vec![long_row(65536, 65536)], 2),
+        ] {
+            let s = f.file("s.jsonl", spec);
+            let i = f.file("i.jsonl", imp);
+            let run = |binary: &str| {
+                let mut cmd = Command::new(binary);
+                cmd.env("LD_PRELOAD", &shim);
+                if merge {
+                    cmd.arg("--merge");
+                }
+                cmd.arg(&s).arg(&i).output().expect("conformance: run join")
+            };
+            let old = run(&base);
+            let new = run(env!("CARGO_BIN_EXE_conf-join"));
+            assert_eq!(old.status.code(), Some(code), "conformance: base exit");
+            assert_eq!(new.status.code(), old.status.code(), "conformance: exit parity");
+            assert_eq!(new.stderr, old.stderr, "conformance: diagnostic byte parity");
+            assert_eq!(new.stdout, old.stdout, "conformance: stdout byte parity");
+            let text = String::from_utf8(new.stdout).expect("conformance: UTF-8 output");
+            assert!(text.contains("peak_rss_kb: 1024\n"), "conformance: active RSS shim");
+            assert!(text.contains("wall_ms: 0\n"), "conformance: active clock shim");
+        }
+    }
+}

@@ -970,11 +970,18 @@ impl DecideReport {
     }
 }
 
-/// `DECIDE`: an order's count vector, widened.
-fn ord_u16(o: &OrdCounts) -> Vec<u16> {
+/// DECIDE: convert only orders in a signature group used by a miss.
+fn ord_u16(o: &OrdCounts, path: &Path, line: usize) -> Result<Vec<u16>, JoinError> {
     match o {
-        OrdCounts::U8(v) => v.iter().map(|c| u16::from(*c)).collect(),
-        OrdCounts::U16(v) => v.clone(),
+        OrdCounts::U8(v) => Ok(v.iter().map(|c| u16::from(*c)).collect()),
+        OrdCounts::U16(v) => Ok(v.clone()),
+        OrdCounts::U32(v) => v.iter()
+            .map(|&c| {
+                u16::try_from(c).map_err(|_| JoinError(format!(
+                    "decide: {}: line {line}: count {c} exceeds 65535", path.display()
+                )))
+            })
+            .collect(),
     }
 }
 
@@ -1018,7 +1025,10 @@ fn decide_entry(
     }
     let counts: Vec<u16> = cs
         .iter()
-        .map(|c| c.as_u64().map(|c| c as u16).ok_or_else(|| bad("a count")))
+        .map(|c| {
+            let c = c.as_u64().ok_or_else(|| bad("a count"))?;
+            u16::try_from(c).map_err(|_| bad(&format!("count {c} exceeds 65535")))
+        })
         .collect::<Result<_, _>>()?;
     let lens: Vec<usize> = obs.iter().map(Vec::len).collect();
     let decision = decide(&lens, &counts, group, budget);
@@ -1504,10 +1514,10 @@ fn conf_join_inner(
             .map(|(_, k)| sig_key(k))
             .collect();
         let mut groups: HashMap<&str, Vec<Vec<u16>>> = HashMap::new();
-        for (_, key, summary) in &s.lines {
+        for (number, key, summary) in &s.lines {
             let g = sig_key(key);
             if wanted.contains(g) {
-                groups.entry(g).or_default().push(ord_u16(&summary.ord));
+                groups.entry(g).or_default().push(ord_u16(&summary.ord, spec, *number)?);
             }
         }
         let mut d = DecideReport::new(budget);
@@ -1629,8 +1639,9 @@ struct SpecGroup {
     key: String,
     index: SetIndex,
     lines: usize,
-    /// `DECIDE`: the lines' count vectors (empty without `--decide`).
-    orders: Vec<Vec<u16>>,
+    /// DECIDE: line numbers and full-width orders, converted only for a NotFound miss.
+    /// Empty without `--decide`.
+    orders: Vec<(usize, OrdCounts)>,
 }
 
 /// `SORTED-JOIN`: `conf-join --merge spec.jsonl impl.jsonl`, the same verdict,
@@ -1703,7 +1714,7 @@ fn conf_join_merge_inner(
                     shapes: &mut HashSet<crate::conformance::compact::SigHash>,
                     prep: &mut Duration|
      -> Result<Option<SpecGroup>, JoinError> {
-        let Some((_, key, summary, _)) = ahead.take() else {
+        let Some((number, key, summary, _)) = ahead.take() else {
             return Ok(None);
         };
         let gk = sig_key(&key).to_owned();
@@ -1713,7 +1724,7 @@ fn conf_join_merge_inner(
         index.insert(&summary);
         if keep {
             let t = Instant::now();
-            orders.push(ord_u16(&summary.ord));
+            orders.push((number, summary.ord.clone()));
             *prep += t.elapsed();
         }
         let mut lines = 1usize;
@@ -1726,7 +1737,7 @@ fn conf_join_merge_inner(
                         index.insert(&s);
                         if keep {
                             let t = Instant::now();
-                            orders.push(ord_u16(&s.ord));
+                            orders.push((n, s.ord.clone()));
                             *prep += t.elapsed();
                         }
                         lines += 1;
@@ -1802,10 +1813,12 @@ fn conf_join_merge_inner(
             if !matches!(found, Some(Covers::Found(_))) {
                 let t2 = Instant::now();
                 let group = match (&found, &group) {
-                    (Some(Covers::NotFound), Some(g)) => g.orders.as_slice(),
-                    _ => &[],
+                    (Some(Covers::NotFound), Some(g)) => g.orders.iter()
+                        .map(|(n, o)| ord_u16(o, spec, *n))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    _ => Vec::new(),
                 };
-                d.push(decide_entry(&key, &names, group, budget)?);
+                d.push(decide_entry(&key, &names, &group, budget)?);
                 decided_ms = t2.elapsed();
                 decide_wall += decided_ms;
             }

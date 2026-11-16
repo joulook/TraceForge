@@ -108,14 +108,15 @@ impl Layout {
         p
     }
 
+    // Traversal cursors count positions, including ends of words longer than 65535.
     /// Whether `(t, c[t])` exists and may follow the ideal `c` under `p`.
-    fn can_add(&self, p: &[u16], c: &[u16], t: usize) -> bool {
-        if c[t] as usize >= self.lens[t] {
+    fn can_add(&self, p: &[u16], c: &[usize], t: usize) -> bool {
+        if c[t] >= self.lens[t] {
             return false;
         }
-        let e = self.off[t] + c[t] as usize;
+        let e = self.off[t] + c[t];
         let row = &p[e * self.t..(e + 1) * self.t];
-        (0..self.t).all(|u| u == t || row[u] <= c[u])
+        (0..self.t).all(|u| u == t || usize::from(row[u]) <= c[u])
     }
 
     /// Completes the prefix `(c, w)` to a linear extension of `p`, with the
@@ -124,7 +125,7 @@ impl Layout {
     fn complete(
         &self,
         p: &[u16],
-        mut c: Vec<u16>,
+        mut c: Vec<usize>,
         mut w: Vec<Pos>,
         before: Option<(Pos, Pos)>,
     ) -> Option<Vec<Pos>> {
@@ -132,11 +133,11 @@ impl Layout {
             let t = (0..self.t).find(|&t| {
                 self.can_add(p, &c, t)
                     && match before {
-                        Some((e, a)) if a == (t, c[t] as usize) => c[e.0] as usize > e.1,
+                        Some((e, a)) if a == (t, c[t]) => c[e.0] > e.1,
                         _ => true,
                     }
             })?;
-            w.push((t, c[t] as usize));
+            w.push((t, c[t]));
             c[t] += 1;
         }
         Some(w)
@@ -144,7 +145,7 @@ impl Layout {
 
     /// Whether `p ∪ q` is acyclic (some linear extension of both exists).
     fn compatible(&self, p: &[u16], q: &[u16]) -> bool {
-        let mut c = vec![0u16; self.t];
+        let mut c = vec![0usize; self.t];
         for _ in 0..self.n {
             match (0..self.t).find(|&t| self.can_add(p, &c, t) && self.can_add(q, &c, t)) {
                 Some(t) => c[t] += 1,
@@ -236,8 +237,8 @@ pub(crate) fn decide(lens: &[usize], cand: &[u16], group: &[Vec<u16>], budget: u
     if m % 64 != 0 {
         full[words - 1] = (1u64 << (m % 64)) - 1;
     }
-    let mut seen: HashMap<Vec<u16>, Vec<Vec<u64>>> = HashMap::new();
-    let mut stack: Vec<(Vec<u16>, Vec<u64>, Vec<Pos>)> = vec![(vec![0; lay.t], full, Vec::new())];
+    let mut seen: HashMap<Vec<usize>, Vec<Vec<u64>>> = HashMap::new();
+    let mut stack: Vec<(Vec<usize>, Vec<u64>, Vec<Pos>)> = vec![(vec![0; lay.t], full, Vec::new())];
     let mut states = 0u64;
     while let Some((c, alive, w)) = stack.pop() {
         if alive.iter().all(|x| *x == 0) {
@@ -258,7 +259,7 @@ pub(crate) fn decide(lens: &[usize], cand: &[u16], group: &[Vec<u16>], budget: u
         if states > budget {
             return done(Outcome::Unresolved, m, states);
         }
-        let mut next: Vec<(u32, Vec<u16>, Vec<u64>, Vec<Pos>)> = Vec::new();
+        let mut next: Vec<(u32, Vec<usize>, Vec<u64>, Vec<Pos>)> = Vec::new();
         for t in 0..lay.t {
             if !lay.can_add(&p, &c, t) {
                 continue;
@@ -272,7 +273,7 @@ pub(crate) fn decide(lens: &[usize], cand: &[u16], group: &[Vec<u16>], budget: u
             let mut c2 = c.clone();
             c2[t] += 1;
             let mut w2 = w.clone();
-            w2.push((t, c[t] as usize));
+            w2.push((t, c[t]));
             let ones = a2.iter().map(|x| x.count_ones()).sum();
             next.push((ones, c2, a2, w2));
         }
@@ -291,9 +292,9 @@ pub(crate) fn extends(lens: &[usize], counts: &[u16], w: &[Pos]) -> bool {
         return false;
     }
     let p = lay.pred(counts);
-    let mut c = vec![0u16; lay.t];
+    let mut c = vec![0usize; lay.t];
     for &(t, i) in w {
-        if t >= lay.t || c[t] as usize != i || !lay.can_add(&p, &c, t) {
+        if t >= lay.t || c[t] != i || !lay.can_add(&p, &c, t) {
             return false;
         }
         c[t] += 1;
