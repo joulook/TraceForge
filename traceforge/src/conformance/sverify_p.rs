@@ -30,7 +30,9 @@
 //! root's panic after cleanup, so a returned run is a completed one; the ends
 //! are the engine's — `StoppedAtFirstReport` iff the token was cancelled,
 //! else `StateSpaceExhausted` — and no context's `end()` is consulted (it is
-//! first-writer-wins and the runner's chunk caps write `MaxIterations`).
+//! first-writer-wins and the runner's chunk caps can write `MaxIterations`).
+//! At a chunk cap, an empty local queue and state stack instead record `StateSpaceExhausted`;
+//! neither chunk end establishes completion of the whole partitioned phase.
 //!
 //! `threads`, `flush_entries` and the runner's `iterations_until_split` are
 //! parameters; nothing here reads the machine. With `phase_peaks` on (I4-3,

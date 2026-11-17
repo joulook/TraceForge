@@ -853,7 +853,8 @@ fn o5_refusals() {
 /// Ch graph is not the first graph): the run stops at it, `lookups: p−1 (p−1
 /// found, …)`, `partial`, `FAILED:` with G1's refusal text. The budget:
 /// `--budget 3` → `partial`; `--budget 13` → O2; `--budget 12` (= the space)
-/// → `partial` (the derivation's D2); bug/bag `--budget I1` → `reports`, U = 1.
+/// → `conforms` (no work is left; the derivation's D2 said `partial`); bug/bag
+/// `--budget I1` → `reports`, U = 1.
 #[test]
 fn o5_failures_and_the_budget() {
     let p = o_prog();
@@ -898,8 +899,9 @@ fn o5_failures_and_the_budget() {
         ("3", expected_text(&spec_head(&s, 2), (3, 3, 0, 0), "partial", false, None, (0, 0), None)),
         ("13", expected_text(
             &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None)),
+        // A budget equal to the space (12 executions) leaves no work: exhausted, conforms.
         ("12", expected_text(
-            &spec_head(&s, 2), (12, 12, 0, 0), "partial", false, None, (0, 0), None)),
+            &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None)),
     ] {
         let (text, code) = run_online(&p, &s, &["--budget", b], ConsType::FIFO, Var::Fixed);
         assert_eq!((text, code), (want, 0), "conformance: C: O5: --budget {b}");
@@ -920,6 +922,42 @@ fn o5_failures_and_the_budget() {
         ),
         "conformance: C: O5: --budget I1"
     );
+}
+
+/// Exact and one-short budgets agree across the end, header and verdict.
+#[test]
+fn m3_exact_budget_is_complete() {
+    let p = o_prog();
+    let dir = scratch("p5-m3");
+    let spec = spec_file(&p, &dir);
+    use online::Verdict::{Conforms, Partial};
+    for (budget, end, enumeration, verdict, stop) in [
+        (12, End::Exhausted, "complete", Conforms, "exhausted"),
+        (11, End::Budget, "bounded", Partial, "budget"),
+    ] {
+        let out = dir.join(format!("b{budget}.jsonl"));
+        let out_string = out.to_string_lossy().into_owned();
+        let budget_string = budget.to_string();
+        let (text, code) = run_online(
+            &p, &spec, &["--budget", &budget_string, "--out", &out_string],
+            ConsType::FIFO, Var::Fixed,
+        );
+        assert_eq!(code, 0, "conformance: M3: {text}");
+        let (header, _) = read_out(&out);
+        let header: serde_json::Value = serde_json::from_str(&header)
+            .expect("conformance: M3: JSON header");
+        assert_eq!(header["enumeration"], enumeration, "conformance: M3: header");
+        let r = online::online(
+            &cfg(ConsType::FIFO), &vis(), imp_of(Var::Fixed), &spec,
+            opts(Mode::Full, Some(budget), None),
+        ).expect("conformance: M3: online run");
+        assert_eq!(r.iterations, budget as usize, "conformance: M3: iterations");
+        assert_eq!(r.end, end, "conformance: M3: end");
+        assert_eq!(r.verdict(), verdict, "conformance: M3: verdict");
+        let measurements = crate::conformance::measure::of_online(&r, 0).render();
+        assert!(measurements.lines().any(|line| line == format!("stop_reason: {stop}")),
+            "conformance: M3: {measurements}");
+    }
 }
 
 /// **O5a** (an assertion failure with revisits left): assert-r and assert-r2

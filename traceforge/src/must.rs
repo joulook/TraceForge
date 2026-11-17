@@ -2242,13 +2242,14 @@ impl Must {
         must.borrow_mut().call_telemetry_after(&condition);
 
         if exceeded_max_executions {
-            // Blocked item **B**: "the search completed" is a carried fact.
-            // This is one of the **three** places `complete_execution` decides
-            // the run is over, and it is the one a *user* asked for. Inert
-            // when `conf` is `None`.
-            let n = must.borrow().config().max_iterations.unwrap_or(0);
-            must.borrow_mut()
-                .conf_record_end(crate::conformance::report::SearchEnd::MaxIterations(n));
+            // Peek only: chunked callers resume from these exact queues.
+            let end = if must.borrow().has_pending_work() {
+                let n = must.borrow().config().max_iterations.unwrap_or(0);
+                crate::conformance::report::SearchEnd::MaxIterations(n)
+            } else {
+                crate::conformance::report::SearchEnd::StateSpaceExhausted
+            };
+            must.borrow_mut().conf_record_end(end);
             return true; // no more executions.
         }
 
@@ -2281,12 +2282,17 @@ impl Must {
 
         let more = must.borrow_mut().try_revisit();
         if !more {
-            // The third site, and the only one that means "the search
-            // completed".
+            // The revisit path also establishes that the search completed.
             must.borrow_mut()
                 .conf_record_end(crate::conformance::report::SearchEnd::StateSpaceExhausted);
         }
         !more
+    }
+
+    // Conservative: even only infeasible or gate-pruned entries mean budget.
+    // Do not call try_revisit: it consumes work needed by chunked callers.
+    fn has_pending_work(&self) -> bool {
+        !self.current.rqueue.is_empty() || !self.states.is_empty()
     }
 
     fn record_ending_telemetry(&mut self, maybe_block: &Option<BlockType>) -> bool {
@@ -2349,7 +2355,9 @@ impl Must {
 
         if let Some(n) = self.config.max_iterations {
             if n <= num_total {
-                println!("Stopping exploration because max_iterations was reached.");
+                if self.has_pending_work() {
+                    println!("Stopping exploration because max_iterations was reached.");
+                }
                 return true; // done
             }
         }
@@ -4006,3 +4014,6 @@ mod threshold_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod budget_tests;
