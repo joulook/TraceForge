@@ -590,8 +590,8 @@ fn t4_the_line_writer() {
     assert!(!path.exists());
 }
 
-/// **T5** (X3): the header — the names sorted and deduplicated from an unsorted
-/// list with a repeat; `FIFO` → `p2p` (G1-4: `Bag` → `asyn`; MO, WB, Mailbox
+/// **T5** (X3): the header — the names sorted from an unsorted list;
+/// `FIFO` → `p2p` (G1-4: `Bag` → `asyn`; MO, WB, Mailbox
 /// refused by name, and an export under MO leaves no file); `program`/`size` as
 /// given; no `seed`, `iterations` or `n`; the key order JMC writes. Failing
 /// direction: the configuration's order kept.
@@ -600,7 +600,12 @@ fn t4_the_line_writer() {
 fn t5_the_header() {
     let dir = scratch("t5");
     let path = dir.join("h.jsonl");
-    let cc = small_cc(&["b", "a", "b"], ConsType::FIFO);
+    let duplicate = small_cc(&["b", "a", "b"], ConsType::FIFO);
+    let error = ex(&duplicate, &bottom_program(), &header("apps/x:impl"), &path)
+        .expect_err("conformance: duplicate declaration refused");
+    assert_eq!(error.to_string(), "a visible name is declared twice",
+        "conformance: duplicate declaration diagnostic");
+    let cc = small_cc(&["b", "a"], ConsType::FIFO);
     ex(&cc, &bottom_program(), &header("apps/x:impl"), &path).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     let first = text.lines().next().unwrap();

@@ -27,7 +27,7 @@ use crate::conformance::compact::{CompactSummary, Covers, SetIndex};
 use crate::conformance::ctx::{CompletionSink, ConfMode, DiagnosticReason, SinkVerdict};
 use crate::conformance::interchange::{
     encode_generic, json_string, line_of, model_name, parse_line, read_file, record_thread_names,
-    sorted_names, write_replacing, Enumeration, ExportHeader, FileHead, ThreadNames,
+    write_replacing, Enumeration, ExportHeader, FileHead, ThreadNames,
 };
 use crate::conformance::measure::Shape;
 use crate::conformance::report::SearchEnd;
@@ -78,12 +78,13 @@ pub(crate) struct FirstMiss {
     pub(crate) kind: MissKind,
 }
 
-/// The run's verdict (JMC's three words).
+/// The conformance verdict, or refusal when runtime names are invalid.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
     Conforms,
     Reports,
     Partial,
+    Refused,
 }
 
 /// What `--out` names: the file and the implementation's own header fields.
@@ -161,6 +162,8 @@ pub(crate) struct OnlineReport {
     pub(crate) end: End,
     /// The failure's message when `end` is `Failed`.
     pub(crate) failure: Option<String>,
+    /// A runtime name refusal invalidates the verdict and output.
+    pub(crate) refused: bool,
     /// The `--out` file written, if any, and its line count.
     pub(crate) out_written: Option<(String, usize)>,
     /// `B` (MEAS-1 K4): the phases, each the floor of its summed durations in
@@ -184,10 +187,12 @@ pub(crate) struct OnlineReport {
 }
 
 impl OnlineReport {
-    /// `reports` if a miss was seen; `conforms` if the run ended by exhaustion
-    /// without a failure; `partial` otherwise.
+    /// A name refusal takes precedence over earlier misses. Otherwise, `reports`
+    /// if a miss was seen, `conforms` on exhaustion, and `partial` otherwise.
     pub(crate) fn verdict(&self) -> Verdict {
-        if matches!(self.end, End::Threshold(_)) {
+        if self.refused {
+            Verdict::Refused
+        } else if matches!(self.end, End::Threshold(_)) {
             Verdict::Partial
         } else if self.first.is_some() {
             Verdict::Reports
@@ -236,6 +241,7 @@ struct State {
     uncovered: HashSet<String>,
     first: Option<FirstMiss>,
     failure: Option<String>,
+    refused: bool,
     /// Every distinct implementation line: kept on every run (`B`, MEAS-1 K4,
     /// for `summaries_distinct`), and written by `--out`.
     lines: Option<HashSet<String>>,
@@ -250,6 +256,7 @@ struct State {
 /// `B`: what one completion measured, computed without the lock (step (2)) and
 /// folded in by the locked update (step (3)).
 struct Probe {
+    refused: bool,
     blocked: bool,
     events: u128,
     messages: u128,
@@ -293,6 +300,7 @@ impl State {
         iteration: usize,
         mode: Mode,
     ) -> SinkVerdict {
+        self.refused |= probe.refused;
         if probe.blocked {
             self.blocked += 1;
         } else {
@@ -370,6 +378,7 @@ fn step_of(
 ) -> (Step, Probe) {
     let (events, messages) = Shape::graph_counts(g);
     let mut probe = Probe {
+        refused: false,
         blocked: g.check_blocked().is_some(),
         events,
         messages,
@@ -382,6 +391,10 @@ fn step_of(
     }
     let t = Instant::now();
     seams.summarise();
+    if let Err(e) = super::interchange::check_visible_graph(g, visible) {
+        probe.refused = true;
+        return (Step::Failed(e.to_string()), probe);
+    }
     let cs = CompactSummary::at_completion(g, visible, "implementation");
     record_thread_names(g, threads);
     let threads: &ThreadNames = threads;
@@ -522,7 +535,8 @@ pub(crate) fn online(
     spec_path: &Path,
     opts: OnlineOpts,
 ) -> Result<OnlineReport, OnlineError> {
-    let names = sorted_names(visible);
+    let names = super::interchange::checked_names(visible)
+        .map_err(|e| OnlineError::Spec(e.to_string()))?;
     // `B` (MEAS-1 K4): `index_ms` is the file read and the inserts.
     let index_started = Instant::now();
     let file = read_file(spec_path).map_err(|e| OnlineError::Spec(e.0))?;
@@ -692,6 +706,7 @@ pub(crate) fn online(
         first: st.first.clone(),
         end,
         failure,
+        refused: st.refused,
         out_written: None,
         index_ms,
         explore_ms: enumerate_wall
@@ -708,7 +723,7 @@ pub(crate) fn online(
         shape: st.shape.clone(),
         parallel: false,
     };
-    if let (Some(out), Some(model)) = (opts.out, model) {
+    if let (Some(out), Some(model)) = (opts.out.filter(|_| !report.refused), model) {
         let enumeration = match report.end {
             End::Exhausted => Enumeration::Complete,
             End::Budget => Enumeration::Bounded,

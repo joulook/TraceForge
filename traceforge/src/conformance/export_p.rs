@@ -37,7 +37,7 @@ use crate::conformance::compact::{CompactSummary, SigHash};
 use crate::conformance::config::{ConfConfig, IndexKind};
 use crate::conformance::ctx::{ConfCtx, ConfMode, DiagnosticReason, SinkVerdict};
 use crate::conformance::interchange::{
-    encode_generic, header_line, line_of, model_name, record_thread_names, sorted_names,
+    encode_generic, header_line, line_of, model_name, record_thread_names,
     ExportError, ExportHeader, ExportStats, ThreadNames,
 };
 use crate::conformance::measure::Shape;
@@ -229,7 +229,7 @@ where
         return Err(ExportError::NotSet);
     }
     let model = model_name(cc.config.cons_type)?;
-    let names = sorted_names(&cc.visible);
+    let names = super::interchange::checked_names(&cc.visible)?;
     crate::conformance::assert_config_in_scope(&cc.config, "export");
     let mut config = cc.config.clone();
     config.max_iterations = None;
@@ -283,6 +283,10 @@ where
                 let (events, messages) = Shape::graph_counts(g);
                 let blocked = g.check_blocked().is_some();
                 let t = Instant::now();
+                if let Err(e) = super::interchange::check_visible_graph(g, &visible) {
+                    shared.refuse(e);
+                    return SinkVerdict::Stop;
+                }
                 let s = CompactSummary::at_completion(g, &visible, "specification");
                 let line = match line_of_graph(g, &s, &names) {
                     Ok(line) => line,

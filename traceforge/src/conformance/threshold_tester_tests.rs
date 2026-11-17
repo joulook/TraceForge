@@ -325,9 +325,20 @@ fn ett3_a_miss_before_the_crossing_gives_no_verdict() {
     assert!(bad.is_empty(), "conformance: ENG-THRESHOLD: {bad:#?}");
     let dir = scratch("online");
     let good = dir.join("spec.jsonl").to_str().unwrap().to_string();
-    let (imp, spec) = (miss_or_cross(false), one());
-    let main = vec!["main".to_string()];
-    let (text, code) = cli(&imp, &spec, &main, &["export", "spec", "--out", &good]);
+    let in_visible = |p: Prog| -> Prog {
+        Arc::new(move || {
+            let p = Arc::clone(&p);
+            crate::thread::Builder::new()
+                .name("visible".into())
+                .spawn(move || p())
+                .unwrap()
+                .join()
+                .unwrap();
+        })
+    };
+    let (imp, spec) = (in_visible(miss_or_cross(false)), in_visible(one()));
+    let visible = vec!["visible".to_string()];
+    let (text, code) = cli(&imp, &spec, &visible, &["export", "spec", "--out", &good]);
     assert_eq!(code, 0, "conformance: ENG-THRESHOLD: export: {text}");
     for threads in ["1", "2"] {
         let args = [
@@ -339,7 +350,7 @@ fn ett3_a_miss_before_the_crossing_gives_no_verdict() {
             "--threshold",
             "16",
         ];
-        let (text, code) = cli(&imp, &spec, &main, &args);
+        let (text, code) = cli(&imp, &spec, &visible, &args);
         assert_eq!(
             code, 0,
             "conformance: ENG-THRESHOLD: online {threads}: {text}"

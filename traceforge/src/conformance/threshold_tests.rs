@@ -33,9 +33,13 @@ fn threshold(text: &str, code: u8, expected: u8, limit: u32) {
 
 #[test]
 fn et_sender_cli_matrix() {
-    let implementation = sender_program();
-    let specification: Prog = Arc::new(|| {});
-    let visible: Vec<String> = vec!["main".to_string()];
+    let sender = sender_program();
+    let implementation: Prog = Arc::new(move || {
+        named("visible", || {}).join().unwrap();
+        sender();
+    });
+    let specification: Prog = Arc::new(|| { named("visible", || {}).join().unwrap(); });
+    let visible: Vec<String> = vec!["visible".to_string()];
     let dir = super::interchange_default_tests::scratch("threshold-matrix");
     let good = dir.join("good.jsonl");
     let cut = dir.join("cut.jsonl");
@@ -313,11 +317,12 @@ fn sender_program() -> Prog {
 
 fn assertion_before_crossing(command: &str, threads: &str) {
     let imp: Prog = Arc::new(|| {
+        named("visible", || {}).join().unwrap();
         named("diagnostic", || crate::assert(false));
         named("sender", long);
     });
-    let spec: Prog = Arc::new(|| {});
-    let visible = vec!["main".to_string()];
+    let spec: Prog = Arc::new(|| { named("visible", || {}).join().unwrap(); });
+    let visible = vec!["visible".to_string()];
     let dir = super::interchange_default_tests::scratch(&format!("assertion-{command}-{threads}"));
     let good = dir.join("good.jsonl");
     let cut = dir.join("cut.jsonl");

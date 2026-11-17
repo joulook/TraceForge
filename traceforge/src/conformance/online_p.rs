@@ -35,7 +35,7 @@ use crate::conformance::compact::{
 use crate::conformance::ctx::{ConfCtx, ConfMode, DiagnosticReason, SinkVerdict};
 use crate::conformance::export_p::write_lines;
 use crate::conformance::interchange::{
-    encode_generic, line_of, model_name, parse_line, read_file, record_thread_names, sorted_names,
+    encode_generic, line_of, model_name, parse_line, read_file, record_thread_names,
     Enumeration, ThreadNames,
 };
 use crate::conformance::measure::Shape;
@@ -135,6 +135,7 @@ struct Shared {
     acc: Mutex<Acc>,
     /// The first failure; never replaced.
     failure: Mutex<Option<String>>,
+    refused: std::sync::atomic::AtomicBool,
     cancel: Arc<CancelToken>,
     #[cfg(test)]
     completions: std::sync::atomic::AtomicUsize,
@@ -242,6 +243,10 @@ fn step(
             return fail(msg);
         }
         let t = Instant::now();
+        if let Err(e) = super::interchange::check_visible_graph(g, visible) {
+            shared.refused.store(true, std::sync::atomic::Ordering::Relaxed);
+            return fail(e.to_string());
+        }
         let cs = CompactSummary::at_completion(g, visible, "implementation");
         let mut threads = ThreadNames::new();
         record_thread_names(g, &mut threads);
@@ -341,7 +346,8 @@ pub(crate) fn online_partitioned_with(
     out: Option<OnlineOut>,
     seams: OnlinePSeams,
 ) -> Result<OnlinePRun, OnlineError> {
-    let names = sorted_names(visible);
+    let names = super::interchange::checked_names(visible)
+        .map_err(|e| OnlineError::Spec(e.to_string()))?;
     let index_started = Instant::now();
     let file = read_file(spec_path).map_err(|e| OnlineError::Spec(e.0))?;
     if file.head.enumeration != Enumeration::Complete {
@@ -398,6 +404,7 @@ pub(crate) fn online_partitioned_with(
         merged: Mutex::new(Merged::default()),
         acc: Mutex::new(Acc::default()),
         failure: Mutex::new(None),
+        refused: std::sync::atomic::AtomicBool::new(false),
         cancel: Arc::clone(&cancel),
         #[cfg(test)]
         completions: std::sync::atomic::AtomicUsize::new(0),
@@ -546,6 +553,7 @@ pub(crate) fn online_partitioned_with(
         first: merged.first,
         end,
         failure,
+        refused: shared.refused.load(std::sync::atomic::Ordering::Relaxed),
         out_written: None,
         index_ms,
         explore_ms: enumerate_wall.as_millis(),
@@ -559,7 +567,7 @@ pub(crate) fn online_partitioned_with(
         shape: acc.shape,
         parallel: true,
     };
-    if let (Some(out), Some(model)) = (out, model) {
+    if let (Some(out), Some(model)) = (out.filter(|_| !report.refused), model) {
         let enumeration = match report.end {
             End::Exhausted => Enumeration::Complete,
             End::Budget => Enumeration::Bounded,

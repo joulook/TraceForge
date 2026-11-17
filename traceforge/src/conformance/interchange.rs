@@ -527,6 +527,38 @@ pub(crate) fn sorted_names(visible: &[String]) -> Vec<String> {
     names
 }
 
+/// Export/online declarations; in-process conformance keeps its own name rules.
+pub(crate) fn checked_names(visible: &[String]) -> Result<Vec<String>, ExportError> {
+    for n in visible {
+        if n.is_empty() || n == "main" || n.starts_with('~') || !n.is_ascii() {
+            return Err(ExportError::Names(format!("invalid declared visible name: {n:?}")));
+        }
+    }
+    let names = sorted_names(visible);
+    if names.len() != visible.len() {
+        return Err(ExportError::Names("a visible name is declared twice".to_string()));
+    }
+    Ok(names)
+}
+
+pub(crate) fn check_visible_graph(
+    g: &ExecutionGraph,
+    visible: &[String],
+) -> Result<(), ExportError> {
+    for tid in g.thread_ids() {
+        if g.is_thread_daemon(tid) {
+            if let Some(n) = g.thread_name(tid) {
+                if visible.iter().any(|v| v == n) {
+                    return Err(ExportError::Names(format!(
+                        "declared visible name is a daemon: {n:?}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------- exporter --
 
 /// The header fields the caller names (X3): `program` and `size`, printed by
@@ -586,6 +618,8 @@ pub enum ExportError {
     NotSet,
     /// The configuration's `ConsType` has no format `model` (G1-4).
     Model(String),
+    /// An invalid export/online declaration.
+    Names(String),
     /// A value's `Debug` rendering outside the derived grammar (G1-1).
     Unparsed {
         type_name: String,
@@ -723,7 +757,7 @@ where
         return Err(ExportError::NotSet);
     }
     let model = model_name(cc.config.cons_type)?;
-    let names = sorted_names(&cc.visible);
+    let names = checked_names(&cc.visible)?;
     let program: Arc<dyn Fn() + Send + Sync> = Arc::new(program);
     let mut config = cc.config.clone();
     config.max_iterations = None;
@@ -735,11 +769,17 @@ where
         0usize,
         Shape::default(),
     )));
+    let refusal = Rc::new(RefCell::new(None));
     let sink: CompletionSink = {
+        let refusal = Rc::clone(&refusal);
         let state = Rc::clone(&state);
         let probe = Rc::clone(&probe);
         let visible = cc.visible.clone();
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
+            if let Err(e) = check_visible_graph(g, &visible) {
+                *refusal.borrow_mut() = Some(e);
+                return SinkVerdict::Stop;
+            }
             let (events, messages) = Shape::graph_counts(g);
             let blocked = g.check_blocked().is_some();
             let t = Instant::now();
@@ -774,6 +814,9 @@ where
         &program,
     );
     let run_wall = run_started.elapsed();
+    if let Some(e) = refusal.borrow_mut().take() {
+        return Err(e);
+    }
     let errors = run.visible_errors.len()
         + run
             .diagnostics

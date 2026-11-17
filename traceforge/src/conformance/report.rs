@@ -3024,6 +3024,7 @@ impl fmt::Display for interchange::ExportError {
         use interchange::ExportError as E;
         match self {
             E::Threshold(reason) => write!(f, "{reason}; export is incomplete"),
+            E::Names(e) => f.write_str(e),
             E::NotSet => write!(f, "the export runs under `index(Set)` only"),
             E::Model(c) => write!(f, "the consistency model {c} has no format `model`"),
             E::Unparsed { type_name, rendering, at } => write!(
@@ -3192,6 +3193,7 @@ impl crate::conformance::online::OnlineReport {
             Verdict::Conforms => "conforms",
             Verdict::Reports => "reports",
             Verdict::Partial => "partial",
+            Verdict::Refused => "refused",
         };
         let _ = writeln!(out, "verdict:    {verdict}");
         let mode = match self.mode {
