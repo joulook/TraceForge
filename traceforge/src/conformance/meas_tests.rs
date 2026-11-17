@@ -744,6 +744,7 @@ fn b_k3_join_blocks() {
     let p = o_prog();
     let dir = scratch("b-k3");
     let s_path = spec_file(&p, &dir);
+    super::online_tests::spec_model(&p, &s_path, ConsType::Bag);
     let e = dir.join("impl.jsonl");
     let es = e.to_string_lossy().into_owned();
     let (t, c) = cli(&p, &["export", "impl", "--out", &es, "--model", "bag", "--seed", "0", "--", "bug"]);
@@ -816,6 +817,12 @@ fn b_k4_online_blocks() {
         (vec!["--model", "fifo", "--seed", "0", "--", "fixed"], fix_graphs.as_slice(), 12, 2, 0, "exhausted", 0),
     ];
     for (args, gs, n, d, u, stop, exit) in cases {
+        let model = if args.windows(2).any(|w| w == ["--model", "bag"]) {
+            ConsType::Bag
+        } else {
+            ConsType::FIFO
+        };
+        super::online_tests::spec_model(&p, &s_path, model);
         let mut a = vec!["online", "--spec", ss.as_str()];
         a.extend(args.iter().copied());
         let (text, code) = cli(&p, &a);
@@ -871,6 +878,12 @@ fn b_k4_online_blocks() {
         (vec!["--budget", "3", "--model", "fifo", "--seed", "0", "--", "fixed"], "budget", 0),
         (vec!["--model", "fifo", "--seed", "0", "--", "ch2"], "error", 1),
     ] {
+        let model = if args.windows(2).any(|w| w == ["--model", "bag"]) {
+            ConsType::Bag
+        } else {
+            ConsType::FIFO
+        };
+        super::online_tests::spec_model(&p, &s_path, model);
         let mut a = vec!["online", "--spec", ss.as_str()];
         a.extend(args.iter().copied());
         let (text, code) = cli(&p, &a);

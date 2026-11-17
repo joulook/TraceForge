@@ -219,6 +219,10 @@ fn md_online() {
     let s = spec_file(&dir);
     for (declared, model, bag) in TABLE {
         let what = format!("online {declared:?} {model:?}");
+        let (text, code) = cli(declared, &with_model(
+            &["export", "spec", "--out", &s], model, &["--seed", "0"],
+        ));
+        assert_eq!(code, 0, "conformance: MD: same-model specification: {text}");
         let a = with_model(&["online", "--spec", &s], model, &["--seed", "0"]);
         let (text, code) = cli(declared, &a);
         let (own, block) = split(&text, &what);

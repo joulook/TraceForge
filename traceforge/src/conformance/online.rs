@@ -532,6 +532,13 @@ pub(crate) fn online(
             enumeration: file.head.enumeration.name().to_string(),
         });
     }
+    let run_model = model_name(config.cons_type)
+        .map_err(|e| OnlineError::Model(e.to_string()))?;
+    if file.head.model != run_model {
+        return Err(OnlineError::Spec(format!(
+            "the two models differ: {} and {}", file.head.model, run_model
+        )));
+    }
     if file.head.visible != names {
         return Err(OnlineError::Visible {
             file: file.head.visible.clone(),

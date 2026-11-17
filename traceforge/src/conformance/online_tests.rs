@@ -403,28 +403,39 @@ const LABELS: [&str; 9] = [
 /// main.
 pub(super) fn spec_file(p: &Prog, dir: &Path) -> PathBuf {
     let s = dir.join("S.jsonl");
+    spec_model(p, &s, ConsType::FIFO);
+    s
+}
+
+pub(super) fn spec_model(p: &Prog, s: &Path, model: ConsType) {
     let ss = s.to_string_lossy().into_owned();
     assert_eq!(
         p.cli(&[
-            "export", "spec", "--out", &ss, "--program", "o", "--size", "k1", "--model", "fifo",
+            "export", "spec", "--out", &ss, "--program", "o", "--size", "k1",
+            "--model", model_arg(model),
             "--seed", "0", "--", "fixed",
         ]),
         (format!("exported: 2 lines from 2 graphs to {ss}\n"), 0),
         "conformance: C: the specification file"
     );
-    s
 }
 
 pub(super) fn spec_head(path: &Path, lines: usize) -> String {
+    let (header, _) = read_jsonl(path);
+    let model = header["model"].as_str().unwrap();
     format!(
-        "spec:       {} (program o, size k1, model p2p, tool traceforge; {lines} lines, {lines} \
-         distinct summaries held, 0 duplicates)\n",
+        "spec:       {} (program o, size k1, model {model}, tool traceforge; \
+         {lines} lines, {lines} distinct summaries held, 0 duplicates)\n",
         path.display()
     )
 }
 
 /// `online` through `run_cli` with `--seed 0`; `extra` before `--model`.
 pub(super) fn run_online(p: &Prog, s: &Path, extra: &[&str], m: ConsType, var: Var) -> (String, u8) {
+    let (header, _) = read_jsonl(s);
+    if header["model"] != super::interchange::model_name(m).unwrap() {
+        spec_model(p, s, m);
+    }
     let ss = s.to_string_lossy().into_owned();
     let mut a: Vec<&str> = vec!["online", "--spec", ss.as_str()];
     a.extend_from_slice(extra);
@@ -568,7 +579,6 @@ fn o1_violating_full_mode() {
     let p = o_prog();
     let dir = scratch("c-o1");
     let s = spec_file(&p, &dir);
-    let head = spec_head(&s, 2);
     // (variant, model, N, F, S, X, U, D, export lines)
     for (var, m, n, f, sm, x, u, d, lines) in [
         (Var::Bug, ConsType::Bag, 24, 8, 12, 4, 16, 6, 8),
@@ -608,6 +618,7 @@ fn o1_violating_full_mode() {
             (format!("exported: {lines} lines from {n} graphs to {es}\n"), 0),
             "conformance: C: O1 {tag}: export impl"
         );
+        spec_model(&p, &s, m);
         let j = conf_join(&s, &e).unwrap_or_else(|er| panic!("conformance: C: O1 {tag}: join: {er}"));
         assert_eq!(j.verdict, JoinVerdict::Violation, "conformance: C: O1 {tag}: the join's verdict");
         assert_eq!(j.uncovered.len(), d, "conformance: C: O1 {tag}: D = the join's count");
@@ -626,7 +637,9 @@ fn o1_violating_full_mode() {
         let (i, t) = first_miss_of(&text).unwrap_or_else(|| panic!("conformance: C: O1 {tag}: no first miss: {text}"));
         assert_eq!(i, i1, "conformance: C: O1 {tag}: the first miss's iteration");
         let w = line_k(&k1);
-        let want = expected_text(&head, (n, f, sm, x), "reports", false, Some((i1, t, w.as_str(), not_found)), (u, d), None);
+        let want = expected_text(
+            &spec_head(&s, 2), (n, f, sm, x), "reports", false,
+            Some((i1, t, w.as_str(), not_found)), (u, d), None);
         assert_eq!(text, want, "conformance: C: O1 {tag}: the lines");
         note!("O1\t{tag}\tI={i1}\tT={t}\tclass={}", if not_found { "NotFound" } else { "NoSig" });
     }
@@ -667,7 +680,6 @@ fn o3_bug_finder() {
     let p = o_prog();
     let dir = scratch("c-o3");
     let s = spec_file(&p, &dir);
-    let head = spec_head(&s, 2);
     let (i1, k1) = first_report(Var::Bug, ConsType::Bag);
     let not_found = class_of(&k1, &[2, 3]) == 'X';
     let (text, code) = run_online(&p, &s, &["--stop-at-first"], ConsType::Bag, Var::Bug);
@@ -678,7 +690,9 @@ fn o3_bug_finder() {
     let w = line_k(&k1);
     assert_eq!(
         text,
-        expected_text(&head, (i1, i1 - 1, sm, x), "reports", true, Some((i1, t, w.as_str(), not_found)), (1, 1), None),
+        expected_text(
+            &spec_head(&s, 2), (i1, i1 - 1, sm, x), "reports", true,
+            Some((i1, t, w.as_str(), not_found)), (1, 1), None),
         "conformance: C: O3: the lines"
     );
     let (full, _) = run_online(&p, &s, &[], ConsType::Bag, Var::Bug);
@@ -687,7 +701,7 @@ fn o3_bug_finder() {
     let (text, code) = run_online(&p, &s, &["--stop-at-first"], ConsType::FIFO, Var::Fixed);
     assert_eq!(
         (text, code),
-        (expected_text(&head, (12, 12, 0, 0), "conforms", true, None, (0, 0), None), 0),
+        (expected_text(&spec_head(&s, 2), (12, 12, 0, 0), "conforms", true, None, (0, 0), None), 0),
         "conformance: C: O3: bug-finder without a miss"
     );
 }
@@ -843,7 +857,6 @@ fn o5_failures_and_the_budget() {
     let p = o_prog();
     let dir = scratch("c-o5f");
     let s = spec_file(&p, &dir);
-    let head = spec_head(&s, 2);
     // The refusal.
     let refusal = match encode_generic(&Val::new(M::Ch('x')), &ThreadNames::new()) {
         Err(e) => e.to_string(),
@@ -861,10 +874,14 @@ fn o5_failures_and_the_budget() {
         assert_eq!(code, 1, "conformance: C: O5: {var:?}: exit 1: {text}");
         assert_eq!(
             text,
-            expected_text(&head, (pos - 1, pos - 1, 0, 0), "partial", false, None, (0, 0), Some(refusal.as_str())),
+            expected_text(
+                &spec_head(&s, 2), (pos - 1, pos - 1, 0, 0), "partial", false, None, (0, 0),
+                Some(refusal.as_str())),
             "conformance: C: O5: {var:?}: the lines"
         );
-        let r = online::online(&cfg(ConsType::FIFO), &vis(), imp_of(var), &s, opts(Mode::Full, None, None))
+        let r = online::online(
+            &cfg(ConsType::FIFO), &vis(), imp_of(var), &s, opts(Mode::Full, None, None),
+        )
             .expect("conformance: C: O5: not refused");
         assert_eq!(
             (r.iterations, r.end.clone()), (pos, End::Failed),
@@ -876,9 +893,11 @@ fn o5_failures_and_the_budget() {
     assert_eq!(done, 1, "conformance: C: O5: exactly one of ch2/ch3 has p >= 2");
     // The budget.
     for (b, want) in [
-        ("3", expected_text(&head, (3, 3, 0, 0), "partial", false, None, (0, 0), None)),
-        ("13", expected_text(&head, (12, 12, 0, 0), "conforms", false, None, (0, 0), None)),
-        ("12", expected_text(&head, (12, 12, 0, 0), "partial", false, None, (0, 0), None)),
+        ("3", expected_text(&spec_head(&s, 2), (3, 3, 0, 0), "partial", false, None, (0, 0), None)),
+        ("13", expected_text(
+            &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None)),
+        ("12", expected_text(
+            &spec_head(&s, 2), (12, 12, 0, 0), "partial", false, None, (0, 0), None)),
     ] {
         let (text, code) = run_online(&p, &s, &["--budget", b], ConsType::FIFO, Var::Fixed);
         assert_eq!((text, code), (want, 0), "conformance: C: O5: --budget {b}");
@@ -892,7 +911,9 @@ fn o5_failures_and_the_budget() {
     assert_eq!(
         (text, code),
         (
-            expected_text(&head, (i1, i1 - 1, sm, x), "reports", false, Some((i1, t, line_k(&k1).as_str(), not_found)), (1, 1), None),
+            expected_text(
+                &spec_head(&s, 2), (i1, i1 - 1, sm, x), "reports", false,
+                Some((i1, t, line_k(&k1).as_str(), not_found)), (1, 1), None),
             0
         ),
         "conformance: C: O5: --budget I1"
@@ -953,7 +974,6 @@ fn o5p_a_panic() {
     let p = o_prog();
     let dir = scratch("c-o5p");
     let s = spec_file(&p, &dir);
-    let head = spec_head(&s, 2);
     let payload = |k: usize| format!("conformance: online test fault at iteration {k}");
     // Before any miss.
     let mut o = opts(Mode::Full, None, None);
@@ -968,7 +988,9 @@ fn o5p_a_panic() {
     );
     assert_eq!(
         r.render(),
-        expected_text(&head, (2, 2, 0, 0), "partial", false, None, (0, 0), Some(payload(3).as_str())),
+        expected_text(
+            &spec_head(&s, 2), (2, 2, 0, 0), "partial", false, None, (0, 0),
+            Some(payload(3).as_str())),
         "conformance: C: O5p: k = 3: the lines"
     );
     // After misses, with --out.
@@ -989,6 +1011,7 @@ fn o5p_a_panic() {
         }),
     );
     o.fault_at = Some(20);
+    spec_model(&p, &s, ConsType::Bag);
     let r = online::online(&cfg(ConsType::Bag), &vis(), imp_of(Var::Bug), &s, o)
         .expect("conformance: C: O5p: not refused");
     invariants(&r);
@@ -1004,7 +1027,7 @@ fn o5p_a_panic() {
     assert_eq!(
         r.render(),
         expected_text(
-            &head,
+            &spec_head(&s, 2),
             (19, c19.f, c19.s, c19.x),
             "reports",
             false,

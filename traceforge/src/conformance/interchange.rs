@@ -1395,7 +1395,7 @@ pub(crate) fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
 /// `SetIndex`, each implementation line queried with `covers`. Refused (`Err`):
 /// a file that does not parse (R1, R2), a duplicate line (R4), unequal
 /// `visible` lists, a specification whose `enumeration` is not `complete`.
-/// `model` is printed, never compared (ruling Q3).
+/// `model` must agree.
 pub fn conf_join(spec: &Path, imp: &Path) -> Result<JoinReport, JoinError> {
     conf_join_with(spec, imp, JoinSeams::default())
 }
@@ -1434,6 +1434,12 @@ fn conf_join_inner(
             "{}: the specification is `{}`, not `complete`",
             spec.display(),
             s.head.enumeration.name()
+        )));
+    }
+    if s.head.model != i.head.model {
+        return Err(JoinError(format!(
+            "the two models differ: {} and {}",
+            s.head.model, i.head.model
         )));
     }
     if s.head.visible != i.head.visible {
@@ -1687,6 +1693,12 @@ fn conf_join_merge_inner(
             "{}: the specification is `{}`, not `complete`",
             spec.display(),
             shead.enumeration.name()
+        )));
+    }
+    if shead.model != ihead.model {
+        return Err(JoinError(format!(
+            "the two models differ: {} and {}",
+            shead.model, ihead.model
         )));
     }
     if shead.visible != ihead.visible {
