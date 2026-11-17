@@ -2060,6 +2060,7 @@ fn c12_the_entry_point_fields() {
     let v = naive_visible(2);
     let cc = built(sb(cfg(ConsType::Bag), &v));
     let StatefulOutcome {
+        witness_error,
         reports,
         counters,
         index,
@@ -2074,6 +2075,7 @@ fn c12_the_entry_point_fields() {
         compact_index,
         set_index,
     } = rw(&cc, &naive(2, 0), &naive(2, 1), false);
+    assert!(witness_error.is_none(), "conformance: no witness failure without a writer");
     // `MIN-ENGINES` E7b (the tester's re-pin at gate 3): the default index is
     // `Set` — the set index present, the compact index and `SigBuckets`
     // empty (both were the default `Current`'s before).

@@ -278,6 +278,7 @@ impl ConfigError {
 /// doc.
 #[derive(Clone)]
 pub struct ConfConfig {
+    pub(crate) witness: Option<String>,
     pub(crate) config: crate::Config,
     pub(crate) visible: Vec<String>,
     pub(crate) payload_names: Vec<String>,
@@ -836,6 +837,7 @@ impl ConfBuilder {
         // after `.config()` has been applied, so it cannot be overwritten.
         config.selector = self.selector;
         Ok(ConfConfig {
+            witness: None,
             config,
             visible: self.visible,
             payload_names: self.payload_names,

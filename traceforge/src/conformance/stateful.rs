@@ -66,6 +66,7 @@ use crate::Config;
 /// produced, with the index and the Spec family for Part 6's certification
 /// oracle, and the graphs only when asked for.
 pub(crate) struct StatefulOutcome {
+    pub(crate) witness_error: Option<String>,
     /// Each reported Impl graph with the replay snapshot taken at its
     /// completion.
     pub(crate) reports: Vec<(ExecutionGraph, ReplaySnapshot)>,
@@ -100,6 +101,7 @@ pub(crate) struct StatefulOutcome {
 /// (`Rc::try_unwrap` would fail while `CURRENT_MUST` still holds the `Must`).
 #[derive(Default)]
 struct SinkState {
+    witness_error: Option<String>,
     index: SigBuckets<BTreeSet<VisOrder>>,
     /// `COMPACT-INDEX` §5.1 item 4(a): `Some` iff `index = Compact`; then
     /// `index` above stays empty.
@@ -132,6 +134,9 @@ pub(crate) fn run(
 ) -> Result<ConfVerdict, ConfError> {
     let started = Instant::now();
     let out = run_with(&cc, &implementation, &specification, false);
+    if let Some(detail) = out.witness_error {
+        return Err(ConfError::Witness { detail });
+    }
     for end in [out.spec_end.clone(), out.impl_end.clone()] {
         if let SearchEnd::Threshold(reason) = end {
             return Err(ConfError::Threshold(reason));
@@ -356,6 +361,7 @@ pub(crate) fn run_with(
             st.counters.compact = Some(si.stats().as_compact_stats());
         }
         return StatefulOutcome {
+            witness_error: None,
             reports: Vec::new(),
             counters: st.counters,
             index: st.index,
@@ -373,8 +379,12 @@ pub(crate) fn run_with(
     }
 
     // -- the stream (T3): Impl, bounded as configured (T5) ---------------
+    let witness = cc.witness.clone().map(|path| {
+        Rc::new(RefCell::new(super::execution_witness::Writer::new(path)))
+    });
     let impl_started = Instant::now();
     let impl_sink = {
+        let witness = witness.clone();
         let state = Rc::clone(&state);
         let visible = visible.clone();
         let config = cc.config.clone();
@@ -490,6 +500,30 @@ pub(crate) fn run_with(
             if covered {
                 return SinkVerdict::Continue;
             }
+            if let Some(writer) = witness.as_ref() {
+                let mut writer = writer.borrow_mut();
+                let result = (|| {
+                    if writer.finished() {
+                        return Ok(());
+                    }
+                    if let Some(e) = super::online::failed_assertion(g) {
+                        return Err(format!("witness: {e}"));
+                    }
+                    let summary = cs.as_ref().expect("conformance: witness needs compact summary");
+                    let names = super::interchange::sorted_names(&visible);
+                    let mut threads = super::interchange::ThreadNames::new();
+                    super::interchange::record_thread_names(g, &mut threads);
+                    let line = super::interchange::line_of(
+                        &summary.sig, &summary.ord, &names,
+                        &|v| super::interchange::encode_generic(v, &threads),
+                    ).map_err(|e| format!("witness: {e}"))?;
+                    writer.write(g, st.executions, &line)
+                })();
+                if let Err(e) = result {
+                    st.witness_error = Some(e);
+                    return SinkVerdict::Stop;
+                }
+            }
             st.counters.reports += 1;
             // `MIN-ENGINES` E9: at the first report, the wall since the
             // implementation run started (after the index run) and `VmHWM`,
@@ -530,6 +564,11 @@ pub(crate) fn run_with(
     );
     let mut st = std::mem::take(&mut *state.borrow_mut());
     st.counters.impl_wall_time_ms = impl_started.elapsed().as_millis();
+    if st.witness_error.is_none() && !matches!(impl_run.end, SearchEnd::Threshold(_)) {
+        if let Some(writer) = witness.as_ref() {
+            st.witness_error = writer.borrow_mut().finish().err();
+        }
+    }
     if let Some(ci) = st.compact.as_ref() {
         // `COMPACT-INDEX` frozen §7: the index's counters; `containment_tests`
         // is the queries' comparisons under `Compact`.
@@ -549,6 +588,7 @@ pub(crate) fn run_with(
     }
 
     StatefulOutcome {
+        witness_error: st.witness_error,
         reports: st.reports,
         counters: st.counters,
         index: st.index,

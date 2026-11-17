@@ -1855,6 +1855,8 @@ impl fmt::Debug for ConfVerdict {
 /// and lost its origin (F-C).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfError {
+    /// A requested execution witness could not be written.
+    Witness { detail: String },
     /// Exploration stopped without producing a conformance verdict.
     Threshold(crate::ThresholdStop),
     /// §5.4: the specification is not error-free, so the problem statement's
@@ -1927,6 +1929,7 @@ impl std::error::Error for ConfError {}
 impl fmt::Display for ConfError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ConfError::Witness { detail } => write!(f, "conformance: {detail}"),
             ConfError::Threshold(reason) => write!(f, "{reason}; no verdict was produced"),
             ConfError::SpecNotErrorFree { detail } => write!(
                 f,

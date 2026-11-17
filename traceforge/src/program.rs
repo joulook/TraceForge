@@ -143,7 +143,12 @@ const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS�
     <bin> row [--model fifo|bag|causal] --seed N [--threshold N] [--dump-large-graph] -- ARGS   \
     (EVAL_ROW, EVAL_COMMIT)\n       \
     <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]] \
-    [--budget N] [--model …] [--seed N] [--threshold N] [--dump-large-graph] [ARGS…]\n";
+    [--budget N] [--model …] [--seed N] [--threshold N] [--dump-large-graph] [ARGS…]\n\
+    \n--witness PATH (online or conf --engine stateful, --threads 1): write the first\n\
+    uncovered execution to a file, or one per distinct summary to PATH ending in /.\n\
+    Witnesses publish at run end; refusal discards staging and preserves existing files.\n\
+    Unnamed threads, control characters in names/messages, and write errors stop the run\n\
+    (online exit 1; conf exit 2). Positions count printed events; iterations count completions.\n";
 
 /// The options of every subcommand, and the program's own arguments.
 struct Opts {
@@ -156,6 +161,7 @@ struct Opts {
     stop_at_first: bool,
     distinct: bool,
     out: Option<String>,
+    witness: Option<String>,
     program: Option<String>,
     size: Option<String>,
     spec: Option<String>,
@@ -174,6 +180,7 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
         stop_at_first: false,
         distinct: false,
         out: None,
+        witness: None,
         program: None,
         size: None,
         spec: None,
@@ -216,6 +223,7 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
             }
             "--stop-at-first" => o.stop_at_first = true,
             "--distinct" => o.distinct = true,
+            "--witness" => o.witness = Some(value()?),
             "--out" => o.out = Some(value()?),
             "--program" => o.program = Some(value()?),
             "--size" => o.size = Some(value()?),
@@ -236,6 +244,22 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
         i += 1;
     }
     Ok(o)
+}
+
+fn check_witness(cmd: &str, o: &Opts) -> Result<(), String> {
+    if o.witness.is_none() {
+        return Ok(());
+    }
+    if !matches!(cmd, "online" | "conf") {
+        return Err("--witness requires online or conf --engine stateful".to_owned());
+    }
+    if o.threads > 1 {
+        return Err("--witness requires --threads 1".to_owned());
+    }
+    if cmd == "conf" && o.engine != "stateful" {
+        return Err("--witness requires conf --engine stateful".to_owned());
+    }
+    Ok(())
 }
 
 fn config_of(o: &Opts) -> Config {
@@ -345,6 +369,9 @@ fn run_named_roles(
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
+            if let Err(e) = check_witness(cmd, &o) {
+                return fail(e);
+            }
             let f = match side_entry(p, args.get(1), &o.args) {
                 Ok(f) => f,
                 Err(e) => return fail(e),
@@ -371,6 +398,9 @@ fn run_named_roles(
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
+            if let Err(e) = check_witness(cmd, &o) {
+                return fail(e);
+            }
             let f = match side_entry(p, args.get(1), &o.args) {
                 Ok(f) => f,
                 Err(e) => return fail(e),
@@ -435,6 +465,9 @@ fn run_named_roles(
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
+            if let Err(e) = check_witness(cmd, &o) {
+                return fail(e);
+            }
             let (engine, set) = match (o.engine.as_str(), o.threads) {
                 ("stateful", 1) => (Engine::Stateful, true),
                 ("stateful", _) => (Engine::SverifyP, true),
@@ -456,10 +489,11 @@ fn run_named_roles(
             if set {
                 b = b.index(IndexKind::Set);
             }
-            let cc = match b.build() {
+            let mut cc = match b.build() {
                 Ok(cc) => cc,
                 Err(e) => return (format!("{bin}: the configuration is refused: {e:?}\n"), 2),
             };
+            cc.witness = o.witness.clone();
             let imp = (p.imp)(&o.args);
             let spec = (p.spec)(&o.args);
             let r = conformance::verify(cc, move || imp(), move || spec());
@@ -488,6 +522,7 @@ fn run_named_roles(
             let valued = [
                 "--threads",
                 "--spec",
+                "--witness",
                 "--out",
                 "--program",
                 "--size",
@@ -504,6 +539,9 @@ fn run_named_roles(
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
+            if let Err(e) = check_witness(cmd, &o) {
+                return fail(e);
+            }
             let Some(spec) = o.spec.clone() else {
                 return fail("online needs --spec FILE".to_string());
             };
@@ -553,6 +591,7 @@ fn run_named_roles(
                     {
                         let mut opts = OnlineOpts::new(mode, o.budget, out);
                         opts.payload_names = payload_names(&o.args);
+                        opts.witness = o.witness.clone();
                         opts
                     },
                 )
@@ -575,6 +614,9 @@ fn run_named_roles(
                 Ok(o) => o,
                 Err(e) => return fail(e),
             };
+            if let Err(e) = check_witness(cmd, &o) {
+                return fail(e);
+            }
             let Some(seed) = o.seed else {
                 return fail("row needs --seed N".to_string());
             };

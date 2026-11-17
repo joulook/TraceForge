@@ -95,6 +95,7 @@ pub(crate) struct OnlineOut {
 
 /// The settings of one online run besides the program.
 pub(crate) struct OnlineOpts {
+    pub(crate) witness: Option<String>,
     pub(crate) payload_names: Vec<String>,
     pub(crate) mode: Mode,
     /// `Config::max_iterations` for the exploration.
@@ -122,6 +123,7 @@ pub(crate) struct OnlineOpts {
 impl OnlineOpts {
     pub(crate) fn new(mode: Mode, budget: Option<u64>, out: Option<OnlineOut>) -> Self {
         OnlineOpts {
+            witness: None,
             payload_names: Vec::new(),
             mode,
             budget,
@@ -463,7 +465,7 @@ impl Seams {
 }
 
 /// The lock, recovered if a panic ever poisoned it.
-fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
     state.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -610,12 +612,16 @@ pub(crate) fn online(
         #[cfg(test)]
         lookup: opts.lookup_delay,
     };
+    let witness = opts.witness.map(|path| {
+        Arc::new(Mutex::new(super::execution_witness::Writer::new(path)))
+    });
     let spawned = Instant::now();
     let worker = {
         let state = Arc::clone(&state);
         let visible = visible.to_vec();
         let names = names.clone();
         let roles = roles.clone();
+        let witness = witness.clone();
         std::thread::Builder::new()
             .name("online".to_string())
             .spawn(move || {
@@ -632,7 +638,7 @@ pub(crate) fn online(
                     if fault_at == Some(iteration) {
                         panic!("conformance: online test fault at iteration {iteration}");
                     }
-                    let step = step_of(
+                    let mut step = step_of(
                         g,
                         &sink_visible,
                         &names,
@@ -643,6 +649,13 @@ pub(crate) fn online(
                         started,
                         &seams,
                     );
+                    if let (Some(writer), Step::Miss { first, .. }) =
+                        (witness.as_ref(), &step.0)
+                    {
+                        if let Err(e) = lock(writer).write(g, iteration, first) {
+                            step.0 = Step::Failed(e);
+                        }
+                    }
                     // (3) one locked update that cannot unwind.
                     lock(&sink_state).commit(step, iteration, mode)
                 });
@@ -773,6 +786,14 @@ pub(crate) fn online(
             Err(e) => {
                 report.end = End::Failed;
                 report.failure = Some(e.to_string());
+            }
+        }
+    }
+    if !report.refused && report.failure.is_none() {
+        if let Some(writer) = witness.as_ref() {
+            if let Err(e) = lock(writer).finish() {
+                report.end = End::Failed;
+                report.failure = Some(e);
             }
         }
     }

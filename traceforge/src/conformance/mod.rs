@@ -1,3 +1,12 @@
+//! `--witness PATH` on sequential `online` and `conf --engine stateful` writes the first
+//! uncovered implementation execution, or one per distinct summary when PATH ends in `/`.
+//! The file contains the queried summary and creation-ordered threads with contiguous event
+//! positions. Unnamed threads, control characters in names/messages and write failures stop
+//! the run (online exit 1, conf exit 2). Witnesses are staged beside their destinations and
+//! published at the end. Refusal or failure before publication discards staging and preserves
+//! existing files; a rename failure stops publication and discards the remaining staging files.
+//! Without the option no witness is formatted or copied.
+//!
 //! Conformance verification: does one program's visible behaviour refine
 //! another's?
 //!
@@ -282,6 +291,7 @@ pub(crate) mod stateful;
 pub(crate) mod sverify_p;
 pub(crate) mod triage;
 pub(crate) mod witness;
+pub(crate) mod execution_witness;
 
 // ---------------------------------------------------------------------------
 // The public surface, and what it commits (criterion 11).
