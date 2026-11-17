@@ -238,6 +238,8 @@ fn cc(visible: &[&str], engine: Engine, seed: u64, flush: usize, model: ConsType
                 .build(),
         )
         .visible_threads(visible.iter().map(|s| (*s).to_owned()))
+        .payload_names(["a", "b", "p", "t", "x2"].into_iter()
+            .filter(|n| !visible.contains(n)))
         .engine(engine)
         .index(IndexKind::Set)
         .flush_entries(flush);

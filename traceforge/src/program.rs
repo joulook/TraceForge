@@ -79,6 +79,14 @@ pub fn main(p: Program) -> ExitCode {
 /// [`main`] for a program whose default model is `default_model`: the one its
 /// README names, used when a run leaves out `--model`.
 pub fn main_with_model(p: Program, default_model: ConsType) -> ExitCode {
+    main_with_payload_names(p, default_model, &|_| Vec::new())
+}
+
+/// As [`main_with_model`], declaring invisible payload-nameable threads for both sides.
+/// The original three-field [`Program`] literal remains unchanged.
+pub fn main_with_payload_names(
+    p: Program, default_model: ConsType, payload_names: &dyn Fn(&[String]) -> Vec<String>,
+) -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let bin = args
         .first()
@@ -88,7 +96,7 @@ pub fn main_with_model(p: Program, default_model: ConsType) -> ExitCode {
         .to_string();
     let mut block = String::new();
     let rest = args.get(1..).unwrap_or(&[]);
-    let (out, code) = run_named(&p, &bin, rest, default_model, &mut block);
+    let (out, code) = run_named_roles(&p, &bin, rest, default_model, &mut block, payload_names);
     if code == 2 {
         eprint!("{out}");
     } else {
@@ -110,6 +118,18 @@ pub fn run_cli(p: &Program, args: &[String]) -> (String, u8) {
 pub fn run_cli_with_model(p: &Program, default_model: ConsType, args: &[String]) -> (String, u8) {
     let mut block = String::new();
     let (out, code) = run_named(p, "program", args, default_model, &mut block);
+    (format!("{out}{block}"), code)
+}
+
+/// [`run_cli_with_model`] with the shared payload-nameable declaration.
+pub fn run_cli_with_payload_names(
+    p: &Program, default_model: ConsType, args: &[String],
+    payload_names: &dyn Fn(&[String]) -> Vec<String>,
+) -> (String, u8) {
+    let mut block = String::new();
+    let (out, code) = run_named_roles(
+        p, "program", args, default_model, &mut block, payload_names,
+    );
     (format!("{out}{block}"), code)
 }
 
@@ -301,6 +321,17 @@ fn run_named(
     default_model: ConsType,
     block: &mut String,
 ) -> (String, u8) {
+    run_named_roles(p, bin, args, default_model, block, &|_| Vec::new())
+}
+
+fn run_named_roles(
+    p: &Program,
+    bin: &str,
+    args: &[String],
+    default_model: ConsType,
+    block: &mut String,
+    payload_names: &dyn Fn(&[String]) -> Vec<String>,
+) -> (String, u8) {
     // `B` (MEAS-1): a block's `wall_ms` runs from here (the start of `main`'s
     // work) to the block.
     let started = std::time::Instant::now();
@@ -352,7 +383,7 @@ fn run_named(
             } else {
                 Engine::Stateful
             };
-            let cc = match builder_of(p, &o)
+            let cc = match builder_of(p, &o).payload_names(payload_names(&o.args))
                 .engine(engine)
                 .threads(o.threads)
                 .index(IndexKind::Set)
@@ -417,7 +448,7 @@ fn run_named(
                     ))
                 }
             };
-            let mut b = builder_of(p, &o)
+            let mut b = builder_of(p, &o).payload_names(payload_names(&o.args))
                 .engine(engine)
                 .threads(o.threads)
                 .stop_at_first_report(o.stop_at_first)
@@ -503,21 +534,27 @@ fn run_named(
             let visible = (p.visible)(&o.args);
             let imp = (p.imp)(&o.args);
             let r = if o.threads > 1 {
-                online_p::online_partitioned(
+                online_p::online_partitioned_roles(
                     &config_of(&o),
                     o.threads,
                     &visible,
                     imp,
                     Path::new(&spec),
                     out,
-                )
+                    online_p::OnlinePSeams::default(),
+                    &payload_names(&o.args),
+                ).map(|r| r.report)
             } else {
                 online::online(
                     &config_of(&o),
                     &visible,
                     imp,
                     Path::new(&spec),
-                    OnlineOpts::new(mode, o.budget, out),
+                    {
+                        let mut opts = OnlineOpts::new(mode, o.budget, out);
+                        opts.payload_names = payload_names(&o.args);
+                        opts
+                    },
                 )
             };
             match r {

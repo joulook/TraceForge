@@ -126,6 +126,8 @@ enum DbgError {
     Refused(&'static str),
     /// A `ThreadId` without a role name in this run.
     Thread(String),
+    /// A visible payload violates its declared role restrictions.
+    PayloadThread(String),
 }
 
 /// The parser of derived `Debug` text: its separators are exactly `", "` and
@@ -346,7 +348,9 @@ impl<'a> DbgParser<'a> {
 }
 
 /// The canonical bytes of a parsed value (G1-1).
-fn render_dbg(v: &DbgVal, threads: &ThreadNames, out: &mut String) -> Result<(), DbgError> {
+fn render_dbg(
+    v: &DbgVal, threads: &ThreadNames, out: &mut String,
+) -> Result<(), DbgError> {
     match v {
         DbgVal::Int(i) => {
             let i = i64::try_from(*i)
@@ -394,7 +398,9 @@ fn render_dbg(v: &DbgVal, threads: &ThreadNames, out: &mut String) -> Result<(),
             out.push(']');
         }
         DbgVal::Thread(n) => match threads.get(n) {
-            Some(ThreadName::Named(name)) => out.push_str(&json_string(name)),
+            Some(ThreadName::Named(name)) => {
+                out.push_str(&json_string(name));
+            }
             Some(ThreadName::Unnamed) => {
                 return Err(DbgError::Thread(format!("thread t{n} has no name")));
             }
@@ -411,9 +417,71 @@ fn render_dbg(v: &DbgVal, threads: &ThreadNames, out: &mut String) -> Result<(),
     Ok(())
 }
 
+/// Check only the new restrictions, using the execution that holds this payload.
+/// Unknown and unnamed identities are left to the legacy encoder.
+fn check_payload(v: &DbgVal, g: &ExecutionGraph, roles: &[String]) -> Result<(), DbgError> {
+    match v {
+        DbgVal::Thread(n) if *n != 0 => {
+            if let Some(tid) = g.thread_ids().into_iter().find(|t| u32::from(*t) == *n) {
+                if g.is_thread_daemon(tid) {
+                    return Err(DbgError::PayloadThread(format!("thread t{n} is a daemon")));
+                }
+                if let Some(name) = g.thread_name(tid) {
+                    if !roles.iter().any(|r| r == name) {
+                        return Err(DbgError::PayloadThread(format!(
+                            "thread t{n} named `{name}` is not declared payload-nameable"
+                        )));
+                    }
+                }
+            }
+        }
+        DbgVal::Named(_, fields) | DbgVal::List(fields) | DbgVal::Set(fields) => {
+            for f in fields {
+                check_payload(f, g, roles)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Sequential export validates before deduplication loses the execution context.
+/// It does not render values or lines; legacy encoding errors remain deferred.
+fn check_payloads(
+    sig: &Sig, g: &ExecutionGraph, visible: &[String], roles: &[String],
+) -> Result<(), ExportError> {
+    for name in visible {
+        for obs in sig.word(name) {
+            let v = match obs {
+                Obs::Send(v) | Obs::Recv(Some(v)) => v,
+                Obs::Recv(None) => continue,
+            };
+            let text = format!("{:?}", &*v.val);
+            let mut p = DbgParser { s: &text, pos: 0 };
+            if let Ok(parsed) = p.value() {
+                if p.pos == text.len() {
+                    if let Err(DbgError::PayloadThread(reason)) = check_payload(&parsed, g, roles) {
+                        return Err(ExportError::PayloadThread {
+                            type_name: v.type_name.clone(),
+                            reason,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `G1`: a value's canonical bytes from its derived `Debug` rendering (G1-1);
 /// refused with the value's type and the offending text.
 pub(crate) fn encode_generic(v: &Val, threads: &ThreadNames) -> Result<String, ExportError> {
+    encode_declared(v, threads, None)
+}
+
+pub(crate) fn encode_declared(
+    v: &Val, threads: &ThreadNames, context: Option<(&ExecutionGraph, &[String])>,
+) -> Result<String, ExportError> {
     let text = format!("{:?}", &*v.val);
     let mut p = DbgParser { s: &text, pos: 0 };
     let parsed = p.value().and_then(|x| {
@@ -424,7 +492,13 @@ pub(crate) fn encode_generic(v: &Val, threads: &ThreadNames) -> Result<String, E
         }
     });
     let mut out = String::new();
-    let rendered = parsed.and_then(|x| render_dbg(&x, threads, &mut out));
+    let rendered = parsed.and_then(|x| {
+        render_dbg(&x, threads, &mut out)?;
+        if let Some((g, roles)) = context {
+            check_payload(&x, g, roles)?;
+        }
+        Ok(())
+    });
     match rendered {
         Ok(()) => Ok(out),
         Err(DbgError::Unparsed(at)) => Err(ExportError::Unparsed {
@@ -436,6 +510,10 @@ pub(crate) fn encode_generic(v: &Val, threads: &ThreadNames) -> Result<String, E
             type_name: v.type_name.clone(),
             rendering: text,
             what: what.to_string(),
+        }),
+        Err(DbgError::PayloadThread(reason)) => Err(ExportError::PayloadThread {
+            type_name: v.type_name.clone(),
+            reason,
         }),
         Err(DbgError::Thread(reason)) => Err(ExportError::Thread {
             type_name: v.type_name.clone(),
@@ -541,6 +619,22 @@ pub(crate) fn checked_names(visible: &[String]) -> Result<Vec<String>, ExportErr
     Ok(names)
 }
 
+/// The union is independent of which identities an execution happens to send.
+pub(crate) fn declared_roles(
+    visible: &[String], payload: &[String],
+) -> Result<Vec<String>, ExportError> {
+    let mut roles = checked_names(visible)?;
+    let extra = checked_names(payload)?;
+    for name in extra {
+        if roles.contains(&name) {
+            return Err(ExportError::Names(format!("role is declared twice: {name:?}")));
+        }
+        roles.push(name);
+    }
+    roles.sort_unstable();
+    Ok(roles)
+}
+
 pub(crate) fn check_visible_graph(
     g: &ExecutionGraph,
     visible: &[String],
@@ -632,8 +726,10 @@ pub enum ExportError {
         rendering: String,
         what: String,
     },
-    /// A `ThreadId` with no role name in the run (G1-1).
+    /// An unnamed, unknown or genuinely conflicting `ThreadId` in the run (G1-1).
     Thread { type_name: String, reason: String },
+    /// A daemon or undeclared identity in a visible payload.
+    PayloadThread { type_name: String, reason: String },
     /// Two entries rendering one line: their `Debug` and `PartialEq` disagree (P3).
     Collision { line: String },
     /// The specification run did not exhaust.
@@ -758,6 +854,7 @@ where
     }
     let model = model_name(cc.config.cons_type)?;
     let names = checked_names(&cc.visible)?;
+    let roles = declared_roles(&names, &cc.payload_names)?;
     let program: Arc<dyn Fn() + Send + Sync> = Arc::new(program);
     let mut config = cc.config.clone();
     config.max_iterations = None;
@@ -770,11 +867,14 @@ where
         Shape::default(),
     )));
     let refusal = Rc::new(RefCell::new(None));
+    let payload_refusal = Rc::new(RefCell::new(None));
     let sink: CompletionSink = {
         let refusal = Rc::clone(&refusal);
+        let payload_refusal = Rc::clone(&payload_refusal);
         let state = Rc::clone(&state);
         let probe = Rc::clone(&probe);
         let visible = cc.visible.clone();
+        let roles = roles.clone();
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
             if let Err(e) = check_visible_graph(g, &visible) {
                 *refusal.borrow_mut() = Some(e);
@@ -784,6 +884,9 @@ where
             let blocked = g.check_blocked().is_some();
             let t = Instant::now();
             let s = CompactSummary::at_completion(g, &visible, "specification");
+            if let Err(e) = check_payloads(&s.sig, g, &visible, &roles) {
+                payload_refusal.borrow_mut().get_or_insert(e);
+            }
             let mut st = state.borrow_mut();
             st.0.insert(&s);
             record_thread_names(g, &mut st.1);
@@ -843,6 +946,10 @@ where
         let (v, b, m, p) = Shape::summary_counts(sig, ord, &names, line.len());
         shape.add_summary_counts(v, b, m, p);
         sorted.push(line);
+    }
+    // Preserve legacy encoding errors, including conflicts learned later in the run.
+    if let Some(e) = payload_refusal.borrow_mut().take() {
+        return Err(e);
     }
     // `SORTED-JOIN`: the lines in byte order, as `export --threads N` writes
     // them, so `conf-join --merge` can read either file as a sorted stream. Two

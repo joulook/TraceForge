@@ -37,7 +37,7 @@ use crate::conformance::compact::{CompactSummary, SigHash};
 use crate::conformance::config::{ConfConfig, IndexKind};
 use crate::conformance::ctx::{ConfCtx, ConfMode, DiagnosticReason, SinkVerdict};
 use crate::conformance::interchange::{
-    encode_generic, header_line, line_of, model_name, record_thread_names,
+    encode_declared, header_line, line_of, model_name, record_thread_names,
     ExportError, ExportHeader, ExportStats, ThreadNames,
 };
 use crate::conformance::measure::Shape;
@@ -161,10 +161,13 @@ fn line_of_graph(
     g: &ExecutionGraph,
     s: &CompactSummary,
     names: &[String],
+    roles: &[String],
 ) -> Result<String, ExportError> {
     let mut threads = ThreadNames::new();
     record_thread_names(g, &mut threads);
-    line_of(&s.sig, &s.ord, names, &|v| encode_generic(v, &threads)).map_err(|e| match e {
+    line_of(&s.sig, &s.ord, names, &|v| {
+            encode_declared(v, &threads, Some((g, roles)))
+        }).map_err(|e| match e {
         ExportError::Thread { type_name, reason } => ExportError::Thread {
             type_name,
             reason: reason.replace("thread of the run", "thread of this graph"),
@@ -230,6 +233,7 @@ where
     }
     let model = model_name(cc.config.cons_type)?;
     let names = super::interchange::checked_names(&cc.visible)?;
+    let roles = super::interchange::declared_roles(&names, &cc.payload_names)?;
     crate::conformance::assert_config_in_scope(&cc.config, "export");
     let mut config = cc.config.clone();
     config.max_iterations = None;
@@ -251,6 +255,7 @@ where
         let config = config.clone();
         let visible = cc.visible.clone();
         let names = names.clone();
+        let roles = roles.clone();
         let shared = Arc::clone(&shared);
         Arc::new(move |must: &mut Must| {
             WORKER.with(|w| {
@@ -267,6 +272,7 @@ where
             );
             let visible = visible.clone();
             let names = names.clone();
+            let roles = roles.clone();
             let shared = Arc::clone(&shared);
             ctx.set_sink(Box::new(move |g, _state| {
                 if shared.cancel.is_cancelled() {
@@ -288,7 +294,7 @@ where
                     return SinkVerdict::Stop;
                 }
                 let s = CompactSummary::at_completion(g, &visible, "specification");
-                let line = match line_of_graph(g, &s, &names) {
+                let line = match line_of_graph(g, &s, &names, &roles) {
                     Ok(line) => line,
                     Err(e) => {
                         shared.refuse(e);

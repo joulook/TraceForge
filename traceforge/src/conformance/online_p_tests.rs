@@ -1267,9 +1267,25 @@ fn po3_spec_refusals() {
 // PO-1.4: per-graph names
 // =========================================================================
 
+fn spec_names<P: Fn() + Send + Sync + 'static>(visible: &[&str], path: &Path, p: P) {
+    let mut config = cc(visible, Engine::SverifyP);
+    config.payload_names = vis(&["a", "b"]);
+    export_partitioned_with(&config, p, &header("spec"), path, ExportPSeams::default())
+        .unwrap_or_else(|e| panic!("conformance: PO: names specification: {e}"));
+}
+
+fn par_names<P: Fn() + Send + Sync + 'static>(
+    visible: &[&str], spec: &Path, out: Option<&Path>, seams: OnlinePSeams, p: P,
+) -> OnlinePRun {
+    super::online_p::online_partitioned_roles(
+        &config(0), 2, &vis(visible), Arc::new(p), spec, out.map(out_of), seams,
+        &vis(&["a", "b"]),
+    ).unwrap_or_else(|e| panic!("conformance: PO: names online: {e}"))
+}
+
 fn names_spec(d: &Path) -> PathBuf {
     let s = d.join("spec.jsonl");
-    spec_par(&["v"], &s, names_fixture);
+    spec_names(&["v"], &s, names_fixture);
     let ls = lines_of(&s);
     assert_eq!(ls.len(), 2, "conformance: PO: the spec's lines: {ls:?}");
     s
@@ -1294,7 +1310,7 @@ fn po4_names_one_worker() {
     let d = dir("po4a");
     let s = names_spec(&d);
     let o = d.join("o.jsonl");
-    let r = par(&["v"], &s, Some(&o), OnlinePSeams::default(), names_fixture);
+    let r = par_names(&["v"], &s, Some(&o), OnlinePSeams::default(), names_fixture);
     assert_eq!(
         r.max_worker_lines, 2,
         "conformance: PO: one worker before a flush"
@@ -1313,7 +1329,7 @@ fn po4_names_one_worker() {
     assert_eq!(lines_of(&o), lines_of(&s), "conformance: PO: the lines");
     let a = d.join("a.jsonl");
     only(&s, "a", &a);
-    let r = par(&["v"], &a, None, OnlinePSeams::default(), names_fixture);
+    let r = par_names(&["v"], &a, None, OnlinePSeams::default(), names_fixture);
     assert_eq!(
         counters(&r.report),
         (2, 1, 1, 0, 1, 1),
@@ -1331,7 +1347,7 @@ fn po4_names_across_a_flush() {
     let mut seams = OnlinePSeams::default();
     seams.flush_entries = Some(1);
     let o = d.join("o.jsonl");
-    let r = par(&["v"], &s, Some(&o), seams, names_fixture);
+    let r = par_names(&["v"], &s, Some(&o), seams, names_fixture);
     assert_eq!(r.max_worker_lines, 1, "conformance: PO: a flush between");
     assert_eq!(
         counters(&r.report),
@@ -1347,12 +1363,12 @@ fn po4_names_across_workers() {
     let s = d.join("spec.jsonl");
     let seen0 = Arc::new(Mutex::new(HashSet::new()));
     let s0 = Arc::clone(&seen0);
-    spec_par(&["v"], &s, move || names_tasks_fixture(Arc::clone(&s0)));
+    spec_names(&["v"], &s, move || names_tasks_fixture(Arc::clone(&s0)));
     assert_eq!(lines_of(&s).len(), 2, "conformance: PO: the spec's lines");
     let seen = Arc::new(Mutex::new(HashSet::new()));
     let s2 = Arc::clone(&seen);
     let o = d.join("o.jsonl");
-    let r = par(&["v"], &s, Some(&o), OnlinePSeams::default(), move || {
+    let r = par_names(&["v"], &s, Some(&o), OnlinePSeams::default(), move || {
         names_tasks_fixture(Arc::clone(&s2))
     });
     assert_eq!(
@@ -1377,7 +1393,7 @@ fn po4_names_across_workers() {
     let aa = d.join("a.jsonl");
     only(&s, "a", &aa);
     let seen = Arc::new(Mutex::new(HashSet::new()));
-    let r = par(&["v"], &aa, None, OnlinePSeams::default(), move || {
+    let r = par_names(&["v"], &aa, None, OnlinePSeams::default(), move || {
         names_tasks_fixture(Arc::clone(&seen))
     });
     assert_eq!(

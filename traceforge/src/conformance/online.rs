@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use crate::conformance::compact::{CompactSummary, Covers, SetIndex};
 use crate::conformance::ctx::{CompletionSink, ConfMode, DiagnosticReason, SinkVerdict};
 use crate::conformance::interchange::{
-    encode_generic, json_string, line_of, model_name, parse_line, read_file, record_thread_names,
+    encode_declared, json_string, line_of, model_name, parse_line, read_file, record_thread_names,
     write_replacing, Enumeration, ExportHeader, FileHead, ThreadNames,
 };
 use crate::conformance::measure::Shape;
@@ -95,6 +95,7 @@ pub(crate) struct OnlineOut {
 
 /// The settings of one online run besides the program.
 pub(crate) struct OnlineOpts {
+    pub(crate) payload_names: Vec<String>,
     pub(crate) mode: Mode,
     /// `Config::max_iterations` for the exploration.
     pub(crate) budget: Option<u64>,
@@ -121,6 +122,7 @@ pub(crate) struct OnlineOpts {
 impl OnlineOpts {
     pub(crate) fn new(mode: Mode, budget: Option<u64>, out: Option<OnlineOut>) -> Self {
         OnlineOpts {
+            payload_names: Vec::new(),
             mode,
             budget,
             out,
@@ -370,6 +372,7 @@ fn step_of(
     g: &ExecutionGraph,
     visible: &[String],
     names: &[String],
+    roles: &[String],
     threads: &mut ThreadNames,
     index: &SetIndex,
     keep_lines: bool,
@@ -398,9 +401,12 @@ fn step_of(
     let cs = CompactSummary::at_completion(g, visible, "implementation");
     record_thread_names(g, threads);
     let threads: &ThreadNames = threads;
-    let text = match line_of(&cs.sig, &cs.ord, names, &|v| encode_generic(v, threads)) {
+    let text = match line_of(&cs.sig, &cs.ord, names, &|v| {
+        encode_declared(v, threads, Some((g, roles)))
+    }) {
         Ok(t) => t,
         Err(e) => {
+            probe.refused = matches!(&e, super::interchange::ExportError::PayloadThread { .. });
             probe.summarise = t.elapsed();
             return (Step::Failed(e.to_string()), probe);
         }
@@ -537,6 +543,8 @@ pub(crate) fn online(
 ) -> Result<OnlineReport, OnlineError> {
     let names = super::interchange::checked_names(visible)
         .map_err(|e| OnlineError::Spec(e.to_string()))?;
+    let roles = super::interchange::declared_roles(&names, &opts.payload_names)
+        .map_err(|e| OnlineError::Spec(e.to_string()))?;
     // `B` (MEAS-1 K4): `index_ms` is the file read and the inserts.
     let index_started = Instant::now();
     let file = read_file(spec_path).map_err(|e| OnlineError::Spec(e.0))?;
@@ -601,6 +609,7 @@ pub(crate) fn online(
         let state = Arc::clone(&state);
         let visible = visible.to_vec();
         let names = names.clone();
+        let roles = roles.clone();
         std::thread::Builder::new()
             .name("online".to_string())
             .spawn(move || {
@@ -621,6 +630,7 @@ pub(crate) fn online(
                         g,
                         &sink_visible,
                         &names,
+                        &roles,
                         &mut threads,
                         &index,
                         keep_lines,

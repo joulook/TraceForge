@@ -3036,7 +3036,8 @@ impl fmt::Display for interchange::ExportError {
                 f,
                 "a value of type `{type_name}` holds {what}, which the format refuses: {rendering}"
             ),
-            E::Thread { type_name, reason } => write!(
+            E::Thread { type_name, reason }
+            | E::PayloadThread { type_name, reason } => write!(
                 f,
                 "a value of type `{type_name}` holds a thread identity without a role name: \
                  {reason}"

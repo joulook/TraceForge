@@ -280,6 +280,7 @@ impl ConfigError {
 pub struct ConfConfig {
     pub(crate) config: crate::Config,
     pub(crate) visible: Vec<String>,
+    pub(crate) payload_names: Vec<String>,
     pub(crate) search_budget: usize,
     pub(crate) stop_at_first_report: bool,
     pub(crate) triage: bool,
@@ -445,6 +446,7 @@ impl ConfConfig {
 pub struct ConfBuilder {
     config: crate::Config,
     visible: Vec<String>,
+    payload_names: Vec<String>,
     search_budget: usize,
     stop_at_first_report: bool,
     triage: bool,
@@ -483,6 +485,7 @@ impl ConfBuilder {
         Self {
             config: crate::Config::default(),
             visible: Vec::new(),
+            payload_names: Vec::new(),
             search_budget: DEFAULT_SEARCH_BUDGET,
             // §7.4: the draft's report-and-continue.
             stop_at_first_report: false,
@@ -757,6 +760,16 @@ impl ConfBuilder {
         self
     }
 
+    /// Invisible threads whose identities may occur in visible payloads, on both sides.
+    pub fn payload_names<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.payload_names = names.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn cons_type(mut self, t: ConsType) -> Self {
         self.config.cons_type = t;
         self
@@ -825,6 +838,7 @@ impl ConfBuilder {
         Ok(ConfConfig {
             config,
             visible: self.visible,
+            payload_names: self.payload_names,
             search_budget: self.search_budget,
             stop_at_first_report: self.stop_at_first_report,
             triage: self.triage,

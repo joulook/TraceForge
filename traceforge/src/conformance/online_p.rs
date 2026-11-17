@@ -35,7 +35,7 @@ use crate::conformance::compact::{
 use crate::conformance::ctx::{ConfCtx, ConfMode, DiagnosticReason, SinkVerdict};
 use crate::conformance::export_p::write_lines;
 use crate::conformance::interchange::{
-    encode_generic, line_of, model_name, parse_line, read_file, record_thread_names,
+    encode_declared, line_of, model_name, parse_line, read_file, record_thread_names,
     Enumeration, ThreadNames,
 };
 use crate::conformance::measure::Shape;
@@ -201,6 +201,7 @@ fn step(
     g: &ExecutionGraph,
     visible: &[String],
     names: &[String],
+    roles: &[String],
     shared: &Shared,
     started: Instant,
     flush_entries: usize,
@@ -250,9 +251,14 @@ fn step(
         let cs = CompactSummary::at_completion(g, visible, "implementation");
         let mut threads = ThreadNames::new();
         record_thread_names(g, &mut threads);
-        let text = match line_of(&cs.sig, &cs.ord, names, &|v| encode_generic(v, &threads)) {
+        let text = match line_of(&cs.sig, &cs.ord, names, &|v| {
+            encode_declared(v, &threads, Some((g, roles)))
+        }) {
             Ok(t) => t,
             Err(e) => {
+                if matches!(&e, super::interchange::ExportError::PayloadThread { .. }) {
+                    shared.refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 w.acc.summarise += t.elapsed();
                 return fail(
                     e.to_string()
@@ -346,7 +352,22 @@ pub(crate) fn online_partitioned_with(
     out: Option<OnlineOut>,
     seams: OnlinePSeams,
 ) -> Result<OnlinePRun, OnlineError> {
+    online_partitioned_roles(config, threads, visible, imp, spec_path, out, seams, &[])
+}
+
+pub(crate) fn online_partitioned_roles(
+    config: &Config,
+    threads: usize,
+    visible: &[String],
+    imp: Arc<dyn Fn() + Send + Sync>,
+    spec_path: &Path,
+    out: Option<OnlineOut>,
+    seams: OnlinePSeams,
+    payload_names: &[String],
+) -> Result<OnlinePRun, OnlineError> {
     let names = super::interchange::checked_names(visible)
+        .map_err(|e| OnlineError::Spec(e.to_string()))?;
+    let roles = super::interchange::declared_roles(&names, payload_names)
         .map_err(|e| OnlineError::Spec(e.to_string()))?;
     let index_started = Instant::now();
     let file = read_file(spec_path).map_err(|e| OnlineError::Spec(e.0))?;
@@ -416,6 +437,7 @@ pub(crate) fn online_partitioned_with(
         let config = run_config.clone();
         let visible = visible.to_vec();
         let names = names.clone();
+        let roles = roles.clone();
         let shared = Arc::clone(&shared);
         let seams = seams.clone();
         Arc::new(move |must: &mut Must| {
@@ -441,10 +463,11 @@ pub(crate) fn online_partitioned_with(
             );
             let visible = visible.clone();
             let names = names.clone();
+            let roles = roles.clone();
             let shared = Arc::clone(&shared);
             let seams = seams.clone();
             ctx.set_sink(Box::new(move |g, _state| {
-                step(g, &visible, &names, &shared, started, flush_entries, &seams)
+                step(g, &visible, &names, &roles, &shared, started, flush_entries, &seams)
             }));
             must.enable_conformance_partitioned(ctx);
         })
