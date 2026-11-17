@@ -189,6 +189,7 @@ thread_local! {
 /// implementation side's per-completion counters.
 #[derive(Default)]
 struct Tally {
+    summarised: (usize, usize),
     flushes: usize,
     flush_entries: usize,
     worker_duplicates: usize,
@@ -222,6 +223,8 @@ struct PhaseAcc {
 impl PhaseAcc {
     fn add(&mut self, t: Tally) {
         let a = &mut self.tally;
+        a.summarised.0 += t.summarised.0;
+        a.summarised.1 += t.summarised.1;
         a.flushes += t.flushes;
         a.flush_entries += t.flush_entries;
         a.worker_duplicates += t.worker_duplicates;
@@ -463,6 +466,11 @@ fn phase(
                     let mut w = w.borrow_mut();
                     let w = w.as_mut().expect("conformance: sverify-p's worker is set");
                     let table = w.table.as_ref().expect("conformance: sverify-p's table");
+                    if g.check_blocked().is_some() {
+                        w.tally.summarised.1 += 1;
+                    } else {
+                        w.tally.summarised.0 += 1;
+                    }
                     w.tally.lookups += 1;
                     let mut tests = 0;
                     let covered = match table.resolve(s.hash, &s.sig, &mut tests) {
@@ -815,6 +823,7 @@ pub(crate) fn run_with(
     counters.impl_tasks = imp.tasks;
     counters.impl_tasks_nonempty = imp.tasks_nonempty;
     counters.impl_flushes = t.flushes;
+    counters.summarised = t.summarised;
     counters.impl_complete = imp.complete;
     counters.impl_blocked = imp.blocked;
     counters.impl_graphs = imp.graphs;

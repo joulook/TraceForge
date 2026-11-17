@@ -144,6 +144,8 @@ const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS�
     (EVAL_ROW, EVAL_COMMIT)\n       \
     <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]] \
     [--budget N] [--model …] [--seed N] [--threshold N] [--dump-large-graph] [ARGS…]\n\
+    \n--audit-graphs (export or online, any thread count): exact canonical graph audit.\n\
+    Retains graphs; diagnostic only, not for timed rows.\n\
     \n--witness PATH (online or conf --engine stateful, --threads 1): write the first\n\
     uncovered execution to a file, or one per distinct summary to PATH ending in /.\n\
     Witnesses publish at run end; refusal discards staging and preserves existing files.\n\
@@ -162,6 +164,7 @@ struct Opts {
     distinct: bool,
     out: Option<String>,
     witness: Option<String>,
+    graph_audit: crate::conformance::graph_audit::OptionalAudit,
     program: Option<String>,
     size: Option<String>,
     spec: Option<String>,
@@ -181,6 +184,7 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
         distinct: false,
         out: None,
         witness: None,
+        graph_audit: None,
         program: None,
         size: None,
         spec: None,
@@ -223,6 +227,9 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
             }
             "--stop-at-first" => o.stop_at_first = true,
             "--distinct" => o.distinct = true,
+            "--audit-graphs" => {
+                o.graph_audit = Some(Default::default());
+            }
             "--witness" => o.witness = Some(value()?),
             "--out" => o.out = Some(value()?),
             "--program" => o.program = Some(value()?),
@@ -247,6 +254,9 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
 }
 
 fn check_witness(cmd: &str, o: &Opts) -> Result<(), String> {
+    if o.graph_audit.is_some() && !matches!(cmd, "export" | "online") {
+        return Err("--audit-graphs requires export or online; not for timed rows".to_owned());
+    }
     if o.witness.is_none() {
         return Ok(());
     }
@@ -270,7 +280,9 @@ fn config_of(o: &Opts) -> Config {
     if let Some(t) = o.threshold {
         b = b.with_thread_threshold(t);
     }
-    b.with_dump_large_graph(o.dump_large_graph).build()
+    let mut config = b.with_dump_large_graph(o.dump_large_graph).build();
+    config.graph_audit = o.graph_audit.clone();
+    config
 }
 
 /// `count`'s configuration. Plain Must explores past an assertion failure, as
@@ -448,6 +460,13 @@ fn run_named_roles(
             // A refusal before the run (`NotSet`, `Model`) prints no block.
             if !matches!(r, Err(ExportError::NotSet) | Err(ExportError::Model(_))) {
                 *block = measure::of_export(&r, side, started.elapsed().as_millis()).render();
+                if r.is_ok() {
+                    if let Some(warning) =
+                        crate::conformance::graph_audit::append(&o.graph_audit, block)
+                    {
+                        eprintln!("{warning}");
+                    }
+                }
             }
             match r {
                 Ok(s) => (
@@ -531,7 +550,7 @@ fn run_named_roles(
                 "--seed",
                 "--threshold",
             ];
-            let flags = ["--stop-at-first", "--dump-large-graph"];
+            let flags = ["--stop-at-first", "--dump-large-graph", "--audit-graphs"];
             if let Some(a) = foreign_option(&args[1..], &valued, &flags) {
                 return fail(format!("online does not take `{a}`"));
             }
@@ -599,6 +618,11 @@ fn run_named_roles(
             match r {
                 Ok(r) => {
                     *block = measure::of_online(&r, started.elapsed().as_millis()).render();
+                    if let Some(warning) =
+                        crate::conformance::graph_audit::append(&o.graph_audit, block)
+                    {
+                        eprintln!("{warning}");
+                    }
                     (r.render(), r.exit_code())
                 }
                 Err(e) => fail(format!("online refused: {e}")),

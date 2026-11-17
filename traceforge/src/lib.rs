@@ -305,6 +305,8 @@ fn is_false(value: &bool) -> bool {
 /// Use the [`ConfigBuilder`] class to construct a `Config` struct.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub(crate) graph_audit: conformance::graph_audit::OptionalAudit,
     pub(crate) stack_size: usize,
     pub(crate) progress_report: usize,
     pub(crate) thread_threshold: u32,
@@ -386,6 +388,7 @@ impl Default for ConfigBuilder {
 impl ConfigBuilder {
     pub fn new() -> Self {
         ConfigBuilder(Config {
+            graph_audit: None,
             stack_size: 0x8000,
             progress_report: 0,
             thread_threshold: 1000,

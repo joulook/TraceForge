@@ -886,7 +886,9 @@ where
         let payload_refusal = Rc::clone(&payload_refusal);
         let state = Rc::clone(&state);
         let probe = Rc::clone(&probe);
+        let audit = cc.config.graph_audit.clone();
         let visible = cc.visible.clone();
+        let names = names.clone();
         let roles = roles.clone();
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
             if let Err(e) = check_roles_graph(g, &visible, &roles) {
@@ -905,6 +907,8 @@ where
             record_thread_names(g, &mut st.1);
             st.2 += 1;
             let mut pr = probe.borrow_mut();
+            // Word lengths need no encoding; payload names are resolved after enumeration.
+            pr.3.add_summary(&s, &names, 0);
             pr.0 += t.elapsed();
             if blocked {
                 pr.2 += 1;
@@ -912,6 +916,7 @@ where
                 pr.1 += 1;
             }
             pr.3.add_graph_counts(events, messages);
+            super::graph_audit::record(&audit, g, &visible);
             SinkVerdict::Continue
         })
     };
@@ -956,8 +961,7 @@ where
     let mut sorted: Vec<String> = Vec::with_capacity(index.stats().entries);
     for (_, sig, _, ord) in index.entries() {
         let line = line_of(sig, ord, &names, &|v| encode_generic(v, threads))?;
-        let (v, b, m, p) = Shape::summary_counts(sig, ord, &names, line.len());
-        shape.add_summary_counts(v, b, m, p);
+        shape.add_summary_bytes(line.len());
         sorted.push(line);
     }
     // Preserve legacy encoding errors, including conflicts learned later in the run.

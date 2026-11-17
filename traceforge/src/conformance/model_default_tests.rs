@@ -127,7 +127,7 @@ fn md_count() {
             "conformance: MD: {what}"
         );
         assert_eq!(
-            key(&block, "graphs_complete"),
+            key(&block, "impl_complete"),
             n.to_string(),
             "conformance: MD: {what}: the block"
         );

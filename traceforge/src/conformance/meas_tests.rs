@@ -193,12 +193,11 @@ fn mean3(sum: usize, n: usize) -> String {
     format!("{:.3}", sum as f64 / n as f64)
 }
 
-/// Σ over the threads of their label counts (MEAS-1's graph events), max and
-/// mean over `gs`.
+/// Witness event counts over the kept executions, maximum and mean.
 fn graph_events(gs: &[ExecutionGraph]) -> (String, String) {
     let ev: Vec<usize> = gs
         .iter()
-        .map(|g| g.thread_ids().into_iter().map(|t| g.thread_size(t)).sum())
+        .map(|g| super::execution_witness::counts(g).0 as usize)
         .collect();
     (
         s(ev.iter().max().copied().unwrap_or(0)),
@@ -331,8 +330,8 @@ fn k1_conformance(engine: &str, c: &HashMap<String, String>) -> Vec<(&'static st
         ("lookup_ms", s("")),
         ("export_ms", s("0")),
         ("join_ms", s("0")),
-        ("graphs_complete", cell(c, "impl_complete")),
-        ("graphs_blocked", cell(c, "impl_blocked")),
+        ("graphs_complete", if parallel { cell(c, "impl_complete") } else { s("") }),
+        ("graphs_blocked", if parallel { cell(c, "impl_blocked") } else { s("") }),
         ("spec_complete", cell(c, "spec_complete")),
         ("spec_blocked", cell(c, "spec_blocked")),
         ("impl_complete", cell(c, "impl_complete")),
@@ -395,8 +394,8 @@ fn k1_explore(explore_p: bool, c: &HashMap<String, String>, xbase: &str) -> Vec<
         ("peak_rss_kb", cell(c, "vm_hwm_kb_after")),
         ("mean_graph_events", s("")),
         ("max_message_events", s("")),
-        ("max_visible_events", s("0")),
-        ("mean_visible_events", s("0.000")),
+        ("max_visible_events", s("")),
+        ("mean_visible_events", s("")),
         ("max_summary_bytes", s("0")),
         ("max_porf_count", s("0")),
         ("max_porf_pairs", s("0")),
@@ -408,8 +407,8 @@ fn k1_explore(explore_p: bool, c: &HashMap<String, String>, xbase: &str) -> Vec<
         v.extend([
             ("spec_phase_ms", cell(c, "spec_wall_time_ms")),
             ("impl_phase_ms", cell(c, "impl_wall_time_ms")),
-            ("graphs_complete", cell(c, "impl_complete")),
-            ("graphs_blocked", cell(c, "impl_blocked")),
+            ("graphs_complete", s("")),
+            ("graphs_blocked", s("")),
             ("spec_complete", cell(c, "spec_complete")),
             ("spec_blocked", cell(c, "spec_blocked")),
             ("impl_complete", cell(c, "impl_complete")),
@@ -419,13 +418,13 @@ fn k1_explore(explore_p: bool, c: &HashMap<String, String>, xbase: &str) -> Vec<
         v.extend([
             ("spec_phase_ms", s("0")),
             ("impl_phase_ms", cell(c, "wall_ms")),
-            ("graphs_complete", s(x["execs"])),
-            ("graphs_blocked", s(x["block"])),
+            ("graphs_complete", s("")),
+            ("graphs_blocked", s("")),
             ("spec_complete", s("0")),
             ("spec_blocked", s("0")),
             ("impl_complete", s(x["execs"])),
             ("impl_blocked", s(x["block"])),
-            ("max_graph_events", s(x["max_graph_events"])),
+            ("max_graph_events", s("")),
         ]);
     }
     v
@@ -535,9 +534,10 @@ fn b_k1_row_blocks() {
                 ("impl_complete", s(24)),
                 ("impl_blocked", s(0)),
             ]);
-            assert!(b.n("max_graph_events") > 0, "conformance: B: K1: ExploreP's max_graph_events");
+            b.expect(&[("max_graph_events", s(""))]);
         } else {
-            b.expect(&[("iterations", s(24)), ("graphs_complete", s(24)), ("graphs_blocked", s(0))]);
+            b.expect(&[("iterations", s(24)), ("graphs_complete", s("")),
+                ("graphs_blocked", s(""))]);
         }
         note!("K1\t{label}\t{}", text.replace('\n', " | "));
     }
@@ -912,7 +912,7 @@ fn b_k4_online_blocks() {
                 b.expect(&[
                     ("max_graph_events", gmax),
                     ("mean_graph_events", gmean),
-                    ("graphs_complete", s(lookups + 1)),
+                    ("graphs_complete", s(lookups)),
                     ("max_summary_bytes", s(327)),
                     ("mean_visible_events", s("6.000")),
                 ]);
@@ -952,14 +952,14 @@ fn b_k5_count_blocks() {
         let explore = s(b.n("explore_ms"));
         let (es, ei) = if side == "spec" { (explore, s(0)) } else { (s(0), explore) };
         b.expect(&[
-            ("graphs_complete", s(stats.execs)),
-            ("graphs_blocked", s(stats.block)),
+            ("graphs_complete", s("")),
+            ("graphs_blocked", s("")),
             ("iterations", s(stats.execs + stats.block)),
-            ("max_graph_events", s(stats.max_graph_events)),
+            ("max_graph_events", s("")),
             ("mean_graph_events", s("")),
             ("max_message_events", s("")),
-            ("max_visible_events", s(0)),
-            ("mean_visible_events", s("0.000")),
+            ("max_visible_events", s("")),
+            ("mean_visible_events", s("")),
             ("max_summary_bytes", s(0)),
             ("max_porf_count", s(0)),
             ("max_porf_pairs", s(0)),

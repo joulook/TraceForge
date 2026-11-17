@@ -49,8 +49,6 @@ use crate::parallel_verify::{verify_partitioned_rayon_with, CancelToken, Partiti
 #[derive(Clone, Copy)]
 struct Record {
     hash: SigHash,
-    /// `Shape::summary_counts` of the line.
-    counts: (u128, u128, u128, u128),
 }
 
 /// A thread's state for the `Must` it serves, kept across that `Must`'s tasks.
@@ -71,7 +69,7 @@ struct Acc {
     blocked: usize,
     errors: usize,
     summarise: Duration,
-    /// The graph counters only; the summary counters come from the merged lines.
+    /// Graph and summary counters over successful summarised executions.
     shape: Shape,
     /// The most lines a worker map held at a flush.
     max_worker_lines: usize,
@@ -274,6 +272,7 @@ where
             let names = names.clone();
             let roles = roles.clone();
             let shared = Arc::clone(&shared);
+            let audit = config.graph_audit.clone();
             ctx.set_sink(Box::new(move |g, _state| {
                 if shared.cancel.is_cancelled() {
                     return SinkVerdict::Stop;
@@ -304,15 +303,11 @@ where
                 WORKER.with(|w| {
                     let mut w = w.borrow_mut();
                     let w = w.as_mut().expect("conformance: export-p's worker is set");
+                    let counts = Shape::summary_counts(&s.sig, &s.ord, &names, line.len());
                     let mut collision = None;
                     match w.lines.entry(line) {
                         Entry::Vacant(e) => {
-                            let bytes = e.key().len();
-                            let counts = Shape::summary_counts(&s.sig, &s.ord, &names, bytes);
-                            e.insert(Record {
-                                hash: s.hash,
-                                counts,
-                            });
+                            e.insert(Record { hash: s.hash });
                         }
                         Entry::Occupied(e) => {
                             if e.get().hash != s.hash {
@@ -328,6 +323,9 @@ where
                         w.acc.complete += 1;
                     }
                     w.acc.shape.add_graph_counts(events, messages);
+                    super::graph_audit::record(&audit, g, &visible);
+                    let (v, b, m, p) = counts;
+                    w.acc.shape.add_summary_counts(v, b, m, p);
                     if let Some(line) = collision {
                         shared.refuse(ExportError::Collision { line });
                         return SinkVerdict::Stop;
@@ -419,16 +417,12 @@ where
     lines.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let count = lines.len();
     let merged_bytes = lines.iter().map(|(l, _)| l.len()).sum();
-    let mut shape = acc.shape;
+    let shape = acc.shape;
     let text = header_line(header, &names, &roles, model);
     write_lines(
         path,
         &text,
-        lines.into_iter().map(|(line, r)| {
-            let (v, b, m, p) = r.counts;
-            shape.add_summary_counts(v, b, m, p);
-            line
-        }),
+        lines.into_iter().map(|(line, _)| line),
     )?;
     let export_ms = export_started.elapsed().as_millis();
     Ok(ExportPRun {

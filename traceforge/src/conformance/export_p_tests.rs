@@ -711,6 +711,49 @@ fn pe3_absent_thread() {
     }
 }
 
+#[test]
+fn sequential_export_resolves_later_thread_names_before_encoding() {
+    use crate::conformance::measure::{Cell, Measurements};
+
+    // Two executions each send Owner(t3); only one creates t3, named x2.
+    // Flipping the branch puts that creation before or after the absent execution.
+    // Both executions have one visible event and collapse to one exported line.
+    // Mutant: encode each completion against the names recorded so far.
+    let d = dir("later-thread-names");
+    let mut previous = None;
+    for present_when in [true, false] {
+        let path = d.join(format!("s{present_when}"));
+        let stats = export_with(
+            &cc(&["v"], Engine::Stateful, 0, DEFAULT_FLUSH, ConsType::Bag),
+            move || absent_fixture(present_when),
+            &header("later-thread-names"),
+            &path,
+            ExportSeams::default(),
+        ).unwrap_or_else(|e| panic!("conformance: sequential export: {e}"));
+        let (_, lines) = read_jsonl(&path);
+        let expected = concat!(
+            r#"{"statuses":{"v":"done"},"words":{"v":[{"s":{"t":"Owner","f":["x2"]}}]},"#,
+            r#""counts":[]}"#,
+        );
+        assert_eq!(lines, vec![expected], "conformance: final names determine the bytes");
+        assert_eq!(stats.graphs_complete, 2, "conformance: both executions count");
+        assert_eq!(stats.graphs_blocked, 0, "conformance: neither execution blocks");
+        let mut m = Measurements::new(false);
+        stats.shape.fill(&mut m, true, true);
+        assert_eq!(m.get("max_visible_events"), &Cell::N(1), "conformance: one send");
+        assert_eq!(m.get("mean_visible_events"), &Cell::Mean(1.0),
+            "conformance: visible counts are per execution");
+        // Mutants: omit final byte accounting; count a distinct line as another execution.
+        assert_eq!(m.get("max_summary_bytes"), &Cell::N(expected.len() as u128),
+            "conformance: bytes of the final encoded line, excluding its newline");
+        let bytes = std::fs::read(&path).expect("conformance: exported bytes");
+        if let Some(previous) = &previous {
+            assert_eq!(&bytes, previous, "conformance: branch order preserves the whole file");
+        }
+        previous = Some(bytes);
+    }
+}
+
 // =========================================================================
 // PE-1.4: X1
 // =========================================================================

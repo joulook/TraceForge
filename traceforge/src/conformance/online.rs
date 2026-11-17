@@ -305,15 +305,13 @@ impl State {
         mode: Mode,
     ) -> SinkVerdict {
         self.refused |= probe.refused;
-        if probe.blocked {
-            self.blocked += 1;
-        } else {
-            self.complete += 1;
-        }
-        // MEAS-1 K4: the shape counters run over the summarised graphs only; a
-        // completion that failed (an assertion, a refused value) is counted in
-        // `graphs_*` but not in the shape (the tester's gate-3 finding).
+        // Refused summaries contribute to iterations, but to no graph or shape counter.
         if let Some((visible, bytes, max, pairs)) = probe.summary {
+            if probe.blocked {
+                self.blocked += 1;
+            } else {
+                self.complete += 1;
+            }
             self.shape.add_graph_counts(probe.events, probe.messages);
             self.shape.add_summary_counts(visible, bytes, max, pairs);
         }
@@ -630,6 +628,7 @@ pub(crate) fn online(
                 let started = Instant::now();
                 let sink_state = Arc::clone(&state);
                 let sink_visible = visible.clone();
+                let audit = run_config.graph_audit.clone();
                 let sink: CompletionSink = Box::new(move |g: &ExecutionGraph, _: &MustState| {
                     // (1) the iteration, under the lock.
                     let iteration = lock(&sink_state).next_iteration();
@@ -655,6 +654,9 @@ pub(crate) fn online(
                         if let Err(e) = lock(writer).write(g, iteration, first) {
                             step.0 = Step::Failed(e);
                         }
+                    }
+                    if step.1.summary.is_some() {
+                        super::graph_audit::record(&audit, g, &sink_visible);
                     }
                     // (3) one locked update that cannot unwind.
                     lock(&sink_state).commit(step, iteration, mode)

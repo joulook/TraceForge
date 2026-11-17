@@ -258,6 +258,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod canon;
+pub(crate) mod graph_audit;
 pub(crate) mod cert;
 pub(crate) mod cfirst;
 pub(crate) mod cfirst_p;

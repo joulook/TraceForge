@@ -144,6 +144,10 @@ fn compare(f: &Fixture, s: &StatefulOutcome, p: &SverifyPOutcome, stop: bool) ->
     let mut bad = Vec::new();
     let c = &p.counters;
     let sc = &s.counters;
+    // A cancelled or refused completion must not enter the summary measurements.
+    if c.summarised.0 + c.summarised.1 != c.lookups {
+        bad.push("summarised graph classes differ from successful summary lookups".to_owned());
+    }
     macro_rules! eq {
         ($a:expr, $b:expr, $what:expr) => {
             if $a != $b {

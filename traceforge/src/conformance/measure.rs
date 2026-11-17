@@ -15,8 +15,6 @@ use crate::conformance::compact::{CompactSummary, OrdCounts};
 use crate::conformance::record::{GridEnd, GridEngine, GridRaw, Row};
 use crate::conformance::sig::Sig;
 use crate::conformance::{ConfError, ConfOutcome, ConfVerdict, Engine};
-use crate::event::Event;
-use crate::event_label::LabelEnum;
 use crate::exec_graph::ExecutionGraph;
 
 /// The block's keys, in order (MEAS-0.1). The three specification keys are
@@ -193,25 +191,9 @@ pub(crate) struct Shape {
 }
 
 impl Shape {
-    /// One graph's events (every label of every thread, Must's count) and
-    /// message events (sends and receives, inbox receives included, of all
-    /// threads).
+    /// Witness event lines and sends/receives over all threads.
     pub(crate) fn graph_counts(g: &ExecutionGraph) -> (u128, u128) {
-        let mut events = 0u128;
-        let mut messages = 0u128;
-        for t in g.thread_ids() {
-            let n = g.thread_size(t);
-            events += n as u128;
-            for i in 0..n {
-                if matches!(
-                    g.label(Event::new(t, i as u32)),
-                    LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_) | LabelEnum::Inbox(_)
-                ) {
-                    messages += 1;
-                }
-            }
-        }
-        (events, messages)
+        super::execution_witness::counts(g)
     }
 
     /// One summary's visible events (Σ of the words' lengths), its normal
@@ -265,6 +247,11 @@ impl Shape {
         self.max_porf_pairs = self.max_porf_pairs.max(pairs);
     }
 
+    /// Records encoded bytes without counting another summarised execution.
+    pub(crate) fn add_summary_bytes(&mut self, bytes: usize) {
+        self.max_summary_bytes = self.max_summary_bytes.max(bytes as u128);
+    }
+
     /// Another shape's counters into this one, as if counted here.
     pub(crate) fn merge(&mut self, o: &Shape) {
         self.graphs += o.graphs;
@@ -290,10 +277,10 @@ impl Shape {
     }
 
     /// Writes the graph counters (`graphs` true) and the summary counters
-    /// (`summaries` true); a mean over nothing is 0.
+    /// (`summaries` true); empty populations leave shared measurements empty.
     pub(crate) fn fill(&self, m: &mut Measurements, graphs: bool, summaries: bool) {
-        let mean = |sum: u128, n: u128| if n == 0 { 0.0 } else { sum as f64 / n as f64 };
-        if graphs {
+        let mean = |sum: u128, n: u128| sum as f64 / n as f64;
+        if graphs && self.graphs != 0 {
             m.n("max_graph_events", self.max_graph_events);
             m.set(
                 "mean_graph_events",
@@ -301,12 +288,14 @@ impl Shape {
             );
             m.n("max_message_events", self.max_message_events);
         }
-        if summaries {
+        if summaries && self.summaries != 0 {
             m.n("max_visible_events", self.max_visible_events);
             m.set(
                 "mean_visible_events",
                 Cell::Mean(mean(self.sum_visible_events, self.summaries)),
             );
+        }
+        if summaries {
             m.n("max_summary_bytes", self.max_summary_bytes);
             m.n("max_porf_count", self.max_porf_count);
             m.n("max_porf_pairs", self.max_porf_pairs);
@@ -361,6 +350,8 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
     m.zero(&["export_ms", "join_ms"]);
     m.set("first_miss_iteration", Cell::Empty);
     if baseline {
+        // Raw exploration has no summary measurements and permits operations
+        // outside canonical conformance enumeration, including repeated samples.
         let (spec_phase, impl_phase) = match engine {
             GridEngine::Explore => (Cell::N(0), num(row, "wall_ms")),
             _ => (num(row, "spec_wall_time_ms"), num(row, "impl_wall_time_ms")),
@@ -374,30 +365,23 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
             "summaries_distinct",
             "impl_summaries",
             "spec_summaries",
-            "max_visible_events",
             "max_summary_bytes",
             "max_porf_count",
             "max_porf_pairs",
             "precheck_ms",
             "merge_ms",
         ]);
-        m.set("mean_visible_events", Cell::Mean(0.0));
         let mut threshold = false;
         match raw {
             Some(GridRaw::Explore(s)) => {
                 threshold = s.threshold.is_some();
-                m.n("graphs_complete", s.execs as u128);
-                m.n("graphs_blocked", s.block as u128);
                 m.n("impl_complete", s.execs as u128);
                 m.n("impl_blocked", s.block as u128);
                 m.zero(&["spec_complete", "spec_blocked"]);
-                m.n("max_graph_events", s.max_graph_events as u128);
             }
             Some(GridRaw::ExploreP(r)) => {
                 threshold = r.spec.stats.threshold.is_some() || r.imp.stats.threshold.is_some();
                 for (k, c) in [
-                    ("graphs_complete", "impl_complete"),
-                    ("graphs_blocked", "impl_blocked"),
                     ("impl_complete", "impl_complete"),
                     ("impl_blocked", "impl_blocked"),
                     ("spec_complete", "spec_complete"),
@@ -405,12 +389,6 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
                 ] {
                     m.set(k, num(row, c));
                 }
-                let max = r
-                    .spec
-                    .stats
-                    .max_graph_events
-                    .max(r.imp.stats.max_graph_events);
-                m.n("max_graph_events", max as u128);
             }
             _ => {}
         }
@@ -455,18 +433,12 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
     ] {
         m.set(k, num(row, k));
     }
-    match (engine, raw) {
-        (GridEngine::Enumerator, Some(GridRaw::Enumerator(o))) => {
-            if let Some(s) = o.stats.as_ref() {
-                m.n("graphs_complete", s.execs as u128);
-                m.n("graphs_blocked", s.block as u128);
-                m.n("max_graph_events", s.max_graph_events as u128);
-            }
-        }
-        _ => {
-            m.set("graphs_complete", num(row, "impl_complete"));
-            m.set("graphs_blocked", num(row, "impl_blocked"));
-        }
+    // Only the partitioned stateful engine records successful summaries by
+    // completion class. Raw engine totals can include pruned or refused graphs.
+    if let Some(GridRaw::SverifyP(r)) = raw {
+        let c = &r.outcome.counters;
+        m.n("graphs_complete", c.summarised.0 as u128);
+        m.n("graphs_blocked", c.summarised.1 as u128);
     }
     let distinct = num(row, "impl_distinct_summaries");
     m.set("summaries_distinct", distinct.clone());
@@ -611,8 +583,8 @@ pub(crate) fn of_verdict(v: &Result<ConfVerdict, ConfError>) -> Measurements {
             if let Some(c) = o.counters.sverify_p.as_ref() {
                 m.n("spec_phase_ms", c.spec_wall_time_ms);
                 m.n("impl_phase_ms", c.impl_wall_time_ms);
-                m.n("graphs_complete", c.impl_complete as u128);
-                m.n("graphs_blocked", c.impl_blocked as u128);
+                m.n("graphs_complete", c.summarised.0 as u128);
+                m.n("graphs_blocked", c.summarised.1 as u128);
                 m.n("impl_complete", c.impl_complete as u128);
                 m.n("impl_blocked", c.impl_blocked as u128);
                 m.n("spec_complete", c.spec_complete as u128);
@@ -744,6 +716,9 @@ pub(crate) enum Side {
 
 /// K2 (`export`): from G1's export run (MEAS-1 K2); `Err` → `error` with only
 /// `wall_ms` and `peak_rss_kb` measured.
+// Completion counts equal distinct canonical graphs because enumeration is optimal.
+// For Boolean tosses the cross-lineage argument is not proven; the optional graph
+// audit checks this dependency on observed export and online runs.
 pub(crate) fn of_export(
     r: &Result<
         crate::conformance::interchange::ExportStats,
@@ -891,10 +866,9 @@ pub(crate) fn of_count(
     m.n("wall_ms", wall_ms);
     m.set("peak_rss_kb", opt(peak_rss_kb().map(u128::from)));
     m.n("explore_ms", explore_ms);
-    m.n("graphs_complete", stats.execs as u128);
-    m.n("graphs_blocked", stats.block as u128);
+    // Stats contains raw completions and label counts, not canonical graph or
+    // summarised-execution measurements. Keep those shared keys unmeasured.
     m.n("iterations", (stats.execs + stats.block) as u128);
-    m.n("max_graph_events", stats.max_graph_events as u128);
     m.stop(if stats.threshold.is_some() { Stop::Threshold } else { Stop::Exhausted });
     m.zero(&[
         "summarise_ms",
@@ -909,13 +883,11 @@ pub(crate) fn of_count(
         "summaries_distinct",
         "spec_summaries",
         "impl_summaries",
-        "max_visible_events",
         "max_summary_bytes",
         "max_porf_count",
         "max_porf_pairs",
         "uncovered_distinct",
     ]);
-    m.set("mean_visible_events", Cell::Mean(0.0));
     let (here, there) = match side {
         Side::Spec => (
             ["explore_spec_ms", "spec_complete", "spec_blocked"],
@@ -931,4 +903,30 @@ pub(crate) fn of_count(
     m.n(here[2], stats.block as u128);
     m.zero(&there);
     m
+}
+
+#[cfg(test)]
+mod population_tests {
+    use super::*;
+
+    #[test]
+    fn empty_population_preserves_unmeasured_shapes_and_tool_counters() {
+        // Mutant: fill any empty-population shared shape with numeric zero.
+        for (graphs, summaries) in [(true, true), (true, false), (false, true)] {
+            let mut m = Measurements::new(true);
+            Shape::default().fill(&mut m, graphs, summaries);
+            for key in ["max_graph_events", "mean_graph_events", "max_message_events",
+                "max_visible_events", "mean_visible_events"]
+            {
+                assert_eq!(m.get(key), &Cell::Empty,
+                    "conformance: empty population leaves {key} unmeasured");
+            }
+            if summaries {
+                for key in ["max_summary_bytes", "max_porf_count", "max_porf_pairs"] {
+                    assert_eq!(m.get(key), &Cell::N(0),
+                        "conformance: tool-specific zero convention for {key}");
+                }
+            }
+        }
+    }
 }

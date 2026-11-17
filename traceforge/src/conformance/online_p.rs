@@ -206,6 +206,7 @@ fn step(
     started: Instant,
     flush_entries: usize,
     seams: &OnlinePSeams,
+    audit: &super::graph_audit::OptionalAudit,
 ) -> SinkVerdict {
     let _ = seams;
     let fail = |msg: String| {
@@ -235,11 +236,6 @@ fn step(
             }
         }
         w.acc.iterations += 1;
-        if blocked {
-            w.acc.blocked += 1;
-        } else {
-            w.acc.complete += 1;
-        }
         if let Some(msg) = failed_assertion(g) {
             return fail(msg);
         }
@@ -271,7 +267,13 @@ fn step(
         });
         w.acc.summarise += t.elapsed();
         let (v, b, m, p) = Shape::summary_counts(&cs.sig, &cs.ord, names, line.len());
+        if blocked {
+            w.acc.blocked += 1;
+        } else {
+            w.acc.complete += 1;
+        }
         w.acc.shape.add_graph_counts(events, messages);
+        super::graph_audit::record(audit, g, visible);
         w.acc.shape.add_summary_counts(v, b, m, p);
 
         let t = Instant::now();
@@ -468,8 +470,9 @@ pub(crate) fn online_partitioned_roles(
             let roles = roles.clone();
             let shared = Arc::clone(&shared);
             let seams = seams.clone();
+            let audit = config.graph_audit.clone();
             ctx.set_sink(Box::new(move |g, _state| {
-                step(g, &visible, &names, &roles, &shared, started, flush_entries, &seams)
+                step(g, &visible, &names, &roles, &shared, started, flush_entries, &seams, &audit)
             }));
             must.enable_conformance_partitioned(ctx);
         })

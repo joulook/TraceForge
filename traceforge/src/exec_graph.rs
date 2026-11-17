@@ -18,7 +18,7 @@ use log::debug;
 /// Encapsulates the execution information about a single thread
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ThreadInfo {
-    tid: ThreadId,
+    pub(crate) tid: ThreadId,
     task_id: Option<TaskId>,
     tclab: TCreate,
     pub(crate) labels: Vec<LabelEnum>,

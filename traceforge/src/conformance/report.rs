@@ -927,6 +927,8 @@ impl UncoveredSummary {
 /// by multiplicity.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SverifyPCounters {
+    /// Successfully summarised implementation completions, complete then blocked.
+    pub(crate) summarised: (usize, usize),
     pub threads: usize,
     pub flush_entries: usize,
     pub iterations_until_split: usize,

@@ -121,6 +121,55 @@ fn emitted(l: &LabelEnum) -> bool {
     }
 }
 
+/// One printable event, including the main thread's implicit end.
+enum EventLine<'a> {
+    Label(Event, &'a LabelEnum),
+    End,
+}
+
+/// Classifies events without inspecting names or encoding payloads. Rendering
+/// and measurement share omissions, terminal suppression and the implicit end.
+fn event_lines(
+    g: &ExecutionGraph, tid: crate::ThreadId,
+) -> impl Iterator<Item = EventLine<'_>> {
+    let mut next = 0;
+    let mut ended = false;
+    let mut finished = false;
+    std::iter::from_fn(move || {
+        while next < g.thread_size(tid) {
+            let e = Event::new(tid, next as u32);
+            next += 1;
+            let label = g.label(e);
+            if !emitted(label) || (ended && matches!(label, LabelEnum::End(_))) {
+                continue;
+            }
+            ended |= matches!(label, LabelEnum::End(_) | LabelEnum::Block(_));
+            return Some(EventLine::Label(e, label));
+        }
+        if !finished && !ended && tid == crate::thread::main_thread_id() {
+            finished = true;
+            return Some(EventLine::End);
+        }
+        None
+    })
+}
+
+/// Witness event lines and sends/receives, even when text rendering would fail.
+/// No text, names, payload encoding or collection allocation is needed.
+pub(crate) fn counts(g: &ExecutionGraph) -> (u128, u128) {
+    let mut events = 0;
+    let mut messages = 0;
+    for thread in g.threads.iter() {
+        for line in event_lines(g, thread.tid) {
+            events += 1;
+            if matches!(line, EventLine::Label(_, LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_))) {
+                messages += 1;
+            }
+        }
+    }
+    (events, messages)
+}
+
 fn render(g: &ExecutionGraph, iteration: usize, line: &str) -> Result<String, String> {
     let tids: Vec<_> = g.thread_ids().into_iter().collect();
     let mut names = HashMap::new();
@@ -134,12 +183,9 @@ fn render(g: &ExecutionGraph, iteration: usize, line: &str) -> Result<String, St
         names.insert(tid, (t, name));
         // Invisible messages may carry daemon identities; their names are still printable.
         threads.insert(tid.to_number(), ThreadName::Named(name.to_owned()));
-        let mut k = 0;
-        for i in 0..g.thread_size(tid) {
-            let e = Event::new(tid, i as u32);
-            if emitted(g.label(e)) {
+        for (k, line) in event_lines(g, tid).enumerate() {
+            if let EventLine::Label(e, _) = line {
                 positions.insert(e, k);
-                k += 1;
             }
         }
     }
@@ -148,21 +194,18 @@ fn render(g: &ExecutionGraph, iteration: usize, line: &str) -> Result<String, St
         let (t, name) = names[&tid];
         let daemon = if g.is_thread_daemon(tid) { ", daemon" } else { "" };
         text.push_str(&format!("thread \"{name}\"[tid={t}{daemon}]:\n"));
-        let mut k = 0;
-        let mut ended = false;
-        for i in 0..g.thread_size(tid) {
-            let e = Event::new(tid, i as u32);
-            let event = match g.label(e) {
+        for (k, line) in event_lines(g, tid).enumerate() {
+            let label = match line {
+                EventLine::End => {
+                    text.push_str(&format!("\t({t}, {k}): END\n"));
+                    continue;
+                }
+                EventLine::Label(_, label) => label,
+            };
+            let event = match label {
                 LabelEnum::Begin(_) => "BEGIN".to_owned(),
-                LabelEnum::End(_) => {
-                    if ended { continue; }
-                    ended = true;
-                    "END".to_owned()
-                }
-                LabelEnum::Block(_) => {
-                    ended = true;
-                    "BLK".to_owned()
-                }
+                LabelEnum::End(_) => "END".to_owned(),
+                LabelEnum::Block(_) => "BLK".to_owned(),
                 LabelEnum::TCreate(c) => {
                     let (child, name) = names[&c.cid()];
                     format!("TCREATE({child}:\"{name}\")")
@@ -191,16 +234,12 @@ fn render(g: &ExecutionGraph, iteration: usize, line: &str) -> Result<String, St
                     }
                 },
                 LabelEnum::CToss(c) => format!("NONDET {}", usize::from(c.result())),
-                LabelEnum::Choice(c) if emitted(g.label(e)) => {
+                LabelEnum::Choice(c) => {
                     format!("NONDET {}", c.result() - c.range().start())
                 }
-                _ => continue,
+                _ => unreachable!("conformance: classified witness event has no renderer"),
             };
             text.push_str(&format!("\t({t}, {k}): {event}\n"));
-            k += 1;
-        }
-        if !ended && tid == crate::thread::main_thread_id() {
-            text.push_str(&format!("\t({t}, {k}): END\n"));
         }
     }
     Ok(text)
@@ -303,8 +342,10 @@ mod tests {
             "thread \"main\"[tid=0]:\n\t(0, 0): BEGIN\n",
             "\t(0, 1): NONDET 0\n\t(0, 2): END\n"
         ), "conformance: omitted labels consume no position");
+        assert_eq!(counts(&g), (3, 0), "conformance: BEGIN, NONDET and implicit END");
         g.add_label(LabelEnum::Block(Block::new(Event::new(tid, 5), BlockType::Assume)));
         assert!(render(&g, 9, "summary").unwrap().ends_with("\t(0, 2): BLK\n"),
             "conformance: blocked main has no end");
+        assert_eq!(counts(&g), (3, 0), "conformance: BLK replaces implicit END");
     }
 }
