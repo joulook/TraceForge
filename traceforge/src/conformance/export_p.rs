@@ -166,8 +166,8 @@ fn line_of_graph(
     let mut threads = ThreadNames::new();
     record_thread_names(g, &mut threads);
     line_of(&s.sig, &s.ord, names, &|v| {
-            encode_declared(v, &threads, Some((g, roles)))
-        }).map_err(|e| match e {
+        encode_declared(v, &threads, Some((g, roles)))
+    }).map_err(|e| match e {
         ExportError::Thread { type_name, reason } => ExportError::Thread {
             type_name,
             reason: reason.replace("thread of the run", "thread of this graph"),
@@ -289,7 +289,7 @@ where
                 let (events, messages) = Shape::graph_counts(g);
                 let blocked = g.check_blocked().is_some();
                 let t = Instant::now();
-                if let Err(e) = super::interchange::check_visible_graph(g, &visible) {
+                if let Err(e) = super::interchange::check_roles_graph(g, &visible, &roles) {
                     shared.refuse(e);
                     return SinkVerdict::Stop;
                 }
@@ -420,7 +420,7 @@ where
     let count = lines.len();
     let merged_bytes = lines.iter().map(|(l, _)| l.len()).sum();
     let mut shape = acc.shape;
-    let text = header_line(header, &names, model);
+    let text = header_line(header, &names, &roles, model);
     write_lines(
         path,
         &text,

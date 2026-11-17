@@ -40,8 +40,9 @@ impl Fixture {
     }
 
     fn file(&self, name: &str, mut lines: Vec<Value>) -> PathBuf {
-        let head = json!({"format":1,"tool":"traceforge","program":"req","size":"2",
-            "visible":["A","B"],"model":"p2p","enumeration":"complete","encoding":1});
+        let head = json!({"format":1,"minor":1,"tool":"traceforge","program":"req","size":"2",
+            "visible":["A","B"],"roles":["A","B"],
+            "model":"p2p","enumeration":"complete","encoding":1});
         // Merge order is the canonical statuses/words/counts order, not JSON map order.
         lines.sort_by_key(|v| format!("{}{}{}", v["statuses"], v["words"], v["counts"]));
         let mut text = format!("{head}\n");

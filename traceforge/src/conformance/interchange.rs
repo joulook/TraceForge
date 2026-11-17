@@ -635,22 +635,30 @@ pub(crate) fn declared_roles(
     Ok(roles)
 }
 
-pub(crate) fn check_visible_graph(
+fn check_named_graph(
     g: &ExecutionGraph,
     visible: &[String],
+    kind: &str,
 ) -> Result<(), ExportError> {
     for tid in g.thread_ids() {
         if g.is_thread_daemon(tid) {
             if let Some(n) = g.thread_name(tid) {
                 if visible.iter().any(|v| v == n) {
                     return Err(ExportError::Names(format!(
-                        "declared visible name is a daemon: {n:?}"
+                        "declared {kind} name is a daemon: {n:?}"
                     )));
                 }
             }
         }
     }
     Ok(())
+}
+
+pub(crate) fn check_roles_graph(
+    g: &ExecutionGraph, visible: &[String], roles: &[String],
+) -> Result<(), ExportError> {
+    check_named_graph(g, visible, "visible")?;
+    check_named_graph(g, roles, "payload-nameable")
 }
 
 // --------------------------------------------------------------- exporter --
@@ -752,14 +760,19 @@ pub fn model_name(c: ConsType) -> Result<&'static str, ExportError> {
     }
 }
 
-pub(crate) fn header_line(h: &ExportHeader, names: &[String], model: &str) -> String {
+pub(crate) fn header_line(
+    h: &ExportHeader, names: &[String], roles: &[String], model: &str,
+) -> String {
     let visible: Vec<String> = names.iter().map(|n| json_string(n)).collect();
+    let roles: Vec<String> = roles.iter().map(|n| json_string(n)).collect();
     format!(
-        "{{\"format\":1,\"tool\":\"traceforge\",\"program\":{},\"size\":{},\"visible\":[{}],\
-         \"model\":{},\"enumeration\":\"complete\",\"encoding\":1}}",
+        "{{\"format\":1,\"minor\":1,\"tool\":\"traceforge\",\"program\":{},\
+         \"size\":{},\"visible\":[{}],\
+         \"roles\":[{}],\"model\":{},\"enumeration\":\"complete\",\"encoding\":1}}",
         json_string(&h.program),
         json_string(&h.size),
         visible.join(","),
+        roles.join(","),
         json_string(model)
     )
 }
@@ -876,7 +889,7 @@ where
         let visible = cc.visible.clone();
         let roles = roles.clone();
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
-            if let Err(e) = check_visible_graph(g, &visible) {
+            if let Err(e) = check_roles_graph(g, &visible, &roles) {
                 *refusal.borrow_mut() = Some(e);
                 return SinkVerdict::Stop;
             }
@@ -939,7 +952,7 @@ where
     let (index, threads, graphs) = (&st.0, &st.1, st.2);
     let (summarise, complete, blocked, mut shape) = probe.borrow().clone();
     let export_started = Instant::now();
-    let text = header_line(header, &names, model);
+    let text = header_line(header, &names, &roles, model);
     let mut sorted: Vec<String> = Vec::with_capacity(index.stats().entries);
     for (_, sig, _, ord) in index.entries() {
         let line = line_of(sig, ord, &names, &|v| encode_generic(v, threads))?;
@@ -1018,6 +1031,7 @@ pub(crate) struct FileHead {
     pub(crate) size: String,
     pub(crate) model: String,
     pub(crate) visible: Vec<String>,
+    pub(crate) roles: Option<Vec<String>>,
     pub(crate) enumeration: Enumeration,
 }
 
@@ -1479,6 +1493,33 @@ fn header_of(text: &str) -> Result<FileHead, String> {
     if sorted_names(&visible).len() != visible.len() {
         return Err("the header's `visible` list names a role twice".to_string());
     }
+    let roles = match m.get("minor") {
+        None => None,
+        Some(v) if v.as_u64() == Some(0) => None,
+        Some(v) if v.as_u64() == Some(1) => {
+            let Some(Value::Array(items)) = m.get("roles") else {
+                return Err("the minor-1 header has no `roles` list".to_string());
+            };
+            let mut roles = Vec::with_capacity(items.len());
+            for item in items {
+                let Some(name) = item.as_str() else {
+                    return Err("a `roles` name is not a string".to_string());
+                };
+                if name.is_empty() || name == "main" || name.starts_with('~') || !name.is_ascii() {
+                    return Err(format!("invalid declared role name: {name:?}"));
+                }
+                roles.push(name.to_string());
+            }
+            if roles.windows(2).any(|w| w[0] >= w[1]) {
+                return Err("the header's `roles` list is not sorted and unique".to_string());
+            }
+            if visible.iter().any(|n| !roles.contains(n)) {
+                return Err("the header's `roles` list omits a visible name".to_string());
+            }
+            Some(roles)
+        }
+        Some(_) => return Err("unsupported header `minor` (expected 0 or 1)".to_string()),
+    };
     let enumeration = match string("enumeration")?.as_str() {
         "complete" => Enumeration::Complete,
         "sampled" => Enumeration::Sampled,
@@ -1492,8 +1533,25 @@ fn header_of(text: &str) -> Result<FileHead, String> {
         size: string("size")?,
         model: string("model")?,
         visible,
+        roles,
         enumeration,
     })
+}
+
+/// Minor 0 remains readable, but cannot establish equality of declarations.
+pub(crate) fn compare_roles(
+    spec: Option<&[String]>, imp: Option<&[String]>,
+) -> Result<(), String> {
+    match (spec, imp) {
+        (Some(a), Some(b)) if a != b => {
+            Err(format!("the two roles lists differ: {a:?} and {b:?}"))
+        }
+        (Some(_), Some(_)) => Ok(()),
+        _ => {
+            crate::conformance::report::warn_uncompared_roles();
+            Ok(())
+        }
+    }
 }
 
 /// A file read whole: its header and, per line, its number, its normal form
@@ -1598,6 +1656,7 @@ fn conf_join_inner(
             s.head.visible, i.head.visible
         )));
     }
+    compare_roles(s.head.roles.as_deref(), i.head.roles.as_deref()).map_err(JoinError)?;
     let t = Instant::now();
     #[cfg(test)]
     if let Some(d) = seams.index_delay {
@@ -1857,6 +1916,7 @@ fn conf_join_merge_inner(
             shead.visible, ihead.visible
         )));
     }
+    compare_roles(shead.roles.as_deref(), ihead.roles.as_deref()).map_err(JoinError)?;
     let names = sorted_names(&ihead.visible);
     let mut index_wall = Duration::ZERO;
     let mut lookup_wall = Duration::ZERO;

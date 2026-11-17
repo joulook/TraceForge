@@ -244,7 +244,7 @@ fn step(
             return fail(msg);
         }
         let t = Instant::now();
-        if let Err(e) = super::interchange::check_visible_graph(g, visible) {
+        if let Err(e) = super::interchange::check_roles_graph(g, visible, roles) {
             shared.refused.store(true, std::sync::atomic::Ordering::Relaxed);
             return fail(e.to_string());
         }
@@ -390,6 +390,8 @@ pub(crate) fn online_partitioned_roles(
             program: names,
         });
     }
+    super::interchange::compare_roles(file.head.roles.as_deref(), Some(&roles))
+        .map_err(OnlineError::Spec)?;
     let model = match &out {
         Some(_) => {
             Some(model_name(config.cons_type).map_err(|e| OnlineError::Model(e.to_string()))?)
@@ -603,6 +605,7 @@ pub(crate) fn online_partitioned_roles(
         let header = out_header(
             &out.header,
             &report.spec.visible,
+            &roles,
             model,
             enumeration,
             &report,

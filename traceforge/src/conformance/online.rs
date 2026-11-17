@@ -394,7 +394,7 @@ fn step_of(
     }
     let t = Instant::now();
     seams.summarise();
-    if let Err(e) = super::interchange::check_visible_graph(g, visible) {
+    if let Err(e) = super::interchange::check_roles_graph(g, visible, roles) {
         probe.refused = true;
         return (Step::Failed(e.to_string()), probe);
     }
@@ -507,22 +507,26 @@ pub(crate) fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 pub(crate) fn out_header(
     h: &ExportHeader,
     names: &[String],
+    roles: &[String],
     model: &str,
     enumeration: Enumeration,
     r: &OnlineReport,
 ) -> String {
     let visible: Vec<String> = names.iter().map(|n| json_string(n)).collect();
+    let roles: Vec<String> = roles.iter().map(|n| json_string(n)).collect();
     let (iteration, wall) = r
         .first
         .as_ref()
         .map_or((0, 0), |f| (f.iteration, f.wall_ms));
     format!(
-        "{{\"format\":1,\"tool\":\"traceforge\",\"program\":{},\"size\":{},\"visible\":[{}],\
-         \"model\":{},\"enumeration\":\"{}\",\"first_miss_iteration\":{},\
+        "{{\"format\":1,\"minor\":1,\"tool\":\"traceforge\",\"program\":{},\
+         \"size\":{},\"visible\":[{}],\
+         \"roles\":[{}],\"model\":{},\"enumeration\":\"{}\",\"first_miss_iteration\":{},\
          \"first_miss_wall_ms\":{},\"uncovered_total\":{},\"encoding\":1}}",
         json_string(&h.program),
         json_string(&h.size),
         visible.join(","),
+        roles.join(","),
         json_string(model),
         enumeration.name(),
         iteration,
@@ -567,6 +571,8 @@ pub(crate) fn online(
             program: names,
         });
     }
+    super::interchange::compare_roles(file.head.roles.as_deref(), Some(&roles))
+        .map_err(OnlineError::Spec)?;
     let model = match &opts.out {
         Some(_) => {
             Some(model_name(config.cons_type).map_err(|e| OnlineError::Model(e.to_string()))?)
@@ -744,6 +750,7 @@ pub(crate) fn online(
         let mut text = out_header(
             &out.header,
             &report.spec_visible_names(),
+            &roles,
             model,
             enumeration,
             &report,

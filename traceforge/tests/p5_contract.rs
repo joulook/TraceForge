@@ -287,7 +287,7 @@ fn visible_payload_identities() {
                 "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
             ]);
             assert_eq!(code, 1, "conformance: payload online exit: {text}");
-            assert!(text.lines().any(|line| line.ends_with(&message)),
+            assert!(text.lines().any(|line| line == format!("FAILED:     {message}")),
                 "conformance: payload online diagnostic: {text}");
         }
     }
@@ -323,6 +323,278 @@ fn payload_identity_runtime_refusals() {
             cli(&["v".to_string()], body, args)
         });
     }
+}
+
+fn minor_one(roles: &str) -> String {
+    header("p2p").replace("\"format\":1", &format!("\"format\":1,\"minor\":1,\"roles\":{roles}"))
+}
+
+#[test]
+fn roles_joins_and_online() {
+    let dir = scratch();
+    let spec = dir.join("s");
+    let imp = dir.join("i");
+    std::fs::write(&spec, minor_one("[\"helper\"]")).unwrap();
+    std::fs::write(&imp, minor_one("[]")).unwrap();
+    for flags in [vec![], vec!["--merge"], vec!["--decide"], vec!["--merge", "--decide"]] {
+        let out = join(&spec, &imp, &flags);
+        assert_eq!(out.status.code(), Some(2), "conformance: roles join exit");
+        assert_eq!(String::from_utf8(out.stderr).unwrap(),
+            "conf-join: refused: the two roles lists differ: [\"helper\"] and []\n",
+            "conformance: roles join diagnostic");
+    }
+    std::fs::write(&imp, minor_one("[\"helper\"]")).unwrap();
+    for flags in [vec![], vec!["--merge"], vec!["--decide"], vec!["--merge", "--decide"]] {
+        let out = join(&spec, &imp, &flags);
+        assert_eq!(out.status.code(), Some(0), "conformance: same roles join");
+        assert!(out.stderr.is_empty(), "conformance: minor-1 joins need no warning");
+    }
+    for threads in ["1", "2"] {
+        let (text, code) = cli(&[], Arc::new(|| {}), &[
+            "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
+        ]);
+        assert_eq!(code, 2, "conformance: roles online exit");
+        assert_eq!(text.lines().next().unwrap(),
+            "program: online refused: the two roles lists differ: [\"helper\"] and []",
+            "conformance: roles online diagnostic");
+        let (text, code) = cli_roles(&[], Arc::new(|| {}), &["helper"], &[
+            "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
+        ]);
+        assert_eq!(code, 0, "conformance: roles online neighbour: {text}");
+    }
+}
+
+#[test]
+fn malformed_roles() {
+    let dir = scratch();
+    let spec = dir.join("s");
+    let imp = dir.join("i");
+    std::fs::write(&imp, minor_one("[]")).unwrap();
+    let mut cases = vec![
+        (minor_one("null"), "the minor-1 header has no `roles` list".to_string()),
+        (minor_one("\"v\""), "the minor-1 header has no `roles` list".to_string()),
+        (minor_one("{}"), "the minor-1 header has no `roles` list".to_string()),
+        (minor_one("[3]"), "a `roles` name is not a string".to_string()),
+        (minor_one("[\"b\",\"a\"]"),
+            "the header's `roles` list is not sorted and unique".to_string()),
+        (minor_one("[\"a\",\"a\"]"),
+            "the header's `roles` list is not sorted and unique".to_string()),
+        (minor_one("[]").replace("\"visible\":[]", "\"visible\":[\"v\"]"),
+            "the header's `roles` list omits a visible name".to_string()),
+        (header("p2p").replace("\"format\":1", "\"format\":1,\"minor\":1"),
+            "the minor-1 header has no `roles` list".to_string()),
+    ];
+    for name in ["", "main", "~a", "é"] {
+        cases.push((minor_one(&format!("[{name:?}]")),
+            format!("invalid declared role name: {name:?}")));
+    }
+    for minor in ["2", "-1", "null", "\"1\"", "1.5"] {
+        cases.push((minor_one("[]").replace("\"minor\":1", &format!("\"minor\":{minor}")),
+            "unsupported header `minor` (expected 0 or 1)".to_string()));
+    }
+    for (header, reason) in cases {
+        std::fs::write(&spec, header).unwrap();
+        for flags in [vec![], vec!["--merge"]] {
+            let out = join(&spec, &imp, &flags);
+            assert_eq!(out.status.code(), Some(2), "conformance: malformed roles exit");
+            assert_eq!(String::from_utf8(out.stderr).unwrap(),
+                format!("conf-join: refused: {}: line 1: {reason}\n", spec.display()),
+                "conformance: malformed roles diagnostic");
+        }
+    }
+}
+
+#[test]
+fn header_bytes_and_declared_daemon() {
+    let dir = scratch();
+    let spec = dir.join("s");
+    let online_out = dir.join("online");
+    let names = vec!["v".to_string()];
+    for threads in ["1", "2"] {
+        let (text, code) = cli_roles(&names, identity("helper", true), &["helper"], &[
+            "export", "spec", "--out", spec.to_str().unwrap(), "--threads", threads,
+        ]);
+        assert_eq!(code, 0, "conformance: header export: {text}");
+        let text = std::fs::read_to_string(&spec).unwrap();
+        assert_eq!(text.lines().next().unwrap(), concat!(
+            "{\"format\":1,\"minor\":1,\"tool\":\"traceforge\",\"program\":\"program:spec\",",
+            "\"size\":\"\",\"visible\":[\"v\"],\"roles\":[\"helper\",\"v\"],",
+            "\"model\":\"p2p\",\"enumeration\":\"complete\",\"encoding\":1}"
+        ), "conformance: export header bytes");
+        assert!(text.lines().skip(1).any(|l| l.contains("\"s\":\"helper\"")),
+            "conformance: declared identity encoded");
+        let (text, code) = cli_roles(&names, identity("helper", true), &["helper"], &[
+            "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
+            "--out", online_out.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "conformance: online header: {text}");
+        let text = std::fs::read_to_string(&online_out).unwrap();
+        assert_eq!(text.lines().next().unwrap(), concat!(
+            "{\"format\":1,\"minor\":1,\"tool\":\"traceforge\",\"program\":\"program:impl\",",
+            "\"size\":\"\",\"visible\":[\"v\"],\"roles\":[\"helper\",\"v\"],",
+            "\"model\":\"p2p\",\"enumeration\":\"complete\",\"first_miss_iteration\":0,",
+            "\"first_miss_wall_ms\":0,\"uncovered_total\":0,\"encoding\":1}"
+        ), "conformance: online header bytes");
+        for command in ["export", "online"] {
+            let before = std::fs::read(&online_out).unwrap();
+            let args = if command == "export" {
+                vec![command, "impl", "--out", online_out.to_str().unwrap(), "--threads", threads]
+            } else {
+                vec![command, "--spec", spec.to_str().unwrap(), "--threads", threads,
+                    "--out", online_out.to_str().unwrap()]
+            };
+            let (text, code) = cli_roles(&names, identity("daemon", false), &["helper"], &args);
+            assert_eq!(code, if command == "export" { 2 } else { 1 },
+                "conformance: declared daemon exit: {text}");
+            let reason = "declared payload-nameable name is a daemon: \"helper\"";
+            let prefix = if command == "export" { "program: export refused: " }
+                else { "FAILED:     " };
+            assert!(text.lines().any(|l| l == format!("{prefix}{reason}")),
+                "conformance: declared daemon diagnostic: {text}");
+            assert_eq!(std::fs::read(&online_out).unwrap(), before,
+                "conformance: invalid roles never overwrite an export");
+        }
+    }
+}
+
+#[test]
+fn unspawned_helper_header_bytes() {
+    let dir = scratch();
+    let names = vec!["v".to_string()];
+    let body: Entry = Arc::new(|| { named("v", || {}).join().unwrap(); });
+    for threads in ["1", "2"] {
+        let spec = dir.join(format!("spec-{threads}"));
+        let online_out = dir.join(format!("online-{threads}"));
+        let (text, code) = cli_roles(&names, Arc::clone(&body), &["helper"], &[
+            "export", "spec", "--out", spec.to_str().unwrap(), "--threads", threads,
+        ]);
+        assert_eq!(code, 0, "conformance: unspawned helper export: {text}");
+        let text = std::fs::read_to_string(&spec).unwrap();
+        assert_eq!(text.split_inclusive('\n').next().unwrap().as_bytes(), concat!(
+            "{\"format\":1,\"minor\":1,\"tool\":\"traceforge\",\"program\":\"program:spec\",",
+            "\"size\":\"\",\"visible\":[\"v\"],\"roles\":[\"helper\",\"v\"],",
+            "\"model\":\"p2p\",\"enumeration\":\"complete\",\"encoding\":1}\n"
+        ).as_bytes(), "conformance: unspawned helper export header bytes");
+        let (text, code) = cli_roles(&names, Arc::clone(&body), &["helper"], &[
+            "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
+            "--out", online_out.to_str().unwrap(),
+        ]);
+        assert_eq!(code, 0, "conformance: unspawned helper online: {text}");
+        let text = std::fs::read_to_string(&online_out).unwrap();
+        assert_eq!(text.split_inclusive('\n').next().unwrap().as_bytes(), concat!(
+            "{\"format\":1,\"minor\":1,\"tool\":\"traceforge\",\"program\":\"program:impl\",",
+            "\"size\":\"\",\"visible\":[\"v\"],\"roles\":[\"helper\",\"v\"],",
+            "\"model\":\"p2p\",\"enumeration\":\"complete\",\"first_miss_iteration\":0,",
+            "\"first_miss_wall_ms\":0,\"uncovered_total\":0,\"encoding\":1}\n"
+        ).as_bytes(), "conformance: unspawned helper online header bytes");
+    }
+}
+
+#[test]
+fn legacy_online_child() {
+    let Ok(spec) = std::env::var("P5_LEGACY_SPEC") else { return; };
+    let threads = std::env::var("P5_LEGACY_THREADS").unwrap();
+    let (text, code) = cli(
+        &[], Arc::new(|| {}), &["online", "--spec", &spec, "--threads", &threads],
+    );
+    print!("{text}");
+    std::process::exit(i32::from(code));
+}
+
+#[test]
+fn legacy_warning_stays_on_stderr() {
+    let dir = scratch();
+    let spec = dir.join("s");
+    let imp = dir.join("i");
+    let warning = "warning: roles were not compared (minor-0 header)\n";
+    for flags in [vec![], vec!["--merge"], vec!["--decide"], vec!["--merge", "--decide"]] {
+        for (s, i) in [(header("p2p"), header("p2p")),
+            (header("p2p").replace("\"format\":1", "\"format\":1,\"minor\":0"),
+                header("p2p")),
+            (header("p2p"), minor_one("[\"helper\"]")),
+            (minor_one("[\"helper\"]"), header("p2p"))] {
+            std::fs::write(&spec, s).unwrap();
+            std::fs::write(&imp, i).unwrap();
+            let out = join(&spec, &imp, &flags);
+            assert_eq!(out.status.code(), Some(0), "conformance: legacy exit");
+            assert_eq!(String::from_utf8(out.stderr).unwrap(), warning,
+                "conformance: legacy stderr");
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            let mut expected = concat!(
+                "spec: tool=test program=p size= model=p2p enumeration=complete\n",
+                "impl: tool=test program=p size= model=p2p enumeration=complete\n",
+                "verdict: conforms\n"
+            ).to_string();
+            if flags.contains(&"--merge") {
+                expected.push_str("merge: spec_groups=0 impl_lines=0 max_group_lines=0\n");
+            }
+            expected.push_str("uncovered: 0\n");
+            if flags.contains(&"--decide") {
+                let ms = stdout.lines().find(|l| l.starts_with("decide: "))
+                    .unwrap().split("decide_ms=").nth(1).unwrap();
+                ms.parse::<u128>().expect("conformance: a numeric Decide duration");
+                expected.push_str(&format!(concat!(
+                    "decide: uncovered=0 violations=0 false_alarms=0 unresolved=0 ",
+                    "max_group=0 states=0 budget=10000000 decide_ms={}\n"
+                ), ms));
+            }
+            assert_eq!(stdout.split("--- measurements").next().unwrap(), expected,
+                "conformance: legacy report bytes");
+            assert!(!stdout.contains("warning"), "conformance: warning absent from stdout");
+        }
+    }
+    std::fs::write(&spec, header("p2p")).unwrap();
+    for threads in ["1", "2"] {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "legacy_online_child", "--nocapture"])
+            .env("P5_LEGACY_SPEC", &spec).env("P5_LEGACY_THREADS", threads)
+            .output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "conformance: legacy online exit");
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), warning,
+            "conformance: legacy online stderr");
+        assert!(!String::from_utf8(out.stdout).unwrap().contains("warning"),
+            "conformance: legacy online stdout");
+    }
+}
+
+#[test]
+fn payload_declarations_are_valid_roles() {
+    let dir = scratch();
+    let spec = dir.join("s");
+    let out = dir.join("o");
+    let names = vec!["v".to_string()];
+    let body: Entry = Arc::new(|| { named("v", || {}).join().unwrap(); });
+    for (roles, reason) in [
+        (vec!["helper", "helper"], "a visible name is declared twice"),
+        (vec!["v"], "role is declared twice: \"v\""),
+        (vec![""], "invalid declared visible name: \"\""),
+        (vec!["main"], "invalid declared visible name: \"main\""),
+        (vec!["~helper"], "invalid declared visible name: \"~helper\""),
+        (vec!["é"], "invalid declared visible name: \"é\""),
+    ] {
+        for threads in ["1", "2"] {
+            for command in ["export", "online"] {
+                let args = if command == "export" {
+                    vec![command, "spec", "--out", out.to_str().unwrap(), "--threads", threads]
+                } else {
+                    vec![command, "--spec", spec.to_str().unwrap(), "--threads", threads]
+                };
+                let (text, code) = cli_roles(&names, Arc::clone(&body), &roles, &args);
+                assert_eq!(code, 2, "conformance: payload declaration exit: {text}");
+                assert_eq!(text.lines().next().unwrap(),
+                    format!("program: {command} refused: {reason}"),
+                    "conformance: payload declaration diagnostic");
+            }
+        }
+    }
+}
+
+#[test]
+fn declared_daemon_runtime_refusal() {
+    runtime_refusal_with_good(identity("daemon", false), identity("helper", false),
+        "declared payload-nameable name is a daemon: \"helper\"", |body, args| {
+            cli_roles(&["v".to_string()], body, &["helper"], args)
+        });
 }
 
 #[test]
@@ -370,9 +642,12 @@ fn changing_daemon_payload_refusal() {
 
 #[test]
 fn changing_daemon_invisible_payload() {
+    runtime_refusal_with_good(identity("daemon", false), identity("helper", true),
+        "declared payload-nameable name is a daemon: \"helper\"", |body, args| {
+            cli_roles(&["v".to_string()], body, &["helper"], args)
+        });
     let dir = scratch();
     let out = dir.join("o");
-    let mut expected = None;
     for threads in ["1", "2"] {
         for orientation in [false, true] {
             for existing in [false, true] {
@@ -393,26 +668,17 @@ fn changing_daemon_invisible_payload() {
                     "export", "spec", "--out", out.to_str().unwrap(), "--threads", threads,
                     "--seed", "0",
                 ]);
-                assert_eq!(code, 0, "conformance: invisible daemon export exit: {text}");
-                let exported = std::fs::read_to_string(&out).unwrap();
-                assert_eq!(exported.lines().count(), 3,
-                    "conformance: both visible words exported");
-                assert!(exported.contains("{\"s\":\"helper\"}"),
-                    "conformance: declared helper payload");
-                if let Some(ref expected) = expected {
-                    assert_eq!(&exported, expected, "conformance: export independent of order");
+                assert_eq!(code, 2, "conformance: declared daemon export exit: {text}");
+                assert_eq!(text.lines().next().unwrap(),
+                    "program: export refused: declared payload-nameable name is a daemon: \
+                     \"helper\"",
+                    "conformance: declared daemon diagnostic");
+                if existing {
+                    assert_eq!(std::fs::read(&out).unwrap(), b"sentinel\n",
+                        "conformance: declared daemon preserves destination");
                 } else {
-                    expected = Some(exported);
+                    assert!(!out.exists(), "conformance: declared daemon creates no destination");
                 }
-                let (text, code) = cli_roles(&["v".to_string()], body, &["helper"], &[
-                    "online", "--spec", out.to_str().unwrap(), "--threads", threads,
-                    "--seed", "0",
-                ]);
-                assert_eq!(code, 0, "conformance: invisible daemon online exit: {text}");
-                let verdicts: Vec<_> = text.lines().filter(|l| l.starts_with("verdict:")).collect();
-                assert_eq!(verdicts, ["verdict:    conforms"],
-                    "conformance: invisible daemon online verdict");
-                assert!(!text.contains("FAILED:"), "conformance: invisible daemon no diagnostic");
             }
         }
     }

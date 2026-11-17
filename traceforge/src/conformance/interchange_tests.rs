@@ -611,7 +611,11 @@ fn t5_the_header() {
     let first = text.lines().next().unwrap();
     assert_eq!(
         first,
-        r#"{"format":1,"tool":"traceforge","program":"apps/x:impl","size":"k1","visible":["a","b"],"model":"p2p","enumeration":"complete","encoding":1}"#
+        concat!(
+            r#"{"format":1,"minor":1,"tool":"traceforge","program":"apps/x:impl","size":"k1","#,
+            r#""visible":["a","b"],"roles":["a","b"],"model":"p2p","#,
+            r#""enumeration":"complete","encoding":1}"#
+        )
     );
     assert_eq!(model_name(ConsType::FIFO), Ok("p2p"));
     for c in [ConsType::MO, ConsType::WB, ConsType::Mailbox] {

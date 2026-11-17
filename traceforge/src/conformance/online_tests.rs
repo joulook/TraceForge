@@ -550,8 +550,9 @@ fn read_out(path: &Path) -> (String, Vec<String>) {
 fn out_head(program: &str, size: &str, model: &str, enumeration: &str, f: (usize, u64, usize)) -> String {
     format!(
         concat!(
-            r#"{{"format":1,"tool":"traceforge","program":"{}","size":"{}","#,
-            r#""visible":["alpha","beta","reader","writer"],"model":"{}","enumeration":"{}","#,
+            r#"{{"format":1,"minor":1,"tool":"traceforge","program":"{}","size":"{}","#,
+            r#""visible":["alpha","beta","reader","writer"],"#,
+            r#""roles":["alpha","beta","reader","writer"],"model":"{}","enumeration":"{}","#,
             r#""first_miss_iteration":{},"first_miss_wall_ms":{},"uncovered_total":{},"encoding":1}}"#
         ),
         program, size, model, enumeration, f.0, f.1, f.2
@@ -663,7 +664,8 @@ fn o2_conforming() {
     assert_eq!(
         (text.as_str(), code),
         (
-            expected_text(&spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None).as_str(),
+            expected_text(
+                &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None).as_str(),
             0
         ),
         "conformance: C: O2: the lines"
@@ -930,7 +932,6 @@ fn o5a_an_assertion_with_revisits_left() {
     let p = o_prog();
     let dir = scratch("c-o5a");
     let s = spec_file(&p, &dir);
-    let head = spec_head(&s, 2);
     for (var, thread, pick) in [
         (Var::AssertR, "reader", (|k: &Kappa| k.err) as fn(&Kappa) -> bool),
         (Var::AssertR2, "reader", (|k: &Kappa| k.err) as fn(&Kappa) -> bool),
@@ -944,7 +945,9 @@ fn o5a_an_assertion_with_revisits_left() {
             ks[..pos - 1].iter().all(|k| class_of(k, &[2, 3]) == 'F'),
             "conformance: C: O5a: {var:?}: every graph before it is found"
         );
-        let r = online::online(&cfg(ConsType::FIFO), &vis(), imp_of(var), &s, opts(Mode::Full, None, None))
+        let r = online::online(
+            &cfg(ConsType::FIFO), &vis(), imp_of(var), &s, opts(Mode::Full, None, None),
+        )
             .expect("conformance: C: O5a: not refused");
         assert_eq!(
             (r.iterations, r.lookups, r.found, r.end.clone()),
@@ -957,7 +960,9 @@ fn o5a_an_assertion_with_revisits_left() {
         let (text, code) = run_online(&p, &s, &[], ConsType::FIFO, var);
         assert_eq!(
             (text, code),
-            (expected_text(&head, (pos - 1, pos - 1, 0, 0), "partial", false, None, (0, 0), Some(msg.as_str())), 1),
+            (expected_text(
+                &spec_head(&s, 2), (pos - 1, pos - 1, 0, 0), "partial", false, None, (0, 0),
+                Some(msg.as_str())), 1),
             "conformance: C: O5a: {var:?}: the lines"
         );
         note!("O5a\t{var:?}\tp={pos}\t{msg}");

@@ -3064,6 +3064,12 @@ impl fmt::Display for interchange::DecVal {
     }
 }
 
+pub(crate) fn warn_uncompared_roles() {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(),
+        "warning: roles were not compared (minor-0 header)");
+}
+
 impl fmt::Display for interchange::JoinError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
