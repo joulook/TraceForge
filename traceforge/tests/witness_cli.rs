@@ -441,7 +441,7 @@ fn runtime_refusals_discard_staged_witnesses() {
                             else { "thread t1 named `helper` is not declared payload-nameable" },
                         ),
                     };
-                    assert_eq!(code, 1, "{out}");
+                    assert_eq!(code, 2, "{out}");
                     assert!(out.lines().any(|l| l == format!("FAILED:     {reason}")), "{out}");
                     assert_eq!(out.lines().filter(|l| l.starts_with("verdict:"))
                         .collect::<Vec<_>>(), ["verdict:    refused"], "{out}");

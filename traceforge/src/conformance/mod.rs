@@ -2,7 +2,8 @@
 //! uncovered implementation execution, or one per distinct summary when PATH ends in `/`.
 //! The file contains the queried summary and creation-ordered threads with contiguous event
 //! positions. Unnamed threads, control characters in names/messages and write failures stop
-//! the run (online exit 1, conf exit 2). Witnesses are staged beside their destinations and
+//! the run (online exit 1, conf exit 2). Online declaration refusals exit 2.
+//! Witnesses are staged beside their destinations and
 //! published at the end. Refusal or failure before publication discards staging and preserves
 //! existing files; a rename failure stops publication and discards the remaining staging files.
 //! Without the option no witness is formatted or copied.

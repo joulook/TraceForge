@@ -150,7 +150,8 @@ const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGSâ
     uncovered execution to a file, or one per distinct summary to PATH ending in /.\n\
     Witnesses publish at run end; refusal discards staging and preserves existing files.\n\
     Unnamed threads, control characters in names/messages, and write errors stop the run\n\
-    (online exit 1; conf exit 2). Positions count printed events; iterations count completions.\n";
+    (online exit 1; conf exit 2). Online declaration refusals exit 2.\n\
+    Positions count printed events; iterations count completions.\n";
 
 /// The options of every subcommand, and the program's own arguments.
 struct Opts {

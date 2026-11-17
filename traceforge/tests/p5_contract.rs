@@ -134,7 +134,7 @@ fn daemon_visible() {
         let (text, code) = cli(&names, Arc::clone(&daemon), &[
             "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
         ]);
-        assert_eq!(code, 1, "conformance: daemon online exit: {text}");
+        assert_eq!(code, 2, "conformance: daemon online exit: {text}");
         assert!(text.lines().any(|line| line ==
             "FAILED:     declared visible name is a daemon: \"v\""),
             "conformance: daemon online diagnostic: {text}");
@@ -185,7 +185,7 @@ fn runtime_refusal_with_good(
                     "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
                     "--seed", "0", "--out", out.to_str().unwrap(),
                 ]);
-                assert_eq!(code, 1, "conformance: runtime refusal exit: {text}");
+                assert_eq!(code, 2, "conformance: runtime refusal exit: {text}");
                 assert!(text.lines().any(|l| l == format!("FAILED:     {reason}")),
                     "conformance: runtime refusal diagnostic: {text}");
                 let verdicts: Vec<_> = text.lines().filter(|l| l.starts_with("verdict:")).collect();
@@ -286,7 +286,8 @@ fn visible_payload_identities() {
             let (text, code) = cli(&names, identity(kind, true), &[
                 "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
             ]);
-            assert_eq!(code, 1, "conformance: payload online exit: {text}");
+            assert_eq!(code, if kind == "unnamed" { 1 } else { 2 },
+                "conformance: payload online exit: {text}");
             assert!(text.lines().any(|line| line == format!("FAILED:     {message}")),
                 "conformance: payload online diagnostic: {text}");
         }
@@ -444,7 +445,7 @@ fn header_bytes_and_declared_daemon() {
                     "--out", online_out.to_str().unwrap()]
             };
             let (text, code) = cli_roles(&names, identity("daemon", false), &["helper"], &args);
-            assert_eq!(code, if command == "export" { 2 } else { 1 },
+            assert_eq!(code, 2,
                 "conformance: declared daemon exit: {text}");
             let reason = "declared payload-nameable name is a daemon: \"helper\"";
             let prefix = if command == "export" { "program: export refused: " }
@@ -726,7 +727,8 @@ fn legacy_identities_keep_aborted_output() {
                         "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
                         "--seed", "0", "--out", out.to_str().unwrap(),
                     ]);
-                    assert_eq!(code, 1, "conformance: identity failure exit: {text}");
+                    assert_eq!(code, if legacy { 1 } else { 2 },
+                        "conformance: identity failure exit: {text}");
                     let prior_miss = text.lines().any(|l| l.starts_with("first miss:"));
                     let verdict = if !legacy { "refused" }
                         else if prior_miss { "reports" } else { "partial" };
@@ -769,6 +771,44 @@ fn legacy_identities_keep_aborted_output() {
                 assert!(saw_prior_miss.into_iter().all(|seen| seen),
                     "conformance: {kind} follows a miss for both destinations, threads={threads}");
             }
+        }
+    }
+}
+
+// Mutants: replace `if self.refused` in exit_code with `if false` or `if true`.
+#[test]
+fn runtime_refusal_and_assertion_have_distinct_exits() {
+    let dir = scratch();
+    let spec = dir.join("s");
+    let names = vec!["v".to_string()];
+    let good: Entry = Arc::new(|| { named("v", || {}).join().unwrap(); });
+    let (text, code) = cli(&names, good, &["export", "spec", "--out", spec.to_str().unwrap()]);
+    assert_eq!(code, 0, "conformance: valid specification: {text}");
+    for threads in ["1", "2"] {
+        for refused in [true, false] {
+            let body: Entry = Arc::new(move || {
+                if refused {
+                    traceforge::thread::Builder::new().name("v".to_string())
+                        .spawn_daemon(|| {}).unwrap();
+                } else {
+                    named("v", || traceforge::assert(false)).join().unwrap();
+                }
+            });
+            let (text, code) = cli(&names, body, &[
+                "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
+            ]);
+            assert_eq!(code, if refused { 2 } else { 1 },
+                "conformance: distinct failure exits, threads={threads}: {text}");
+            let reason = if refused { "declared visible name is a daemon: \"v\"" }
+                else { "assertion failure on thread `v`" };
+            let failed = format!("FAILED:     {reason}");
+            assert!(text.lines().any(|l| if refused { l == failed }
+                else { l.starts_with(&format!("{failed} at ")) }),
+                "conformance: failure diagnostic: {text}");
+            let verdict = if refused { "refused" } else { "partial" };
+            assert!(text.lines().any(|l| l == format!("verdict:    {verdict}")),
+                "conformance: failure verdict: {text}");
+            assert!(text.contains("--- measurements"), "conformance: measurements: {text}");
         }
     }
 }

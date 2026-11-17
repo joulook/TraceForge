@@ -15,6 +15,7 @@
 //! - **Failures** (an assertion failure, a value the encoder refuses, a panic)
 //!   end the run `failed` with the state of the last completed update; the
 //!   exploration runs on a worker thread so that a panic reaches the join.
+//!   Declaration refusals exit 2; other failures exit 1; reporting runs exit 0.
 //!
 //! The text is rendered in `report.rs` (S5 criterion 1); nothing here prints.
 
@@ -207,9 +208,11 @@ impl OnlineReport {
         }
     }
 
-    /// JMC's exit codes: 0 with a verdict, 1 when the run failed.
+    /// Exit codes: 2 for a refused run, 1 for other failures, 0 with a verdict.
     pub(crate) fn exit_code(&self) -> u8 {
-        if self.end == End::Failed {
+        if self.refused {
+            2
+        } else if self.end == End::Failed {
             1
         } else {
             0
