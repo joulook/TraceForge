@@ -53,6 +53,7 @@ use crate::conformance::measure;
 use crate::conformance::online::{self, Mode, OnlineOpts, OnlineOut};
 use crate::conformance::online_p;
 use crate::conformance::record::{self, Subject};
+use crate::conformance::witness_graph;
 use crate::conformance::{self, ConfBuilder, ConfVerdict, Engine, ExportHeader};
 use crate::{Config, ConsType};
 
@@ -165,6 +166,10 @@ struct Opts {
     distinct: bool,
     out: Option<String>,
     witness: Option<String>,
+    /// `--graphs PATH`: the graph store beside an export.
+    graphs: Option<String>,
+    /// `--graphs-limit N`.
+    graphs_limit: Option<usize>,
     graph_audit: crate::conformance::graph_audit::OptionalAudit,
     program: Option<String>,
     size: Option<String>,
@@ -185,6 +190,8 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
         distinct: false,
         out: None,
         witness: None,
+        graphs: None,
+        graphs_limit: None,
         graph_audit: None,
         program: None,
         size: None,
@@ -232,6 +239,11 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
                 o.graph_audit = Some(Default::default());
             }
             "--witness" => o.witness = Some(value()?),
+            "--graphs" => o.graphs = Some(value()?),
+            "--graphs-limit" => {
+                o.graphs_limit =
+                    Some(value()?.parse().map_err(|_| "--graphs-limit needs a number")?)
+            }
             "--out" => o.out = Some(value()?),
             "--program" => o.program = Some(value()?),
             "--size" => o.size = Some(value()?),
@@ -258,6 +270,15 @@ fn check_witness(cmd: &str, o: &Opts) -> Result<(), String> {
     if o.graph_audit.is_some() && !matches!(cmd, "export" | "online") {
         return Err("--audit-graphs requires export or online; not for timed rows".to_owned());
     }
+    if o.graphs_limit.is_some() && o.graphs.is_none() {
+        return Err("--graphs-limit requires --graphs".to_owned());
+    }
+    if o.graphs.is_some() && cmd != "export" {
+        return Err("--graphs requires export".to_owned());
+    }
+    if o.graphs.is_some() && o.threads > 1 && o.graphs_limit != Some(0) {
+        return Err("--graphs with --threads N>1 requires --graphs-limit 0".to_owned());
+    }
     if o.witness.is_none() {
         return Ok(());
     }
@@ -271,6 +292,58 @@ fn check_witness(cmd: &str, o: &Opts) -> Result<(), String> {
         return Err("--witness requires conf --engine stateful".to_owned());
     }
     Ok(())
+}
+
+/// Whether an export at `out` and a graph store at `graphs` would share a file: either path, or
+/// the `.tmp` staging file of either, names the same file as one of the other's. Paths are made
+/// absolute; an existing file, or the directory of a new one, is resolved through symbolic links,
+/// and existing files are also compared by their filesystem identity (hard links).
+fn overlapping_paths(out: &Path, graphs: &Path) -> bool {
+    fn with_tmp(p: &Path) -> [std::path::PathBuf; 2] {
+        let mut t = p.as_os_str().to_owned();
+        t.push(".tmp");
+        [p.to_path_buf(), t.into()]
+    }
+    fn resolved(p: &Path) -> std::path::PathBuf {
+        let mut abs = std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+        // A link whose target does not exist yet still names that target: follow it by hand
+        // (a bounded number of times, against loops) before resolving the rest.
+        for _ in 0..40 {
+            if let Ok(c) = std::fs::canonicalize(&abs) {
+                return c;
+            }
+            match std::fs::read_link(&abs) {
+                Ok(target) => {
+                    let base = abs.parent().map(Path::to_path_buf).unwrap_or_default();
+                    abs = std::path::absolute(base.join(target)).unwrap_or_else(|_| abs.clone());
+                }
+                Err(_) => break,
+            }
+        }
+        match (abs.parent(), abs.file_name()) {
+            (Some(dir), Some(name)) => {
+                std::fs::canonicalize(dir).map(|d| d.join(name)).unwrap_or(abs.clone())
+            }
+            _ => abs,
+        }
+    }
+    let a: Vec<_> = with_tmp(out).iter().map(|p| resolved(p)).collect();
+    let b: Vec<_> = with_tmp(graphs).iter().map(|p| resolved(p)).collect();
+    if a.iter().any(|x| b.contains(x)) {
+        return true;
+    }
+    // Hard links: two existing paths of the one file have different names but one identity.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let id = |p: &std::path::PathBuf| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+        let a: Vec<_> = a.iter().filter_map(id).collect();
+        let b: Vec<_> = b.iter().filter_map(id).collect();
+        if a.iter().any(|x| b.contains(x)) {
+            return true;
+        }
+    }
+    false
 }
 
 fn config_of(o: &Opts) -> Config {
@@ -447,15 +520,51 @@ fn run_named_roles(
             } else {
                 measure::Side::Impl
             };
-            let r = if o.threads > 1 {
-                export_p::export_partitioned(&cc, move || f(), &header, Path::new(&out))
+            if let Some(g) = &o.graphs {
+                if overlapping_paths(Path::new(&out), Path::new(g)) {
+                    return fail(
+                        "--graphs must name another file than --out (and than either one's .tmp)"
+                            .to_owned(),
+                    );
+                }
+            }
+            let store = o.graphs.as_ref().map(|g| witness_graph::GraphStoreOpts {
+                path: g.into(),
+                limit: o.graphs_limit,
+                run: witness_graph::RunIdentity::of_process(
+                    &args[1],
+                    &o.args,
+                    &witness_graph::model_label(o.model),
+                    o.seed,
+                    o.threshold,
+                ),
+            });
+            if let Some(w) = store.as_ref().and_then(|s| s.run.warning.as_ref()) {
+                eprintln!("{w}");
+            }
+            let (r, report) = if o.threads > 1 {
+                let r = export_p::export_partitioned(&cc, move || f(), &header, Path::new(&out));
+                // `--graphs-limit 0` (checked above): the identity line, with the export's header.
+                let report = match (&r, &store) {
+                    (Ok(_), Some(st)) => Some(
+                        std::fs::read_to_string(&out)
+                            .map_err(|e| format!("graphs: {out}: {e}"))
+                            .and_then(|t| {
+                                let h = t.lines().next().unwrap_or_default().to_owned();
+                                witness_graph::write_identity_only(st, &h)
+                            }),
+                    ),
+                    _ => None,
+                };
+                (r, report)
             } else {
-                interchange::export_with(
+                interchange::export_with_store(
                     &cc,
                     move || f(),
                     &header,
                     Path::new(&out),
                     interchange::ExportSeams::default(),
+                    store,
                 )
             };
             // A refusal before the run (`NotSet`, `Model`) prints no block.
@@ -469,15 +578,26 @@ fn run_named_roles(
                     }
                 }
             }
-            match r {
-                Ok(s) => (
-                    format!(
-                        "exported: {} lines from {} graphs to {out}\n",
-                        s.lines, s.spec_graphs
-                    ),
-                    0,
-                ),
-                Err(e) => (format!("{bin}: export refused: {e}\n"), 2),
+            match (r, report) {
+                (Ok(_), Some(Err(e))) => {
+                    (format!("{bin}: the export was written; the graph store was not: {e}\n"), 2)
+                }
+                (Ok(s), report) => {
+                    if let Some(Ok(rep)) = report {
+                        for m in &rep.messages {
+                            eprintln!("{m}");
+                        }
+                        rep.append(block);
+                    }
+                    (
+                        format!(
+                            "exported: {} lines from {} graphs to {out}\n",
+                            s.lines, s.spec_graphs
+                        ),
+                        0,
+                    )
+                }
+                (Err(e), _) => (format!("{bin}: export refused: {e}\n"), 2),
             }
         }
         "conf" => {

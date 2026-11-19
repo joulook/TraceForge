@@ -122,14 +122,14 @@ fn emitted(l: &LabelEnum) -> bool {
 }
 
 /// One printable event, including the main thread's implicit end.
-enum EventLine<'a> {
+pub(super) enum EventLine<'a> {
     Label(Event, &'a LabelEnum),
     End,
 }
 
 /// Classifies events without inspecting names or encoding payloads. Rendering
 /// and measurement share omissions, terminal suppression and the implicit end.
-fn event_lines(
+pub(super) fn event_lines(
     g: &ExecutionGraph, tid: crate::ThreadId,
 ) -> impl Iterator<Item = EventLine<'_>> {
     let mut next = 0;

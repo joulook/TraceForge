@@ -859,6 +859,56 @@ pub(crate) fn export_with<P>(
 where
     P: Fn() + Send + Sync + 'static,
 {
+    export_with_store(cc, program, header, path, seams, None).0
+}
+
+/// [`export_with`] that also writes a graph store (`--graphs`) when `store` is given: one graph
+/// per distinct line, from the line's first execution, written after the export succeeded. The
+/// second result is `None` without a store, else the store's report or its write error.
+#[allow(clippy::type_complexity)]
+pub(crate) fn export_with_store<P>(
+    cc: &ConfConfig,
+    program: P,
+    header: &ExportHeader,
+    path: &Path,
+    seams: ExportSeams,
+    store: Option<crate::conformance::witness_graph::GraphStoreOpts>,
+) -> (
+    Result<ExportStats, ExportError>,
+    Option<Result<crate::conformance::witness_graph::StoreReport, String>>,
+)
+where
+    P: Fn() + Send + Sync + 'static,
+{
+    let wanted = store.is_some();
+    let store = Rc::new(RefCell::new(
+        store.map(|o| crate::conformance::witness_graph::StoreBuilder::new(o, &cc.visible)),
+    ));
+    let r = export_inner(cc, program, header, path, seams, &store);
+    let report = match (&r, wanted) {
+        (_, false) => None,
+        (Err(_), true) => None,
+        (Ok((_, text, sorted)), true) => {
+            let b = store.borrow_mut().take().expect("conformance: the store builder is kept");
+            Some(b.finish(text, sorted))
+        }
+    };
+    (r.map(|(stats, _, _)| stats), report)
+}
+
+#[allow(clippy::type_complexity)]
+fn export_inner<P>(
+    cc: &ConfConfig,
+    program: P,
+    header: &ExportHeader,
+    path: &Path,
+    seams: ExportSeams,
+    store: &Rc<RefCell<Option<crate::conformance::witness_graph::StoreBuilder>>>,
+) -> Result<(ExportStats, String, Vec<String>), ExportError>
+where
+    P: Fn() + Send + Sync + 'static,
+{
+    use crate::conformance::compact::Inserted;
     use crate::conformance::measure::Shape;
     use std::time::{Duration, Instant};
     let _ = &seams;
@@ -890,6 +940,7 @@ where
         let visible = cc.visible.clone();
         let names = names.clone();
         let roles = roles.clone();
+        let store = Rc::clone(store);
         Box::new(move |g: &ExecutionGraph, _: &MustState| {
             if let Err(e) = check_roles_graph(g, &visible, &roles) {
                 *refusal.borrow_mut() = Some(e);
@@ -903,13 +954,27 @@ where
                 payload_refusal.borrow_mut().get_or_insert(e);
             }
             let mut st = state.borrow_mut();
-            st.0.insert(&s);
+            let new = matches!(st.0.insert(&s).1, Inserted::Stored(_));
             record_thread_names(g, &mut st.1);
             st.2 += 1;
+            // `--graphs`: the first execution of a new line, while the limit allows. Its time is
+            // the store's, kept out of the summarise phase here and out of exploration below.
+            let mut graph_time = Duration::ZERO;
+            if new {
+                if let Some(b) = store.borrow_mut().as_mut().filter(|b| b.wants()) {
+                    let tg = Instant::now();
+                    // A line that does not encode is refused by the export itself, later.
+                    if let Ok(line) = line_of(&s.sig, &s.ord, &names, &|v| encode_generic(v, &st.1)) {
+                        b.add(g, line, st.2);
+                    }
+                    graph_time = tg.elapsed();
+                    b.time_line(graph_time);
+                }
+            }
             let mut pr = probe.borrow_mut();
             // Word lengths need no encoding; payload names are resolved after enumeration.
             pr.3.add_summary(&s, &names, 0);
-            pr.0 += t.elapsed();
+            pr.0 += t.elapsed().saturating_sub(graph_time);
             if blocked {
                 pr.2 += 1;
             } else {
@@ -934,7 +999,10 @@ where
         },
         &program,
     );
-    let run_wall = run_started.elapsed();
+    // The graphs' walk and encoding are not exploration.
+    let run_wall = run_started
+        .elapsed()
+        .saturating_sub(store.borrow().as_ref().map_or(Duration::ZERO, |b| b.time));
     if let Some(e) = refusal.borrow_mut().take() {
         return Err(e);
     }
@@ -983,9 +1051,15 @@ where
     if let Some(d) = seams.export_delay {
         std::thread::sleep(d);
     }
-    crate::conformance::export_p::write_lines(path, &text, sorted.into_iter())?;
+    let kept = if store.borrow().is_some() {
+        crate::conformance::export_p::write_lines(path, &text, sorted.iter().cloned())?;
+        sorted
+    } else {
+        crate::conformance::export_p::write_lines(path, &text, sorted.into_iter())?;
+        Vec::new()
+    };
     let export_ms = export_started.elapsed().as_millis();
-    Ok(ExportStats {
+    let stats = ExportStats {
         lines,
         orders_held: index.stats().entries,
         spec_graphs: graphs,
@@ -996,7 +1070,8 @@ where
         graphs_complete: complete,
         graphs_blocked: blocked,
         shape,
-    })
+    };
+    Ok((stats, text, kept))
 }
 
 // ------------------------------------------------------ reader and join --

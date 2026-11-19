@@ -294,6 +294,9 @@ pub(crate) mod sverify_p;
 pub(crate) mod triage;
 pub(crate) mod witness;
 pub(crate) mod execution_witness;
+pub(crate) mod witness_graph;
+#[cfg(test)]
+mod witness_graph_tests;
 
 // ---------------------------------------------------------------------------
 // The public surface, and what it commits (criterion 11).
