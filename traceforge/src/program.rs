@@ -429,10 +429,11 @@ fn replay_command(p: &Program, bin: &str, args: &[String], block: &mut String) -
         }
         warnings.push("source-change".to_owned());
     }
-    let mut b = Config::builder().with_cons_type(model).with_verbose(0);
-    if let Some(seed) = rec.seed {
-        b = b.with_seed(seed);
-    }
+    // The replay is guided, so its seed decides nothing; it is the run's (or the default) all the same.
+    let mut b = Config::builder()
+        .with_cons_type(model)
+        .with_verbose(0)
+        .with_seed(rec.seed.unwrap_or(DEFAULT_SEED));
     if let Some(t) = rec.threshold {
         b = b.with_thread_threshold(t);
     }
@@ -503,11 +504,17 @@ fn replay_command(p: &Program, bin: &str, args: &[String], block: &mut String) -
     (line, code)
 }
 
+/// The seed of a run without `--seed`. The library's default seed is random, and the seed decides
+/// the first value of every `nondet()` toss, so it decides the order in which a sequential
+/// exploration meets its executions (not which executions it meets). A fixed default makes that
+/// order, and with it every graph store's `iteration` and line order, the same on every run.
+const DEFAULT_SEED: u64 = 0;
+
 fn config_of(o: &Opts) -> Config {
-    let mut b = Config::builder().with_cons_type(o.model).with_verbose(0);
-    if let Some(s) = o.seed {
-        b = b.with_seed(s);
-    }
+    let mut b = Config::builder()
+        .with_cons_type(o.model)
+        .with_verbose(0)
+        .with_seed(o.seed.unwrap_or(DEFAULT_SEED));
     if let Some(t) = o.threshold {
         b = b.with_thread_threshold(t);
     }

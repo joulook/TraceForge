@@ -109,6 +109,14 @@ fn fixture(name: &str) -> (Entry, Vec<String>) {
             for _ in 0..TOSSES.load(Ordering::Relaxed) { let _ = traceforge::nondet(); }
             v.join().unwrap();
         }), vis(&["v"])),
+        // Four tosses; the line is how many came up true, so most lines have several executions
+        // and the store keeps whichever the exploration order meets first.
+        "tosses" => (Arc::new(|| {
+            named("v", || {
+                let n = (0..4).filter(|_| traceforge::nondet()).count();
+                traceforge::send_msg(me(), n);
+            }).join().unwrap();
+        }), vis(&["v"])),
         // Must not be explored.
         "panic" => (Arc::new(|| panic!("must not explore")), vis(&["v"])),
         other => panic!("unknown fixture {other}"),
@@ -1397,4 +1405,50 @@ fn the_export_prints_a_store_summary_line() {
     let (t, code, _, _) = export("visible-float", &dir, "f", &["--graphs", "@STORE"], &[]);
     assert_eq!(code, 2);
     assert!(!t.contains("graph_store:"), "{t}");
+}
+
+#[test]
+fn a_run_without_seed_has_one_exploration_order() {
+    // Separate processes, no --seed: the stores must be byte-identical (iteration and line order
+    // included). Three pairs, so that a random default seed would almost surely show.
+    let dir = scratch();
+    let bin = child_binary(&dir, "tf_seed");
+    let run = |tag: &str, extra: &[&str]| -> (Vec<u8>, Vec<u8>) {
+        let out = dir.join(format!("{tag}.jsonl"));
+        let g = dir.join(format!("{tag}.g"));
+        let mut args = vec!["export", "impl", "--out", out.to_str().unwrap(), "--graphs", g.to_str().unwrap()];
+        args.extend(extra);
+        let (t, e, c) = child(&bin, "tosses", &args);
+        assert_eq!((c, e.as_str()), (0, ""), "{t}");
+        (std::fs::read(&out).unwrap(), std::fs::read(&g).unwrap())
+    };
+    let (export0, store0) = run("a0", &[]);
+    for i in 1..6 {
+        let (e, s) = run(&format!("a{i}"), &[]);
+        assert_eq!(e, export0, "run {i}: export");
+        assert_eq!(s, store0, "run {i}: store");
+    }
+    // The first graph is the first execution: iterations run 1, 2, ... in store order.
+    let st: Vec<String> = String::from_utf8(store0.clone()).unwrap().lines().map(str::to_owned).collect();
+    assert_eq!(st.len(), 6, "an identity line and five lines (0 to 4 trues)");
+    // --seed 7: the same export; a valid store of the same lines (iteration and order may differ).
+    let (e7, s7) = run("s7", &["--seed", "7"]);
+    assert_eq!(e7, export0, "--seed 7: export");
+    let lines: Vec<String> = String::from_utf8(e7).unwrap().lines().map(str::to_owned).collect();
+    let st7: Vec<String> = String::from_utf8(s7).unwrap().lines().map(str::to_owned).collect();
+    assert_eq!(st7.len(), 6);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut last = 0;
+    for raw in &st7[1..] {
+        let g = check_graph_line(raw, &lines[0], &lines);
+        assert!(seen.insert(g["line"].as_str().unwrap().to_owned()));
+        let it = g["run"]["iteration"].as_u64().unwrap();
+        assert!(it > last, "first occurrences in order");
+        last = it;
+        assert_eq!(g["run"]["options"], serde_json::json!({"seed": 7}));
+    }
+    for raw in &st[1..] {
+        check_graph_line(raw, &lines[0], &lines);
+        assert_eq!(json(raw)["run"]["options"], serde_json::json!({}), "no seed recorded without --seed");
+    }
 }
