@@ -182,9 +182,13 @@ fn refusals_before_exploration() {
             "--witness requires online or conf --engine stateful"),
         (vec!["count", "impl", "--witness", "x"],
             "--witness requires online or conf --engine stateful"),
-        (vec!["row", "--witness", "x"],
-            "row takes only --model, --seed, --threshold and --dump-large-graph, not `--witness`"),
     ];
+    let mut cases = cases.to_vec();
+    // `row` exists only in the eval build.
+    if cfg!(feature = "eval") {
+        cases.push((vec!["row", "--witness", "x"],
+            "row takes only --model, --seed, --threshold and --dump-large-graph, not `--witness`"));
+    }
     let usage = cli(body.clone(), &[]).0.split_once('\n').unwrap().1.to_owned();
     for (args, reason) in cases {
         assert_eq!(cli(body.clone(), &args), (format!("program: {reason}\n{usage}"), 2));

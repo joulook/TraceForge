@@ -11,41 +11,43 @@
 //! Conformance verification: does one program's visible behaviour refine
 //! another's?
 //!
+//! The summary files that `export`, `online` and `conf-join` read and write follow
+//! daavar's `format/SUMMARY-FORMAT.md`, the format TraceForge and JMC both implement.
+//!
 //! The implementation and the specification are both ordinary TraceForge
 //! programs. Two checkers are offered, chosen by [`Engine`]
 //! (`ConfBuilder::engine`; the default is the enumerator):
 //!
-//! - **The directed enumerator** (`Engine::Enumerator`, paper §8.7). The
+//! - **The directed enumerator** (`Engine::Enumerator`, experimental). The
 //!   implementation is explored by the stock Must engine; the specification is
 //!   consulted through *probe* executions, which report what it could do next
 //!   without committing to any of it. A search over specification graphs then
 //!   tries those options, looking for one that matches what the implementation
-//!   has done so far. It runs §5.4's precheck, the §7.1 diagnostics and §7.3's
-//!   triage.
-//! - **The stateful checker** (`Engine::Stateful`, paper §8.3, `P4-STATEFUL`).
+//!   has done so far. It runs the precheck, the diagnostics and the triage.
+//! - **The stateful checker** (`Engine::Stateful`, the stable engine).
 //!   Both programs are enumerated in full by two gate-disabled runs: the
 //!   specification's run builds an index of signatures and orders and *is* the
-//!   §5.4 check (the opt-out has no effect), and the implementation's run looks
+//!   precheck (the opt-out has no effect), and the implementation's run looks
 //!   each complete graph up in it. A report is an uncovered complete
 //!   implementation graph, with no probe, no inner search, no diagnostics and
 //!   no triage. `search_budget`, `inner_order` and `memo` are ignored.
-//! - **The complete-first checker** (`Engine::CompleteFirst`, paper §8.5,
-//!   `P4-CFIRST`). Must on the implementation, uncut, with §5.4's precheck
+//! - **The complete-first checker** (`Engine::CompleteFirst`,
+//!   experimental). Must on the implementation, uncut, with the precheck
 //!   run unbounded first (skippable); at each complete graph the witness cache
 //!   `W` is probed and, on a miss, the specification is swept by Must on its
 //!   own thread, unpruned, stopped at the first covering graph, which joins
 //!   `W`. A report is an uncovered complete implementation graph (or, with
 //!   `early_error_cut(true)`, a visible-error prefix — then the engine decides
-//!   but does not enumerate, A27). No probe, no inner search, no diagnostics,
+//!   but does not enumerate). No probe, no inner search, no diagnostics,
 //!   no triage. `search_budget`, `inner_order` and `memo` are ignored.
-//! - **The gated checker** (`Engine::Gated`, paper §8.6, `P4-GATED`). The
+//! - **The gated checker** (`Engine::Gated`, experimental). The
 //!   complete-first checker plus a gate after every visible event of the
 //!   implementation: the carried witness is re-tested by one `cone` test, and
 //!   on a miss the policy (`GatePolicy`) decides whether to sweep the
 //!   specification for a fresh witness or an absence certificate, which
 //!   transfers to every extension and skips every gate and completion test
-//!   below it. Exhaustive mode reports uncovered complete graphs
-//!   (`thm:gated`); first-failure mode (`GatedMode`) reports the first gated
+//!   below it. Exhaustive mode reports uncovered complete graphs;
+//!   first-failure mode (`GatedMode`) reports the first gated
 //!   partial graph with no match, or the first uncovered complete graph, and
 //!   stops. `early_error_cut` is ignored.
 //!
@@ -75,19 +77,18 @@
 //! being a fact the engine records rather than one inferred from the first
 //! two. Every other outcome names why it is not a certificate. A **report** is
 //! a *candidate* violation: it certifies that no complete specification graph
-//! covers any event-extension of the reported graph, modulo the draft's own
+//! covers any event-extension of the reported graph, modulo the checker's own
 //! lemmas, and certifies nothing about whether the report list is complete.
 //!
 //! # `verify` panics on invalid input
 //!
-//! Blocked item C's ruling. [`ConfError`] carries the failures of a run that
-//! started legitimately — §5.4's precheck and §7.3's triage. §8's
-//! visible-thread violations and §9's scope rejections are "this program is
-//! not a valid input", and they **panic**, with a message naming the event,
-//! which is what §9 asks for in terms and what Rust's convention says for a
-//! precondition a caller can check. The alternative needs a `catch_unwind`
-//! boundary inside conformance's hot path, and S4 was bitten at that exact
-//! boundary by a failure that became a different failure and lost its origin.
+//! [`ConfError`] carries the failures of a run that started legitimately: the
+//! precheck and the triage. Visible-thread violations and scope rejections mean
+//! "this program is not a valid input", and they **panic**, with a message
+//! naming the event, as Rust's convention says for a precondition a caller can
+//! check. The alternative needs a `catch_unwind` boundary inside conformance's
+//! hot path, where a failure can turn into a different failure and lose its
+//! origin.
 //!
 //! # Writing a pair: both programs must be re-entrant
 //!
@@ -96,7 +97,7 @@
 //! replaying the prefix it has recorded — `lib.rs`'s
 //! `loop { Execution::new(..); execution.run(|| f()) }` — and conformance does the
 //! same to the *specification* once per inner-search node, which is far more
-//! often: 372 246 probes in one `verify` run of the `ndk3` pair measured in F63.
+//! often: 372 246 probes were measured in one `verify` run of a three-node pair.
 //!
 //! What replay restores is the **engine's** decisions: thread interleaving,
 //! `nondet()`, and which send a receive reads from. All three live in the graph.
@@ -117,11 +118,9 @@
 //! divergence can be caught loudly, and can also pass unnoticed — detection is not
 //! something to rely on.
 //!
-//! `traceforge/tests/f72_stateful_program.rs` (on `fix/f72-contract`) exhibits the
-//! silent side: a captured counter reads `0` then `1` across two executions, and a
-//! program whose *pending* send value depends on it completes normally with no
-//! diagnostic. Backlog **F72**; the same account belongs on [`crate::verify`],
-//! which is an upstream change.
+//! The silent side, for example: a captured counter reads `0` then `1` across two
+//! executions, and a program whose *pending* send value depends on it completes
+//! normally with no diagnostic. The same holds for [`crate::verify`].
 //!
 //! # Writing a pair: do not send a `ThreadId` a visible thread will observe
 //!
@@ -138,7 +137,7 @@
 //!   3  participant (visible)
 //! ```
 //!
-//! §6.1 matches a visible thread's observations **by value**. If the
+//! The check matches a visible thread's observations **by value**. If the
 //! participant receives `Prepare(coordinator_id)`, the implementation observes
 //! `2` and the specification `1`, so every such observation mismatches and the
 //! run reports a candidate violation although the two programs agree.
@@ -151,7 +150,7 @@
 //! each of the three configurations: `Send + PartialEq + DynClone + 'static`
 //! throughout, plus `Debug` with no feature (`msg.rs:129`) and under
 //! `print_vals` (`:134`), but `Display` under `print_vals_custom` (`:147`).
-//! `PartialEq` is the bound §6.1's by-value matching rests on and is demanded
+//! `PartialEq` is the bound the by-value matching rests on and is demanded
 //! everywhere; the formatting bound is not, so nothing here may assume `Debug`
 //! without naming the feature. Note the feature-free arm asks for `Debug` while
 //! its trait adds no formatting supertrait at all — part of why that build does
@@ -237,12 +236,16 @@
 //!
 //! # Map of the module
 //!
-//! `prober`/`probe` (S1) ask the specification what it could do next;
-//! `obs`/`morphism` (S2) are the observation adapters and the morphism;
-//! `search` (S3) is `Cover`/`SpecVisit`/`Done`/Φ; `ctx` (S4) is the gate's
-//! state on the outer `Must`; and `config`, `report`, `precheck`, `triage`,
-//! `diagnose` (S5) are the configuration, the reporting product and the two
-//! extra engine runs. See `plan/traceForge/conf-plan.md`.
+//! `prober`/`probe` ask the specification what it could do next; `obs`/`morphism`
+//! are the observation adapters and the morphism; `search` is the cover search
+//! (`Cover`/`SpecVisit`/`Done`/Φ); `ctx` is the gate's state on the outer `Must`;
+//! `config`, `report`, `precheck`, `triage` and `diagnose` are the configuration,
+//! the reporting product and the two extra engine runs; `interchange` and
+//! `export_p` read and write summary files; `online` looks an implementation's
+//! executions up in a specification's summary file; `measure` is the measurement
+//! block every subcommand prints; `witness_graph`, `witness_join`, `witness_json`
+//! and `witness_replay` are the witness graphs and their replay; `decide`
+//! classifies uncovered lines.
 
 // **Still needed, and narrower than it was.** S4 carried a blanket
 // `allow(dead_code)` for the sink's read side; S5 consumes that, and what
@@ -274,16 +277,17 @@ pub(crate) mod export_p;
 pub(crate) mod interchange;
 pub(crate) mod morphism;
 pub(crate) mod obs;
-/// `C`: the online check, two exploration modes (`criteria/ONLINE.md`).
+/// The online check, in two exploration modes.
 pub(crate) mod online;
 pub(crate) mod online_p;
-/// `B`: the measurement block (`criteria/MEAS.md`).
+/// The measurement block.
 pub(crate) mod measure;
 pub(crate) mod precheck;
 pub(crate) mod probe;
 pub(crate) mod prober;
-/// `H` H-0.1: one evaluation row's record, run on a program's entry points
-/// (a copy of the test-only `grid.rs`/`eval.rs` record code; `program.rs`'s `row`).
+/// One evaluation row's record, run on a program's entry points (the `row`
+/// subcommand); only with the `eval` feature.
+#[cfg(feature = "eval")]
 pub(crate) mod record;
 pub(crate) mod report;
 pub(crate) mod search;
@@ -387,28 +391,27 @@ pub use interchange::{conf_join_decide, conf_join_merge_decide};
 
 use std::sync::Arc;
 
-/// The §9 config predicate, in one place.
+/// The configuration scope predicate, in one place.
 ///
-/// `conf-plan.md` §9 calls the constructor-side check "the guarantee", and
-/// gives the reason: a `Config` can reach a `Must` without ever passing
+/// The constructor-side check is "the guarantee", for this reason: a `Config` can reach a `Must` without ever passing
 /// `check_valid` — `replay` deserializes one, and `estimate_execs_with_config`
 /// silently overwrites `cons_type` *and* `schedule_policy`. Builder validation
 /// is UX; this is the guarantee.
 ///
-/// §9 applies it "to the outer conf run, the probe `Must`, and the err-freedom
-/// precheck alike". It is a single function so those cannot drift apart: the
+/// It applies to the outer conf run, the probe `Must`, and the err-freedom
+/// precheck alike. It is a single function so those cannot drift apart: the
 /// probe used to carry **four** of the seven exclusions and the gap went
 /// unnoticed for three review rounds, because the four were written out by
-/// hand at one call site and nothing compared them to §9's list.
+/// hand at one call site and nothing compared them to the scope's list.
 ///
 /// **It tests nine `Config` fields with seven assertion macros**, because two
 /// of them cover two fields each (`!parallel && !partitioned_parallelization`,
 /// and both predetermined maps). [`ConfBuilder::build`] enumerates the same
 /// nine independently, and `s5_tests` diffs the two per *field* — a per-macro
 /// diff would pass while `partitioned_parallelization` went unchecked at
-/// config time, which is the failure criterion 7 names.
+/// config time, which is the failure to avoid.
 ///
-/// §5.4's precheck now calls this, with the engine name `"precheck"`.
+/// The precheck calls this too, with the engine name `"precheck"`.
 pub(crate) fn assert_config_in_scope(config: &crate::Config, engine: &str) {
     use crate::channel::cons_to_model;
     use crate::{CommunicationModel, ExplorationMode, SchedulePolicy};
@@ -457,13 +460,13 @@ pub(crate) fn assert_config_in_scope(config: &crate::Config, engine: &str) {
     );
 }
 
-/// `SVERIFY-P` I3-2: the second scope predicate, for the partitioned stateful
+/// The second scope predicate, for the partitioned stateful
 /// checker's worker `Must`s (`Must::enable_conformance_partitioned`). Every
 /// check of `assert_config_in_scope`, with one difference: the partitioned
 /// mode is **required** (it is the checker's own run mode) and the
 /// shared-queue mode still refused. The partitioned mode's `backward_revisit`
 /// ships the graph to a task that explores it to completion, where the
-/// completion sink sees it (`SVERIFY-P` I1); so the exclusion's reason (a
+/// completion sink sees it; so the exclusion's reason (a
 /// post-apply gate never firing for a shipped revisit) does not apply to a
 /// sink-only mode.
 pub(crate) fn assert_config_in_scope_partitioned(config: &crate::Config, engine: &str) {
@@ -516,16 +519,16 @@ pub(crate) fn assert_config_in_scope_partitioned(config: &crate::Config, engine:
 pub(crate) mod adversarial;
 #[cfg(test)]
 mod apparatus_tests;
-/// S7's benchmark: two-phase commit, and what conformance costs. **Test-only**;
+/// A benchmark: two-phase commit, and what conformance costs. **Test-only**;
 /// the measurements are `#[ignore]`d because they are a table for a human.
 #[cfg(all(test, feature = "fixture-tests"))]
 mod bench;
 #[cfg(test)]
 mod cfirst_tests;
-/// A guided demonstration of the draft's examples, one at a time. **Test-only.**
+/// A guided demonstration of worked examples, one at a time. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod demo;
-/// §11.6's differential harness: the tool against the oracle. **Test-only.**
+/// The differential harness: the tool against the oracle. **Test-only.**
 #[cfg(test)]
 pub(crate) mod differential;
 #[cfg(test)]
@@ -536,12 +539,12 @@ mod enumerator_tests;
 mod gate_tests;
 #[cfg(test)]
 mod gated_tests;
-/// §11.6's fragment program generator. **Test-only.**
+/// The fragment program generator. **Test-only.**
 #[cfg(test)]
 pub(crate) mod generator;
-/// P4-DIFF's grid (plan §6): the fixture registry, the per-configuration
-/// runner and the table writer (lead); the oracle and the tests are the
-/// tester's `grid_oracle.rs`/`grid_tests.rs`. **Test-only.**
+/// The fixture grid: the fixture registry, the per-configuration runner and
+/// the table writer; the oracle and the tests are `grid_oracle.rs` and
+/// `grid_tests.rs`. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod grid;
 #[cfg(all(test, feature = "fixture-tests"))]
@@ -552,40 +555,39 @@ mod grid_tests;
 mod mixed_tests;
 #[cfg(all(test, feature = "fixture-tests"))]
 mod flat_tests;
-/// P5-HARNESS's evaluation runner (lead) and the tester's fixtures and tests.
-/// **Test-only.**
+/// The evaluation runner, with its fixtures and tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod eval;
 #[cfg(all(test, feature = "fixture-tests"))]
 mod eval_tests;
-/// P5-APPS's tests (tester). **Test-only.**
+/// The application benchmarks' tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod apps_tests;
-/// P5-APPTAB's tests (tester). **Test-only.**
+/// The application table's tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod apptab_tests;
-/// P5-CFCFG's tests (tester). **Test-only.**
+/// The complete-first configurations' tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod cfcfg_tests;
-/// P5-XBASE's tests (tester). **Test-only.**
+/// The cross-baseline tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod xbase_tests;
-/// COMPACT-INDEX's tests (tester). **Test-only.**
+/// The compact index's tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod compact_tests;
-/// SVERIFY-P I3's tests (tester). **Test-only.**
+/// The partitioned stateful checker's tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod sverify_p_tests;
-/// P5-SYNTH's tests (tester). **Test-only.**
+/// The synthetic benchmarks' tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod synth_tests;
-/// P5-CAMPAIGN's tests (tester). **Test-only.**
+/// The evaluation campaign's tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod campaign_tests;
-/// P5-X5's tests (tester). **Test-only.**
+/// The cross-tool export tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod x5_tests;
-/// J3's tests (tester). **Test-only.**
+/// The summary-file join's tests. **Test-only.**
 #[cfg(all(test, feature = "fixture-tests"))]
 mod interchange_tests;
 #[cfg(test)]
@@ -604,13 +606,13 @@ mod export_p_tests;
 mod meas_keys_tests;
 #[cfg(test)]
 mod online_p_tests;
-/// DECIDE: tests.
+/// Decide's tests.
 #[cfg(test)]
 mod decide_tests;
-/// §11.6's `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground
-/// truth the differential harness measures the tool against, it is the naive
-/// exponential algorithm the paper's algorithm exists to avoid, and nothing
-/// in it is reachable from the public API (criterion 17).
+/// The `vis(Impl) ⊆ vis(Spec)` oracle. **Test-only**: it is the ground truth
+/// the differential harness measures the tool against, it is the naive
+/// exponential algorithm the checkers exist to avoid, and nothing in it is
+/// reachable from the public API.
 #[cfg(test)]
 pub(crate) mod oracle;
 #[cfg(test)]
@@ -634,9 +636,9 @@ pub(crate) mod testing;
 
 /// What a conformance run found, at the sink's level of detail.
 ///
-/// The minimal sink's read side (§4.2, owner ruling 2026-09-12). [`verify`]
-/// turns this into the reporting product; it deliberately renders nothing, and
-/// S4's gate tests are written against it.
+/// The minimal sink's read side. [`verify`] turns this into the reporting
+/// product; it deliberately renders nothing, and the gate tests are written
+/// against it.
 #[derive(Debug, Default)]
 pub(crate) struct Outcome {
     pub(crate) reports: Vec<ctx::Report>,
@@ -644,33 +646,33 @@ pub(crate) struct Outcome {
     pub(crate) diagnostics: Vec<ctx::Diagnostic>,
     pub(crate) stats: Option<crate::Stats>,
     pub(crate) end: report::SearchEnd,
-    /// How many gates F49's replay-frontier skip suppressed (review `P3-A16`).
+    /// How many gates the replay-frontier skip suppressed.
     ///
     /// **A skipped gate is a check that did not happen.** A run with a non-zero
     /// count established "no gate *that ran* found a violation", which is
     /// weaker than refinement — so any figure derived from it must assert this
-    /// is zero or state what it was. Same obligation F43 imposes for
+    /// is zero or state what it was. The same obligation holds for
     /// exhaustions.
     pub(crate) skipped_gates: usize,
-    /// The random seed the outer engine used (F61). Any figure derived from a
+    /// The random seed the outer engine used. Any figure derived from a
     /// program that calls `nondet()` depends on it; print it with the figure.
     pub(crate) seed: u64,
-    /// How many gates F42's inertness skip suppressed — a fresh event that
+    /// How many gates the inertness skip suppressed — a fresh event that
     /// changed nothing observable, so the gate's answer could not differ.
     pub(crate) inert_gates: usize,
-    /// `P4-ENUMERATOR` criterion 9: the inner search aborted on a
+    /// The inner search aborted on a
     /// specification assertion. **An engine-only consumer checks this first**,
     /// ahead of `reports` and `end`: the run was abandoned at that gate, and
     /// what it recorded before is not a verdict about anything.
     pub(crate) spec_error: Option<(String, crate::event::Event)>,
-    /// Criterion 13.
+    /// The run's counters.
     pub(crate) counters: report::ConfCounters,
 }
 
 /// Run `implementation` under conformance against `specification`, at the
 /// sink's level of detail.
 ///
-/// The engine half of [`verify`], kept separate because S4's gate tests are
+/// The engine half of [`verify`], kept separate because the gate tests are
 /// written against it and because it is the piece with no post-processing: no
 /// precheck, no diagnostics, no triage, no rendering.
 ///
@@ -717,7 +719,7 @@ pub(crate) fn verify_conformance_with(
     )
 }
 
-/// [`verify_conformance_with`] carrying knob B (`P4-SELECTOR` S3, route (a));
+/// [`verify_conformance_with`] carrying knob B, the inner offer order;
 /// the signature-stable function above delegates here with `Recorded`.
 pub(crate) fn verify_conformance_with_order(
     config: crate::Config,
@@ -742,9 +744,8 @@ pub(crate) fn verify_conformance_with_order(
     )
 }
 
-/// [`verify_conformance_with_order`] carrying every inner-search option
-/// (`P4-ENUMERATOR` criterion 4, route (a)); the signature-stable functions
-/// above delegate here.
+/// [`verify_conformance_with_order`] carrying every inner-search option; the
+/// signature-stable functions above delegate here.
 pub(crate) fn verify_conformance_with_opts(
     config: crate::Config,
     implementation: Arc<dyn Fn() + Send + Sync>,
@@ -801,13 +802,13 @@ pub(crate) fn verify_conformance_with_opts(
     }
 }
 
-/// **The public entry point** (§8).
+/// **The public entry point.**
 ///
-/// Under the default [`Engine::Enumerator`]: runs §5.4's specification
+/// Under the default [`Engine::Enumerator`]: runs the specification's
 /// err-freedom precheck (unless opted out), then the outer conformance
-/// exploration, then — per report — the §7.1 diagnostics and §7.3's triage if
+/// exploration, then — per report — the diagnostics and the triage if
 /// asked for. Under [`Engine::Stateful`]: two full enumerations, the
-/// specification's doubling as the §5.4 check, with none of the per-report
+/// specification's doubling as the precheck, with none of the per-report
 /// steps. Under [`Engine::CompleteFirst`]: the unbounded precheck, then
 /// Must on the implementation with a witness-cache probe and a sweep of the
 /// specification at each complete graph, again with none of the per-report
@@ -819,14 +820,14 @@ pub(crate) fn verify_conformance_with_opts(
 ///
 /// On **invalid input**, deliberately and with a message naming the event:
 ///
-/// - §8's visible-thread violations — a declared visible name spawned after
+/// - visible-thread violations — a declared visible name spawned after
 ///   its program has communicated (`ctx.rs`), spawned twice, or (at a complete
 ///   execution) never spawned;
-/// - §9's scope rejections, from either program — `inbox`, `sample`, a
+/// - scope rejections, from either program — `inbox`, `sample`, a
 ///   `TotalOrder` send or receive, monitor registration, symmetric spawning, a
 ///   predetermined named choice, or symbolic evaluation.
 ///
-/// A configuration outside §9's scope is refused earlier and more gently, by
+/// A configuration outside the scope is refused earlier and more gently, by
 /// [`ConfBuilder::build`], which returns a [`ConfigError`]. That layer is UX;
 /// the panic is the guarantee.
 ///
@@ -840,7 +841,7 @@ pub(crate) fn verify_conformance_with_opts(
 /// the complete-first and gated checkers, the precheck, the outer run and one
 /// scoped thread per sweep — so none of them may share a thread with a caller that is
 /// itself inside an execution. A panic raised inside is re-raised on the
-/// caller's thread with its original payload, so §8's and §9's messages arrive
+/// caller's thread with its original payload, so those panic messages arrive
 /// as themselves rather than as a join error.
 pub fn verify<I, S>(
     config: ConfConfig,

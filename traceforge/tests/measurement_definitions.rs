@@ -390,8 +390,10 @@ fn toss_revisits_have_distinct_completions_on_all_four_paths() {
 fn graph_audit_is_refused_on_timed_commands() {
     // Mutant: remove the diagnostic-command guard or allow the flag in row.
     let body: Entry = Arc::new(|| { named("v", || {}).join().unwrap(); });
-    for args in [vec!["row", "--audit-graphs"], vec!["count", "impl", "--audit-graphs"],
-        vec!["conf", "--audit-graphs"]]
+    let mut cases = vec![vec!["count", "impl", "--audit-graphs"], vec!["conf", "--audit-graphs"]];
+    // `row` exists only in the eval build.
+    if cfg!(feature = "eval") { cases.insert(0, vec!["row", "--audit-graphs"]); }
+    for args in cases
     {
         let (out, code) = cli(body.clone(), &args);
         assert_eq!(code, 2, "conformance: {out}");

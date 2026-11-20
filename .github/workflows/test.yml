@@ -23,8 +23,11 @@ jobs:
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2
 
+      - name: Build (default features, without the evaluation-only code)
+        run: cargo build --workspace --all-targets
+
       - name: Build
-        run: cargo build --workspace --all-targets --features symbolic
+        run: cargo build --workspace --all-targets --features symbolic,eval
 
       - name: Run tests
-        run: cargo test --workspace --all-targets --features symbolic
+        run: cargo test --workspace --all-targets --features symbolic,eval

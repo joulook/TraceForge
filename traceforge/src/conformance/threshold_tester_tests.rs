@@ -771,6 +771,7 @@ fn ett9_online_p_a_sink_failure_and_a_crossing() {
 /// first. Synthetic rows through `of_row` with `GridEnd::Panicked`, for the conformance
 /// engines whose block comes from the row (code review round 02, m1).
 #[test]
+#[cfg(feature = "eval")]
 fn ett10_a_panicked_row_with_a_threshold_end_is_an_error() {
     use super::record::{GridConfig, GridEnd, GridEngine};
     let reason = "Threshold(ThresholdStop { thread: \"main\", limit: 16 })".to_string();

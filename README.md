@@ -150,7 +150,7 @@ implementation's uncovered lines. Its options (`conf-join --help`):
 |---|---|
 | `--merge` | read both files as sorted streams (bounded memory) |
 | `--decide` | classify each uncovered line: a violation (with a witness), a false alarm or unresolved; the verdict and exit code stay the join's |
-| `--decide-budget N` | the search states per line for `--decide` (implies `--decide`) |
+| `--decide-budget N` | the search states per line for `--decide` (default 10 000 000; implies `--decide`) |
 | `--witness-dir D` | write the witness graph of each uncovered line to `D` (new or empty), looked up in the exports' graph stores |
 | `--impl-graphs P` | with `--witness-dir`: the implementation's store (default `impl.jsonl.graphs.jsonl`) |
 | `--spec-graphs Q` | with `--witness-dir`: the specification's store (default `spec.jsonl.graphs.jsonl`) |

@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use crate::conformance::compact::{CompactSummary, OrdCounts};
+#[cfg(feature = "eval")]
 use crate::conformance::record::{GridEnd, GridEngine, GridRaw, Row};
 use crate::conformance::sig::Sig;
 use crate::conformance::{ConfError, ConfOutcome, ConfVerdict, Engine};
@@ -303,9 +304,10 @@ impl Shape {
     }
 }
 
-// ------------------------------------------------------------------- K1 --
+// ------------------------------------- `row` (the `eval` feature) --
 
 /// A record cell by name, `None` when absent or blank.
+#[cfg(feature = "eval")]
 fn cell<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
     row.iter()
         .find(|(k, _)| *k == key)
@@ -316,6 +318,7 @@ fn cell<'a>(row: &'a Row, key: &str) -> Option<&'a str> {
 /// A record cell as a number; `Empty` when blank, `None` or not a number. A
 /// cell the record writes as an `Option`'s `Debug` (`vm_hwm_kb_after` reads
 /// `Some(8632)`) is unwrapped (the tester's gate-3 finding).
+#[cfg(feature = "eval")]
 fn num(row: &Row, key: &str) -> Cell {
     opt(cell(row, key).and_then(|v| {
         let v = v
@@ -329,6 +332,7 @@ fn num(row: &Row, key: &str) -> Cell {
 /// K1 (`row`): the block from the record's cells and the raw result
 /// (MEAS-1 K1). A `Verdict` route takes K6's table, keeping the record's
 /// `wall_ms`, `peak_rss_kb` and `iterations`.
+#[cfg(feature = "eval")]
 pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usize) -> Measurements {
     let raw = match end {
         GridEnd::Ok(r) => Some(&r.raw),
@@ -494,6 +498,7 @@ pub(crate) fn of_row(row: &Row, end: &GridEnd, engine: GridEngine, threads: usiz
 }
 
 /// K1's `stop_reason` from the record (MEAS-1 K1, §7's precedence).
+#[cfg(feature = "eval")]
 fn row_stop(row: &Row, panicked: bool) -> Stop {
     let errors = cell(row, "spec_errors")
         .and_then(|v| v.parse::<u64>().ok())

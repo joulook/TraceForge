@@ -1274,10 +1274,12 @@ fn g1_t9_the_readers_extension() {
 // H (the tester's; `criteria/H.md` H-2 A1, A2, F, G; `log/dev/H.md` §2.0)
 // =========================================================================
 
+#[cfg(feature = "eval")]
 use crate::conformance::record::{self, Subject};
 
 /// `cluster/schema8-header.csv` (md5 9ac763f3…, = Daavar's `scripts/`): the 262
 /// names in order, unquoted and comma-joined (the record's own header).
+#[cfg(feature = "eval")]
 const SCHEMA8_HEADER: &str = concat!(
     "key,run_kind,profile,commit,rep,tier,end_class,censor_via,censored,proc_wall_ms,pid,",
     "rss_sampled_hwm_kb,rss_child_hwm_kb,run_dir,diag_keys,diag_bytes_est,family,knobs,k1,k2,",
@@ -1335,6 +1337,7 @@ const SCHEMA8_HEADER: &str = concat!(
 /// **H A1** (H-2 A): the library's header is schema 8's, 262 names in order.
 /// Failing direction: MA1 (two header columns swapped, a scratch mutant).
 #[test]
+#[cfg(feature = "eval")]
 fn h_a1_the_header_is_schema_8s() {
     let want: Vec<&str> = SCHEMA8_HEADER.split(',').collect();
     assert_eq!(want.len(), 262, "conformance: H: the embedded header");
@@ -1345,6 +1348,7 @@ fn h_a1_the_header_is_schema_8s() {
 }
 
 /// The 14 label forms of the cluster's smoke rows (`cluster/smoke.rows`).
+#[cfg(feature = "eval")]
 const SMOKE_LABELS: [&str; 14] = [
     "Stateful/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set",
     "SverifyP/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set/threads=1",
@@ -1366,6 +1370,7 @@ const SMOKE_LABELS: [&str; 14] = [
 /// misspelled forms are refused. Failing direction: MA2 (the printer drops
 /// `/threads=`, a scratch mutant).
 #[test]
+#[cfg(feature = "eval")]
 fn h_a2_the_14_label_forms_round_trip() {
     let distinct: BTreeSet<&str> = SMOKE_LABELS.iter().copied().collect();
     assert_eq!(distinct.len(), 14, "conformance: H: 14 distinct forms");
@@ -1385,12 +1390,14 @@ fn h_a2_the_14_label_forms_round_trip() {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg(feature = "eval")]
 enum FMsg {
     V(i32),
 }
 
 /// `a` sends `V(x)` to `b`, `x` one of `values` chosen by `nondet()`; `b`
 /// receives it (a pair that is no benchmark: H-2 F).
+#[cfg(feature = "eval")]
 fn f_program(values: [i32; 2]) -> Entry {
     Arc::new(move || {
         let b = named("b", || {
@@ -1406,6 +1413,7 @@ fn f_program(values: [i32; 2]) -> Entry {
 
 /// The subject of an F row: FIFO, seed 0, visible `a`, `b`; the specification
 /// sends {1, 2}, the implementation `imp`.
+#[cfg(feature = "eval")]
 fn f_subject(name: &str, imp: [i32; 2]) -> Subject {
     Subject {
         name: name.to_owned(),
@@ -1420,6 +1428,7 @@ fn f_subject(name: &str, imp: [i32; 2]) -> Subject {
 }
 
 /// A row's `EVAL_ROW` JSON with the smoke rows' fields and the given label.
+#[cfg(feature = "eval")]
 fn f_json(name: &str, label: &str) -> String {
     format!(
         r#"{{"fixture":"{name}","label":"{label}","rep":0,"tier":{{"name":"c1h","wall_ms":3600000,"mem_kb":262144000}},"run_kind":"timed","family":"f","knobs":"","k":[null,null,null,null],"variant":"conforming","twin_key":""}}"#
@@ -1427,6 +1436,7 @@ fn f_json(name: &str, label: &str) -> String {
 }
 
 /// An all-quoted RFC 4180 record (the sentinel stripped), split into cells.
+#[cfg(feature = "eval")]
 pub(super) fn record_cells(line: &str) -> Vec<String> {
     let body = line
         .strip_prefix(record::SENTINEL)
@@ -1453,6 +1463,7 @@ pub(super) fn record_cells(line: &str) -> Vec<String> {
 }
 
 /// One F row: the record by header name.
+#[cfg(feature = "eval")]
 fn f_row(name: &str, label: &str, imp: [i32; 2]) -> HashMap<String, String> {
     let lines = record::run_row(&f_json(name, label), "F", |n| f_subject(n, imp))
         .unwrap_or_else(|e| panic!("conformance: H: F: {label}: refused: {e}"));
@@ -1468,6 +1479,7 @@ fn f_row(name: &str, label: &str, imp: [i32; 2]) -> HashMap<String, String> {
 
 /// The F row of `rows` whose label starts with `prefix`, has `stop=false` and,
 /// if given, ends with `/threads=<threads>`.
+#[cfg(feature = "eval")]
 fn f_by<'a>(
     rows: &'a [(String, HashMap<String, String>)],
     prefix: &str,
@@ -1485,6 +1497,7 @@ fn f_by<'a>(
 }
 
 /// H-1's core list (the cells compared across engines in F where both fill them).
+#[cfg(feature = "eval")]
 const CORE: [&str; 18] = [
     "verdict",
     "end_class",
@@ -1515,6 +1528,7 @@ const CORE: [&str; 18] = [
 /// `count`. Failing direction: a CFirstP label with the selector `Ltr` is
 /// refused with no record.
 #[test]
+#[cfg(feature = "eval")]
 fn h_f_generic_engine_gating() {
     let mut labels: Vec<String> = SMOKE_LABELS.iter().map(|s| (*s).to_owned()).collect();
     labels.push(SMOKE_LABELS[1].replace("threads=1", "threads=2"));
@@ -1593,6 +1607,7 @@ fn h_f_generic_engine_gating() {
 
 /// `b` receives twice; `a` sends `V(1)` and, by `nondet()`, `V(2)`: one graph
 /// ends with `b` blocked on its second receive.
+#[cfg(feature = "eval")]
 fn h_blocked_program() -> Entry {
     Arc::new(|| {
         let b = named("b", || {
@@ -1615,6 +1630,7 @@ fn h_blocked_program() -> Entry {
 /// `spec_blocked > 0` is asserted. A no-op without `H_B_OUT`.
 #[test]
 #[ignore]
+#[cfg(feature = "eval")]
 fn h_b_blocked_spec_record() {
     let Some(out) = std::env::var_os("H_B_OUT") else {
         return;

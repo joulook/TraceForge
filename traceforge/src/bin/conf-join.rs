@@ -1,11 +1,11 @@
-//! `conf-join spec.jsonl impl.jsonl` (`J3`): joins two compact summary files of
-//! `plan/jmc-must/SUMMARY-FORMAT.md` — every implementation line against the
+//! `conf-join spec.jsonl impl.jsonl`: joins two summary files (the format of
+//! daavar's `format/SUMMARY-FORMAT.md`) — every implementation line against the
 //! specification's on TraceForge's `Set` index — and prints the verdict and the
 //! uncovered lines. Exit 0 conforms or no verdict, 1 violation, 2 refused input
-//! (the reason on stderr). `B`: after the report, or after a refusal, the
-//! measurement block on stdout. `DECIDE`: `--decide` classifies each uncovered
-//! line as a violation (with a witness), a false alarm or unresolved; the
-//! verdict and exit code stay the join's. `--witness-dir D` writes the witness graphs of the
+//! (the reason on stderr). After the report, or after a refusal, the measurement
+//! block on stdout. `--merge` reads the two files as sorted streams. `--decide`
+//! classifies each uncovered line as a violation (with a witness), a false alarm
+//! or unresolved; the verdict and exit code stay the join's. `--witness-dir D` writes the witness graphs of the
 //! uncovered lines, looked up in the exports' graph stores (`--impl-graphs P`, `--spec-graphs Q`,
 //! by default `<file>.graphs.jsonl`), at most `--witness-limit N|all` of them (default 20), with
 //! up to `--witness-nearest N` nearest specification graphs each (default 3).
@@ -24,7 +24,7 @@ usage: conf-join [--merge] [--decide [--decide-budget N]]
 
   --merge               read both files as sorted streams (bounded memory)
   --decide              classify each uncovered line: violation, false alarm or unresolved
-  --decide-budget N     search states per line for --decide (implies --decide)
+  --decide-budget N     search states per line for --decide (default 10000000; implies --decide)
   --witness-dir D       write the witness graph of each uncovered line to D (D new or empty),
                         looked up in the exports' graph stores
   --impl-graphs P       the implementation's store (default: impl.jsonl.graphs.jsonl)
@@ -43,9 +43,9 @@ fn main() -> ExitCode {
         print!("{HELP}");
         return ExitCode::SUCCESS;
     }
-    // `SORTED-JOIN`: `--merge` reads the two files as sorted streams.
+    // `--merge` reads the two files as sorted streams.
     let merge = args.iter().position(|a| a == "--merge").map(|i| args.remove(i)).is_some();
-    // `DECIDE`: `--decide` classifies every uncovered line; `--decide-budget N`
+    // `--decide` classifies every uncovered line; `--decide-budget N`
     // bounds the search states per line (implies `--decide`).
     let mut decide = args.iter().position(|a| a == "--decide").map(|i| args.remove(i)).is_some();
     let mut budget = traceforge::conformance::DEFAULT_DECIDE_BUDGET;

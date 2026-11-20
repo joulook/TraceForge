@@ -1,46 +1,33 @@
-//! `G1`: the shared main of a Must program (`criteria/G1.md` G1-5).
+//! The shared main of a TraceForge benchmark binary: a specification program
+//! and an implementation program, checked against each other.
 //!
 //! A program names only what is inherent to it — its visible threads and its
 //! specification and implementation entry points, each built from the
 //! program's own arguments — and gets the same subcommands as every other
-//! program:
-//!
-//! ```text
-//! <bin> count  spec|impl [--threads N] [--model fifo|bag|causal] [--seed N] [--threshold N]
-//!              [ARGS…]
-//! <bin> export spec|impl --out FILE [--threads N] [--model …] [--program S] [--size S]
-//!              [ARGS…]
-//! <bin> conf   [--engine stateful|stateless|gated|enumerator] [--threads N]
-//!              [--stop-at-first] [--distinct] [--model …] [ARGS…]
-//! <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]]
-//!              [--budget N] [--model …] [ARGS…]
-//! <bin> row    [--model …] --seed N [--threshold N] [--dump-large-graph] -- ARGS
-//!              (with EVAL_ROW, EVAL_COMMIT)
-//! ```
+//! program: `count`, `export`, `online`, `replay` and `conf`, listed with their
+//! options and exit codes by `<bin> --help` (the `HELP` text, which also marks
+//! the experimental engines and options).
 //!
 //! `ARGS` are everything after the options (or after `--`), passed verbatim to
 //! the program's entry points: a program's size and variant reach it only this
-//! way. `count` prints `execs=<c> blocked=<b>`, on the partitioned Must when
-//! `--threads` is above 1; `export` writes the summary file
-//! through [`crate::conformance::export`] (the generic encoder: no per-program
-//! code), on the partitioned Must with its lines sorted when `--threads` is
-//! above 1; `conf` runs [`crate::conformance::verify`] and prints its verdict,
-//! exit 0 when it conforms, 1 when it reports, 2 otherwise (an inconclusive
-//! run or an error). A usage error exits 2.
+//! way. `count` prints `execs=<c> blocked=<b>`; `export` writes the summary file
+//! (daavar's `format/SUMMARY-FORMAT.md`) through [`crate::conformance::export`],
+//! the generic encoder with no per-program code; `conf` runs
+//! [`crate::conformance::verify`] and prints its verdict. A usage error exits 2.
 //!
-//! `row` (`H`, criteria `H.md` H-0.2) runs one evaluation row: it reads the
-//! row's JSON from `EVAL_ROW` (label, tier, rep, run kind, family, knobs, `k`,
-//! variant, twin key and the row's name, which is copied into the record and
-//! never resolved) and the commit from `EVAL_COMMIT`, runs the row's engine on
-//! the program's entry points built from `ARGS`, and prints `EVALROW\t` and the
+//! With the `eval` feature, `row` runs one evaluation row: it reads the row's
+//! JSON from `EVAL_ROW` (label, tier, rep, run kind, family, knobs, `k`, variant,
+//! twin key and the row's name, which is copied into the record and never
+//! resolved) and the commit from `EVAL_COMMIT`, runs the row's engine on the
+//! program's entry points built from `ARGS`, and prints `EVALROW\t` and the
 //! schema-8 record (after the split line on an `Explore` row); exit 0 with a
 //! record (also when the engine panicked, `end_class=panicked`), 2 without one.
-//! The `row` options are `--model`, `--seed` (required), `--threshold`,
-//! and `--dump-large-graph`.
+//! Its options are `--model`, `--seed` (required), `--threshold` and
+//! `--dump-large-graph`.
 //!
-//! **The default model** (`MODEL-DEFAULT`): without `--model`, a run uses the
-//! program's own default, declared through [`main_with_model`]; [`main`] declares
-//! `fifo`. So leaving out `--model` never changes the meaning of a benchmark.
+//! **The default model**: without `--model`, a run uses the program's own
+//! default, declared through [`main_with_model`]; [`main`] declares `fifo`. So
+//! leaving out `--model` never changes the meaning of a benchmark.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -52,6 +39,7 @@ use crate::conformance::interchange::{self, ExportError};
 use crate::conformance::measure;
 use crate::conformance::online::{self, Mode, OnlineOpts, OnlineOut};
 use crate::conformance::online_p;
+#[cfg(feature = "eval")]
 use crate::conformance::record::{self, Subject};
 use crate::conformance::witness_graph;
 use crate::conformance::{self, ConfBuilder, ConfVerdict, Engine, ExportHeader};
@@ -134,16 +122,20 @@ pub fn run_cli_with_payload_names(
     (format!("{out}{block}"), code)
 }
 
-const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS…]\n       \
+/// The error usage text, with `row`'s line (`$row`) when the `eval` feature is on.
+macro_rules! usage_text {
+    ($row:literal) => {
+        concat!(
+            "usage: <bin> count spec|impl [--threads N] [options] [ARGS…]\n       \
     <bin> export spec|impl --out FILE [--threads N] [options] [ARGS…]\n       \
     <bin> conf [--engine stateful|stateless|gated|enumerator] [--threads N] \
     [--stop-at-first] [--distinct] [options] [ARGS…]\n\
     options: --model fifo|bag|causal (default: the program's), --seed N, --threshold N, \
     --dump-large-graph, --program S, --size S; \
     `--` ends the options\n       \
-    <bin> row [--model fifo|bag|causal] --seed N [--threshold N] [--dump-large-graph] -- ARGS   \
-    (EVAL_ROW, EVAL_COMMIT)\n       \
-    <bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]] \
+",
+            $row,
+            "<bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]] \
     [--budget N] [--model …] [--seed N] [--threshold N] [--dump-large-graph] [ARGS…]\n\
     \n--audit-graphs (export or online, any thread count): exact canonical graph audit.\n\
     Retains graphs; diagnostic only, not for timed rows.\n\
@@ -152,7 +144,18 @@ const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGS�
     Witnesses publish at run end; refusal discards staging and preserves existing files.\n\
     Unnamed threads, control characters in names/messages, and write errors stop the run\n\
     (online exit 1; conf exit 2). Online declaration refusals exit 2.\n\
-    Positions count printed events; iterations count completions.\n";
+    Positions count printed events; iterations count completions.\n"
+        )
+    };
+}
+
+#[cfg(feature = "eval")]
+const USAGE: &str = usage_text!(
+    "<bin> row [--model fifo|bag|causal] --seed N [--threshold N] [--dump-large-graph] -- ARGS   \
+    (EVAL_ROW, EVAL_COMMIT)\n       "
+);
+#[cfg(not(feature = "eval"))]
+const USAGE: &str = usage_text!("");
 
 /// `--help`: the stable subcommands and options, then the experimental ones.
 const HELP: &str = "\
@@ -584,6 +587,7 @@ fn count_config(o: &Opts) -> Config {
     config
 }
 
+#[cfg(feature = "eval")]
 /// `row`'s model, seed, thread threshold and optional large-graph diagnostic.
 fn row_config(o: &Opts, seed: u64) -> Config {
     let mut b = Config::builder().with_cons_type(o.model).with_seed(seed);
@@ -609,6 +613,7 @@ fn foreign_option<'a>(args: &'a [String], valued: &[&str], flags: &[&str]) -> Op
     None
 }
 
+#[cfg(feature = "eval")]
 /// The first option of `args` that `row` does not take, if any; `row`'s
 /// settings come from the row's label.
 fn row_foreign_option(args: &[String]) -> Option<&str> {
@@ -1024,6 +1029,7 @@ fn run_named_roles(
             }
         }
         "replay" => replay_command(p, bin, &args[1..], block),
+        #[cfg(feature = "eval")]
         "row" => {
             if let Some(a) = row_foreign_option(&args[1..]) {
                 return fail(format!(

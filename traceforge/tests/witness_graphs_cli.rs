@@ -789,15 +789,20 @@ fn graphs_on_online_and_row_are_refused_before_any_run() {
     let g = dir.join("g");
     let gs = g.to_str().unwrap();
     let mut firsts = Vec::new();
-    for args in [vec!["online", "--spec", spec.to_str().unwrap(), "--graphs", gs],
-                 vec!["row", "--seed", "0", "--graphs", gs]] {
+    let mut cases = vec![vec!["online", "--spec", spec.to_str().unwrap(), "--graphs", gs]];
+    // `row` exists only in the eval build.
+    if cfg!(feature = "eval") { cases.push(vec!["row", "--seed", "0", "--graphs", gs]); }
+    for args in cases {
         let (t, code) = cli("panic", &args);
         assert_eq!(code, 2, "{t}");
         assert!(!g.exists());
         firsts.push(t.lines().next().unwrap().to_owned());
     }
-    assert_eq!(firsts, ["program: --graphs with online requires --out",
-        "program: row takes only --model, --seed, --threshold and --dump-large-graph, not `--graphs`"]);
+    let mut want = vec!["program: --graphs with online requires --out"];
+    if cfg!(feature = "eval") {
+        want.push("program: row takes only --model, --seed, --threshold and --dump-large-graph, not `--graphs`");
+    }
+    assert_eq!(firsts, want);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the specification file");
 }
 
@@ -1619,4 +1624,27 @@ fn conf_join_help_says_nearest_needs_decide() {
     entry.extend(lines[i + 1..].iter().take_while(|l| l.starts_with("                    ")));
     assert!(entry.len() >= 2, "{entry:?}");
     assert!(entry[1..].join(" ").contains("--decide"), "{entry:?}");
+}
+
+#[test]
+fn row_exists_only_in_the_eval_build() {
+    let (usage_err, _) = cli("panic", &["nosuch"]);
+    let usage = usage_err.split_once('\n').unwrap().1.to_owned();
+    let (t, c) = cli("halves", &["row", "--seed", "0"]);
+    if cfg!(feature = "eval") {
+        assert!(usage.contains("<bin> row [--model fifo|bag|causal] --seed N"), "{usage}");
+        assert!(usage.contains("EVAL_ROW") && usage.contains("EVAL_COMMIT"), "{usage}");
+        // row runs (here it refuses, without EVAL_ROW): not an unknown subcommand.
+        assert!(!t.contains("unknown subcommand"), "{t}");
+    } else {
+        assert_eq!((t, c), (format!("program: unknown subcommand `row`\n{usage}"), 2));
+        let words: Vec<&str> = usage.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').collect();
+        assert!(!words.contains(&"row"), "{usage}");
+        assert!(!usage.contains("EVAL"), "{usage}");
+    }
+    // The help never names it.
+    let (h, hc) = cli("panic", &["--help"]);
+    assert_eq!(hc, 0);
+    let words: Vec<&str> = h.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').collect();
+    assert!(!words.contains(&"row") && !h.contains("EVAL"), "{h}");
 }

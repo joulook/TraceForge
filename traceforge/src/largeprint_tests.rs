@@ -192,6 +192,7 @@ fn el_cli_matrix() {
 }
 
 #[test]
+#[cfg(feature = "eval")]
 fn el_row() {
     for limit in ["16", "128"] {
         pair(

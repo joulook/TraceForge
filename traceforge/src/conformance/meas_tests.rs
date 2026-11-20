@@ -11,18 +11,23 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "eval")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::conformance::config::{ConfBuilder, Engine, IndexKind};
 use crate::conformance::interchange::{self, conf_join_with, ExportHeader, ExportSeams, JoinSeams};
-use crate::conformance::interchange_default_tests::{record_cells, scratch, split_block};
+use crate::conformance::interchange_default_tests::{scratch, split_block};
+#[cfg(feature = "eval")]
+use crate::conformance::interchange_default_tests::record_cells;
 use crate::conformance::measure::{self, Side};
 use crate::conformance::online::{self, Mode, OnlineOpts, OnlineOut};
 use crate::conformance::interchange_default_tests::named;
 use crate::conformance::online_tests::{
-    body, first_miss_of, imp_of, o_prog, reference, spec_file, vis, Prog, Var, M,
+    body, first_miss_of, imp_of, o_prog, reference, spec_file, vis, Prog, Var,
 };
+use crate::conformance::online_tests::M;
+#[cfg(feature = "eval")]
 use crate::conformance::record::{self, Subject};
 use crate::exec_graph::ExecutionGraph;
 use crate::{Config, ConsType};
@@ -242,14 +247,22 @@ fn cli(p: &Prog, args: &[&str]) -> (String, u8) {
 // K1: `row` through `record::run_row` (MEAS-1 K1)
 // =========================================================================
 
+#[cfg(feature = "eval")]
 const L_STATEFUL: &str = "Stateful/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set";
+#[cfg(feature = "eval")]
 const L_SVP1: &str = "SverifyP/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set/threads=1";
+#[cfg(feature = "eval")]
 const L_CF_STOP: &str = "CompleteFirst/Plain/stop=true/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set";
+#[cfg(feature = "eval")]
 const L_CF_PRE: &str = "CompleteFirst/Ltr/stop=false/Exhaustive/Always/memo=false/Default/precheck=true/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set";
+#[cfg(feature = "eval")]
 const L_EXPLORE: &str = "Explore/Ltr/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep";
+#[cfg(feature = "eval")]
 const L_EXPLOREP1: &str = "ExploreP/Ltr/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/threads=1";
+#[cfg(feature = "eval")]
 const L_REFUSED: &str = "CompleteFirst/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Flat";
 
+#[cfg(feature = "eval")]
 fn k1_json(label: &str) -> String {
     format!(
         r#"{{"fixture":"b-po","label":"{label}","rep":0,"tier":{{"name":"c1h","wall_ms":3600000,"mem_kb":262144000}},"run_kind":"timed","family":"b","knobs":"","k":[null,null,null,null],"variant":"bug","twin_key":""}}"#
@@ -257,6 +270,7 @@ fn k1_json(label: &str) -> String {
 }
 
 /// The K1 subject: P_o's specification against `bug`, Bag, seed 0.
+#[cfg(feature = "eval")]
 fn k1_subject(name: &str) -> Subject {
     Subject {
         name: name.to_owned(),
@@ -271,6 +285,7 @@ fn k1_subject(name: &str) -> Subject {
 }
 
 /// A record cell, `Some(n)` unwrapped, `None` as empty.
+#[cfg(feature = "eval")]
 fn cell(c: &HashMap<String, String>, k: &str) -> String {
     let v = c
         .get(k)
@@ -286,6 +301,7 @@ fn cell(c: &HashMap<String, String>, k: &str) -> String {
 }
 
 /// MEAS-1 K1's `stop_reason` from the record.
+#[cfg(feature = "eval")]
 fn k1_stop(c: &HashMap<String, String>) -> &'static str {
     let end = if cell(c, "impl_end").is_empty() {
         cell(c, "end")
@@ -311,6 +327,7 @@ fn k1_stop(c: &HashMap<String, String>) -> &'static str {
 
 /// MEAS-1 K1's map, conformance engines on the record route (Stateful,
 /// SverifyP, CompleteFirst at one thread).
+#[cfg(feature = "eval")]
 fn k1_conformance(engine: &str, c: &HashMap<String, String>) -> Vec<(&'static str, String)> {
     let (spec_phase, impl_phase) = match engine {
         "Stateful" | "SverifyP" => (cell(c, "spec_wall_time_ms"), cell(c, "impl_wall_time_ms")),
@@ -369,6 +386,7 @@ fn k1_conformance(engine: &str, c: &HashMap<String, String>) -> Vec<(&'static st
 }
 
 /// MEAS-1 K1's map for Explore and ExploreP; `xbase` is Explore's split line.
+#[cfg(feature = "eval")]
 fn k1_explore(explore_p: bool, c: &HashMap<String, String>, xbase: &str) -> Vec<(&'static str, String)> {
     let x: HashMap<&str, &str> = xbase
         .trim_start_matches("xbase: ")
@@ -436,6 +454,7 @@ fn k1_explore(explore_p: bool, c: &HashMap<String, String>, xbase: &str) -> Vec<
 /// against the derivation's hand values (§4). Failing directions F1, F4–F8,
 /// F11, F12, an offline row filling `explore_*`.
 #[test]
+#[cfg(feature = "eval")]
 fn b_k1_row_blocks() {
     let header = record::header();
     let row = |label: &str| {
@@ -581,6 +600,9 @@ fn burst(n: i32, fifo: bool) {
 /// Stateful and ExploreP t1 rows; K6 Stateful through `of_verdict`.
 #[test]
 fn b_k1_k6_sides_pinned() {
+    // K1: the record's rows (eval only).
+    #[cfg(feature = "eval")]
+    {
     let header = record::header();
     let subject = |name: &str| Subject {
         name: name.to_owned(),
@@ -623,6 +645,8 @@ fn b_k1_k6_sides_pinned() {
         ]);
         note!("PINNED	{label}	spec {sw}	impl {iw}	VmHWM {before}->{after}");
     }
+    }
+    // K6: `verify` and `of_verdict`.
     let cc = ConfBuilder::new()
         .config(Config::builder().with_cons_type(ConsType::Bag).with_verbose(0).with_seed(0).build())
         .cons_type(ConsType::Bag)

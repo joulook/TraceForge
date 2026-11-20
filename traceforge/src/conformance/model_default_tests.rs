@@ -6,11 +6,15 @@
 //! and 3! = 6 under `bag`; the specification's channel is FIFO by construction,
 //! 1 graph under both, so 5 of the 6 are signature misses under `bag`.
 
+#[cfg(feature = "eval")]
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::conformance::interchange_default_tests::{named, record_cells, scratch, split_block};
+use crate::conformance::interchange_default_tests::{named, scratch, split_block};
+#[cfg(feature = "eval")]
+use crate::conformance::interchange_default_tests::record_cells;
+#[cfg(feature = "eval")]
 use crate::conformance::record;
 use crate::program::{run_cli, run_cli_with_model, Entry, Program};
 use crate::ConsType;
@@ -259,11 +263,14 @@ fn md_online() {
     }
 }
 
+#[cfg(feature = "eval")]
 const ROW: &str = r#"{"fixture":"md-d","label":"Stateful/Plain/stop=false/Exhaustive/Always/memo=false/Default/precheck=false/instr=false/cut=false/cover=Sweep/w=inf/quiet=false/index=set","rep":0,"tier":{"name":"c1h","wall_ms":3600000,"mem_kb":262144000},"run_kind":"timed","family":"md","knobs":"","k":[null,null,null,null],"variant":"conforming","twin_key":""}"#;
 
 /// Set only on `md_row`'s child: the index into `TABLE` it runs.
+#[cfg(feature = "eval")]
 const ROW_CASE: &str = "MD_ROW_CASE";
 /// Set only on `md_row`'s child: the file it writes its exit code and text to.
+#[cfg(feature = "eval")]
 const ROW_OUT: &str = "MD_ROW_OUT";
 
 /// `row` reads `EVAL_ROW` and `EVAL_COMMIT` from the process's environment, and this
@@ -272,6 +279,7 @@ const ROW_OUT: &str = "MD_ROW_OUT";
 /// child only. The existing row tests' child, `eval::eval_row`, resolves a registered
 /// fixture and does not reach `program`'s `row` on an inline program, so `md_row` is
 /// its own child. A file carries the result: a child that ran nothing leaves none.
+#[cfg(feature = "eval")]
 fn row_in_child(dir: &Path, case: usize, what: &str) -> (String, u8) {
     let out = dir.join(format!("case-{case}"));
     let child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -310,6 +318,7 @@ fn row_in_child(dir: &Path, case: usize, what: &str) -> (String, u8) {
 }
 
 /// The child's part of `md_row`: the one case, through `run_cli` or `run_cli_with_model`.
+#[cfg(feature = "eval")]
 fn row_child(case: &str) {
     let out = std::env::var(ROW_OUT).expect("conformance: MD: the child's result file");
     let case: usize = case.parse().expect("conformance: MD: the child's case");
@@ -323,6 +332,7 @@ fn row_child(case: &str) {
 /// `LocalOrder` with 1 and 0 under `fifo`. Failing directions as `count`'s, on
 /// `row`.
 #[test]
+#[cfg(feature = "eval")]
 fn md_row() {
     if let Ok(case) = std::env::var(ROW_CASE) {
         return row_child(&case);
@@ -367,8 +377,10 @@ fn md_usage() {
             text.contains("--model fifo|bag|causal (default: the program's)"),
             "conformance: MD: the option's text: {text}"
         );
-        assert!(
+        // `row` and its usage line exist only in the eval build.
+        assert_eq!(
             text.contains("<bin> row [--model fifo|bag|causal] --seed N"),
+            cfg!(feature = "eval"),
             "conformance: MD: row's text: {text}"
         );
         assert!(

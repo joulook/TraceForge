@@ -9,8 +9,11 @@ use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 
 use crate::conformance::config::{ConfBuilder, Engine, IndexKind};
-use crate::conformance::interchange_default_tests::{named, record_cells, scratch, split_block};
+use crate::conformance::interchange_default_tests::{named, scratch, split_block};
+#[cfg(feature = "eval")]
+use crate::conformance::interchange_default_tests::record_cells;
 use crate::conformance::measure;
+#[cfg(feature = "eval")]
 use crate::conformance::record::{self, Subject};
 use crate::conformance::report::{ConfError, ConfVerdict};
 use crate::program::{run_cli_with_model, Entry, Program};
@@ -683,6 +686,7 @@ fn mk2_abandoned_and_watch() {
 const STOPLESS: &str = "stop=false/Exhaustive/Always/memo=false/Default/precheck=false/\
                         instr=false/cut=false/cover=Sweep";
 
+#[cfg(feature = "eval")]
 fn row_json(label: &str) -> String {
     format!(
         concat!(
@@ -695,6 +699,7 @@ fn row_json(label: &str) -> String {
     )
 }
 
+#[cfg(feature = "eval")]
 fn row_of(
     label: &str,
     imp: Arc<dyn Fn() + Send + Sync>,
@@ -721,6 +726,7 @@ fn row_of(
     (l.measurements.render(), cells)
 }
 
+#[cfg(feature = "eval")]
 fn fan_arc(dup: bool) -> Arc<dyn Fn() + Send + Sync> {
     Arc::new(move || fan(dup))
 }
@@ -728,6 +734,7 @@ fn fan_arc(dup: bool) -> Arc<dyn Fn() + Send + Sync> {
 /// `conf` and `row` agree, per engine, at N = 1: the same four values. On the fixture with
 /// hits; the record's cells give them too.
 #[test]
+#[cfg(feature = "eval")]
 fn mk4_conf_and_row_agree() {
     let set = "/w=inf/quiet=false/index=set";
     let cases: Vec<(Engine, String, [String; 4])> = vec![
@@ -796,29 +803,36 @@ fn mk4_stateful_is_graphs_not_orders() {
     ] {
         let r = verify(engine, 1, &["v"], || fan(false), || fan(true));
         let a = block_of(&r);
-        let (b, cells) = row_of(&label, fan_arc(false), fan_arc(true), &["v"]);
         assert_eq!(four(&a)[0], "8", "conformance: MK: {engine:?}: conf: {a}");
-        assert_eq!(four(&b)[0], "8", "conformance: MK: {engine:?}: row: {b}");
         assert_eq!(
             key(&a, "spec_summaries"),
             "4",
             "conformance: MK: {engine:?}: conf: {a}"
         );
         assert_eq!(
-            cells.get("orders_held").map(String::as_str),
-            Some("4"),
-            "conformance: MK: {engine:?}"
-        );
-        assert_eq!(
             key(&a, "iterations"),
             "4",
             "conformance: MK: {engine:?}: the impl's: {a}"
         );
+        // The same through `row` (eval only).
+        #[cfg(feature = "eval")]
+        {
+            let (b, cells) = row_of(&label, fan_arc(false), fan_arc(true), &["v"]);
+            assert_eq!(four(&b)[0], "8", "conformance: MK: {engine:?}: row: {b}");
+            assert_eq!(
+                cells.get("orders_held").map(String::as_str),
+                Some("4"),
+                "conformance: MK: {engine:?}"
+            );
+        }
+        #[cfg(not(feature = "eval"))]
+        let _ = &label;
     }
 }
 
 /// `Explore`: the plain Must's blocks are empty, on `row`.
 #[test]
+#[cfg(feature = "eval")]
 fn mk3_plain_must_row() {
     let (b, _) = row_of(
         &format!("Explore/Ltr/{STOPLESS}"),
@@ -846,6 +860,9 @@ fn mk2_aborted() {
     let pos = fan_positions();
     let at = |p: usize| *pos.iter().find(|(_, q)| **q == p).unwrap().0;
     let (third, last) = (at(3), at(4));
+    // `row` (eval only): the aborted sweep's keys.
+    #[cfg(feature = "eval")]
+    {
     let (b, cells) = row_of(
         &format!("CompleteFirst/Plain/{STOPLESS}/w=inf/quiet=false/index=set"),
         Arc::new(move || v_after_go(last, || -1)),
@@ -878,6 +895,7 @@ fn mk2_aborted() {
         tested, 4,
         "conformance: MK: the aborted sweep goes on to its witness"
     );
+    }
     // `conf`: the precheck refuses; nothing is written.
     let r = verify(
         Engine::CompleteFirst,

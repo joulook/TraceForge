@@ -581,6 +581,7 @@ fn et_inline_sweep_cancels_before_cleanup() {
 }
 
 #[test]
+#[cfg(feature = "eval")]
 fn et_baseline_row_threshold() {
     use super::record::{self, GridConfig, GridEnd, GridEngine, GridRaw, GridResult, Subject};
 
