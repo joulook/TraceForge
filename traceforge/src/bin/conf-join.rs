@@ -13,9 +13,36 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+/// `--help`: the options, all stable.
+const HELP: &str = "\
+conf-join: join two summary files and report the implementation's uncovered lines.
+
+usage: conf-join [--merge] [--decide [--decide-budget N]]
+                 [--witness-dir D [--impl-graphs P] [--spec-graphs Q] [--witness-limit N|all]
+                  [--witness-nearest N]]
+                 spec.jsonl impl.jsonl
+
+  --merge               read both files as sorted streams (bounded memory)
+  --decide              classify each uncovered line: violation, false alarm or unresolved
+  --decide-budget N     search states per line for --decide (implies --decide)
+  --witness-dir D       write the witness graph of each uncovered line to D (D new or empty),
+                        looked up in the exports' graph stores
+  --impl-graphs P       the implementation's store (default: impl.jsonl.graphs.jsonl)
+  --spec-graphs Q       the specification's store (default: spec.jsonl.graphs.jsonl)
+  --witness-limit N|all at most N graphs (default 20)
+  --witness-nearest N   at most N nearest specification graphs per line (default 3);
+                        only with --decide, for the lines it finds no match for
+
+Exit codes: 0 conforms (or no verdict), 1 a violation, 2 refused input.
+";
+
 fn main() -> ExitCode {
     let started = std::time::Instant::now();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.as_slice(), [a] if a == "--help" || a == "-h") {
+        print!("{HELP}");
+        return ExitCode::SUCCESS;
+    }
     // `SORTED-JOIN`: `--merge` reads the two files as sorted streams.
     let merge = args.iter().position(|a| a == "--merge").map(|i| args.remove(i)).is_some();
     // `DECIDE`: `--decide` classifies every uncovered line; `--decide-budget N`

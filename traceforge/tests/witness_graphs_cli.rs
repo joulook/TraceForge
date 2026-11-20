@@ -1452,3 +1452,171 @@ fn a_run_without_seed_has_one_exploration_order() {
         assert_eq!(json(raw)["run"]["options"], serde_json::json!({}), "no seed recorded without --seed");
     }
 }
+
+// ---------------------------------------------------------------------- help --
+
+/// The `const <name>: &str = "\` … `";` literal of a source file, unescaped (the help texts use
+/// only `\` line continuations at their start).
+fn source_literal(file: &str, name: &str) -> String {
+    let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file)).unwrap();
+    let head = format!("const {name}: &str = \"\\\n");
+    let at = src.find(&head).unwrap_or_else(|| panic!("{name} in {file}")) + head.len();
+    let end = at + src[at..].find("\";\n").unwrap();
+    let text = &src[at..end];
+    assert!(!text.contains('\\'), "{name}: only plain text is expected");
+    text.to_owned()
+}
+
+/// The lines of `text` between the line `start` and the next line from `ends` (or the end).
+fn section<'a>(text: &'a str, start: &str, ends: &[&str]) -> Vec<&'a str> {
+    let mut on = false;
+    let mut out = Vec::new();
+    for l in text.lines() {
+        if on && ends.iter().any(|e| l.starts_with(e)) { break; }
+        if on { out.push(l); }
+        if l.starts_with(start) { on = true; }
+    }
+    assert!(on, "section {start}");
+    out
+}
+
+#[test]
+fn help_lists_the_stable_and_the_experimental_surface() {
+    let help = source_literal("src/program.rs", "HELP");
+    let dir = scratch();
+    let bin = child_binary(&dir, "tf_help");
+    for arg in ["--help", "-h", "help"] {
+        let (t, e, c) = child(&bin, "panic", &[arg]);
+        assert_eq!((c, e.as_str()), (0, ""), "{arg}");
+        assert_eq!(t, help, "{arg}: the HELP text");
+    }
+    let heads = ["Stable subcommands:", "Stable options:", "Exit codes", "Experimental (outputs and options may change):"];
+    let subs = section(&help, heads[0], &heads[1..]).join("\n");
+    let opts = section(&help, heads[1], &heads[2..]).join("\n");
+    let exp = section(&help, heads[3], &[]).join("\n");
+    let stable = format!("{subs}\n{opts}");
+    // The stable subcommands, each a line starting with its name, and their options.
+    let sub_line = |name: &str| subs.lines().find(|l| l.trim_start().starts_with(name)).map(str::to_owned)
+        .unwrap_or_else(|| panic!("stable subcommand {name}"));
+    let export = sub_line("export spec|impl");
+    assert!(sub_line("count spec|impl").starts_with("  count"));
+    assert!(export.contains("--graphs PATH") && export.contains("--out FILE"), "{export}");
+    let online = subs.split("\n  online").nth(1).unwrap().split("\n  replay").next().unwrap();
+    for o in ["--spec FILE", "--witness PATH", "--graphs PATH"] {
+        assert!(online.contains(o), "online {o}: {online}");
+    }
+    assert!(sub_line("replay").contains("--graph FILE"));
+    assert!(sub_line("conf").contains("--engine stateful"));
+    for o in ["--model", "--seed", "--program", "--size"] {
+        assert!(opts.lines().any(|l| l.trim_start().starts_with(o) || l.contains(&format!(", {o}"))), "stable option {o}");
+    }
+    // The experimental items, each its own line in that section, and none of them in a stable one.
+    let items = ["conf --engine stateless", "conf --engine gated", "conf --engine enumerator",
+        "--threads N (N > 1)", "--threshold N", "--dump-large-graph", "--audit-graphs"];
+    for it in items {
+        assert_eq!(exp.lines().filter(|l| l.trim_start().starts_with(it)).count(), 1, "experimental {it}: {exp}");
+    }
+    assert_eq!(exp.lines().filter(|l| !l.trim().is_empty()).count(), items.len(), "one line each: {exp}");
+    for word in ["stateless", "gated", "enumerator", "--threads", "--threshold", "--dump-large-graph", "--audit-graphs"] {
+        assert!(!stable.contains(word), "{word} is experimental, not stable");
+    }
+    // Nothing of the evaluation's own commands.
+    let words: Vec<&str> = help.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').collect();
+    assert!(!words.contains(&"row") && !help.contains("EVAL"), "{help}");
+}
+
+#[test]
+fn conf_join_help_lists_every_option() {
+    let help = source_literal("src/bin/conf-join.rs", "HELP");
+    for arg in ["--help", "-h"] {
+        let out = {
+            let _r = spawn_guard();
+            Command::new(env!("CARGO_BIN_EXE_conf-join")).arg(arg).output().unwrap()
+        };
+        assert_eq!(out.status.code(), Some(0), "{arg}");
+        assert!(out.stderr.is_empty(), "{arg}");
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), help, "{arg}");
+    }
+    for o in ["--merge", "--decide", "--decide-budget N", "--witness-dir D", "--impl-graphs P", "--spec-graphs Q",
+              "--witness-limit N|all", "--witness-nearest N"] {
+        let usage = help.split("\n\n").nth(1).unwrap();
+        assert!(usage.contains(o), "usage lists {o}");
+        assert!(help.lines().any(|l| l.trim_start().starts_with(o)), "a line describes {o}");
+    }
+    // --help is only help on its own; with files it is a usage error as before.
+    let out = {
+        let _r = spawn_guard();
+        Command::new(env!("CARGO_BIN_EXE_conf-join")).args(["--help", "a", "b"]).output().unwrap()
+    };
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn error_usage_is_not_the_help() {
+    // The error path prints the usage text on stderr-bound output with exit 2, not the help.
+    let help = source_literal("src/program.rs", "HELP");
+    for args in [vec![], vec!["nosuch"], vec!["--bogus"]] {
+        let (t, c) = cli("panic", &args);
+        assert_eq!(c, 2, "{args:?}");
+        assert_ne!(t, help);
+        assert!(t.lines().nth(1).is_some_and(|l| l.starts_with("usage: ")), "{args:?}: {t}");
+    }
+}
+
+/// `src/<file>` as text.
+fn source(file: &str) -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join(file)).unwrap()
+}
+
+#[test]
+fn help_exit_codes_are_the_ones_the_code_returns() {
+    // The codes, read off the source.
+    let program = source("program.rs");
+    let online = source("conformance/online.rs");
+    for (what, text, needle) in [
+        ("conf conforms", &program, "ConfVerdict::Conforms(_) => 0,"),
+        ("conf reported", &program, "ConfVerdict::Reported(_) => 1,"),
+        ("conf inconclusive", &program, "ConfVerdict::Inconclusive(_) => 2,"),
+        ("replay usage and refusals", &program, "let fail = |msg: String| (format!(\"{bin}: replay: {msg}\\n{usage}\\n\"), 2u8);"),
+        ("replay failed run", &program, "return (format!(\"{bin}: replay failed: {e}\\n\"), 1),"),
+        ("replay panic", &program, "return (format!(\"{bin}: replay failed: the program panicked: {msg}\\n\"), 1);"),
+        ("replay report not written", &program, "return (format!(\"{line}{bin}: replay: {path}: {e}\\n\"), 2);"),
+        ("export refused", &program, "(Err(e), _) => (format!(\"{bin}: export refused: {e}\\n\"), 2),"),
+        ("online", &online, "if self.refused {\n            2\n        } else if self.end == End::Failed {\n            1\n        } else {\n            0\n        }"),
+    ] {
+        assert!(text.contains(needle), "{what}: the source holds {needle:?}");
+    }
+    // Replay: reproduced 0, a deviation 1.
+    let rep = program.split("ReplayResult::Reproduced").nth(1).unwrap();
+    assert!(rep.split("ReplayResult::Deviation").next().unwrap().contains("0u8,"), "reproduced is 0");
+    assert!(rep.split("ReplayResult::Deviation").nth(1).unwrap().split("};").next().unwrap().contains("1u8,"), "a deviation is 1");
+    // The help's section says the same.
+    let help = source_literal("src/program.rs", "HELP");
+    let codes = section(&help, "Exit codes", &["Experimental"]);
+    let heading = help.lines().find(|l| l.starts_with("Exit codes")).unwrap();
+    assert!(heading.contains("2") && heading.contains("usage error"), "{heading}");
+    let line = |name: &str| codes.iter().find(|l| l.trim_start().starts_with(name)).copied()
+        .unwrap_or_else(|| panic!("exit codes of {name}: {codes:?}"));
+    let has = |l: &str, parts: &[&str]| parts.iter().all(|p| l.contains(p));
+    let ce = line("count, export");
+    assert!(has(ce, &["0", "2 refused"]) && !ce.contains(" 1 "), "{ce}");
+    let on = line("online");
+    assert!(has(on, &["0 a verdict", "conforms", "reports", "partial", "1 the run failed", "2 refused"]), "{on}");
+    let rp = line("replay");
+    assert!(has(rp, &["0 reproduced", "1 a deviation or a failed replay", "2 refused", "report not written"]), "{rp}");
+    let cf = line("conf");
+    assert!(has(cf, &["0 conforms", "1 reported", "2 inconclusive or refused"]), "{cf}");
+    assert_eq!(codes.iter().filter(|l| !l.trim().is_empty()).count(), 4, "four command lines: {codes:?}");
+}
+
+#[test]
+fn conf_join_help_says_nearest_needs_decide() {
+    let help = source_literal("src/bin/conf-join.rs", "HELP");
+    let lines: Vec<&str> = help.lines().collect();
+    let i = lines.iter().position(|l| l.trim_start().starts_with("--witness-nearest N")).expect("the entry");
+    let mut entry = vec![lines[i]];
+    entry.extend(lines[i + 1..].iter().take_while(|l| l.starts_with("                    ")));
+    assert!(entry.len() >= 2, "{entry:?}");
+    assert!(entry[1..].join(" ").contains("--decide"), "{entry:?}");
+}

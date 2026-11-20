@@ -116,6 +116,52 @@ which led to the violation. The trace can be replayed under a debugger to invest
 Importantly, if TraceForge finishes without finding a counterexample, we know that no counterexample exists, 
 under the assumptions of the test scenario.
 
+## Conformance checking
+
+TraceForge also checks that an implementation program conforms to a specification program: every client-visible
+behaviour of the implementation must be one the specification allows. Both are ordinary TraceForge programs; their
+visible behaviour is compared through summary files in a shared format (daavar's `format/SUMMARY-FORMAT.md`), so a
+TraceForge program can also be checked against a program of another tool that writes the same format.
+
+A benchmark binary is built around `traceforge::program::main` (or `main_with_model`), which gives it these
+subcommands (`<bin> --help` lists them with their options):
+
+| subcommand | what it does |
+|---|---|
+| `count spec\|impl` | explore one side and print its execution counts |
+| `export spec\|impl --out FILE [--graphs PATH]` | write the side's summary file; with `--graphs`, its witness graph store |
+| `online --spec FILE [--witness PATH] [--out FILE [--graphs PATH]]` | explore the implementation and look every execution up in a specification summary file |
+| `replay --graph FILE` | re-run the program once along a witness graph and report the first deviation |
+| `conf --engine stateful` | check the implementation against the specification in one process |
+
+Exit codes (2 is also every usage error):
+
+| subcommand | 0 | 1 | 2 |
+|---|---|---|---|
+| `count`, `export` | done | — | refused |
+| `online` | a verdict: conforms, reports or partial (printed) | the run failed | refused |
+| `replay` | reproduced | a deviation, or the replay failed | refused, or the report not written |
+| `conf` | conforms | reported | inconclusive or refused |
+
+The `conf-join` binary (`conf-join [options] spec.jsonl impl.jsonl`) joins two summary files and lists the
+implementation's uncovered lines. Its options (`conf-join --help`):
+
+| option | meaning |
+|---|---|
+| `--merge` | read both files as sorted streams (bounded memory) |
+| `--decide` | classify each uncovered line: a violation (with a witness), a false alarm or unresolved; the verdict and exit code stay the join's |
+| `--decide-budget N` | the search states per line for `--decide` (implies `--decide`) |
+| `--witness-dir D` | write the witness graph of each uncovered line to `D` (new or empty), looked up in the exports' graph stores |
+| `--impl-graphs P` | with `--witness-dir`: the implementation's store (default `impl.jsonl.graphs.jsonl`) |
+| `--spec-graphs Q` | with `--witness-dir`: the specification's store (default `spec.jsonl.graphs.jsonl`) |
+| `--witness-limit N\|all` | with `--witness-dir`: at most `N` graphs (default 20) |
+| `--witness-nearest N` | with `--witness-dir`: at most `N` nearest specification graphs per line (default 3); written only with `--decide`, for the lines it finds no match for |
+
+`conf-join` exits 0 when the files conform or there is no verdict, 1 on a violation, 2 on refused input.
+
+Experimental, and subject to change: the `conf` engines `stateless`, `gated` and `enumerator`; parallel exploration
+(`--threads N` above 1); `--threshold`, `--dump-large-graph` and `--audit-graphs`.
+
 ## Related Tools
 
 TraceForge is inspired by other tools for checking concurrent Rust code, such as [Loom](http://github.com/tokio-rs/loom) and [Shuttle](https://github.com/awslabs/shuttle).

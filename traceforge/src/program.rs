@@ -154,6 +154,53 @@ const USAGE: &str = "usage: <bin> count spec|impl [--threads N] [options] [ARGSâ
     (online exit 1; conf exit 2). Online declaration refusals exit 2.\n\
     Positions count printed events; iterations count completions.\n";
 
+/// `--help`: the stable subcommands and options, then the experimental ones.
+const HELP: &str = "\
+A TraceForge benchmark binary: a specification program and an implementation program,
+explored by TraceForge and compared through summary files.
+
+usage: <bin> <subcommand> [options] [-- ARGS]
+ARGS are passed to the program's entry points (its size, variant or reading).
+
+Stable subcommands:
+  count spec|impl [--model M] [--seed N] [-- ARGS]
+      Explore one side and print its execution counts.
+  export spec|impl --out FILE [--program S] [--size S] [--graphs PATH [--graphs-limit N]]
+         [--model M] [--seed N] [-- ARGS]
+      Write the side's summary file; with --graphs, also its witness graph store
+      (one graph per summary line; --graphs-limit N keeps the first N).
+  online --spec FILE [--out FILE [--program S] [--size S] [--graphs PATH [--graphs-limit N]]]
+         [--witness PATH] [--stop-at-first] [--budget N] [--model M] [--seed N] [-- ARGS]
+      Explore the implementation and look every execution up in the specification's
+      summary file. --witness writes the first uncovered execution (one per summary if
+      PATH ends in /); --out and --graphs write its summary file and graph store.
+  replay --graph FILE [--report FILE] [--allow-source-change] [--allow-tool-change] [-- ARGS]
+      Re-run the program once along a witness graph; exit 0 reproduced, 1 a deviation.
+  conf [--engine stateful] [--witness PATH] [--stop-at-first] [--distinct] [--model M]
+       [--seed N] [-- ARGS]
+      Check the implementation against the specification in one process.
+
+Stable options:
+  --model fifo|bag|causal   the communication model (default: the program's)
+  --seed N                  the exploration's seed (default 0; it fixes the order)
+  --program S, --size S     the summary file header's program and size
+
+Exit codes (2 is also every usage error):
+  count, export   0 done, 2 refused.
+  online          0 a verdict (conforms, reports or partial, as printed), 1 the run failed, 2 refused.
+  replay          0 reproduced, 1 a deviation or a failed replay, 2 refused or the report not written.
+  conf            0 conforms, 1 reported, 2 inconclusive or refused.
+
+Experimental (outputs and options may change):
+  conf --engine stateless   the complete-first checker: sweeps the specification per completion.
+  conf --engine gated       the gated checker, which re-tests a witness at every visible event.
+  conf --engine enumerator  the directed enumerator, which probes the specification as it goes.
+  --threads N (N > 1)       parallel exploration of count, export, online and conf.
+  --threshold N             stop the run when a thread exceeds N events (default 1000).
+  --dump-large-graph        print the graph when a thread exceeds the threshold.
+  --audit-graphs            check that every completion is a distinct graph (export, online).
+";
+
 /// The options of every subcommand, and the program's own arguments.
 struct Opts {
     model: ConsType,
@@ -614,6 +661,7 @@ fn run_named_roles(
         return fail("no subcommand".to_string());
     };
     match cmd.as_str() {
+        "--help" | "-h" | "help" => (HELP.to_owned(), 0),
         "count" => {
             let o = match parse_opts(&args[2.min(args.len())..], default_model) {
                 Ok(o) => o,
