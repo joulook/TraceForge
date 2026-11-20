@@ -295,6 +295,9 @@ pub(crate) mod triage;
 pub(crate) mod witness;
 pub(crate) mod execution_witness;
 pub(crate) mod witness_graph;
+pub(crate) mod witness_join;
+pub(crate) mod witness_json;
+pub(crate) mod witness_replay;
 #[cfg(test)]
 mod witness_graph_tests;
 
@@ -379,6 +382,7 @@ pub use interchange::{
     JoinError, JoinReport, MergeStats,
 };
 pub use decide::DEFAULT_DECIDE_BUDGET;
+pub use witness_join::{check_witness_dir, write_join_witnesses, WitnessJoinOpts};
 pub use interchange::{conf_join_decide, conf_join_merge_decide};
 
 use std::sync::Arc;

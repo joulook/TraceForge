@@ -3154,6 +3154,10 @@ impl interchange::JoinReport {
                     let _ = writeln!(out, "  witness: {w}");
                 }
             }
+            // `--witness-dir`: the line's graph file, or why there is none.
+            if let Some(g) = self.witness.as_ref().and_then(|w| w.graphs.get(j)) {
+                let _ = writeln!(out, "  graph: {g}");
+            }
         }
         out
     }
@@ -3293,6 +3297,12 @@ impl interchange::JoinReport {
             let _ = writeln!(out, "decide_max_group: {}", d.max_group);
             let _ = writeln!(out, "decide_states: {}", d.states);
             let _ = writeln!(out, "decide_ms: {}", d.ms);
+        }
+        // `--witness-dir`: its keys last, only with the option.
+        if let Some(w) = &self.witness {
+            let _ = writeln!(out, "witness_written: {}", w.written);
+            let _ = writeln!(out, "witness_missing: {}", w.missing);
+            let _ = writeln!(out, "witness_refused: {}", w.refused);
         }
         out
     }

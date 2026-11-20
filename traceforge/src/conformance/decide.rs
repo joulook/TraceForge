@@ -284,6 +284,34 @@ pub(crate) fn decide(lens: &[usize], cand: &[u16], group: &[Vec<u16>], budget: u
     done(Outcome::FalseAlarm, m, states)
 }
 
+/// The group's effective orders as [`decide`] counts them (its `k_min`): the indices into
+/// `group` of the orders an extension of the candidate's order must break, after the same two
+/// steps (compatible orders only, then minimal ones; of equal orders the first stays), and the
+/// same one-order shortcut. Empty when `decide` needs no group order.
+pub(crate) fn effective_group(lens: &[usize], cand: &[u16], group: &[Vec<u16>]) -> Vec<usize> {
+    let k = group.len();
+    if k == 0 {
+        return Vec::new();
+    }
+    if k == 1 && !contained(&group[0], cand) {
+        return vec![0];
+    }
+    let lay = Layout::new(lens);
+    let p = lay.pred(cand);
+    let preds: Vec<Vec<u16>> = group.iter().map(|q| lay.pred(q)).collect();
+    let live: Vec<usize> = (0..k).filter(|&j| lay.compatible(&p, &preds[j])).collect();
+    live.iter()
+        .copied()
+        .filter(|&j| {
+            !live.iter().any(|&i| {
+                i != j
+                    && contained(&group[i], &group[j])
+                    && (!contained(&group[j], &group[i]) || i < j)
+            })
+        })
+        .collect()
+}
+
 /// Whether `w` is a linear extension of the order of `counts` (tests and the
 /// witness check).
 pub(crate) fn extends(lens: &[usize], counts: &[u16], w: &[Pos]) -> bool {

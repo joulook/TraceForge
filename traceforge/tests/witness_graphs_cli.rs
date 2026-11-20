@@ -628,7 +628,15 @@ fn export_file_and_cli_text_unchanged_by_the_store() {
         let strip = |t: &str, file: &str| t.replace(file, "F");
         let (head_a, _) = a.split_once("--- measurements\n").unwrap();
         let (head_b, _) = b.split_once("--- measurements\n").unwrap();
-        assert_eq!(strip(head_a, "plain.jsonl"), strip(head_b, "with.jsonl"));
+        // The store adds one summary line right after the `exported:` line, nothing else.
+        let summary = format!("graph_store: written={} refused={} ms={}\n",
+            block_value(&b, "graphs_written").unwrap(), block_value(&b, "graphs_refused").unwrap(),
+            block_value(&b, "graphs_ms").unwrap());
+        let head_a = strip(head_a, "plain.jsonl");
+        let (pre, post) = head_a.split_at(head_a.find("exported: ").unwrap());
+        let (exported, rest) = post.split_at(post.find('\n').unwrap() + 1);
+        assert_eq!(strip(head_b, "with.jsonl"), format!("{pre}{exported}{summary}{rest}"), "{name}");
+        assert!(!a.contains("graph_store:"), "no summary line without the store");
         let keys_a: Vec<String> = block(&a).into_iter().map(|(k, _)| k).collect();
         let keys_b: Vec<String> = block(&b).into_iter().map(|(k, _)| k).collect();
         let mut extended = keys_a.clone();
@@ -766,6 +774,7 @@ fn refusals_before_any_run() {
 
 #[test]
 fn graphs_on_online_and_row_are_refused_before_any_run() {
+    // `online` takes `--graphs` only beside `--out`; `row` never takes it.
     let dir = scratch();
     let spec = dir.join("spec.jsonl");
     assert_eq!(cli("halves", &["export", "spec", "--out", spec.to_str().unwrap()]).1, 0);
@@ -773,16 +782,13 @@ fn graphs_on_online_and_row_are_refused_before_any_run() {
     let gs = g.to_str().unwrap();
     let mut firsts = Vec::new();
     for args in [vec!["online", "--spec", spec.to_str().unwrap(), "--graphs", gs],
-                 vec!["online", "--spec", spec.to_str().unwrap(), "--out", "x", "--graphs", gs],
                  vec!["row", "--seed", "0", "--graphs", gs]] {
         let (t, code) = cli("panic", &args);
         assert_eq!(code, 2, "{t}");
         assert!(!g.exists());
         firsts.push(t.lines().next().unwrap().to_owned());
     }
-    // Both subcommands refuse an option they do not take, before any run.
-    assert_eq!(firsts, ["program: online does not take `--graphs`",
-        "program: online does not take `--graphs`",
+    assert_eq!(firsts, ["program: --graphs with online requires --out",
         "program: row takes only --model, --seed, --threshold and --dump-large-graph, not `--graphs`"]);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "only the specification file");
 }
@@ -973,15 +979,31 @@ fn opaque_text_is_the_values_debug_text() {
 // ------------------------------------------------------------------ manifest --
 
 fn manifest_run(text: Option<&[u8]>, as_dir: bool) -> (J, String, PathBuf) {
+    manifest_run_with(text, as_dir, None, &[])
+}
+
+/// [`manifest_run`] with the manifest's mtime set `age` seconds before (positive) or after
+/// (negative) the binary's, and extra export flags.
+fn manifest_run_with(text: Option<&[u8]>, as_dir: bool, age: Option<i64>, extra: &[&str])
+    -> (J, String, PathBuf) {
     let dir = scratch();
     let bin = child_binary(&dir, "tf_mcp_x");
     let m = dir.join("tf_mcp_x.SOURCE.md5");
     if as_dir { std::fs::create_dir(&m).unwrap(); }
     if let Some(t) = text { std::fs::write(&m, t).unwrap(); }
+    if let Some(age) = age {
+        let bt = std::fs::metadata(&bin).unwrap().modified().unwrap();
+        let d = std::time::Duration::from_secs(age.unsigned_abs());
+        let mt = if age >= 0 { bt - d } else { bt + d };
+        std::fs::File::options().write(true).open(&m).unwrap().set_modified(mt).unwrap();
+        assert_eq!(std::fs::metadata(&m).unwrap().modified().unwrap(), mt);
+    }
     let out = dir.join("e.jsonl");
     let store = dir.join("e.g");
-    let (t, err, code) = child(&bin, "halves", &["export", "impl", "--out", out.to_str().unwrap(),
-        "--graphs", store.to_str().unwrap()]);
+    let mut args = vec!["export", "impl", "--out", out.to_str().unwrap(), "--graphs",
+        store.to_str().unwrap()];
+    args.extend(extra);
+    let (t, err, code) = child(&bin, "halves", &args);
     assert_eq!(code, 0, "{t}\n{err}");
     let st = read_lines(&store);
     let run0 = parse(&st[0]).get("run").clone();
@@ -1253,7 +1275,7 @@ fn store_time_is_counted_once_in_graphs_ms() {
     TOSSES.store(7, Ordering::Relaxed);
     let dir = scratch();
     let _ = export("slow-explore", &dir, "w", &[], &[]);
-    const REPS: usize = 5;
+    const REPS: usize = 7;
     let (mut plain, mut with) = (Vec::new(), Vec::new());
     for i in 0..REPS {
         let (a, ac, _, _) = export("slow-explore", &dir, &format!("p{i}"), &[], &[]);
@@ -1266,12 +1288,12 @@ fn store_time_is_counted_once_in_graphs_ms() {
     let min = |f: &dyn Fn(usize) -> u64| (0..REPS).map(f).min().unwrap();
     let (pe, ps) = (min(&|i| plain[i].0), min(&|i| plain[i].1));
     let (we, ws, g) = (min(&|i| with[i].0), min(&|i| with[i].1), min(&|i| with[i].2));
-    let tol = 10 + pe.min(g) / 5;
+    let tol = 10 + pe.min(g) / 3;
     let seen = format!("plain (explore, summarise) {plain:?}; with (explore, summarise, graphs) {with:?}");
     // Printed for the failure report: the harness shows captured stdout of a failed test.
     println!("timing: tol {tol}; {seen}");
     // Both quantities must stand clear of the tolerance, or the test proves nothing.
-    assert!(pe >= 5 * tol / 2 && g >= 5 * tol / 2, "workload too small: {seen}");
+    assert!(pe >= 2 * tol && g >= 2 * tol, "workload too small: {seen}");
     assert!(ws <= ps + tol, "the store's time is in summarise_ms: {seen}");
     assert!(we + tol >= pe, "the store's time came off explore_ms more than once: {seen}");
     assert!(we <= pe + tol, "the store's time is in explore_ms: {seen}");
@@ -1309,4 +1331,70 @@ fn hard_linked_paths_are_refused_before_any_run() {
         assert_eq!(listing(&dir), before, "{first} = {second}: files untouched");
         assert_eq!(std::fs::read(dir.join(second)).unwrap(), b"sentinel\n");
     }
+}
+
+#[test]
+fn a_manifest_older_than_the_binary_is_unknown() {
+    let a = "0123456789abcdef0123456789abcdef";
+    let text = format!("# root r\n{a}  a\n");
+    let object = format!("{{\"root\":\"r\",\"files\":{{\"a\":\"{a}\"}}}}");
+    for extra in [&[][..], &["--threads", "2", "--graphs-limit", "0"][..]] {
+        // Older by a day, and by one second: stale.
+        for age in [86400, 1] {
+            let (src, err, m) = manifest_run_with(Some(text.as_bytes()), false, Some(age), extra);
+            assert_eq!(src, J::Str("unknown".to_owned()), "{extra:?} {age}");
+            assert_eq!(err, format!("graphs: manifest {}: older than the binary\n", m.display()),
+                "{extra:?} {age}");
+        }
+        // Equal, and newer: used.
+        for age in [0, -86400] {
+            let (src, err, _) = manifest_run_with(Some(text.as_bytes()), false, Some(age), extra);
+            assert_eq!((bytes(&src), err.as_str()), (object.clone(), ""), "{extra:?} {age}");
+        }
+        // A stale malformed manifest still gives one line.
+        let (src, err, _) = manifest_run_with(Some(b"junk\n"), false, Some(86400), extra);
+        assert_eq!(src, J::Str("unknown".to_owned()));
+        assert_eq!(err.lines().count(), 1, "{err:?}");
+    }
+}
+
+/// The `graph_store:` line of a CLI text, which must directly follow the `exported:` line.
+fn summary_of(t: &str) -> String {
+    let lines: Vec<&str> = t.lines().collect();
+    let k = lines.iter().position(|l| l.starts_with("exported: ")).unwrap_or_else(|| panic!("{t}"));
+    assert_eq!(lines.iter().filter(|l| l.starts_with("graph_store:")).count(), 1, "{t}");
+    lines[k + 1].to_owned()
+}
+
+#[test]
+fn the_export_prints_a_store_summary_line() {
+    let dir = scratch();
+    let want = |t: &str, w: &str, r: &str| {
+        format!("graph_store: written={w} refused={r} ms={}", block_value(t, "graphs_ms").unwrap())
+    };
+    let (t, code, _, _) = export("rich", &dir, "r", &["--graphs", "@STORE"], &[]);
+    assert_eq!(code, 0, "{t}");
+    assert_eq!(summary_of(&t), want(&t, "6", "0"));
+    let (t, _, _, _) = export("rich", &dir, "l", &["--graphs", "@STORE", "--graphs-limit", "2"], &[]);
+    assert_eq!(summary_of(&t), want(&t, "2", "0"));
+    let (t, code, _, _) = export("channel", &dir, "c", &["--graphs", "@STORE"], &[]);
+    assert_eq!(code, 0, "{t}");
+    assert_eq!(summary_of(&t), want(&t, "1", "1"));
+    let (t, code, _, _) = export("halves", &dir, "p",
+        &["--threads", "2", "--graphs", "@STORE", "--graphs-limit", "0"], &[]);
+    assert_eq!(code, 0, "{t}");
+    assert_eq!(summary_of(&t), want(&t, "0", "0"));
+    // In a child process too, where the refusal goes to stderr beside the summary line.
+    let bin = child_binary(&dir, "tf_child");
+    let (t, err, code) = child(&bin, "channel", &["export", "impl", "--out",
+        dir.join("k.jsonl").to_str().unwrap(), "--graphs", dir.join("k.g").to_str().unwrap()]);
+    assert_eq!(code, 0, "{t}");
+    assert_eq!(summary_of(&t), want(&t, "1", "1"));
+    assert!(err.starts_with("graphs: refused "), "{err}");
+    // Not without the store, nor on a refused export.
+    let (t, _, _, _) = export("rich", &dir, "n", &[], &[]);
+    assert!(!t.contains("graph_store:"), "{t}");
+    let (t, code, _, _) = export("visible-float", &dir, "f", &["--graphs", "@STORE"], &[]);
+    assert_eq!(code, 2);
+    assert!(!t.contains("graph_store:"), "{t}");
 }

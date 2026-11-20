@@ -5,7 +5,10 @@
 //! (the reason on stderr). `B`: after the report, or after a refusal, the
 //! measurement block on stdout. `DECIDE`: `--decide` classifies each uncovered
 //! line as a violation (with a witness), a false alarm or unresolved; the
-//! verdict and exit code stay the join's.
+//! verdict and exit code stay the join's. `--witness-dir D` writes the witness graphs of the
+//! uncovered lines, looked up in the exports' graph stores (`--impl-graphs P`, `--spec-graphs Q`,
+//! by default `<file>.graphs.jsonl`), at most `--witness-limit N|all` of them (default 20), with
+//! up to `--witness-nearest N` nearest specification graphs each (default 3).
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -30,18 +33,82 @@ fn main() -> ExitCode {
         }
         decide = true;
     }
+    // `--witness-dir D` and its options (each takes one value).
+    let mut take = |flag: &str| -> Result<Option<String>, String> {
+        match args.iter().position(|a| a == flag) {
+            None => Ok(None),
+            Some(i) if i + 1 < args.len() => {
+                args.remove(i);
+                Ok(Some(args.remove(i)))
+            }
+            Some(_) => Err(format!("conf-join: {flag} takes a value")),
+        }
+    };
+    let witness = (|| -> Result<Option<traceforge::conformance::WitnessJoinOpts>, String> {
+        let dir = take("--witness-dir")?;
+        let impl_graphs = take("--impl-graphs")?;
+        let spec_graphs = take("--spec-graphs")?;
+        let limit = take("--witness-limit")?;
+        let nearest = take("--witness-nearest")?;
+        let Some(dir) = dir else {
+            if impl_graphs.is_some() || spec_graphs.is_some() || limit.is_some() || nearest.is_some() {
+                return Err("conf-join: the witness options need --witness-dir".to_owned());
+            }
+            return Ok(None);
+        };
+        let mut o = traceforge::conformance::WitnessJoinOpts::new(dir.into());
+        o.impl_graphs = impl_graphs.map(Into::into);
+        o.spec_graphs = spec_graphs.map(Into::into);
+        o.merge = merge;
+        if let Some(l) = limit {
+            o.limit = match l.as_str() {
+                "all" => None,
+                n => Some(n.parse().map_err(|_| "conf-join: --witness-limit takes N or all".to_owned())?),
+            };
+        }
+        if let Some(n) = nearest {
+            o.nearest = n.parse().map_err(|_| "conf-join: --witness-nearest takes N".to_owned())?;
+        }
+        Ok(Some(o))
+    })();
+    let witness = match witness {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(2);
+        }
+    };
     let [spec, imp] = args.as_slice() else {
+        // The usage line is unchanged; the witness options are listed in this file's header.
         eprintln!(
             "usage: conf-join [--merge] [--decide [--decide-budget N]] spec.jsonl impl.jsonl"
         );
         return ExitCode::from(2);
     };
     let (spec, imp) = (Path::new(spec), Path::new(imp));
+    // The witness directory must not exist or be empty: checked before the join runs.
+    if let Some(o) = &witness {
+        if let Err(e) = traceforge::conformance::check_witness_dir(&o.dir) {
+            eprintln!("conf-join: refused: {e}");
+            print!(
+                "{}",
+                traceforge::conformance::JoinReport::refused_measurements(started.elapsed().as_millis())
+            );
+            return ExitCode::from(2);
+        }
+    }
     let joined = match (merge, decide) {
         (true, false) => traceforge::conformance::conf_join_merge(spec, imp),
         (false, false) => traceforge::conformance::conf_join(spec, imp),
         (true, true) => traceforge::conformance::conf_join_merge_decide(spec, imp, budget),
         (false, true) => traceforge::conformance::conf_join_decide(spec, imp, budget),
+    };
+    // `--witness-dir`: the graphs, after the join; an unusable store refuses the run.
+    let joined = match (joined, &witness) {
+        (Ok(mut report), Some(o)) => {
+            traceforge::conformance::write_join_witnesses(&mut report, spec, imp, o).map(|()| report)
+        }
+        (r, _) => r,
     };
     match joined {
         Ok(report) => {

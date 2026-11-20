@@ -111,7 +111,7 @@ fn printable_value(v: &serde_json::Value) -> Result<(), String> {
     }
 }
 
-fn emitted(l: &LabelEnum) -> bool {
+pub(super) fn emitted(l: &LabelEnum) -> bool {
     match l {
         LabelEnum::Begin(_) | LabelEnum::End(_) | LabelEnum::TCreate(_)
         | LabelEnum::TJoin(_) | LabelEnum::SendMsg(_) | LabelEnum::RecvMsg(_)

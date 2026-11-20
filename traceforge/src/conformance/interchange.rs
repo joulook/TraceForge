@@ -1168,6 +1168,8 @@ pub struct JoinReport {
     pub(crate) merge: Option<MergeStats>,
     /// `DECIDE`: the post-pass's classifications (`None` without `--decide`).
     pub(crate) decide: Option<DecideReport>,
+    /// `--witness-dir`: what became of each uncovered line's graph (`None` without it).
+    pub(crate) witness: Option<crate::conformance::witness_join::WitnessSummary>,
 }
 
 /// `DECIDE`: one uncovered line's classification and its witness, rendered.
@@ -1177,6 +1179,9 @@ pub(crate) struct DecideEntry {
     /// For a violation: the labelled word (`<role>:<observation>` in the
     /// witness's order), then the statuses.
     pub(crate) witness: Option<String>,
+    /// The specification lines of the effective group (`k_min` of them), in normal form: the
+    /// candidate's statuses and words with each effective order's counts.
+    pub(crate) nearest: Vec<String>,
 }
 
 /// `DECIDE`: the classifications of the uncovered lines, `entries` in the
@@ -1292,7 +1297,17 @@ fn decide_entry(
         }
         Outcome::FalseAlarm | Outcome::Unresolved => None,
     };
-    Ok(DecideEntry { decision, witness })
+    // The nearest specification lines: the same signature, the effective orders' counts. The
+    // counts are the normal form's last key, and nothing after them holds a string.
+    let at = key.rfind(",\"counts\":[").ok_or_else(|| bad("no counts"))?;
+    let nearest = crate::conformance::decide::effective_group(&lens, &counts, group)
+        .into_iter()
+        .map(|j| {
+            let c: Vec<String> = group[j].iter().map(u16::to_string).collect();
+            format!("{},\"counts\":[{}]}}", &key[..at], c.join(","))
+        })
+        .collect();
+    Ok(DecideEntry { decision, witness, nearest })
 }
 
 /// `SORTED-JOIN`: what the merge over two sorted files held at most.
@@ -1323,7 +1338,7 @@ impl std::error::Error for JoinError {}
 
 /// A value's normal form (R2, ruling Q8; G1-2 widened Q9): integers, strings,
 /// booleans, lists and `{t, f}` objects; `Err` names a value version 1 forbids.
-fn normal_value(v: &Value) -> Result<String, String> {
+pub(crate) fn normal_value(v: &Value) -> Result<String, String> {
     match v {
         Value::Number(n) => match n.as_i64() {
             Some(i) => Ok(i.to_string()),
@@ -1796,6 +1811,7 @@ fn conf_join_inner(
         shape,
         merge: None,
         decide: None,
+        witness: None,
     };
     // `DECIDE`: after the join, outside its timings; the specification's
     // orders of the `not-found` lines' signatures only.
@@ -2190,5 +2206,6 @@ fn conf_join_merge_inner(
             d.ms = decide_wall.as_millis();
             d
         }),
+        witness: None,
     })
 }

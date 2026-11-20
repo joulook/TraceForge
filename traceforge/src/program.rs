@@ -273,8 +273,11 @@ fn check_witness(cmd: &str, o: &Opts) -> Result<(), String> {
     if o.graphs_limit.is_some() && o.graphs.is_none() {
         return Err("--graphs-limit requires --graphs".to_owned());
     }
-    if o.graphs.is_some() && cmd != "export" {
+    if o.graphs.is_some() && !matches!(cmd, "export" | "online") {
         return Err("--graphs requires export".to_owned());
+    }
+    if o.graphs.is_some() && cmd == "online" && o.out.is_none() {
+        return Err("--graphs with online requires --out".to_owned());
     }
     if o.graphs.is_some() && o.threads > 1 && o.graphs_limit != Some(0) {
         return Err("--graphs with --threads N>1 requires --graphs-limit 0".to_owned());
@@ -344,6 +347,160 @@ fn overlapping_paths(out: &Path, graphs: &Path) -> bool {
         }
     }
     false
+}
+
+/// `replay --graph FILE [--report FILE] [--allow-source-change] [--allow-tool-change] [-- ARGS]`:
+/// one guided execution of this program along a witness graph. Exit 0 reproduced, 1 a deviation,
+/// 2 refused (before running) or bad arguments.
+fn replay_command(p: &Program, bin: &str, args: &[String], block: &mut String) -> (String, u8) {
+    let started = std::time::Instant::now();
+    let usage = "usage: <bin> replay --graph FILE [--report FILE] [--allow-source-change] \
+                 [--allow-tool-change] [-- ARGS]";
+    let fail = |msg: String| (format!("{bin}: replay: {msg}\n{usage}\n"), 2u8);
+    let (mut graph, mut report, mut allow_source, mut allow_tool, mut given) = (None, None, false, false, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--graph" | "--report" if i + 1 < args.len() => {
+                let v = args[i + 1].clone();
+                if args[i] == "--graph" { graph = Some(v) } else { report = Some(v) }
+                i += 2;
+            }
+            "--allow-source-change" => { allow_source = true; i += 1 }
+            "--allow-tool-change" => { allow_tool = true; i += 1 }
+            "--" => { given = Some(args[i + 1..].to_vec()); break }
+            a => return fail(format!("unknown or incomplete option `{a}`")),
+        }
+    }
+    let Some(graph) = graph else { return fail("--graph FILE is required".into()) };
+    let text = match std::fs::read_to_string(&graph) {
+        Ok(t) => t,
+        Err(e) => return fail(format!("{graph}: {e}")),
+    };
+    let text = text.trim_end_matches('\n');
+    let rec = match crate::conformance::witness_json::check_graph(text) {
+        Ok(g) => g,
+        Err(e) => return fail(format!("{graph}: refused: {e}")),
+    };
+    if rec.tool != "traceforge" {
+        return fail(format!("refused: the graph is from {:?}, not traceforge", rec.tool));
+    }
+    let entry = witness_graph::RunIdentity::of_process("", &[], "", None, None);
+    if rec.entry != entry.entry {
+        return fail(format!("refused: the graph is of {:?}, this binary is {:?}", rec.entry, entry.entry));
+    }
+    let Some(side) = rec.side.clone() else {
+        return fail("refused: the graph has no side".to_owned());
+    };
+    let gargs = rec.args.clone();
+    if given.as_ref().is_some_and(|a| *a != gargs) {
+        return fail(format!("refused: the ARGS differ from the graph's {gargs:?}"));
+    }
+    let model = match rec.model.as_deref() {
+        Some("fifo") => ConsType::FIFO,
+        Some("bag") => ConsType::Bag,
+        Some("causal") => ConsType::Causal,
+        m => return fail(format!("refused: the graph's model {m:?}")),
+    };
+    let mut warnings: Vec<String> = Vec::new();
+    let commit = rec.tool_commit.clone();
+    if commit != witness_graph::TOOL_COMMIT || commit == "unknown" {
+        if !allow_tool {
+            return fail(format!(
+                "refused: the graph was made by TraceForge {commit:?}, this build is {:?} (--allow-tool-change)",
+                witness_graph::TOOL_COMMIT
+            ));
+        }
+        warnings.push(format!("tool-change: {commit} -> {}", witness_graph::TOOL_COMMIT));
+    }
+    if let Some(w) = &entry.warning {
+        eprintln!("{w}");
+    }
+    // The two `files` maps are compared; the roots are not.
+    use crate::conformance::witness_json::{parse_source, Source};
+    let same_source = match (parse_source(&entry.source), &rec.source) {
+        (Ok(Source::Known { files: a, .. }), Source::Known { files: b, .. }) => a == *b,
+        _ => false,
+    };
+    if !same_source {
+        if !allow_source {
+            return fail("refused: the benchmark source differs from the graph's, or is unknown \
+                         (--allow-source-change)".to_owned());
+        }
+        warnings.push("source-change".to_owned());
+    }
+    let mut b = Config::builder().with_cons_type(model).with_verbose(0);
+    if let Some(seed) = rec.seed {
+        b = b.with_seed(seed);
+    }
+    if let Some(t) = rec.threshold {
+        b = b.with_thread_threshold(t);
+    }
+    let config = b.build();
+    let f = match side_entry(p, Some(&side), &gargs) {
+        Ok(f) => f,
+        Err(e) => return fail(e),
+    };
+    // A program that panics during the replay is a failed run (exit 1), not a crash of this tool.
+    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::conformance::witness_replay::replay(config, f, &rec)
+    }));
+    let out = match run {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return (format!("{bin}: replay failed: {e}\n"), 1),
+        Err(p) => {
+            let msg = p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                .unwrap_or_else(|| "a panic".to_owned());
+            return (format!("{bin}: replay failed: the program panicked: {msg}\n"), 1);
+        }
+    };
+    warnings.extend(out.warnings.iter().cloned());
+    use crate::conformance::witness_replay::ReplayResult;
+    let js = |o: &Option<String>| o.as_deref().map_or_else(|| "null".to_owned(), crate::conformance::interchange::json_string);
+    let (line, code, report_json) = match &out.result {
+        ReplayResult::Reproduced { events, threads } => (
+            format!("replay: reproduced ({events} events, {threads} threads)\n"),
+            0u8,
+            "\"result\":\"reproduced\",\"at\":null,\"thread\":null,\"kind\":null,\"expected\":null,\"actual\":null".to_owned(),
+        ),
+        ReplayResult::Deviation(d) => (
+            format!(
+                "replay: deviation at ({}, {}) thread {}: {}: expected {}, got {}\n",
+                d.at.0,
+                d.at.1,
+                d.thread.as_deref().map_or_else(|| "-".to_owned(), |n| format!("{n:?}")),
+                d.kind,
+                d.expected.as_deref().unwrap_or("nothing"),
+                d.actual.as_deref().unwrap_or("nothing")
+            ),
+            1u8,
+            format!(
+                "\"result\":\"deviation\",\"at\":[{},{}],\"thread\":{},\"kind\":\"{}\",\"expected\":{},\"actual\":{}",
+                d.at.0, d.at.1, js(&d.thread), d.kind, js(&d.expected), js(&d.actual)
+            ),
+        ),
+    };
+    if let Some(path) = report {
+        let w: Vec<String> = warnings.iter().map(|w| crate::conformance::interchange::json_string(w)).collect();
+        let body = format!(
+            "{{\"replay\":1,\"graph\":{},{report_json},\"warnings\":[{}]}}\n",
+            crate::conformance::interchange::json_string(&graph),
+            w.join(",")
+        );
+        if let Err(e) = std::fs::write(&path, body) {
+            return (format!("{line}{bin}: replay: {path}: {e}\n"), 2);
+        }
+    }
+    let events: usize = rec.events.iter().map(Vec::len).sum();
+    *block = format!(
+        "--- measurements\nwall_ms: {}\npeak_rss_kb: {}\nreplay_events: {events}\n",
+        started.elapsed().as_millis(),
+        crate::conformance::measure::peak_rss_kb().map_or_else(String::new, |k| k.to_string())
+    );
+    (line, code)
 }
 
 fn config_of(o: &Opts) -> Config {
@@ -583,19 +740,16 @@ fn run_named_roles(
                     (format!("{bin}: the export was written; the graph store was not: {e}\n"), 2)
                 }
                 (Ok(s), report) => {
+                    let mut text =
+                        format!("exported: {} lines from {} graphs to {out}\n", s.lines, s.spec_graphs);
                     if let Some(Ok(rep)) = report {
                         for m in &rep.messages {
                             eprintln!("{m}");
                         }
+                        text.push_str(&rep.summary_line());
                         rep.append(block);
                     }
-                    (
-                        format!(
-                            "exported: {} lines from {} graphs to {out}\n",
-                            s.lines, s.spec_graphs
-                        ),
-                        0,
-                    )
+                    (text, 0)
                 }
                 (Err(e), _) => (format!("{bin}: export refused: {e}\n"), 2),
             }
@@ -670,6 +824,8 @@ fn run_named_roles(
                 "--model",
                 "--seed",
                 "--threshold",
+                "--graphs",
+                "--graphs-limit",
             ];
             let flags = ["--stop-at-first", "--dump-large-graph", "--audit-graphs"];
             if let Some(a) = foreign_option(&args[1..], &valued, &flags) {
@@ -710,6 +866,34 @@ fn run_named_roles(
                 },
             });
             let visible = (p.visible)(&o.args);
+            if let (Some(g), Some(out)) = (&o.graphs, &o.out) {
+                if overlapping_paths(Path::new(out), Path::new(g)) {
+                    return fail(
+                        "--graphs must name another file than --out (and than either one's .tmp)"
+                            .to_owned(),
+                    );
+                }
+            }
+            let store_opts = o.graphs.as_ref().map(|g| {
+                let mut run = witness_graph::RunIdentity::of_process(
+                    "impl",
+                    &o.args,
+                    &witness_graph::model_label(o.model),
+                    o.seed,
+                    o.threshold,
+                );
+                run.producer = "online";
+                witness_graph::GraphStoreOpts { path: g.into(), limit: o.graphs_limit, run }
+            });
+            if let Some(w) = store_opts.as_ref().and_then(|s| s.run.warning.as_ref()) {
+                eprintln!("{w}");
+            }
+            // The sequential check fills the store as it runs; the partitioned one writes the
+            // identity line only (`--graphs-limit 0`, checked above).
+            let store: Option<witness_graph::SharedStore> = store_opts
+                .as_ref()
+                .filter(|_| o.threads == 1)
+                .map(|s| Arc::new(std::sync::Mutex::new(Some(witness_graph::StoreBuilder::new(s.clone(), &visible)))));
             let imp = (p.imp)(&o.args);
             let r = if o.threads > 1 {
                 online_p::online_partitioned_roles(
@@ -732,6 +916,7 @@ fn run_named_roles(
                         let mut opts = OnlineOpts::new(mode, o.budget, out);
                         opts.payload_names = payload_names(&o.args);
                         opts.witness = o.witness.clone();
+                        opts.graphs = store.clone();
                         opts
                     },
                 )
@@ -744,11 +929,46 @@ fn run_named_roles(
                     {
                         eprintln!("{warning}");
                     }
-                    (r.render(), r.exit_code())
+                    let mut text = r.render();
+                    // `--graphs`: the store, once the --out file is written, from that file's
+                    // header (without the online fields) and lines.
+                    if let (Some(st), Some((out, _))) = (&store_opts, &r.out_written) {
+                        let report = std::fs::read_to_string(out)
+                            .map_err(|e| format!("graphs: {out}: {e}"))
+                            .and_then(|t| {
+                                let mut ls = t.lines();
+                                let h = ls.next().unwrap_or_default();
+                                let h = crate::conformance::witness_join::without_fields(
+                                    h,
+                                    &crate::conformance::witness_join::ONLINE_FIELDS,
+                                )
+                                .ok_or_else(|| format!("graphs: {out}: the header is not JSON"))?;
+                                let lines: Vec<String> = ls.map(str::to_owned).collect();
+                                match store.as_ref().and_then(|s| s.lock().ok()?.take()) {
+                                    Some(b) => b.finish(&h, &lines),
+                                    None => witness_graph::write_identity_only(st, &h),
+                                }
+                            });
+                        match report {
+                            Ok(rep) => {
+                                for m in &rep.messages {
+                                    eprintln!("{m}");
+                                }
+                                text.push_str(&rep.summary_line());
+                                rep.append(block);
+                            }
+                            Err(e) => {
+                                text.push_str(&format!("{bin}: the graph store was not written: {e}\n"));
+                                return (text, 2);
+                            }
+                        }
+                    }
+                    (text, r.exit_code())
                 }
                 Err(e) => fail(format!("online refused: {e}")),
             }
         }
+        "replay" => replay_command(p, bin, &args[1..], block),
         "row" => {
             if let Some(a) = row_foreign_option(&args[1..]) {
                 return fail(format!(

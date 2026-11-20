@@ -102,6 +102,8 @@ pub(crate) struct OnlineOpts {
     /// `Config::max_iterations` for the exploration.
     pub(crate) budget: Option<u64>,
     pub(crate) out: Option<OnlineOut>,
+    /// `--graphs`: the store builder the sink fills with the first execution of each new line.
+    pub(crate) graphs: Option<super::witness_graph::SharedStore>,
     /// Test seam (M1): panic in the sink's unlocked computation at this
     /// iteration.
     #[cfg(test)]
@@ -129,6 +131,7 @@ impl OnlineOpts {
             mode,
             budget,
             out,
+            graphs: None,
             #[cfg(test)]
             fault_at: None,
             #[cfg(test)]
@@ -616,6 +619,7 @@ pub(crate) fn online(
     let witness = opts.witness.map(|path| {
         Arc::new(Mutex::new(super::execution_witness::Writer::new(path)))
     });
+    let store = opts.graphs.clone();
     let spawned = Instant::now();
     let worker = {
         let state = Arc::clone(&state);
@@ -623,6 +627,8 @@ pub(crate) fn online(
         let names = names.clone();
         let roles = roles.clone();
         let witness = witness.clone();
+        let store = store.clone();
+        let mut stored: HashSet<String> = HashSet::new();
         std::thread::Builder::new()
             .name("online".to_string())
             .spawn(move || {
@@ -660,6 +666,21 @@ pub(crate) fn online(
                     }
                     if step.1.summary.is_some() {
                         super::graph_audit::record(&audit, g, &sink_visible);
+                    }
+                    // `--graphs`: the first execution of a new line, while the limit allows.
+                    if let Some(store) = store.as_ref() {
+                        let line = match &step.0 {
+                            Step::Found { out: Some(l) } | Step::Miss { out: Some(l), .. } => Some(l),
+                            _ => None,
+                        };
+                        if let Some(l) = line.filter(|l| !stored.contains(*l)) {
+                            stored.insert(l.clone());
+                            if let Some(b) = lock(store).as_mut().filter(|b| b.wants()) {
+                                let t = Instant::now();
+                                b.add(g, l.clone(), iteration);
+                                b.time_line(t.elapsed());
+                            }
+                        }
                     }
                     // (3) one locked update that cannot unwind.
                     lock(&sink_state).commit(step, iteration, mode)
@@ -746,6 +767,7 @@ pub(crate) fn online(
         explore_ms: enumerate_wall
             .saturating_sub(st.summarise)
             .saturating_sub(st.lookup)
+            .saturating_sub(store.as_ref().and_then(|s| lock(s).as_ref().map(|b| b.time)).unwrap_or_default())
             .as_millis(),
         summarise_ms: st.summarise.as_millis(),
         lookup_ms: st.lookup.as_millis(),

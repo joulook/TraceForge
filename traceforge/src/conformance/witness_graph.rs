@@ -43,11 +43,14 @@ pub(crate) struct RunIdentity {
     pub(crate) source: String,
     /// Why an existing manifest was not used, for the caller to print.
     pub(crate) warning: Option<String>,
+    /// `run.producer`: `export` or `online`.
+    pub(crate) producer: &'static str,
 }
 
 impl RunIdentity {
     /// The identity of this process's run. Reads the manifest beside the running binary; a
-    /// malformed one gives `"unknown"` and a `warning` line for the caller to print.
+    /// malformed one, or one older than the binary, gives `"unknown"` and a `warning` line for the
+    /// caller to print.
     pub(crate) fn of_process(
         side: &str, args: &[String], model: &str, seed: Option<u64>, threshold: Option<u32>,
     ) -> Self {
@@ -58,10 +61,22 @@ impl RunIdentity {
         let mut warning = None;
         let source = match std::env::current_exe() {
             Ok(exe) => {
+                let exe_path = exe.clone();
                 let mut m = exe.into_os_string();
                 m.push(".SOURCE.md5");
                 let m = PathBuf::from(m);
-                match source_of_manifest(&m) {
+                // A manifest older than the binary describes an earlier build: treated as missing.
+                let modified = |p: &Path| fs::metadata(p).and_then(|x| x.modified());
+                let stale = match (modified(&m), modified(&exe_path)) {
+                    (Ok(mt), Ok(bt)) => mt < bt,
+                    _ => false,
+                };
+                let parsed = if stale {
+                    Err("older than the binary".to_owned())
+                } else {
+                    source_of_manifest(&m)
+                };
+                match parsed {
                     Ok(Some(s)) => s,
                     Ok(None) => "\"unknown\"".to_owned(),
                     Err(e) => {
@@ -81,6 +96,7 @@ impl RunIdentity {
             entry,
             source,
             warning,
+            producer: "export",
         }
     }
 
@@ -98,7 +114,7 @@ impl RunIdentity {
         format!(
             "{{\"tool\":\"traceforge\",\"tool_commit\":{},\"entry\":{},\"side\":{},\"args\":[{}],\
              \"model\":{},\"options\":{{{}}},\"source\":{},\"iteration\":{},\
-             \"producer\":\"export\",\"order\":\"first\"}}",
+             \"producer\":\"{}\",\"order\":\"first\"}}",
             json_string(TOOL_COMMIT),
             json_string(&self.entry),
             json_string(&self.side),
@@ -106,7 +122,8 @@ impl RunIdentity {
             json_string(&self.model),
             options.join(","),
             self.source,
-            iteration
+            iteration,
+            self.producer
         )
     }
 }
@@ -316,6 +333,9 @@ struct Pending {
     threads: Result<String, String>,
 }
 
+/// A store builder shared with a run's completion sink (the online check).
+pub(crate) type SharedStore = std::sync::Arc<std::sync::Mutex<Option<StoreBuilder>>>;
+
 /// The store being built during an export, written once the export has succeeded.
 pub(crate) struct StoreBuilder {
     opts: GraphStoreOpts,
@@ -337,6 +357,11 @@ pub(crate) struct StoreReport {
 }
 
 impl StoreReport {
+    /// The export's summary line for the store.
+    pub(crate) fn summary_line(&self) -> String {
+        format!("graph_store: written={} refused={} ms={}\n", self.written, self.refused, self.ms)
+    }
+
     /// The three tool-specific measurement keys.
     pub(crate) fn append(&self, block: &mut String) {
         block.push_str(&format!(
