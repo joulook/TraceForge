@@ -184,7 +184,8 @@ Stable subcommands:
       Check the implementation against the specification in one process.
 
 Stable options:
-  --model fifo|bag|causal   the communication model (default: the program's)
+  --model fifo|bag|causal   the communication model (default: the program's);
+                            p2p, asyn and cd are aliases of fifo, bag and causal
   --seed N                  the exploration's seed (default 0; it fixes the order)
   --program S, --size S     the summary file header's program and size
 
@@ -265,10 +266,15 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
             }
             "--model" => {
                 o.model = match value()?.as_str() {
-                    "fifo" => ConsType::FIFO,
-                    "bag" => ConsType::Bag,
-                    "causal" => ConsType::Causal,
-                    m => return Err(format!("unknown model `{m}`: fifo, bag or causal")),
+                    // The summary format's names (p2p, asyn, cd) are aliases.
+                    "fifo" | "p2p" => ConsType::FIFO,
+                    "bag" | "asyn" => ConsType::Bag,
+                    "causal" | "cd" => ConsType::Causal,
+                    m => {
+                        return Err(format!(
+                            "unknown model `{m}`: fifo, bag or causal (or p2p, asyn, cd)"
+                        ))
+                    }
                 }
             }
             "--seed" => o.seed = Some(value()?.parse().map_err(|_| "--seed needs a number")?),

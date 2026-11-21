@@ -104,7 +104,7 @@ fn split(text: &str, what: &str) -> (String, String) {
 
 /// Every declared default against every `--model`, and which column it must give.
 /// `true` is the `bag` column.
-const TABLE: [(Declared, Option<&str>, bool); 8] = [
+const TABLE: [(Declared, Option<&str>, bool); 14] = [
     (Some(ConsType::Bag), None, true),
     (Some(ConsType::Bag), Some("bag"), true),
     (Some(ConsType::Bag), Some("fifo"), false),
@@ -113,6 +113,14 @@ const TABLE: [(Declared, Option<&str>, bool); 8] = [
     (Some(ConsType::FIFO), Some("fifo"), false),
     (None, None, false),
     (None, Some("bag"), true),
+    // The summary format's names are aliases: p2p = fifo, asyn = bag, cd = causal (on this
+    // program causal delivery is one sender's order, as fifo).
+    (Some(ConsType::Bag), Some("p2p"), false),
+    (Some(ConsType::FIFO), Some("asyn"), true),
+    (None, Some("asyn"), true),
+    (None, Some("p2p"), false),
+    (None, Some("cd"), false),
+    (Some(ConsType::Bag), Some("causal"), false),
 ];
 
 /// **`count`.** Failing directions: the default ignored; the default overriding
@@ -166,7 +174,11 @@ fn md_export() {
                     .expect("conformance: MD: the header parses");
             assert_eq!(
                 head["model"],
-                if bag { "asyn" } else { "p2p" },
+                match model {
+                    Some("cd" | "causal") => "cd",
+                    _ if bag => "asyn",
+                    _ => "p2p",
+                },
                 "conformance: MD: {what}: the header's model"
             );
             assert_eq!(
@@ -351,6 +363,8 @@ fn md_row() {
         let cells: HashMap<&str, String> = header.iter().copied().zip(record_cells(line)).collect();
         let (comm, graphs, reports) = if bag {
             ("NoOrder", "6", "5")
+        } else if matches!(model, Some("cd" | "causal")) {
+            ("CausalOrder", "1", "0")
         } else {
             ("LocalOrder", "1", "0")
         };

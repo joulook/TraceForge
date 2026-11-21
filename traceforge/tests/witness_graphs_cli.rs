@@ -117,6 +117,13 @@ fn fixture(name: &str) -> (Entry, Vec<String>) {
                 traceforge::send_msg(me(), n);
             }).join().unwrap();
         }), vis(&["v"])),
+        // `w` sends 1, 2, 3 to `r`: one order under fifo and causal, six under bag.
+        "models" => (Arc::new(|| {
+            let r = named("r", || { for _ in 0..3 { let _ = traceforge::recv_msg_block::<usize>(); } });
+            let rid = r.thread().id();
+            named("w", move || { for i in 1..4usize { traceforge::send_msg(rid, i); } }).join().unwrap();
+            r.join().unwrap();
+        }), vis(&["r", "w"])),
         // Must not be explored.
         "panic" => (Arc::new(|| panic!("must not explore")), vis(&["v"])),
         other => panic!("unknown fixture {other}"),
@@ -1647,4 +1654,75 @@ fn row_exists_only_in_the_eval_build() {
     assert_eq!(hc, 0);
     let words: Vec<&str> = h.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').collect();
     assert!(!words.contains(&"row") && !h.contains("EVAL"), "{h}");
+}
+
+/// The text with every timing and memory value masked.
+fn untimed(t: &str) -> String {
+    t.lines().map(|l| match l.split_once(": ") {
+        Some((k, _)) if k.ends_with("_ms") || k == "peak_rss_kb" => format!("{k}: <masked>"),
+        // `first miss: iteration N, T ms`: the count stays, the time goes.
+        _ if l.starts_with("graph_store:") => l.rsplit_once(" ms=").map_or(l.to_owned(), |(a, _)| format!("{a} ms=<masked>")),
+        _ if l.starts_with("first miss:") => l.rsplit_once(',').map_or(l.to_owned(), |(a, _)| format!("{a}, <masked>")),
+        _ => l.to_owned(),
+    }).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn model_aliases_behave_as_their_canonical_names() {
+    let dir = scratch();
+    for (alias, canon, header_name, executions) in [("p2p", "fifo", "p2p", 1), ("asyn", "bag", "asyn", 6), ("cd", "causal", "cd", 1)] {
+        let mut out: Vec<(String, Vec<String>, Vec<String>, String)> = Vec::new();
+        for m in [alias, canon] {
+            let tag = format!("{alias}-{m}");
+            let (count, c) = cli("models", &["count", "impl", "--model", m]);
+            assert_eq!(c, 0, "{count}");
+            assert!(count.starts_with(&format!("execs={executions} ")), "{m}: {count}");
+            let e = dir.join(format!("{tag}.jsonl"));
+            let g = dir.join(format!("{tag}.g"));
+            let (ex, c) = cli("models", &["export", "impl", "--model", m, "--out", e.to_str().unwrap(),
+                "--graphs", g.to_str().unwrap(), "--seed", "0"]);
+            assert_eq!(c, 0, "{ex}");
+            let lines = read_lines(&e);
+            assert_eq!(json(&lines[0])["model"], header_name, "{m}: the header's model");
+            let store = read_lines(&g);
+            for raw in &store {
+                assert_eq!(json(raw)["run"]["model"], canon, "{m}: run.model");
+            }
+            let spec = dir.join(format!("{tag}-spec.jsonl"));
+            assert_eq!(cli("models", &["export", "spec", "--model", m, "--out", spec.to_str().unwrap()]).1, 0);
+            let (on, c) = cli("models", &["online", "--spec", spec.to_str().unwrap(), "--model", m, "--seed", "0"]);
+            assert_eq!(c, 0, "{on}");
+            let (conf, c) = cli("models", &["conf", "--engine", "stateful", "--model", m, "--seed", "0"]);
+            assert!(c == 0 || c == 1, "{conf}");
+            let text = format!("{}\n{}\n{}\n{}", untimed(&count), untimed(&ex).replace(&tag, "T"),
+                untimed(&on).replace(&tag, "T"), untimed(&conf));
+            out.push((text, lines, store, m.to_owned()));
+        }
+        // Printed for the failure report (the library's panic hook can swallow the message).
+        for (x, y) in out[0].0.lines().zip(out[1].0.lines()) {
+            if x != y { println!("{alias} vs {canon}: {x:?} != {y:?}"); }
+        }
+        if out[0].1 != out[1].1 { println!("{alias} vs {canon}: summary files differ:\n{:?}\n{:?}", out[0].1, out[1].1); }
+        if out[0].2 != out[1].2 { println!("{alias} vs {canon}: stores differ"); }
+        assert_eq!(out[0].0, out[1].0, "{alias} = {canon}: stdout");
+        assert_eq!(out[0].1, out[1].1, "{alias} = {canon}: the summary file");
+        assert_eq!(out[0].2, out[1].2, "{alias} = {canon}: the graph store");
+    }
+}
+
+#[test]
+fn unknown_models_are_refused_with_the_names_listed() {
+    let usage = cli("panic", &[]).0.split_once('\n').unwrap().1.to_owned();
+    for m in ["mo", "FIFO", "P2P", "Bag", "fifo ", "", "mailbox"] {
+        for head in [vec!["count", "impl"], vec!["export", "impl", "--out", "x"], vec!["conf"]] {
+            let mut a = head.clone();
+            a.extend(["--model", m]);
+            let (t, c) = cli("panic", &a);
+            assert_eq!((t, c), (format!("program: unknown model `{m}`: fifo, bag or causal (or p2p, asyn, cd)\n{usage}"), 2), "{a:?}");
+        }
+    }
+    let (t, c) = cli("panic", &["online", "--spec", "s", "--model", "FIFO"]);
+    assert_eq!(c, 2, "{t}");
+    assert!(t.starts_with("program: unknown model `FIFO`: fifo, bag or causal (or p2p, asyn, cd)\n"), "{t}");
+    assert!(!Path::new("x").exists());
 }

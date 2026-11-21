@@ -134,6 +134,15 @@ subcommands (`<bin> --help` lists them with their options):
 | `replay --graph FILE` | re-run the program once along a witness graph and report the first deviation |
 | `conf --engine stateful` | check the implementation against the specification in one process |
 
+`--model` takes the communication model by either of its names; summary file headers always carry the summary
+format's name, and witness graphs the TraceForge name:
+
+| TraceForge name | summary format name (alias) | meaning |
+|---|---|---|
+| `fifo` | `p2p` | each sender's messages to one receiver arrive in order |
+| `bag` | `asyn` | messages arrive in any order |
+| `causal` | `cd` | causal delivery |
+
 Exit codes (2 is also every usage error):
 
 | subcommand | 0 | 1 | 2 |
