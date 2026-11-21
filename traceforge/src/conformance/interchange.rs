@@ -1555,7 +1555,7 @@ pub(crate) fn normal_line(text: &str, visible: &[String]) -> Result<String, Stri
     parse_line(text, &sorted_names(visible)).map(|(key, _)| key)
 }
 
-fn header_of(text: &str) -> Result<FileHead, String> {
+pub(crate) fn header_of(text: &str) -> Result<FileHead, String> {
     let v: Value =
         serde_json::from_str(text).map_err(|e| format!("the header is not JSON: {e}"))?;
     let Value::Object(m) = v else {

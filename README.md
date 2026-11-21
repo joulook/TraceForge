@@ -165,8 +165,36 @@ implementation's uncovered lines. Its options (`conf-join --help`):
 | `--spec-graphs Q` | with `--witness-dir`: the specification's store (default `spec.jsonl.graphs.jsonl`) |
 | `--witness-limit N\|all` | with `--witness-dir`: at most `N` graphs (default 20) |
 | `--witness-nearest N` | with `--witness-dir`: at most `N` nearest specification graphs per line (default 3); written only with `--decide`, for the lines it finds no match for |
+| `--no-pairing-check` | skip the pairing check that runs before every join |
+| `--check-pairing` | run only the pairing check (with `--merge` and `--decide` as the join would) and print its result |
 
-`conf-join` exits 0 when the files conform or there is no verdict, 1 on a violation, 2 on refused input.
+`conf-join` exits 0 when the files conform or there is no verdict, 1 on a violation, 2 on refused input or a
+failed pairing check.
+
+Before comparing anything, `conf-join` checks that the two files can meaningfully be joined. Each failure names its
+row of the JMC/TraceForge comparison contract:
+
+| row | the check fails when |
+|---|---|
+| C2 | a `visible` list is not byte-sorted, or the two files' `visible` or `roles` lists differ |
+| C3 | the models differ, or a model is not `p2p` or `asyn` |
+| C4 | the specification is not `complete` |
+| C6 | a file repeats a line, or (with `--merge`) its lines are not in byte order |
+| C10 | a count exceeds 2^31−1 or a word has more than 2^31−1 events |
+| C13 | a tag is used with different field counts in the two files |
+
+A tag found in one file only is a warning: the implementation may never send one of the specification's
+messages, and a message only the implementation sends is reported by the join as an uncovered line. With
+`--check-pairing --decide`, a count above 65535 is also a warning, because `--decide` refuses it in a line that
+it classifies. A value tagged `ThreadId` or `Tid` is a warning (C18): process identities must be sent as role
+names, which the files cannot tell from other strings. An invalid header, or a line that does not parse, is left to
+the join's own refusal; such a line still counts for C6 (by its text) and C10.
+
+`--check-pairing` prints `pairing: <row>: …` per failure, `pairing: warning: <row>: …` per warning, then
+`pairing: ok` (exit 0) or `pairing: failed (K checks)` (exit 2). Before a join, a passing check prints only its
+warnings, each as `conf-join: pairing: warning: <row>: …` on stderr. A failing check prints only its failures, as
+`conf-join: pairing: <row>: …`, then `conf-join: refused: the pairing check failed (K checks; --no-pairing-check
+skips it)`, and exits 2.
 
 Experimental, and subject to change: the `conf` engines `stateless`, `gated` and `enumerator`; parallel exploration
 (`--threads N` above 1); `--threshold`, `--dump-large-graph` and `--audit-graphs`.

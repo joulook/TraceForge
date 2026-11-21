@@ -48,7 +48,8 @@ fn model_joins() {
         let out = join(&spec, &imp, &flags);
         assert_eq!(out.status.code(), Some(2), "conformance: model exit");
         assert_eq!(String::from_utf8(out.stderr).unwrap(),
-            "conf-join: refused: the two models differ: p2p and asyn\n",
+            concat!("conf-join: pairing: C3: the two models differ: p2p and asyn\n",
+                "conf-join: refused: the pairing check failed (1 checks; --no-pairing-check skips it)\n"),
             "conformance: model diagnostic");
         std::fs::write(&imp, header("p2p")).unwrap();
         assert_eq!(join(&spec, &imp, &flags).status.code(), Some(0),
@@ -341,7 +342,8 @@ fn roles_joins_and_online() {
         let out = join(&spec, &imp, &flags);
         assert_eq!(out.status.code(), Some(2), "conformance: roles join exit");
         assert_eq!(String::from_utf8(out.stderr).unwrap(),
-            "conf-join: refused: the two roles lists differ: [\"helper\"] and []\n",
+            concat!("conf-join: pairing: C2: the two `roles` lists differ: [\"helper\"] and []\n",
+                "conf-join: refused: the pairing check failed (1 checks; --no-pairing-check skips it)\n"),
             "conformance: roles join diagnostic");
     }
     std::fs::write(&imp, minor_one("[\"helper\"]")).unwrap();
