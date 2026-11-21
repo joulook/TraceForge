@@ -345,7 +345,7 @@ mod witness_graph_tests;
 // `String` positions rather than `Event`s so that no engine type crosses the
 // boundary.
 //
-// Everything above is a semver commitment on a crate at 0.2.1. The
+// Everything above is a semver commitment on a 0.x crate. The
 // enumerations are the risk: adding a `ReportGate` variant or a `ConfError`
 // variant is a breaking change for a caller that matches exhaustively. They
 // are left exhaustive rather than `#[non_exhaustive]` on purpose — the gate
@@ -991,7 +991,7 @@ fn run(
         // are two transcriptions of one algorithm, so their agreement carried
         // no information; and the outcome type it rendered would have become a
         // semver commitment the moment `pub mod conformance` shipped, on a
-        // crate at 0.2.1. §11.6's `vis(Impl) ⊆ vis(Spec)` checker is this
+        // 0.x crate. §11.6's `vis(Impl) ⊆ vis(Spec)` checker is this
         // project's first genuine oracle — it materialises word sets rather
         // than re-running the morphism — and it is test-only, in
         // `conformance::oracle`.
