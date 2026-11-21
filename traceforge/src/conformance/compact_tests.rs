@@ -5239,22 +5239,13 @@ fn e1_names_only_on_the_compact_summary() {
 /// one key, which parses to `Ltr` with no legacy selector and reprints itself;
 /// complete-first with the precheck names its selector (three keys, each
 /// round-tripping exactly); `Plain` on the enumerator, the gated engine or a
-/// precheck row is no key. (b)–(c) Every key of the four stores
-/// (`campaign-1`, `apptab-1`, `cfirst-1`, `compact-2`) parses and reprints byte
-/// for byte; a stored stateful or precheck-free complete-first key naming a
-/// selector is a legacy identity (`legacy_selector: Some(s)`); each of the
-/// three spellings is stored on both engines; one stored key of each is
-/// refused by `run_row_in_process` with its spelling and the fix in the
-/// payload and no program run (a counting fixture, which runs under the
-/// `Plain` key).
+/// precheck row is no key. Items (b)–(c), on the recorded stores, are
+/// `e1_the_key_plain_and_legacy`'s.
 #[test]
-fn e1_the_key_plain_and_legacy() {
-    use crate::conformance::eval::{parse_key, parse_label, read_rows, run_row_in_process};
-    use crate::conformance::eval::x1_config;
-    use crate::conformance::grid::GridEnd;
+fn e1_the_key_plain_labels() {
+    use crate::conformance::eval::parse_label;
     use crate::conformance::selector::Selector;
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::collections::BTreeSet;
     let sels = [Selector::Ltr, Selector::Reverse, Selector::FewestEvents];
     let mut bad = Vec::new();
     for engine in [GridEngine::Stateful, GridEngine::CompleteFirst] {
@@ -5291,6 +5282,26 @@ fn e1_the_key_plain_and_legacy() {
             bad.push(format!("(a) `Plain` parsed on {p}"));
         }
     }
+    assert!(bad.is_empty(), "conformance: E1-2: {bad:#?}");
+}
+
+/// The key's items (b)–(c), on the recorded stores: every key of the
+/// four stores (`campaign-1`, `apptab-1`, `cfirst-1`, `compact-2`) parses and reprints byte for
+/// byte; a stored stateful or precheck-free complete-first key naming a selector is a legacy
+/// identity (`legacy_selector: Some(s)`); each of the three spellings is stored on both engines;
+/// one stored key of each is refused by `run_row_in_process` with its spelling and the fix in the
+/// payload and no program run. The labels are `e1_the_key_plain_labels`'s; the counting
+/// fixture's run under its `Plain` key is `e1_the_counting_fixture_runs_under_its_plain_key`'s.
+#[test]
+#[ignore = "reads the campaign's recorded rows, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn e1_the_key_plain_and_legacy() {
+    use crate::conformance::eval::{parse_key, read_rows, run_row_in_process};
+    use crate::conformance::grid::GridEnd;
+    use crate::conformance::selector::Selector;
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let sels = [Selector::Ltr, Selector::Reverse, Selector::FewestEvents];
+    let mut bad = Vec::new();
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../plan/traceForge/log/eval");
     let mut seen: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -5362,12 +5373,34 @@ fn e1_the_key_plain_and_legacy() {
             bad.push(format!("(b) {e} {s}: a program ran"));
         }
     }
-    let before = E1_CALLS.load(SeqCst);
-    let end = run_row_in_process(&fx, &x1_config(GridEngine::Stateful, Selector::Ltr), false);
-    if E1_CALLS.load(SeqCst) == before || matches!(end, GridEnd::Panicked { .. }) {
-        bad.push(format!("(b) the counting fixture did not run under `Plain`: {end:?}"));
-    }
     assert!(bad.is_empty(), "conformance: E1-2: {bad:#?}");
+}
+
+/// The key's positive control: a counting fixture runs under the stateful engine's `Plain`
+/// key without a refusal, and its program runs.
+#[test]
+fn e1_the_counting_fixture_runs_under_its_plain_key() {
+    use crate::conformance::eval::{run_row_in_process, x1_config};
+    use crate::conformance::grid::GridEnd;
+    use crate::conformance::selector::Selector;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let counting = || {
+        crate::conformance::grid::prog(|| {
+            CALLS.fetch_add(1, SeqCst);
+            let _ = crate::thread::Builder::new()
+                .name("r".to_owned())
+                .spawn(|| {})
+                .unwrap();
+        })
+    };
+    let fx = local_fixture("e1:counting-plain", counting(), counting(), &["r"]);
+    let before = CALLS.load(SeqCst);
+    let end = run_row_in_process(&fx, &x1_config(GridEngine::Stateful, Selector::Ltr), false);
+    assert!(
+        CALLS.load(SeqCst) > before && !matches!(end, GridEnd::Panicked { .. }),
+        "conformance: the counting fixture did not run under `Plain`: {end:?}"
+    );
 }
 
 /// MIN-ENGINES E1-2 (derived §E1 item 14 (b)), through the child: `EVAL_ROW`
@@ -7153,9 +7186,8 @@ const E9_C04: [&str; 4] = [
 /// `all_reports` off and on: `wall_ms_at_first_report` and
 /// `vmhwm_kb_at_first_report` are `Some` iff `counters.reports ≥ 1`; then
 /// `W ≤ impl_wall_time_ms` (both floors of elapsed times from the one
-/// `impl_started`, read in that order) and `vm_hwm_kb_before ≤ H ≤
-/// vm_hwm_kb_after` (the grid run's own reads; `VmHWM` never decreases); the
-/// row's two cells are the values' text, blank for `None`; the report count
+/// `impl_started`, read in that order); the memory readings are not ordered
+/// against each other (see the comment in the body); the row's two cells are the values' text, blank for `None`; the report count
 /// and the presence are equal across `all_reports`. Fails before E9 (no
 /// fields; the row has no such cells).
 #[test]
@@ -7188,16 +7220,15 @@ fn e9_a_the_stateful_columns_follow_the_reports() {
                     if w.is_some() != (n >= 1) || h.is_some() != (n >= 1) {
                         bad.push(format!("{what}: reports {n}, {w:?} {h:?}"));
                     }
-                    if let (Some(w), Some(h)) = (w, h) {
-                        let (before, after) = r.vm_hwm_kb;
-                        let ok = w <= c.impl_wall_time_ms
-                            && before.is_some_and(|b| b <= h)
-                            && after.is_some_and(|a| h <= a);
-                        if !ok {
-                            bad.push(format!(
-                                "{what}: {w} ms of {} ms; {before:?} <= {h} <= {after:?}",
-                                c.impl_wall_time_ms
-                            ));
+                    // Only the clocks are ordered. `VmHWM` is the larger of the recorded
+                    // high-water mark and the current RSS, and the kernel keeps the RSS in
+                    // per-CPU counters that a read does not sum exactly (Linux 6.2 and later),
+                    // so two `VmHWM` reads can come out in either order, within an accounting
+                    // error whose bound grows with the number of CPUs. The memory readings at the first report
+                    // and around the run are therefore not compared.
+                    if let (Some(w), Some(_)) = (w, h) {
+                        if w > c.impl_wall_time_ms {
+                            bad.push(format!("{what}: {w} ms of {} ms", c.impl_wall_time_ms));
                         }
                     }
                     let row = row_of(&r);

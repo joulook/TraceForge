@@ -11,6 +11,10 @@
 //! with both values. Tests that spawn child processes are `#[ignore]`d and run
 //! one per invocation (`--ignored --exact … --test-threads=1`), writing only
 //! under the system temporary directory.
+//!
+//! Tests whose ignore reason names inputs outside this repository read the project's campaign
+//! records; `PLAN` locates them two directories above `CARGO_MANIFEST_DIR`. Run one with those files
+//! beside the repo and `--include-ignored <its name>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -593,13 +597,20 @@ fn vmhwm_now() -> u64 {
 /// C4 (F2): on `ex:naive/k2/enc1` (2 reports) and `apps/a1/eager/spec/n2r2`
 /// (55 reports) under `stop = false`, every configuration:
 /// `wall_ms_at_first_report` is `Some` and ≤ `outer_wall_time_ms`,
-/// `vmhwm_kb_at_first_report` is `Some` and ≤ the process's `VmHWM` after the
-/// run (monotone); both columns non-blank in the record. On
+/// `vmhwm_kb_at_first_report` is `Some` and positive (memory readings are not
+/// ordered against each other: see the comment in the body); both columns
+/// non-blank in the record. On
 /// `apps/a1/correct/spec/n2r2` and `synth/share/m2c1` (no report): `None`,
 /// blank. A `stop = true` run's first report is at the same completion (its
 /// wall is a lower bound of nothing — only `Some` is pinned).
 #[test]
 fn c04_first_report_counters() {
+    // Only the clocks are ordered. `VmHWM` is the larger of the recorded high-water mark and the
+    // current RSS, and the kernel keeps the RSS in per-CPU counters that a read does not sum
+    // exactly (Linux 6.2 and later), so two `VmHWM` reads can come out in either order, within an
+    // accounting error whose bound grows with the number of CPUs; another test running in this process can also
+    // reset the high-water mark. The reading at the first report is therefore compared with
+    // neither the process's `VmHWM` after the run nor the row's child high-water mark.
     let mut bad = Vec::new();
     for (name, violating) in [
         ("ex:naive/k2/enc1", true),
@@ -611,14 +622,13 @@ fn c04_first_report_counters() {
         for w in CFGS {
             let cfg = cfg_of(&cf_label(w));
             let o = cfirst_raw(&f, &cfg);
-            let after = vmhwm_now();
             let c = &o.counters;
             if violating {
                 match (c.wall_ms_at_first_report, c.vmhwm_kb_at_first_report) {
                     (Some(t), Some(v)) => {
-                        if t > c.outer_wall_time_ms || v > after {
+                        if t > c.outer_wall_time_ms || v == 0 {
                             bad.push(format!(
-                                "{name} {w}: {t} > {} or {v} > {after}",
+                                "{name} {w}: {t} > {} or VmHWM {v}",
                                 c.outer_wall_time_ms
                             ));
                         }
@@ -637,11 +647,6 @@ fn c04_first_report_counters() {
                 bad.push(format!(
                     "{name} {w}: columns {:?} {:?}",
                     r["wall_ms_at_first_report"], r["vmhwm_kb_at_first_report"]
-                ));
-            }
-            if violating && n(&r, "vmhwm_kb_at_first_report") > n(&r, "rss_child_hwm_kb") {
-                bad.push(format!(
-                    "{name} {w}: VmHWM at the first report above the row's"
                 ));
             }
         }
@@ -854,6 +859,7 @@ fn c06_the_label_round_trips() {
 /// C6: every key of `campaign-1/rows.csv` and `apptab-1/rows.csv` parses
 /// (read-only scan), and its label prints back byte for byte.
 #[test]
+#[ignore = "reads the campaign's recorded rows, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c06_every_stored_key_parses() {
     let mut bad = Vec::new();
     let mut counts = Vec::new();
@@ -885,11 +891,10 @@ fn c06_every_stored_key_parses() {
 // Criterion 7 — schema 3
 // =========================================================================
 
-/// C7 (F5, E-CF-6): `SCHEMA_VERSION = 3`; the header is 185 columns with the
-/// five new ones right after `witnesses`; `Store::open` refuses a schema-2
-/// store (a copy of `apptab-1/rows.csv`) by name, with and without
-/// `allow_mixed`; `read_rows` reads that copy by its own header (36 rows,
-/// the five columns absent).
+/// C7 (F5, E-CF-6): the schema version and the header's width, with the five
+/// first-report columns right after `witnesses`; a file whose first line is not
+/// a header is refused. The refusal of the older recorded stores is
+/// `c07_older_recorded_stores_are_refused`'s.
 #[test]
 fn c07_schema_three() {
     // COMPACT-INDEX re-pin (2026-10-17, gate 3 F1): schema 4, 202 columns;
@@ -918,7 +923,19 @@ fn c07_schema_three() {
         ],
         "conformance: the five columns after witnesses"
     );
+    // A file whose first line is not a header is refused.
     let d = temp("c07");
+    let junk = d.join("junk.csv");
+    fs::write(&junk, "not,a,header\n").unwrap();
+    assert!(read_rows(&junk).is_err(), "conformance: no header, refused");
+}
+
+/// C7 on the recorded stores: a schema-2 and a schema-3 store are refused by `Store::open`, with
+/// and without `allow_mixed`, and `read_rows` reads the schema-2 copy by its own header.
+#[test]
+#[ignore = "reads the campaign's recorded rows, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn c07_older_recorded_stores_are_refused() {
+    let d = temp("c07-stores");
     let copy = d.join("rows.csv");
     fs::copy(plan("log/eval/apptab-1/rows.csv"), &copy).unwrap();
     for allow in [false, true] {
@@ -943,10 +960,6 @@ fn c07_schema_three() {
         !rows[0].contains_key("admissions"),
         "conformance: no schema-3 column"
     );
-    // A file whose first line is not a header is refused.
-    let junk = d.join("junk.csv");
-    fs::write(&junk, "not,a,header\n").unwrap();
-    assert!(read_rows(&junk).is_err(), "conformance: no header, refused");
 }
 
 // =========================================================================

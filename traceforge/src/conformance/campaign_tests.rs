@@ -19,6 +19,10 @@
 //! (the measured graph counts), `log/dev/P5-SYNTH.models.md` (criterion 7),
 //! `log/dev/P5-CAMPAIGN.coverage.md` and `.counts.md`, and the
 //! `log/dev/P5-APPS.expected.md` addendum.
+//!
+//! Tests whose ignore reason names inputs outside this repository read the project's campaign
+//! records; the helper `plan()` locates them two directories above `CARGO_MANIFEST_DIR`. Run one
+//! with those files beside the repo and `--include-ignored <its name>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -2059,8 +2063,10 @@ fn measured_counts() -> Vec<(String, u128, u128, &'static str)> {
 }
 
 /// Criterion 3: A1/A2/A4's formulas (`pair-swap`: `2^q`) and the A3 counts hold
-/// at every point the v2 store or the pilot measured.
+/// at every point the v2 store or the pilot measured. The formulas at the
+/// quoted points are `c03_count_formulas_at_the_quoted_points`'s.
 #[test]
+#[ignore = "reads the campaign's recorded rows and pilot tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c03_count_formulas_hold_where_measured() {
     let mut checked = 0;
     let mut bad = Vec::new();
@@ -2078,7 +2084,11 @@ fn c03_count_formulas_hold_where_measured() {
         checked >= 100,
         "conformance: the store and the pilot measure ≥ 100 such rows"
     );
-    // The joint corners and C3's quoted end points by the formulas.
+}
+
+/// Criterion 3: the formulas at the joint corners and C3's quoted end points.
+#[test]
+fn c03_count_formulas_at_the_quoted_points() {
     assert_eq!(formula("apps/a1/correct/spec/n3r2"), Some((2_304, 256)));
     assert_eq!(
         formula("apps/a1/correct/spec/n6r1").map(|x| x.0),
@@ -2104,7 +2114,7 @@ fn c03_count_formulas_hold_where_measured() {
 }
 
 /// C3/criterion 3: A3's counts by the tester's procedure equal C3's eleven
-/// quoted figures and every cell of the lead's `counts.md` table.
+/// quoted figures.
 #[test]
 fn c03_a3_counts_by_the_testers_procedure() {
     for (kind, k, q, n) in [
@@ -2122,6 +2132,13 @@ fn c03_a3_counts_by_the_testers_procedure() {
     ] {
         assert_eq!(a3_count(k, q, kind), n, "conformance: {kind} ({k},{q})");
     }
+}
+
+/// C3/criterion 3: A3's counts by the tester's procedure equal every cell of the lead's
+/// recorded count table.
+#[test]
+#[ignore = "reads the campaign's recorded count tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn c03_a3_counts_match_the_recorded_table() {
     let text = read_plan("log/dev/P5-CAMPAIGN.counts.md");
     let tables = md_tables(&text);
     let (hdr, rows) = tables
@@ -4124,11 +4141,12 @@ fn c04_controls_in_x1_and_the_excluded_points() {
     }
 }
 
-/// Criterion 4: every application point's expected verdict is total
-/// (derived.md §8: every X2 point reports, every X1 point conforms; none
-/// vacuous) and the lead's addendum lists exactly the six classes of points
-/// the earlier tables do not, with the derived verdicts.
+/// Criterion 4: the lead's addendum lists exactly the six classes of points the
+/// earlier tables do not, with the derived verdicts (derived.md §8; none
+/// vacuous). That every application point's expected verdict is total is
+/// `c04_every_application_point_has_its_derived_side`'s.
 #[test]
+#[ignore = "reads the campaign's expected-verdict tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c04_expected_verdicts_are_total() {
     let text = read_plan("log/dev/P5-APPS.expected.md");
     let add = text
@@ -4170,7 +4188,11 @@ fn c04_expected_verdicts_are_total() {
         "conformance: the addendum's verdicts = derived.md §8"
     );
     assert!(add.contains("None of these is vacuous"));
-    // Totality over the grid: the derived side of every application point.
+}
+
+/// C4: totality over the grid: the derived side of every application point.
+#[test]
+fn c04_every_application_point_has_its_derived_side() {
     let d = derived();
     for p in apps_grid() {
         let reports = !(p.variant == "conforming" || p.variant.starts_with("control:"));
@@ -4310,6 +4332,7 @@ fn coverage_globs() -> Vec<(String, String)> {
 /// **Fails while T1 stands**: E2's `synth/reset-ctl/*|Gated/*` names X1V, which
 /// holds no reset-ctl key. (Ignored while it stands.)
 #[test]
+#[ignore = "reads the campaign's coverage map, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn t1_c05_every_coverage_glob_selects_a_key_of_its_spec() {
     let mut bad = Vec::new();
     for (sp, g) in coverage_globs() {
@@ -4323,12 +4346,14 @@ fn t1_c05_every_coverage_glob_selects_a_key_of_its_spec() {
     assert!(bad.is_empty(), "conformance: {bad:#?}");
 }
 
-/// Criterion 5 (the parts T1 does not touch): the map parses into ≥ 40
-/// (spec, glob) pairs; every glob but E2's reset-ctl one selects ≥ 1 key of its
-/// spec; the baselines' globs name `baseline` rows; every §6 key of X1/X2 is
-/// named by a glob of its own spec; every synthetic/application key is on its
-/// family's line (a series); the "not run" cells are listed.
+/// Criterion 5 (the parts T1 does not touch), on the coverage map: the map parses
+/// into ≥ 40 (spec, glob) pairs; every glob but E2's reset-ctl one selects ≥ 1
+/// key of its spec; the baselines' globs name `baseline` rows; every §6 key of
+/// X1/X2 is named by a glob of its own spec; the "not run" cells are listed.
+/// E2's reset-ctl glob and every other key's line are
+/// `c05_the_reset_ctl_glob_and_every_series_key_has_a_line`'s.
 #[test]
+#[ignore = "reads the campaign's coverage map, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c05_coverage_map_names_every_key_and_the_cells_not_run() {
     let globs = coverage_globs();
     assert!(globs.len() >= 40, "conformance: {}", globs.len());
@@ -4342,13 +4367,6 @@ fn c05_coverage_map_names_every_key_and_the_cells_not_run() {
             "conformance: {sp}: {g} selects nothing"
         );
     }
-    // E2's control glob selects X1V's gated reset-ctl rows (T1 fixed): 30
-    // points × 3 selectors × 3 reps.
-    let e2 = ks("X1V")
-        .iter()
-        .filter(|k| glob_match("synth/reset-ctl/*|Gated/*", k))
-        .count();
-    assert_eq!(e2, 30 * 9, "conformance: E2's reset-ctl glob");
     for name in ["X1", "X2", "X1V", "X3A"] {
         let mine: Vec<&String> = globs
             .iter()
@@ -4362,12 +4380,6 @@ fn c05_coverage_map_names_every_key_and_the_cells_not_run() {
                 assert!(
                     mine.iter().any(|g| glob_match(g, &k)),
                     "conformance: {name}: {k} unnamed"
-                );
-            } else {
-                assert!(
-                    r.series.is_some(),
-                    "conformance: {name}: {} has no line",
-                    r.fixture
                 );
             }
         }
@@ -4406,6 +4418,29 @@ fn c05_coverage_map_names_every_key_and_the_cells_not_run() {
             flat.contains(cell),
             "conformance: not-run cell missing: {cell}"
         );
+    }
+}
+
+/// Criterion 5, the parts that need no coverage map: E2's control glob selects X1V's gated
+/// reset-ctl rows (T1 fixed: 30 points × 3 selectors × 3 reps), and every synthetic or
+/// application key of X1, X2, X1V and X3A outside §6 (X3A: every key) is on its family's line.
+#[test]
+fn c05_the_reset_ctl_glob_and_every_series_key_has_a_line() {
+    let e2 = ks("X1V")
+        .iter()
+        .filter(|k| glob_match("synth/reset-ctl/*|Gated/*", k))
+        .count();
+    assert_eq!(e2, 30 * 9, "conformance: E2's reset-ctl glob");
+    for name in ["X1", "X2", "X1V", "X3A"] {
+        for r in &spec(name).rows {
+            if !(r.family == "sec6" && name != "X3A") {
+                assert!(
+                    r.series.is_some(),
+                    "conformance: {name}: {} has no line",
+                    r.fixture
+                );
+            }
+        }
     }
 }
 
@@ -4505,6 +4540,7 @@ fn reach(fx: &str, e: GridEngine) -> bool {
 /// 6's exhaustive verdicts as recorded, on every §6 fixture the records
 /// decide; the records hold no conflicting verdicts.
 #[test]
+#[ignore = "reads the earlier evaluation's tables and the campaign's pilot tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c05_section6_sides_are_part_6s() {
     let rec = record();
     assert!(
@@ -4592,8 +4628,10 @@ fn reach_counts(
 /// Criterion 6: the reach predicate (fixture, engine) from the records; the
 /// derived specs' keys inside/outside reach equal derived.md §9's figures; the
 /// landed specs' counts (reported); `ex:naive` `k ∈ {6,7}`'s X2 rows on the
-/// sweeping engines (72) all outside, on the enumerator and stateful inside.
+/// sweeping engines all outside, on the enumerator and stateful inside. How many
+/// such sweeping rows X2 holds is `c06_x2_holds_48_sweeping_rows_of_the_largest_naive_points`'s.
 #[test]
+#[ignore = "reads the earlier evaluation's tables and the campaign's pilot tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c06_reach_predicate_and_counts_per_spec() {
     let d = derived();
     let sw = [GridEngine::CompleteFirst, GridEngine::Gated];
@@ -4608,24 +4646,14 @@ fn c06_reach_predicate_and_counts_per_spec() {
     let x3a_in = reach_counts(&d.x1, &[GridEngine::Enumerator], 1, 3).0
         + reach_counts(&d.s1a1, &[GridEngine::Enumerator], 2, 3).0;
     assert_eq!(x3a_in, 522);
-    let mut sweeping_out = 0;
-    for r in &spec("X2").rows {
-        if ["k6", "k7"]
-            .iter()
-            .any(|k| r.fixture.starts_with(&format!("ex:naive/{k}/")))
-        {
-            let e = r.config.engine;
-            if matches!(e, GridEngine::CompleteFirst | GridEngine::Gated) {
-                assert!(!reach(&r.fixture, e), "conformance: {} {e:?}", r.fixture);
-                sweeping_out += 1;
-            } else {
-                assert!(reach(&r.fixture, e), "conformance: {} {e:?}", r.fixture);
-            }
+    for r in x2_largest_naive_rows() {
+        let e = r.config.engine;
+        if matches!(e, GridEngine::CompleteFirst | GridEngine::Gated) {
+            assert!(!reach(&r.fixture, e), "conformance: {} {e:?}", r.fixture);
+        } else {
+            assert!(reach(&r.fixture, e), "conformance: {} {e:?}", r.fixture);
         }
     }
-    // `MIN-ENGINES` E1 (the tester's re-pin at gate 3): 4 points × (complete-first
-    // 3 + gated 9) = 48 (72 with three complete-first selectors).
-    assert_eq!(sweeping_out, 48);
     for s in specs() {
         let inside = s
             .rows
@@ -4641,12 +4669,33 @@ fn c06_reach_predicate_and_counts_per_spec() {
     }
 }
 
+/// X2's rows of the `ex:naive` points with `k ∈ {6,7}`.
+fn x2_largest_naive_rows() -> impl Iterator<Item = &'static RowSpec> {
+    spec("X2").rows.iter().filter(|r| {
+        ["k6", "k7"]
+            .iter()
+            .any(|k| r.fixture.starts_with(&format!("ex:naive/{k}/")))
+    })
+}
+
+/// Criterion 6: X2 holds 48 rows of the `ex:naive` points with `k ∈ {6,7}` on the
+/// sweeping engines: 4 points × (complete-first 3 + gated 9), the complete-first key
+/// printing `Plain` (72 with three complete-first selectors).
+#[test]
+fn c06_x2_holds_48_sweeping_rows_of_the_largest_naive_points() {
+    let sweeping = x2_largest_naive_rows()
+        .filter(|r| matches!(r.config.engine, GridEngine::CompleteFirst | GridEngine::Gated))
+        .count();
+    assert_eq!(sweeping, 48);
+}
+
 /// Criterion 6's obligation on rows inside reach, checked where it can be
 /// before the campaign: every landed X1 point decided by the records conforms
 /// there and every X2 point violates there. **Fails while T1–T3 stand** (the
 /// misplaced points disagree with their exhaustive runs). Ignored while it
 /// stands; measured: the reset-ctl, `DecoupleImpl` and `conf/n4` points.
 #[test]
+#[ignore = "reads the earlier evaluation's tables and the campaign's pilot tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn t1_t2_t3_c06_sides_agree_with_the_exhaustive_runs() {
     let rec = record();
     let mut bad = Vec::new();
@@ -4716,6 +4765,7 @@ fn sets_in(s: &str) -> Vec<(String, Option<BTreeSet<i64>>)> {
 /// the line count — and its gate-4 A-series note (parsed) against
 /// `apps_grid()`: each model's three-or-fewer axis sets and the four corners.
 #[test]
+#[ignore = "reads the campaign's model tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c07_models_md_tables_match_the_grids() {
     let text = read_plan("log/dev/P5-SYNTH.models.md");
     let grid = synth_grid();
@@ -5032,6 +5082,7 @@ fn check_store(
 /// store (`log/eval/rows.csv`, X0's `ex:naive/k2/enc1` rows) plus seven planted
 /// violations — the checker detects every plant, at its key, and nothing else.
 #[test]
+#[ignore = "reads the evaluation harness's recorded rows and the campaign's pilot tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c09_read_time_checker_detects_the_seven_plants() {
     let dev = read_rows(&plan().join("log/eval/rows.csv"))
         .unwrap_or_else(|e| panic!("conformance: {}", e.text()));

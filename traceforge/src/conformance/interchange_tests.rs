@@ -13,6 +13,10 @@
 //! place of record `plan/jmc-must/log/runs/J3/`), `J3_GOLDEN` (JMC's files; default
 //! `plan/jmc-must/log/runs/J4/`, read-only), `J3_CONF_JOIN` (the binary; default
 //! `target/debug/conf-join`).
+//!
+//! Tests whose ignore reason names inputs outside this repository read JMC's golden exports;
+//! `golden_dir()` locates them two directories above `CARGO_MANIFEST_DIR` unless `J3_GOLDEN` names
+//! them. Run one with those files beside the repo and `--include-ignored <its name>`.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -110,6 +114,12 @@ impl Row {
             q,
             s,
         }
+    }
+
+    /// The size string JMC's header gives the row: `k<k>q<q>`, then `s<s>` if the row has one.
+    fn size(&self) -> String {
+        let s = self.s.map(|s| format!("s{s}")).unwrap_or_default();
+        format!("k{}q{}{s}", self.k, self.q)
     }
 
     fn is_spec(&self) -> bool {
@@ -273,13 +283,10 @@ fn program_of(row: &Row) -> (Fixture, Prog, ConfConfig) {
     (f, p, cc)
 }
 
-/// Exports one row to `dir/<row>.traceforge.jsonl`, `size` from JMC's header.
+/// Exports one row to `dir/<row>.traceforge.jsonl`, with the `size` JMC's header gives that row
+/// (derived from the row's name, so no golden file is read).
 fn export_row(row: &Row, dir: &Path) -> (PathBuf, ExportStats) {
-    let (head, _) = read_jsonl(&golden_dir().join(format!("{}.must.jsonl", row.jmc)));
-    let size = head["size"]
-        .as_str()
-        .expect("conformance: J3: a size")
-        .to_owned();
+    let size = row.size();
     let (f, p, cc) = program_of(row);
     let header = ExportHeader {
         program: format!("{}:{}", f.name, row.side()),
@@ -301,12 +308,34 @@ fn enc<T: crate::msg::Message + Clone + 'static>(v: &T) -> String {
         .unwrap_or_else(|e| panic!("conformance: J3: an A3/A2 value encodes: {e}"))
 }
 
-/// **T1** (E1): the canonical bytes of each of the eight tags, each literal also
-/// found verbatim in a golden file. Failing direction: `f` before `t`, `Put`'s
-/// fields reordered.
+/// **T1** (E1): the canonical bytes of each of the eight tags. Failing direction: `f` before
+/// `t`, `Put`'s fields reordered.
 #[test]
 fn t1_the_encoder_writes_jmcs_bytes() {
-    let cases: Vec<(String, &str)> = vec![
+    for (got, want) in &t1_cases() {
+        assert_eq!(got, want, "conformance: J3: E1");
+    }
+}
+
+/// T1's literals are JMC's: each is found verbatim in a golden file.
+#[test]
+#[ignore = "reads JMC's golden exports, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn t1_the_literals_occur_in_jmcs_golden_files() {
+    let mut golden = String::new();
+    for e in std::fs::read_dir(golden_dir()).expect("conformance: J3: the golden directory") {
+        golden.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
+    }
+    for (_, want) in &t1_cases() {
+        assert!(
+            golden.contains(want),
+            "conformance: J3: {want} is not in a golden file"
+        );
+    }
+}
+
+/// T1's cases: (the encoder's bytes, the expected literal).
+fn t1_cases() -> Vec<(String, &'static str)> {
+    vec![
         (enc(&Msg::Acq(0)), r#"{"t":"Acq","f":[0]}"#),
         (enc(&Msg::Rel(1)), r#"{"t":"Rel","f":[1]}"#),
         (enc(&Grant(1, 0)), r#"{"t":"Grant","f":[1,0]}"#),
@@ -322,18 +351,7 @@ fn t1_the_encoder_writes_jmcs_bytes() {
         (enc(&Rep::Val(0)), r#"{"t":"Val","f":[0]}"#),
         (enc(&Rep::Ack), r#"{"t":"Ack","f":[]}"#),
         (enc(&Rep::None), r#"{"t":"None","f":[]}"#),
-    ];
-    let mut golden = String::new();
-    for e in std::fs::read_dir(golden_dir()).expect("conformance: J3: the golden directory") {
-        golden.push_str(&std::fs::read_to_string(e.unwrap().path()).unwrap());
-    }
-    for (got, want) in &cases {
-        assert_eq!(got, want, "conformance: J3: E1");
-        assert!(
-            golden.contains(want),
-            "conformance: J3: {want} is not in a golden file"
-        );
-    }
+    ]
 }
 
 /// The A3/A2 value domain at the 74 rows' sizes (k ≤ 3 clients, q ≤ 3 rounds):
@@ -821,7 +839,9 @@ fn t7_the_export_is_deterministic_and_complete_only() {
     let b1 = std::fs::read(&p1).unwrap();
     let (p2, s2) = export_row(&row, &dir);
     let b2 = std::fs::read(&p2).unwrap();
-    assert_eq!(s1, s2);
+    // The two runs' statistics agree but for their clocks (`*_ms`), which are measured.
+    let unclocked = |s: &ExportStats| ExportStats { explore_ms: 0, summarise_ms: 0, export_ms: 0, ..s.clone() };
+    assert_eq!(unclocked(&s1), unclocked(&s2));
     assert_eq!(s1.lines, 36);
     assert!(b1 == b2, "conformance: J3: X5: two exports differ as bytes");
     // X4: a run that panics (`ghost` declared, never spawned)
@@ -960,6 +980,7 @@ fn golden_lines() -> Vec<(PathBuf, usize, Vec<String>, String, String)> {
 /// of one golden file with a value written `{"f":[0],"t":"Acq"}`, and one with a
 /// space after a `:` (`J3_GOLDEN`); a reader writing `f` before `t`.
 #[test]
+#[ignore = "reads JMC's golden exports, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn t17_jmcs_lines_are_already_normal() {
     let lines = golden_lines();
     let mut bad = Vec::new();

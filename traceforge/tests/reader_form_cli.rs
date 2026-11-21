@@ -153,6 +153,9 @@ fn any_n_in_last_position_is_accepted() {
         ("two-to-64", "18446744073709551616", ""), ("1e3", "1e3", ""),
         // Raw text with a space only inside a JSON string, and a nested value: kept as spelt.
         ("spaced-string", "\"a A\"", ""), ("nested", "{\"a b\":18446744073709551616}", ""),
+        // A string with an escape and a space, and one with an escaped quote and a space: their
+        // raw spelling is kept.
+        ("escaped-spaced", "\"\\u0061 A\"", ""), ("escaped-quote", "\"x\\\"y z\"", ""),
         ("five", "5", "5")] {
         let imp = write(&dir, &format!("{name}.jsonl"),
             &format!("{HEAD}\n{},\"n\":{n}}}\n", &LINE[..LINE.len() - 1]));

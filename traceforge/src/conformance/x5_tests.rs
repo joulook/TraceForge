@@ -18,6 +18,10 @@
 //!
 //! Records read at test time (read-only): `plan/traceForge/log/dev/P4-FLAT.tables.md`
 //! (criterion 9's table: `communication_flat` and the verdict per fixture).
+//!
+//! Tests whose ignore reason names inputs outside this repository read the earlier evaluation's
+//! tables; the helper `plan()` locates them two directories above `CARGO_MANIFEST_DIR`. Run one with
+//! those files beside the repo and `--include-ignored <its name>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -300,13 +304,12 @@ fn frozen_text(x5: Option<&[String]>) -> String {
 // =========================================================================
 
 /// C1: `FLAT_SUBSET` is the parsed table's `communication_flat = true` set
-/// minus `mixed/*` (62 names: 24 conforming, 38 violating), names no `apps/*`,
-/// `synth/reset*`, `synth/share-ctl*`, and no name twice.
+/// minus `mixed/*` (62 names: 24 conforming, 38 violating).
 #[test]
+#[ignore = "reads the earlier evaluation's flat tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn c01_flat_subset_is_the_parsed_table_minus_mixed() {
     let parsed = parsed_flat_subset();
-    let landed: BTreeSet<String> = FLAT_SUBSET.iter().map(|s| (*s).to_owned()).collect();
-    assert_eq!(landed.len(), FLAT_SUBSET.len(), "conformance: a name twice");
+    let landed = flat_subset();
     assert_eq!(parsed.len(), 62, "conformance: the table's flat subset");
     assert_eq!(landed, parsed, "conformance: FLAT_SUBSET against the table");
     let violating = parsed.iter().filter(|n| parsed_violating(n)).count();
@@ -315,6 +318,20 @@ fn c01_flat_subset_is_the_parsed_table_minus_mixed() {
         (24, 38),
         "conformance: conforming / violating"
     );
+}
+
+/// `FLAT_SUBSET` as a set.
+fn flat_subset() -> BTreeSet<String> {
+    FLAT_SUBSET.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// C1: `FLAT_SUBSET` has 62 names, none twice, and names no `apps/*`, `synth/reset*`,
+/// `synth/share-ctl*` or `ex:naive/e2/k{5,6,7}` point.
+#[test]
+fn c01_flat_subset_names_no_excluded_point() {
+    let landed = flat_subset();
+    assert_eq!(landed.len(), FLAT_SUBSET.len(), "conformance: a name twice");
+    assert_eq!(landed.len(), 62, "conformance: FLAT_SUBSET's size");
     for n in &landed {
         assert!(
             !n.starts_with("apps/")
@@ -423,6 +440,9 @@ fn selectors_of(rows: &[&RowSpec]) -> BTreeMap<(String, bool), BTreeSet<String>>
 /// reps = 186 — T1 fixed) + **294** sweep rows (every partner listed, T2
 /// fixed) = **588** keys, each once; X5G (gate 4 m2: exhaustive points only) 186 + 186 = **372**. The
 /// sweep rows are exactly the partners of the Flat rows (`x5_partner`).
+///
+/// The Ltr points are compared with `FLAT_SUBSET`; that `FLAT_SUBSET` is the earlier
+/// evaluation's table is `c01_flat_subset_is_the_parsed_table_minus_mixed`'s.
 #[test]
 fn c01_x5_and_x5g_rows_with_the_list_empty() {
     for (name, gated) in [("X5", false), ("X5G", true)] {
@@ -455,7 +475,7 @@ fn c01_x5_and_x5g_rows_with_the_list_empty() {
         assert_eq!(stop_points, want_stop, "conformance: {name} stop points");
         assert_eq!(
             ltr_points,
-            parsed_flat_subset(),
+            flat_subset(),
             "conformance: {name} FLAT_SUBSET points (all 62)"
         );
         let n_flat = if gated { 186 } else { 294 };
@@ -494,7 +514,7 @@ fn c01_every_flat_subset_point_has_its_ltr_rows_with_the_list_empty() {
     {
         *per.entry(r.fixture.clone()).or_default() += 1;
     }
-    let missing: Vec<String> = parsed_flat_subset()
+    let missing: Vec<String> = flat_subset()
         .into_iter()
         .filter(|n| per.get(n) != Some(&3))
         .collect();
@@ -660,7 +680,7 @@ fn c01_shared_keys_carry_the_same_twin_key() {
 }
 
 /// C1 (round 03 m1, m2; E-X5-3; T4): `x5_partner` is the sole partner API —
-/// its class equals the class derived per point kind, its key is the Flat
+/// its key is the Flat
 /// label with `cover = Sweep` (and `precheck = false` in the complete-first
 /// host only; `MIN-ENGINES` E7b, ISSUE-min-engines §13 (a): the Flat row runs `Current`, its
 /// partner the Sweep row's default index, `Set` in the complete-first host and `Current` in the
@@ -668,17 +688,16 @@ fn c01_shared_keys_carry_the_same_twin_key() {
 /// or the host's own) and of the host. With the list empty: X5's partners X1
 /// 72, X1V 18, X2 108, own 96; X5G's own 186. No own partner is a key of X1,
 /// X1V or X2. X2's complete-first configuration is X1's with `stop`.
+///
+/// The holder is the partner class `x5_partner` gives; that this class is the one derived from
+/// the earlier evaluation's verdicts is `c01_every_partner_class_follows_the_recorded_verdicts`'s.
 #[test]
 fn c01_every_partner_is_a_key_of_its_named_spec() {
     for (name, gated) in [("X5", false), ("X5G", true)] {
         let mut per: BTreeMap<String, usize> = BTreeMap::new();
         let mut bad = Vec::new();
         for r in spec(name).rows.iter().filter(|r| is_flat(r)) {
-            let (pk, class) = x5_partner(r);
-            let want = derived_class(&r.fixture, r.config.stop_at_first_report, gated);
-            if class != want {
-                bad.push(format!("{}: class {class:?}, derived {want:?}", r.fixture));
-            }
+            let (pk, want) = x5_partner(r);
             if r.config.index != IndexKind::Current {
                 bad.push(format!("{}: Flat index {:?}", r.fixture, r.config.index));
             }
@@ -740,13 +759,58 @@ fn c01_every_partner_is_a_key_of_its_named_spec() {
     }
 }
 
+/// C1: every Flat row's partner class is the one derived from the earlier evaluation's verdicts
+/// (a conforming point → X1, an exhaustive `ex:naive/k*` → X1V, `stop` → X2, else its own host).
+#[test]
+#[ignore = "reads the earlier evaluation's flat tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn c01_every_partner_class_follows_the_recorded_verdicts() {
+    let mut bad = Vec::new();
+    for (name, gated) in [("X5", false), ("X5G", true)] {
+        for r in spec(name).rows.iter().filter(|r| is_flat(r)) {
+            let (_, class) = x5_partner(r);
+            let want = derived_class(&r.fixture, r.config.stop_at_first_report, gated);
+            if class != want {
+                bad.push(format!("{name} {}: class {class:?}, derived {want:?}", r.fixture));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "conformance: {bad:#?}");
+}
+
 /// C1, F5/criterion 6's status per point: every X5 point is an X1 point (X1
 /// holds its four checkers under `Ltr`) or "not an X1 point". With the list
 /// empty: the 24 conforming `FLAT_SUBSET` points are X1 points (incl.
 /// `traces/self`: the reason the own count is 96, not 99); the 32 violating
-/// ones and the 12 `ex:naive` `stop` points are not.
+/// ones and the 12 `ex:naive` `stop` points are not. That every X1 point conforms
+/// by the earlier evaluation's verdicts is `c06_every_x1_point_conforms_in_the_recorded_table`'s.
 #[test]
 fn c06_x1_status_of_every_x5_point() {
+    let (x1_points, not_x1) = x1_status();
+    assert!(
+        x1_points.contains("traces/self"),
+        "conformance: traces/self is an X1 point"
+    );
+    assert_eq!(
+        (x1_points.len(), not_x1.len()),
+        (24, 44),
+        "conformance: X1 points / not"
+    );
+}
+
+/// C1/C6: every X1 point conforms by the earlier evaluation's verdicts.
+#[test]
+#[ignore = "reads the earlier evaluation's flat tables, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn c06_every_x1_point_conforms_in_the_recorded_table() {
+    let (x1_points, _) = x1_status();
+    assert!(
+        x1_points.iter().all(|n| !parsed_violating(n)),
+        "conformance: every X1 point conforms"
+    );
+}
+
+/// X5's Flat points split by whether X1 holds their four checkers under `Ltr`: (X1 points, the
+/// others).
+fn x1_status() -> (BTreeSet<String>, BTreeSet<String>) {
     let x1 = ks("X1");
     let mut x1_points = BTreeSet::new();
     let mut not_x1 = BTreeSet::new();
@@ -775,19 +839,7 @@ fn c06_x1_status_of_every_x5_point() {
             not_x1.insert(r.fixture.clone());
         }
     }
-    assert!(
-        x1_points.contains("traces/self"),
-        "conformance: traces/self is an X1 point"
-    );
-    assert_eq!(
-        (x1_points.len(), not_x1.len()),
-        (24, 44),
-        "conformance: X1 points / not"
-    );
-    assert!(
-        x1_points.iter().all(|n| !parsed_violating(n)),
-        "conformance: every X1 point conforms"
-    );
+    (x1_points, not_x1)
 }
 
 /// The frozen `x5` list's admissible set (E-X5-1; F2): a `synth/reset/*`,

@@ -6,6 +6,10 @@
 //! `backlog/changes.md`); the counts are `cfirst-1`'s (read-only). Tests that
 //! spawn child processes are `#[ignore]`d and run one per invocation, writing
 //! only under the system temporary directory; the real stores are only read.
+//!
+//! Tests whose ignore reason names inputs outside this repository read the project's campaign
+//! records; `PLAN` locates them two directories above `CARGO_MANIFEST_DIR`. Run one with those files
+//! beside the repo and `--include-ignored <its name>`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -319,8 +323,9 @@ fn c02_the_configuration_as_passed() {
 // =========================================================================
 
 /// C3 (F1, F3): the label pin, eleven fields, `parse_label` the identity,
-/// `parse_engine("Explore")`; every `XBASE` key is distinct from every key of
-/// `cfirst-1` and `apptab-1` (read-only scans) and every old key still parses.
+/// `parse_engine("Explore")`; every `XBASE` key parses back to `Explore` and the
+/// label. The scans of the recorded stores are
+/// `c03_xbase_keys_are_new_to_the_recorded_stores`'s.
 #[test]
 fn c03_the_label_and_the_key() {
     let l = xbase_config().label();
@@ -337,6 +342,22 @@ fn c03_the_label_and_the_key() {
         LABEL_PIN,
         "conformance: LABEL_PIN"
     );
+    let xr: BTreeSet<String> = xbase_spec().rows.iter().map(|r| r.key("release")).collect();
+    let mut bad = Vec::new();
+    for k in &xr {
+        let (_, c, ..) = parse_key(k).unwrap_or_else(|| panic!("conformance: {k}"));
+        if c.engine != GridEngine::Explore || c.label() != XBASE_LABEL {
+            bad.push(format!("key {k}"));
+        }
+    }
+    assert!(bad.is_empty(), "conformance: criterion 3: {bad:#?}");
+}
+
+/// C3 on the recorded stores: every `XBASE` key is distinct from every key of `cfirst-1` and
+/// `apptab-1` (read-only scans), and every old key still parses.
+#[test]
+#[ignore = "reads the campaign's recorded rows, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn c03_xbase_keys_are_new_to_the_recorded_stores() {
     let prof = profile_name();
     let xk: BTreeSet<String> = xbase_spec().rows.iter().map(|r| r.key(prof)).collect();
     let xr: BTreeSet<String> = xbase_spec().rows.iter().map(|r| r.key("release")).collect();
@@ -353,12 +374,6 @@ fn c03_the_label_and_the_key() {
             }
         }
         note!("c03: {store} {} keys scanned", rows.len());
-    }
-    for k in &xr {
-        let (_, c, ..) = parse_key(k).unwrap_or_else(|| panic!("conformance: {k}"));
-        if c.engine != GridEngine::Explore || c.label() != XBASE_LABEL {
-            bad.push(format!("key {k}"));
-        }
     }
     assert!(bad.is_empty(), "conformance: criterion 3: {bad:#?}");
 }
@@ -555,40 +570,9 @@ fn c04_the_split_line_through_the_child() {
 // Criterion 5 — the spec
 // =========================================================================
 
-/// derived.md §5, re-derived from `cfirst-1` by the rule (read-only): the
-/// largest size with an `ok` or `capped_*` row in any configuration.
-fn max_from_cfirst() -> BTreeMap<String, usize> {
-    let rows = read_rows(&plan("log/eval/cfirst-1/rows.csv"))
-        .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
-    let mut m = BTreeMap::new();
-    for r in &rows {
-        let ec = &r["end_class"];
-        if ec != "ok" && !ec.starts_with("capped_") {
-            continue;
-        }
-        let fxn = r["key"].split('|').next().unwrap();
-        let (pair, s) = crate::conformance::grid::apptab_pair_of(fxn)
-            .unwrap_or_else(|| panic!("conformance: {fxn}"));
-        let e = m
-            .entry(pair.label().to_owned() + "@" + pair.family())
-            .or_insert(0);
-        *e = (*e).max(s);
-    }
-    m
-}
-
-/// C5 (F3): 114 keys = `ApptabPair::ALL × 2..=max(pair) × {0,1,2}`; the
-/// `max` table equals the rule on `cfirst-1` (derived.md §5); the vector is
-/// size → benchmark → pair → rep; every row `timed`, `default`, `Explore`,
-/// the series scope `<family>|<variant>|diag|<label>|default|timed` at the
-/// row's size; `XBASE` absent from `builtin_specs` and no built-in spec holds
-/// an `Explore` row.
-#[test]
-fn c05_the_spec() {
-    let spec = xbase_spec();
-    let mut bad = Vec::new();
-    assert_eq!(spec.name, "XBASE");
-    let derived: BTreeMap<(&str, &str), usize> = [
+/// derived.md §5's largest size per pair (pair → size).
+fn derived_max() -> BTreeMap<(&'static str, &'static str), usize> {
+    [
         (("a1", "correct"), 4),
         (("a1", "eager"), 3),
         (("a1", "silent"), 3),
@@ -606,7 +590,15 @@ fn c05_the_spec() {
         (("le", "silent"), 4),
     ]
     .into_iter()
-    .collect();
+    .collect()
+}
+
+/// C5 on the recorded store: the `max` table equals the rule on `cfirst-1` (derived.md §5).
+#[test]
+#[ignore = "reads the campaign's recorded rows, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
+fn c05_the_max_sizes_follow_the_rule_on_the_recorded_store() {
+    let derived = derived_max();
+    let mut bad = Vec::new();
     let rule = max_from_cfirst();
     // O7 (owner, 2026-10-16; COMPACT-INDEX gate 3 F3, tester re-pin
     // 2026-10-17): the committed `XBASE_MAX_SIZE` fixes A3 fifo's series at 3
@@ -632,6 +624,44 @@ fn c05_the_spec() {
             ));
         }
     }
+    assert!(bad.is_empty(), "conformance: criterion 5: {bad:#?}");
+}
+
+/// derived.md §5, re-derived from `cfirst-1` by the rule (read-only): the
+/// largest size with an `ok` or `capped_*` row in any configuration.
+fn max_from_cfirst() -> BTreeMap<String, usize> {
+    let rows = read_rows(&plan("log/eval/cfirst-1/rows.csv"))
+        .unwrap_or_else(|e| panic!("conformance: {}", e.text()));
+    let mut m = BTreeMap::new();
+    for r in &rows {
+        let ec = &r["end_class"];
+        if ec != "ok" && !ec.starts_with("capped_") {
+            continue;
+        }
+        let fxn = r["key"].split('|').next().unwrap();
+        let (pair, s) = crate::conformance::grid::apptab_pair_of(fxn)
+            .unwrap_or_else(|| panic!("conformance: {fxn}"));
+        let e = m
+            .entry(pair.label().to_owned() + "@" + pair.family())
+            .or_insert(0);
+        *e = (*e).max(s);
+    }
+    m
+}
+
+/// C5 (F3): 114 keys = `ApptabPair::ALL × 2..=max(pair) × {0,1,2}` (that the
+/// `max` table equals the rule on the recorded store is
+/// `c05_the_max_sizes_follow_the_rule_on_the_recorded_store`'s); the vector is
+/// size → benchmark → pair → rep; every row `timed`, `default`, `Explore`,
+/// the series scope `<family>|<variant>|diag|<label>|default|timed` at the
+/// row's size; `XBASE` absent from `builtin_specs` and no built-in spec holds
+/// an `Explore` row.
+#[test]
+fn c05_the_spec() {
+    let spec = xbase_spec();
+    let mut bad = Vec::new();
+    assert_eq!(spec.name, "XBASE");
+    let derived = derived_max();
     let mut want = Vec::new();
     for s in 2..=5usize {
         for p in ApptabPair::ALL {

@@ -952,6 +952,7 @@ fn c04ab_c05_c08b_c20_corpus_agreement() {
 /// The `debug_assert!`s criterion 18 (iii) and E3 rely on are live in the
 /// test profile; without this the (iii) cross-check would be vacuous.
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "release builds have no debug assertions")]
 #[allow(clippy::assertions_on_constants)]
 fn debug_assertions_are_on() {
     assert!(

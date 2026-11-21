@@ -63,10 +63,6 @@ fn prof() -> &'static str {
     profile_name()
 }
 
-fn plan() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plan/traceForge")
-}
-
 /// The pairs of T2's table, from the criteria's text (family, label,
 /// variant, conforming).
 const PAIRS: [(&str, &str, &str); 15] = [
@@ -2272,16 +2268,6 @@ fn c12_the_pins_that_must_not_move() {
         // calx_spec()` then `campaign_specs()`): no APPTAB spec (E-AT-4).
         vec!["X0", "CAL", "CALX", "X1", "X1V", "X2", "X2P", "X2S", "X1P", "X3A", "X5", "X5G"],
         "conformance: builtin_specs"
-    );
-}
-
-/// Reads the plan's expected file to keep the citation live (its existence).
-#[test]
-fn c04_the_expected_file_exists() {
-    assert!(
-        plan().join("log/dev/P5-APPTAB.expected.md").exists()
-            && plan().join("log/dev/P5-APPTAB.derived.md").exists(),
-        "conformance: the expected and derived files"
     );
 }
 

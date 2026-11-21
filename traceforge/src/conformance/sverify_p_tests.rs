@@ -1759,8 +1759,9 @@ fn i3_1_the_two_knobs_are_read_by_the_engine_only() {
         }
     }
     let mut readers: BTreeMap<String, usize> = BTreeMap::new();
-    // `SVERIFY-P` P-S (the tester's re-pin at gate 3): `threads` is read by the parallel
-    // stateless engine too (criteria `SVERIFY-P-PS` PS-1), `flush_entries` by I3's only.
+    // Both knobs are read by the parallel stateful engine and by the partitioned export, which
+    // explores on that many threads and flushes its writer at that many lines; `threads` by the
+    // parallel stateless engine too.
     let mut by_knob: BTreeMap<(String, &str), usize> = BTreeMap::new();
     for rel in &files {
         for (_, l) in code_lines(rel) {
@@ -1791,12 +1792,13 @@ fn i3_1_the_two_knobs_are_read_by_the_engine_only() {
     };
     assert_eq!(
         files_of("flush_entries"),
-        vec!["conformance/sverify_p.rs".to_owned()],
+        vec!["conformance/export_p.rs".to_owned(), "conformance/sverify_p.rs".to_owned()],
         "conformance: I3-1: flush_entries readers: {by_knob:?}"
     );
     assert_eq!(
         files_of("threads"),
-        vec!["conformance/cfirst_p.rs".to_owned(), "conformance/sverify_p.rs".to_owned()],
+        vec!["conformance/cfirst_p.rs".to_owned(), "conformance/export_p.rs".to_owned(),
+            "conformance/sverify_p.rs".to_owned()],
         "conformance: I3-1 / P-S PS-1: threads readers: {by_knob:?}"
     );
 }
@@ -2176,6 +2178,7 @@ fn i4_1_the_labels_round_trip_and_refuse_what_is_not_canonical() {
 /// engine field is `SverifyP` or `ExploreP`, and only the stores written since I4 (I4's, V-S's two)
 /// hold one; on every other key the new fields are at their defaults.
 #[test]
+#[ignore = "reads every recorded evaluation store, kept outside this repository; run it with those files beside the repo and `--include-ignored <its name>`"]
 fn i4_1_c_every_stored_key_reprints() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plan/traceForge/log/eval");
     let mut files = Vec::new();
