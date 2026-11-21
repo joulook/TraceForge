@@ -1023,13 +1023,13 @@ fn sj7_the_timers() {
 // SJ-1.2, 1.8: the exporters
 // =========================================================================
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, crate::conformance::SummaryShape)]
 struct Fielded {
     a: i32,
     b: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, crate::conformance::SummaryShape)]
 enum E {
     S(String),
     I(i64),
@@ -1043,6 +1043,10 @@ enum E {
 }
 
 fn awkward() -> Vec<E> {
+    // `E::Set` holds a set, which may be empty: the documented declaration, made here so that
+    // every test exporting these values declares `E` itself (the shape registry is process-wide,
+    // and no test may depend on another having run first).
+    crate::conformance::declare::<E>();
     let s = |t: &str| E::S(t.to_owned());
     vec![
         s("plain"),

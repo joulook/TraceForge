@@ -946,14 +946,31 @@ fn choice_program<M: crate::msg::Message + Clone + 'static>(make: fn(bool) -> M)
 /// consequence). Failing direction: MU16 (the `Collision` check removed).
 #[test]
 fn g1_tp_the_preconditions() {
-    // P1
+    // P1: an empty `{}` is a set only where the message type's declared shape
+    // says so. Undeclared: refused; declared with a map: refused as a map;
+    // declared with only a set: `[]`. The declared types are local to this test.
     assert_eq!(
-        gen_ok(GMaps {
-            m: HashMap::new(),
-            s: HashSet::new()
-        }),
-        r#"{"t":"GMaps","f":[[],[]]}"#
+        refusal(Val::new(GMaps { m: HashMap::new(), s: HashSet::new() })),
+        "refused: an empty `{}` whose type is not declared a set (an empty set and an empty map \
+         print alike: derive `SummaryShape` for the message type and call \
+         `traceforge::conformance::declare`)"
     );
+    #[derive(Clone, Debug, PartialEq, crate::conformance::SummaryShape)]
+    struct GMapsDeclared {
+        m: HashMap<u8, u8>,
+        s: HashSet<u8>,
+    }
+    #[derive(Clone, Debug, PartialEq, crate::conformance::SummaryShape)]
+    struct GSetDeclared {
+        s: HashSet<u8>,
+    }
+    crate::conformance::declare::<GMapsDeclared>();
+    crate::conformance::declare::<GSetDeclared>();
+    assert_eq!(
+        refusal(Val::new(GMapsDeclared { m: HashMap::new(), s: HashSet::new() })),
+        "refused: a map"
+    );
+    assert_eq!(gen_ok(GSetDeclared { s: HashSet::new() }), r#"{"t":"GSetDeclared","f":[[]]}"#);
     let cc = small_cc(&["a", "b"], ConsType::FIFO);
     let dir = scratch("g1-tp");
     // P3a

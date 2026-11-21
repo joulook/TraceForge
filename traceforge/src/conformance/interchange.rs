@@ -5,10 +5,11 @@
 //!   derived `Debug` rendering ([`encode_generic`]): a struct, tuple struct or
 //!   variant becomes `{"t":<name>,"f":[…]}`, lists, sets (sorted), integers,
 //!   strings and booleans as the format says, a `ThreadId` its role name;
-//!   anything else is refused with the value's type. Preconditions P1–P3 of
-//!   `criteria/G1.md`: no map-typed value; the text `ThreadId { opaque_id: N }`
-//!   reserved; a value's `Debug` agrees with its `PartialEq`. No per-program
-//!   encoder exists.
+//!   anything else is refused with the value's type. Maps are refused; an
+//!   empty `{}` (an empty set or an empty map) is a set only where the message
+//!   type's declared shape says so (`conformance::shape`). Preconditions: the
+//!   text `ThreadId { opaque_id: N }` is reserved; a value's `Debug` agrees with
+//!   its `PartialEq`. No per-program encoder exists.
 //! - **The exporter** (G1-3): [`export`] enumerates the program once as a
 //!   specification with its own sink, which fills a `SetIndex` exactly as the
 //!   stateful engine's specification sink does and records the thread names;
@@ -112,7 +113,8 @@ enum DbgVal {
     /// A struct, a tuple struct or an enum variant; a unit one has no fields.
     Named(String, Vec<DbgVal>),
     List(Vec<DbgVal>),
-    /// `{a, b}`; also an empty `{}`, which an empty map prints too (P1).
+    /// `{a, b}`; also an empty `{}`, which an empty map prints too: the
+    /// declared shape decides ([`check_braces`]).
     Set(Vec<DbgVal>),
     /// The reserved shape `ThreadId { opaque_id: N }` (P2).
     Thread(u32),
@@ -209,7 +211,7 @@ impl<'a> DbgParser<'a> {
     fn brace(&mut self) -> Result<DbgVal, DbgError> {
         self.pos += 1;
         if self.eat("}") {
-            // P1: an empty set and an empty map print alike.
+            // An empty set and an empty map print alike: `check_braces` decides.
             return Ok(DbgVal::Set(Vec::new()));
         }
         let first = self.value()?;
@@ -417,6 +419,70 @@ fn render_dbg(
     Ok(())
 }
 
+/// Whether `v` holds a `{}`, which needs the declared shape.
+fn has_empty_brace(v: &DbgVal) -> bool {
+    match v {
+        DbgVal::Set(items) if items.is_empty() => true,
+        DbgVal::Set(items) | DbgVal::List(items) | DbgVal::Named(_, items) => {
+            items.iter().any(has_empty_brace)
+        }
+        _ => false,
+    }
+}
+
+/// The refusal of a `{}` the declared shape does not make a set.
+const UNDECLARED_BRACE: &str = "an empty `{}` whose type is not declared a set (an empty set and an \
+     empty map print alike: derive `SummaryShape` for the message type and call \
+     `traceforge::conformance::declare`)";
+
+/// Each `{}` in `v` against the declared shape `s`: an empty set where `s` has a
+/// set, refused where it has a map ("a map", as every map) or nothing known.
+/// Where the parsed value and the shape disagree (a hand-written `Debug`), the
+/// rest is unknown.
+///
+/// `undeclared_as_set`: an undescribed `{}` is an empty set instead of refused.
+fn check_braces(
+    v: &DbgVal, s: &crate::conformance::shape::Shape, undeclared_as_set: bool,
+) -> Result<(), DbgError> {
+    use crate::conformance::shape::Shape;
+    let each = |items: &[DbgVal], f: &dyn Fn(usize) -> Shape| -> Result<(), DbgError> {
+        for (k, x) in items.iter().enumerate() {
+            if has_empty_brace(x) {
+                check_braces(x, &f(k), undeclared_as_set)?;
+            }
+        }
+        Ok(())
+    };
+    match v {
+        DbgVal::Set(items) => match s {
+            Shape::Set(elem) => each(items, &|_| elem()),
+            Shape::Map => Err(DbgError::Refused("a map")),
+            _ if items.is_empty() && !undeclared_as_set => Err(DbgError::Refused(UNDECLARED_BRACE)),
+            _ if items.is_empty() => Ok(()),
+            _ => each(items, &|_| Shape::Opaque),
+        },
+        DbgVal::List(items) => match s {
+            Shape::List(elem) => each(items, &|_| elem()),
+            _ => each(items, &|_| Shape::Opaque),
+        },
+        DbgVal::Named(tag, fields) => {
+            let declared = match s {
+                Shape::Record(name, fs) if *name == tag.as_str() && fs.len() == fields.len() => Some(fs),
+                Shape::Variants(vs) => vs
+                    .iter()
+                    .find(|(name, fs)| *name == tag.as_str() && fs.len() == fields.len())
+                    .map(|(_, fs)| fs),
+                _ => None,
+            };
+            match declared {
+                Some(fs) => each(fields, &|k| fs[k]()),
+                None => each(fields, &|_| Shape::Opaque),
+            }
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Check only the new restrictions, using the execution that holds this payload.
 /// Unknown and unnamed identities are left to the legacy encoder.
 fn check_payload(v: &DbgVal, g: &ExecutionGraph, roles: &[String]) -> Result<(), DbgError> {
@@ -482,6 +548,23 @@ pub(crate) fn encode_generic(v: &Val, threads: &ThreadNames) -> Result<String, E
 pub(crate) fn encode_declared(
     v: &Val, threads: &ThreadNames, context: Option<(&ExecutionGraph, &[String])>,
 ) -> Result<String, ExportError> {
+    encode_with(v, threads, context, false)
+}
+
+/// The text witness's encoding of a send (`execution_witness`): as
+/// [`encode_generic`], except that a `{}` the message type does not declare is
+/// written as an empty set, as before shapes existed. The witness prints every
+/// send, invisible ones included, whose values are never summarised or
+/// compared; a visible value's `{}` has already been checked strictly when its
+/// summary line was encoded. A declared map is still refused.
+pub(crate) fn encode_witness_value(v: &Val, threads: &ThreadNames) -> Result<String, ExportError> {
+    encode_with(v, threads, None, true)
+}
+
+fn encode_with(
+    v: &Val, threads: &ThreadNames, context: Option<(&ExecutionGraph, &[String])>,
+    undeclared_as_set: bool,
+) -> Result<String, ExportError> {
     let text = format!("{:?}", &*v.val);
     let mut p = DbgParser { s: &text, pos: 0 };
     let parsed = p.value().and_then(|x| {
@@ -494,6 +577,10 @@ pub(crate) fn encode_declared(
     let mut out = String::new();
     let rendered = parsed.and_then(|x| {
         render_dbg(&x, threads, &mut out)?;
+        if has_empty_brace(&x) {
+            let id = std::any::Any::type_id(v.val.msg_as_any_ref());
+            check_braces(&x, &crate::conformance::shape::declared(id), undeclared_as_set)?;
+        }
         if let Some((g, roles)) = context {
             check_payload(&x, g, roles)?;
         }

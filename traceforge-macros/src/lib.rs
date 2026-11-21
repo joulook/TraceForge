@@ -247,3 +247,57 @@ fn impl_into(name: &Ident, vname: &Ident, ty: &TypePath) -> TokenStream {
         }
     }
 }
+
+/// `#[derive(SummaryShape)]`: implements `traceforge::conformance::SummaryShape`
+/// for a struct or an enum, its fields in order; every type parameter gets a
+/// `SummaryShape` bound.
+#[proc_macro_derive(SummaryShape)]
+pub fn derive_summary_shape(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let mut ast = syn::parse_macro_input!(input as DeriveInput);
+    let name = &ast.ident;
+    // Derived `Debug` prints a raw identifier without its `r#`.
+    let tag = syn::ext::IdentExt::unraw(name).to_string();
+    let fields = |f: &syn::Fields| -> Vec<TokenStream> {
+        f.iter()
+            .map(|f| {
+                let ty = &f.ty;
+                quote! { <#ty as ::traceforge::conformance::SummaryShape>::shape as ::traceforge::conformance::ShapeFn }
+            })
+            .collect()
+    };
+    let body = match &ast.data {
+        syn::Data::Struct(s) => {
+            let fs = fields(&s.fields);
+            quote! { ::traceforge::conformance::Shape::Record(#tag, ::std::vec![#(#fs),*]) }
+        }
+        syn::Data::Enum(e) => {
+            let vs = e.variants.iter().map(|v| {
+                let vtag = syn::ext::IdentExt::unraw(&v.ident).to_string();
+                let fs = fields(&v.fields);
+                quote! { (#vtag, ::std::vec![#(#fs),*]) }
+            });
+            quote! { ::traceforge::conformance::Shape::Variants(::std::vec![#(#vs),*]) }
+        }
+        syn::Data::Union(_) => {
+            return syn::Error::new_spanned(name, "SummaryShape cannot be derived for a union")
+                .to_compile_error()
+                .into()
+        }
+    };
+    let params: Vec<Ident> = ast.generics.type_params().map(|p| p.ident.clone()).collect();
+    {
+        let wc = ast.generics.make_where_clause();
+        for p in &params {
+            wc.predicates.push(syn::parse_quote! { #p: ::traceforge::conformance::SummaryShape });
+        }
+    }
+    let (impl_generics, ty_generics, where_clause) = ast.generics.split_for_impl();
+    quote! {
+        impl #impl_generics ::traceforge::conformance::SummaryShape for #name #ty_generics #where_clause {
+            fn shape() -> ::traceforge::conformance::Shape {
+                #body
+            }
+        }
+    }
+    .into()
+}

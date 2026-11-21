@@ -9,7 +9,7 @@ use crate::event::Event;
 use crate::event_label::LabelEnum;
 use crate::exec_graph::ExecutionGraph;
 
-use super::interchange::{encode_generic, record_thread_names, ThreadName, ThreadNames};
+use super::interchange::{encode_witness_value, record_thread_names, ThreadName, ThreadNames};
 
 pub(crate) struct Writer {
     path: PathBuf,
@@ -216,7 +216,7 @@ fn render(g: &ExecutionGraph, iteration: usize, line: &str) -> Result<String, St
                         "witness: a send destination is not a thread".to_owned())?;
                     let name = names.get(&dest).ok_or_else(||
                         "witness: a send destination is unknown".to_owned())?.1;
-                    let value = encode_generic(s.val(), &threads)
+                    let value = encode_witness_value(s.val(), &threads)
                         .map_err(|e| format!("witness: {e}"))?;
                     let decoded = serde_json::from_str(&value)
                         .map_err(|e| format!("witness: invalid encoded value: {e}"))?;

@@ -1,4 +1,6 @@
 // #![doc = include_str!("../../README.md")]
+// Lets `#[derive(SummaryShape)]`'s `::traceforge::…` paths resolve inside this crate.
+extern crate self as traceforge;
 pub mod channel;
 // §3 item 4's re-export, which S4 deferred because every item in the module
 // was `pub(crate)` and publishing then would have exported an empty namespace

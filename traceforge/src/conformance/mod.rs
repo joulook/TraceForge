@@ -276,6 +276,7 @@ pub(crate) mod gated;
 pub(crate) mod export_p;
 pub(crate) mod interchange;
 pub(crate) mod pairing;
+pub(crate) mod shape;
 pub(crate) mod morphism;
 pub(crate) mod obs;
 /// The online check, in two exploration modes.
@@ -388,6 +389,9 @@ pub use interchange::{
 };
 pub use decide::DEFAULT_DECIDE_BUDGET;
 pub use pairing::{check_pairing, PairingItem, PairingOpts, PairingReport};
+pub use shape::{declare, Shape, ShapeFn, SummaryShape};
+/// `#[derive(SummaryShape)]`: see [`SummaryShape`].
+pub use traceforge_macros::SummaryShape;
 pub use witness_join::{check_witness_dir, write_join_witnesses, WitnessJoinOpts};
 pub use interchange::{conf_join_decide, conf_join_merge_decide};
 

@@ -196,6 +196,28 @@ warnings, each as `conf-join: pairing: warning: <row>: …` on stderr. A failing
 `conf-join: pairing: <row>: …`, then `conf-join: refused: the pairing check failed (K checks; --no-pairing-check
 skips it)`, and exits 2.
 
+Summary values are encoded from each message's derived `Debug` text. Maps are refused, as JMC refuses them. An
+empty set and an empty map both print `{}`, so a `{}` is encoded as an empty set (`[]`) only when the message
+type declares it. Derive `SummaryShape` for the message type (and for the types of its fields, beyond the standard
+ones), then declare it once before the run:
+
+```rust
+use std::collections::BTreeSet;
+use traceforge::conformance::SummaryShape;
+
+#[derive(Clone, Debug, PartialEq, SummaryShape)]
+enum Msg { Reply { id: u32, deps: BTreeSet<u32> }, Ack }
+
+fn main() {
+    traceforge::conformance::declare::<Msg>();
+    // ... traceforge::program::main(...)
+}
+```
+
+A `{}` in a value of an undeclared type, or at a position that its declared shape gives as a map or does not
+describe, is refused, and the export names the type. Programs whose visible messages never hold an empty `{}` need
+no declaration.
+
 Experimental, and subject to change: the `conf` engines `stateless`, `gated` and `enumerator`; parallel exploration
 (`--threads N` above 1); `--threshold`, `--dump-large-graph` and `--audit-graphs`.
 
