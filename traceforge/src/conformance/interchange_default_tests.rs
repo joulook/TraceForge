@@ -1250,7 +1250,11 @@ fn g1_t9_the_readers_extension() {
     assert_eq!(n(r#""é""#).unwrap(), vline(r#""é""#));
     assert_eq!(n(r#""a\"b\\c\n\u0001""#).unwrap(), vline(r#""a\"b\\c\n\u0001""#));
     assert_eq!(n("true").unwrap(), vline("true"));
-    assert_eq!(n("[ [1, 2] , [] ]").unwrap(), vline("[[1,2],[]]"));
+    // The reader accepts only the writers' compact form: whitespace inside a value is refused,
+    // the compact spelling is its own normal form.
+    let spaced = n("[ [1, 2] , [] ]").unwrap_err();
+    assert!(spaced.starts_with("the line is not in the form the writers emit"), "conformance: G1: {spaced}");
+    assert_eq!(n("[[1,2],[]]").unwrap(), vline("[[1,2],[]]"));
     for bad in ["1.5", "[null]", r#"{"x":1}"#] {
         let e = n(bad).unwrap_err();
         assert!(e.contains("invalid in format version 1"), "conformance: G1: {bad}: {e}");

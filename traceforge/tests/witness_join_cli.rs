@@ -847,30 +847,31 @@ fn nondet_bounds_are_exact_integers() {
     }
 }
 
+/// A spaced spec header (`{ "k": v, ... }`, with or without the online fields) is not in the form
+/// the writers emit. The reader refuses it before the join, so no witness is written; the header
+/// is never carried into a graph's `against`.
 #[test]
-fn a_spaced_spec_header_is_kept_byte_for_byte() {
+fn a_spaced_spec_header_is_refused_before_any_witness() {
     let online = ", \"first_miss_iteration\": 3, \"first_miss_wall_ms\": 7, \"uncovered_total\": 1";
     for with_online in [false, true] {
         let m = mix(&[], &[]);
         let mut l = read_lines(&m.spec);
         let v = parse(&l[0]);
         let J::Obj(fields) = v else { panic!() };
-        // `{ "k": v, ... }` with the online fields after `enumeration` when asked.
         let mut parts = Vec::new();
         for (k, x) in &fields {
             parts.push(format!("{}: {}", serde_json::to_string(k).unwrap(), bytes(x)));
             if with_online && k == "enumeration" { parts.push(online[2..].to_owned()); }
         }
-        let spaced = format!("{{ {} }}", parts.join(", "));
-        let kept = format!("{{ {} }}", fields.iter().map(|(k, x)| format!("{}: {}", serde_json::to_string(k).unwrap(), bytes(x)))
-            .collect::<Vec<_>>().join(", "));
-        l[0] = spaced.clone();
+        l[0] = format!("{{ {} }}", parts.join(", "));
         std::fs::write(&m.spec, l.join("\n") + "\n").unwrap();
         let (o, e, c, w) = m.join(&["--decide"], "w");
-        assert_eq!((c, e.as_str()), (1, ""), "{o}");
-        let g = std::fs::read_to_string(w.join("1.graph.json")).unwrap();
-        let want = if with_online { kept.clone() } else { spaced.clone() };
-        assert!(g.contains(&format!(",\"against\":{want},\"against_run\":")), "online {with_online}: {g}");
+        assert_eq!((c, e), (2, format!(concat!("conf-join: refused: {}: line 1: the header is not in the form the ",
+            "writers emit (compact, each key once, in the order format, minor, tool, program, size, visible, roles, ",
+            "model, enumeration, seed, iterations, the online fields, encoding): it differs at byte 1\n"),
+            m.spec.display())), "online {with_online}: {o}");
+        let entries = std::fs::read_dir(&w).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(entries, 0, "online {with_online}: the witness directory stays empty");
     }
 }
 
@@ -1076,37 +1077,42 @@ fn a_store_run_with_unknown_keys_is_refused() {
 
 #[test]
 fn a_spec_header_that_cannot_be_against_refuses_the_witness_run() {
-    let edits: Vec<(&str, Box<dyn Fn(&str) -> String>)> = vec![
-        ("an unknown key", Box::new(|h: &str| format!("{},\"x\":1}}", &h[..h.len() - 1]))),
-        ("reordered keys", Box::new(|h: &str| h.replacen("{\"format\":1,\"minor\":1,", "{\"minor\":1,\"format\":1,", 1))),
-        ("a string seed", Box::new(|h: &str| h.replacen(",\"enumeration\":\"complete\",", ",\"enumeration\":\"complete\",\"seed\":\"1\",", 1))),
+    // Each variant is a header that also cannot be a witness graph's `against`; none is in the
+    // form the writers emit any more, so the reader refuses each at line 1 first (an unknown
+    // key; reordered keys; a `seed`, here a string, in a file that is not sampled), with or
+    // without --witness-dir, and no witness file is written. No variant is left that the reader
+    // accepts and only the witness identity check refuses.
+    let form = concat!("the header is not in the form the writers emit (compact, each key once, in the order ",
+        "format, minor, tool, program, size, visible, roles, model, enumeration, seed, iterations, the online ",
+        "fields, encoding): it differs at byte 2");
+    let edits: Vec<(&str, Box<dyn Fn(&str) -> String>, &str)> = vec![
+        ("an unknown key", Box::new(|h: &str| format!("{},\"x\":1}}", &h[..h.len() - 1])),
+            "unknown header key `x` (neither writer emits it)"),
+        ("reordered keys", Box::new(|h: &str| h.replacen("{\"format\":1,\"minor\":1,", "{\"minor\":1,\"format\":1,", 1)),
+            form),
+        ("a string seed", Box::new(|h: &str| h.replacen(",\"enumeration\":\"complete\",", ",\"enumeration\":\"complete\",\"seed\":\"1\",", 1)),
+            "the header has `seed` in a file that is not `sampled`"),
     ];
-    for (what, edit) in &edits {
+    for (what, edit, why) in &edits {
         for merge in [false, true] {
             let m = mix(&[], &[]);
             // No spec store: the header itself is what is judged.
             std::fs::remove_file(m.spec_store()).unwrap();
             let mut l = read_lines(&m.spec);
-            let plain_before = {
-                let mut a: Vec<&str> = if merge { vec!["--merge"] } else { vec![] };
-                a.extend([m.spec.to_str().unwrap(), m.imp.to_str().unwrap()]);
-                conf_join(&a)
-            };
+            let before = l[0].clone();
             l[0] = edit(&l[0]);
+            assert_ne!(l[0], before, "{what}: the edit applies");
             assert!(serde_json::from_str::<serde_json::Value>(&l[0]).is_ok(), "{what}: still JSON");
             std::fs::write(&m.spec, l.join("\n") + "\n").unwrap();
             let flags: Vec<&str> = if merge { vec!["--merge", "--decide"] } else { vec!["--decide"] };
             let (o, e, c, w) = m.join(&flags, "w");
-            assert_eq!(c, 2, "{what} merge {merge}: {o}");
-            assert!(e.starts_with(&format!("conf-join: refused: {}: the header cannot be a witness graph's `against`", m.spec.display())), "{what}: {e}");
+            let want = format!("conf-join: refused: {}: line 1: {why}\n", m.spec.display());
+            assert_eq!((c, e.as_str()), (2, want.as_str()), "{what} merge {merge}: {o}");
             assert!(files(&w).is_empty(), "{what}: no file is written");
-            // Without --witness-dir the join runs as it did.
             let mut a: Vec<&str> = if merge { vec!["--merge"] } else { vec![] };
             a.extend([m.spec.to_str().unwrap(), m.imp.to_str().unwrap()]);
-            let (o2, e2, c2) = conf_join(&a);
-            assert_eq!((c2, e2.as_str()), (plain_before.2, plain_before.1.as_str()), "{what}: {o2}");
-            let verdicts = |t: &str| t.lines().filter(|l| l.starts_with("verdict:") || l.starts_with("uncovered:")).map(str::to_owned).collect::<Vec<_>>();
-            assert_eq!(verdicts(&o2), verdicts(&plain_before.0), "{what}");
+            let (_, e2, c2) = conf_join(&a);
+            assert_eq!((c2, e2), (2, want), "{what} merge {merge}: without --witness-dir");
         }
     }
 }

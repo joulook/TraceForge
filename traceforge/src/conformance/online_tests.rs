@@ -731,14 +731,18 @@ fn o4_a_later_first_miss() {
     assert!(i4 >= 2, "conformance: C: O4: the first miss is later than iteration 1");
     let removed = hand_line(vstar, false, false, false);
     let kept_line = hand_line(first_v, false, false, false);
-    let (h, body) = read_jsonl(&s);
+    let (_, body) = read_jsonl(&s);
     let mut want_body = vec![removed.clone(), kept_line.clone()];
     want_body.sort();
     let mut got_body = body.clone();
     got_body.sort();
     assert_eq!(got_body, want_body, "conformance: C: O4: S holds the two hand lines");
     let s4 = dir.join("S-minus.jsonl");
-    std::fs::write(&s4, format!("{}\n{kept_line}\n", serde_json::to_string(&h).unwrap()))
+    // The reduced file keeps S's header text as the writer emitted it (re-serialising the parsed
+    // header would order its keys alphabetically, a form the reader refuses).
+    let s_head = std::fs::read_to_string(&s).expect("conformance: C: O4: read S");
+    let s_head = s_head.lines().next().expect("conformance: C: O4: S's header").to_owned();
+    std::fs::write(&s4, format!("{s_head}\n{kept_line}\n"))
         .expect("conformance: C: O4: write the reduced file");
     let head = spec_head(&s4, 1);
     let (text, code) = run_online(&p, &s4, &[], ConsType::FIFO, Var::Fixed);

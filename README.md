@@ -190,6 +190,14 @@ it classifies. A value tagged `ThreadId` or `Tid` is a warning (C18): process id
 names, which the files cannot tell from other strings. An invalid header, or a line that does not parse, is left to
 the join's own refusal; such a line still counts for C6 (by its text) and C10.
 
+`conf-join` reads a summary file only in the form the two writers (TraceForge's `export`/`online --out` and
+JMC's) emit. The header has the known keys, compact, each once, in the writers' order; `minor` is absent (minor 0)
+or 1, with `roles` exactly when `minor` is present; `seed` and `iterations` are integers and only in a `sampled`
+file; the three online fields come together, as integers. Each summary line is its normal form, optionally followed
+by a compact `"n":N` as its last member. `n` is information only: a value outside 1..=2^64−1 is kept, but the
+join's `uncovered_total` is then left empty. Anything else, including blank lines, unknown keys, whitespace, reordered
+members and repeated lines, is refused with the number of the line.
+
 `--check-pairing` prints `pairing: <row>: …` per failure, `pairing: warning: <row>: …` per warning, then
 `pairing: ok` (exit 0) or `pairing: failed (K checks)` (exit 2). Before a join, a passing check prints only its
 warnings, each as `conf-join: pairing: warning: <row>: …` on stderr. A failing check prints only its failures, as

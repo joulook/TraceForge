@@ -327,8 +327,11 @@ fn payload_identity_runtime_refusals() {
     }
 }
 
+/// A minor-1 header in the writers' key order: `minor` after `format`, `roles` after `visible`
+/// (the reader accepts no other order).
 fn minor_one(roles: &str) -> String {
-    header("p2p").replace("\"format\":1", &format!("\"format\":1,\"minor\":1,\"roles\":{roles}"))
+    header("p2p").replace("\"format\":1", "\"format\":1,\"minor\":1")
+        .replace("\"visible\":[]", &format!("\"visible\":[],\"roles\":{roles}"))
 }
 
 #[test]
@@ -384,8 +387,9 @@ fn malformed_roles() {
             "the header's `roles` list is not sorted and unique".to_string()),
         (minor_one("[]").replace("\"visible\":[]", "\"visible\":[\"v\"]"),
             "the header's `roles` list omits a visible name".to_string()),
+        // `minor` without `roles`: the reader's header-form check names the pair.
         (header("p2p").replace("\"format\":1", "\"format\":1,\"minor\":1"),
-            "the minor-1 header has no `roles` list".to_string()),
+            "the header has `roles` without `minor` or `minor` without `roles`".to_string()),
     ];
     for name in ["", "main", "~a", "é"] {
         cases.push((minor_one(&format!("[{name:?}]")),
@@ -393,7 +397,7 @@ fn malformed_roles() {
     }
     for minor in ["2", "-1", "null", "\"1\"", "1.5"] {
         cases.push((minor_one("[]").replace("\"minor\":1", &format!("\"minor\":{minor}")),
-            "unsupported header `minor` (expected 0 or 1)".to_string()));
+            "unsupported header `minor` (expected 1, or no `minor` for minor 0)".to_string()));
     }
     for (header, reason) in cases {
         std::fs::write(&spec, header).unwrap();
@@ -512,8 +516,6 @@ fn legacy_warning_stays_on_stderr() {
     let warning = "warning: roles were not compared (minor-0 header)\n";
     for flags in [vec![], vec!["--merge"], vec!["--decide"], vec!["--merge", "--decide"]] {
         for (s, i) in [(header("p2p"), header("p2p")),
-            (header("p2p").replace("\"format\":1", "\"format\":1,\"minor\":0"),
-                header("p2p")),
             (header("p2p"), minor_one("[\"helper\"]")),
             (minor_one("[\"helper\"]"), header("p2p"))] {
             std::fs::write(&spec, s).unwrap();
@@ -545,6 +547,16 @@ fn legacy_warning_stays_on_stderr() {
                 "conformance: legacy report bytes");
             assert!(!stdout.contains("warning"), "conformance: warning absent from stdout");
         }
+    }
+    // Minor 0 is written with no `minor` key; an explicit `"minor":0` is refused by the reader.
+    std::fs::write(&spec, header("p2p").replace("\"format\":1", "\"format\":1,\"minor\":0")).unwrap();
+    std::fs::write(&imp, header("p2p")).unwrap();
+    for flags in [vec![], vec!["--merge"]] {
+        let out = join(&spec, &imp, &flags);
+        assert_eq!(out.status.code(), Some(2), "conformance: explicit minor 0 exit");
+        assert_eq!(String::from_utf8(out.stderr).unwrap(), format!(
+            "conf-join: refused: {}: line 1: the header has `\"minor\":0`; a minor-0 header has no `minor` key\n",
+            spec.display()), "conformance: explicit minor 0 diagnostic");
     }
     std::fs::write(&spec, header("p2p")).unwrap();
     for threads in ["1", "2"] {

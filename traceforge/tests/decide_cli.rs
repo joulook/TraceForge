@@ -39,12 +39,16 @@ impl Fixture {
         Self(dir)
     }
 
-    fn file(&self, name: &str, mut lines: Vec<Value>) -> PathBuf {
-        let head = json!({"format":1,"minor":1,"tool":"traceforge","program":"req","size":"2",
-            "visible":["A","B"],"roles":["A","B"],
-            "model":"p2p","enumeration":"complete","encoding":1});
-        // Merge order is the canonical statuses/words/counts order, not JSON map order.
-        lines.sort_by_key(|v| format!("{}{}{}", v["statuses"], v["words"], v["counts"]));
+    fn file(&self, name: &str, lines: Vec<Value>) -> PathBuf {
+        // The reader accepts only the form the writers emit: the header's keys in the writers'
+        // order, and each line `statuses`, `words`, `counts` (then `n`), compact, a tagged value
+        // `t` before `f`. `serde_json` prints object keys alphabetically, so both are written
+        // here by hand rather than with `Value`'s `Display`.
+        let head = concat!(r#"{"format":1,"minor":1,"tool":"traceforge","program":"req","size":"2","#,
+            r#""visible":["A","B"],"roles":["A","B"],"model":"p2p","enumeration":"complete","encoding":1}"#);
+        // Merge order is the byte order of these normal-form lines.
+        let mut lines: Vec<String> = lines.iter().map(writer_line).collect();
+        lines.sort();
         let mut text = format!("{head}\n");
         for line in lines {
             text.push_str(&format!("{line}\n"));
@@ -64,6 +68,36 @@ impl Fixture {
         cmd.args(flags).arg(s).arg(i).output().unwrap()
     }
 }
+/// A value in the writers' form: a tagged value as `{"t":…,"f":[…]}`, other objects with their
+/// keys in byte order (thread names), lists and scalars compact.
+fn writer_value(v: &Value) -> String {
+    match v {
+        Value::Object(m) if m.len() == 2 && m.contains_key("t") && m.contains_key("f") => {
+            format!("{{\"t\":{},\"f\":{}}}", m["t"], writer_value(&m["f"]))
+        }
+        Value::Object(m) => format!("{{{}}}", m.iter()
+            .map(|(k, x)| format!("{}:{}", Value::String(k.clone()), writer_value(x)))
+            .collect::<Vec<_>>().join(",")),
+        Value::Array(xs) => format!("[{}]", xs.iter().map(writer_value).collect::<Vec<_>>().join(",")),
+        other => other.to_string(),
+    }
+}
+
+/// A summary line in the writers' member order: `statuses`, `words`, `counts`, then `n` if any.
+/// A value without `statuses` (a deliberately malformed line) is written as it is.
+fn writer_line(v: &Value) -> String {
+    if v.get("statuses").is_none() {
+        return v.to_string();
+    }
+    let mut out = format!("{{\"statuses\":{},\"words\":{},\"counts\":{}",
+        writer_value(&v["statuses"]), writer_value(&v["words"]), writer_value(&v["counts"]));
+    if let Some(n) = v.get("n") {
+        out.push_str(&format!(",\"n\":{n}"));
+    }
+    out.push('}');
+    out
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).unwrap();

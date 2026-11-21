@@ -599,7 +599,9 @@ fn sj4_a_descent_on_either_side() {
     }
 }
 
-/// A repeat, in the normal form, whatever its text: whitespace, member order, `n`.
+/// A repeat: the same text, or the same normal form with an `n`. A repeat spelt otherwise
+/// (whitespace, member order, an escape) is not in the form the writers emit, and the reader
+/// refuses that line for its form before comparing it.
 #[test]
 fn sj4_a_normalised_duplicate_on_either_side() {
     let d = scratch("sj4b");
@@ -608,18 +610,19 @@ fn sj4_a_normalised_duplicate_on_either_side() {
     let parts = l.strip_prefix('{').unwrap().strip_suffix('}').unwrap();
     let (st, rest) = parts.split_once(",\"words\"").unwrap();
     let reordered = format!("{{\"words\"{rest},{st}}}");
-    for (what, other) in [
-        ("whitespace", format!("{{ {parts} }}")),
-        ("member order", reordered),
-        ("n", format!("{{{parts},\"n\":3}}")),
-        ("an escape", l.replace("\"Acq\"", "\"\\u0041cq\"")),
-        ("the same text", l.clone()),
+    let form = "line 3: the line is not in the form the writers emit";
+    for (what, other, want) in [
+        ("whitespace", format!("{{ {parts} }}"), form),
+        ("member order", reordered, form),
+        ("n", format!("{{{parts},\"n\":3}}"), "repeats line 2"),
+        ("an escape", l.replace("\"Acq\"", "\"\\u0041cq\""), form),
+        ("the same text", l.clone(), "repeats line 2"),
     ] {
         let dup = file(&d, "dup", AB, &[l.clone(), other.clone()]);
-        let (_, o) = refused_by_both(&ok, &dup, what, "repeats line 2");
-        assert!(o.contains("repeats line 2"), "conformance: SJ: {what}: {o}");
-        let (_, o) = refused_by_both(&dup, &ok, what, "repeats line 2");
-        assert!(o.contains("repeats line 2"), "conformance: SJ: {what}: {o}");
+        let (_, o) = refused_by_both(&ok, &dup, what, want);
+        assert!(o.contains(want), "conformance: SJ: {what}: {o}");
+        let (_, o) = refused_by_both(&dup, &ok, what, want);
+        assert!(o.contains(want), "conformance: SJ: {what}: {o}");
     }
 }
 
@@ -697,13 +700,15 @@ fn sj4_what_lies_between_the_lines() {
         p
     };
     let body = format!("{AB}\n{}", ab_v(1, 1));
-    // No final newline; CRLF; a CR at the very end: all accepted alike.
+    // No final newline; CRLF: accepted alike. A CR at the very end, with no newline after it,
+    // stays part of the last line's text, which is then not in the form the writers emit: both
+    // readers refuse it.
     let p = write("nonl", body.clone().into_bytes());
     agree(&spec, &p, "no final newline");
     let p = write("crlf", format!("{AB}\r\n{}\r\n", ab_v(1, 1)).into_bytes());
     agree(&spec, &p, "CRLF");
     let p = write("cr", format!("{body}\r").into_bytes());
-    agree(&spec, &p, "a final CR");
+    refused_by_both(&spec, &p, "a final CR", "line 2: the line is not in the form the writers emit");
     // A blank line; invalid UTF-8; both refused.
     let p = write("blank", format!("{body}\n\n").into_bytes());
     refused_by_both(&spec, &p, "a blank line", "not JSON");
@@ -808,10 +813,12 @@ fn sj5_the_values() {
     let recv = sorted_file(&d, "r", AB, &[valued("1", "null"), valued("1", "2")]);
     let (a, _) = agree(&recv, &recv, "a receive of nothing");
     assert_eq!(a.verdict, Verdict::Conforms, "conformance: SJ");
-    // The two spellings of a value: one normal form, one signature, one group.
+    // A value has one spelling, the writers': `"\u0041"` for `"A"` is refused for its form,
+    // while `"A"` itself is accepted.
     let spelt = file(&d, "spelt", AB, &[valued("\"\\u0041\"", "1")]);
     let plain = file(&d, "plain", AB, &[valued("\"A\"", "1")]);
-    let (a, _) = agree(&spelt, &plain, "two spellings");
+    refused_by_both(&plain, &spelt, "two spellings", "line 2: the line is not in the form the writers emit");
+    let (a, _) = agree(&plain, &plain, "the writers' spelling");
     assert_eq!(a.verdict, Verdict::Conforms, "conformance: SJ");
     // Numbers version 1 forbids, on the side the reader meets them.
     for n in ["1.0", "1e0", "-0", "18446744073709551615"] {

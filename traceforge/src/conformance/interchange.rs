@@ -1596,6 +1596,7 @@ pub(crate) fn parse_line_n(
     }
 
     let key = render_line(names, &statuses, &words, &counts);
+    writer_form(text, &key, m.get("n"))?;
 
     // The summary uses the longest word's width, as `OrdCounts::of`.
     let longest = words.iter().map(Vec::len).max().unwrap_or(0);
@@ -1630,6 +1631,127 @@ pub(crate) fn parse_line_n(
     Ok((key, summary, n))
 }
 
+/// A summary line is accepted only in the form both writers emit: its normal
+/// form, optionally followed by an `n` member (JMC's execution count) as the
+/// last member, compact. This refuses what a writer never writes: a repeated
+/// key, members or `t`/`f` out of order, whitespace, other spellings of a value.
+/// The value of `n` is not checked here: `n` is information only, and one that
+/// is not a positive integer empties the join's total without refusing the
+/// line. `key` is the line's normal form, `n` its `n` member.
+fn writer_form(text: &str, key: &str, n: Option<&Value>) -> Result<(), String> {
+    let expected = match n {
+        None => key.to_owned(),
+        Some(v) => {
+            // `n` is compared by its own text, compact: a number outside u64
+            // (2^64, say) has no exact re-rendering.
+            let head = format!("{},\"n\":", &key[..key.len() - 1]);
+            if let Some(raw) = text.strip_prefix(&head).and_then(|r| r.strip_suffix('}')) {
+                if compact_json(raw) && serde_json::from_str::<Value>(raw).is_ok() {
+                    return Ok(());
+                }
+            }
+            format!("{head}{v}}}")
+        }
+    };
+    if text == expected {
+        return Ok(());
+    }
+    let at = text.bytes().zip(expected.bytes()).take_while(|(a, b)| a == b).count();
+    Err(format!(
+        "the line is not in the form the writers emit (the normal form, then `n` if any; \
+         compact, each key once, in order): it differs at byte {at}"
+    ))
+}
+
+/// Whether `raw` has no whitespace outside its JSON strings (escapes respected).
+fn compact_json(raw: &str) -> bool {
+    let (mut in_string, mut escaped) = (false, false);
+    for b in raw.bytes() {
+        if in_string {
+            match (escaped, b) {
+                (true, _) => escaped = false,
+                (false, b'\\') => escaped = true,
+                (false, b'"') => in_string = false,
+                _ => {}
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b.is_ascii_whitespace() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The header keys, in the order the writers emit them; each is optional here,
+/// and [`header_of`] checks which must be present.
+const HEADER_KEYS: [&str; 15] = [
+    "format", "minor", "tool", "program", "size", "visible", "roles", "model", "enumeration",
+    "seed", "iterations", "first_miss_iteration", "first_miss_wall_ms", "uncovered_total",
+    "encoding",
+];
+
+/// A header is accepted only in the form both writers emit: the known keys, in
+/// [`HEADER_KEYS`] order, each once, compact; `minor` absent (minor 0) or 1, and
+/// `roles` exactly with `minor`; `seed` and `iterations` integers and only in a
+/// `sampled` file (JMC writes them there); the three online fields together and
+/// integers (JMC may write -1). The other fields' types are [`header_of`]'s.
+fn header_writer_form(text: &str, m: &serde_json::Map<String, Value>) -> Result<(), String> {
+    if let Some(k) = m.keys().find(|k| !HEADER_KEYS.contains(&k.as_str())) {
+        return Err(format!("unknown header key `{k}` (neither writer emits it)"));
+    }
+    if m.get("minor").is_some_and(|v| v.as_u64() == Some(0)) {
+        return Err("the header has `\"minor\":0`; a minor-0 header has no `minor` key".to_string());
+    }
+    if m.contains_key("roles") != m.contains_key("minor") {
+        return Err("the header has `roles` without `minor` or `minor` without `roles`".to_string());
+    }
+    let integer = |v: &Value| v.is_i64() || v.is_u64();
+    for k in ["seed", "iterations"] {
+        if let Some(v) = m.get(k) {
+            if m.get("enumeration").and_then(Value::as_str) != Some("sampled") {
+                return Err(format!("the header has `{k}` in a file that is not `sampled`"));
+            }
+            if !integer(v) {
+                return Err(format!("the header's `{k}` is {v}, not an integer"));
+            }
+        }
+    }
+    let online = ["first_miss_iteration", "first_miss_wall_ms", "uncovered_total"];
+    let present = online.iter().filter(|k| m.contains_key(**k)).count();
+    if present != 0 && present != online.len() {
+        return Err("the header has some of the online fields (first_miss_iteration, \
+             first_miss_wall_ms, uncovered_total) but not all three"
+            .to_string());
+    }
+    for k in online {
+        if let Some(v) = m.get(k).filter(|v| !integer(v)) {
+            return Err(format!("the header's `{k}` is {v}, not an integer"));
+        }
+    }
+    let mut expected = String::from("{");
+    for k in HEADER_KEYS {
+        if let Some(v) = m.get(k) {
+            if expected.len() > 1 {
+                expected.push(',');
+            }
+            expected.push_str(&json_string(k));
+            expected.push(':');
+            expected.push_str(&v.to_string());
+        }
+    }
+    expected.push('}');
+    if text == expected {
+        return Ok(());
+    }
+    let at = text.bytes().zip(expected.bytes()).take_while(|(a, b)| a == b).count();
+    Err(format!(
+        "the header is not in the form the writers emit (compact, each key once, in the order \
+         format, minor, tool, program, size, visible, roles, model, enumeration, seed, iterations, \
+         the online fields, encoding): it differs at byte {at}"
+    ))
+}
+
 /// `JOIN-TOTAL`: the sum with one more uncovered line's `n`; `None` from the
 /// first line that carries none.
 fn add_n(total: Option<u128>, n: Option<u64>) -> Option<u128> {
@@ -1648,6 +1770,7 @@ pub(crate) fn header_of(text: &str) -> Result<FileHead, String> {
     let Value::Object(m) = v else {
         return Err("the header is not a JSON object".to_string());
     };
+    header_writer_form(text, &m)?;
     let int = |k: &str| m.get(k).and_then(Value::as_i64);
     let string = |k: &str| -> Result<String, String> {
         match m.get(k) {
@@ -1676,7 +1799,6 @@ pub(crate) fn header_of(text: &str) -> Result<FileHead, String> {
     }
     let roles = match m.get("minor") {
         None => None,
-        Some(v) if v.as_u64() == Some(0) => None,
         Some(v) if v.as_u64() == Some(1) => {
             let Some(Value::Array(items)) = m.get("roles") else {
                 return Err("the minor-1 header has no `roles` list".to_string());
@@ -1699,7 +1821,7 @@ pub(crate) fn header_of(text: &str) -> Result<FileHead, String> {
             }
             Some(roles)
         }
-        Some(_) => return Err("unsupported header `minor` (expected 0 or 1)".to_string()),
+        Some(_) => return Err("unsupported header `minor` (expected 1, or no `minor` for minor 0)".to_string()),
     };
     let enumeration = match string("enumeration")?.as_str() {
         "complete" => Enumeration::Complete,
