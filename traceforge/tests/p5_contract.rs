@@ -66,9 +66,17 @@ fn model_online() {
         let args = ["online", "--spec", spec.to_str().unwrap(), "--threads", threads];
         let (text, code) = cli(&[], Arc::new(|| {}), &args);
         assert_eq!(code, 2, "conformance: online model exit");
+        // The pairing check before the run refuses it; without the check, the run's own refusal.
+        assert_eq!(text, concat!("program: pairing: C3: the two models differ: asyn and p2p\n",
+            "program: refused: the pairing check failed (1 checks; --no-pairing-check skips it)\n"),
+            "conformance: online model diagnostic");
+        let mut unchecked = args.to_vec();
+        unchecked.push("--no-pairing-check");
+        let (text, code) = cli(&[], Arc::new(|| {}), &unchecked);
+        assert_eq!(code, 2, "conformance: online model exit, unchecked");
         assert_eq!(text.lines().next().unwrap(),
             "program: online refused: the two models differ: asyn and p2p",
-            "conformance: online model diagnostic");
+            "conformance: online model diagnostic, unchecked");
         std::fs::write(&spec, header("p2p")).unwrap();
         assert_eq!(cli(&[], Arc::new(|| {}), &args).1, 0,
             "conformance: online same model");
@@ -360,9 +368,17 @@ fn roles_joins_and_online() {
             "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
         ]);
         assert_eq!(code, 2, "conformance: roles online exit");
+        // The pairing check before the run refuses it; without the check, the run's own refusal.
+        assert_eq!(text, concat!("program: pairing: C2: the two `roles` lists differ: [\"helper\"] and []\n",
+            "program: refused: the pairing check failed (1 checks; --no-pairing-check skips it)\n"),
+            "conformance: roles online diagnostic");
+        let (text, code) = cli(&[], Arc::new(|| {}), &[
+            "online", "--spec", spec.to_str().unwrap(), "--threads", threads, "--no-pairing-check",
+        ]);
+        assert_eq!(code, 2, "conformance: roles online exit, unchecked");
         assert_eq!(text.lines().next().unwrap(),
             "program: online refused: the two roles lists differ: [\"helper\"] and []",
-            "conformance: roles online diagnostic");
+            "conformance: roles online diagnostic, unchecked");
         let (text, code) = cli_roles(&[], Arc::new(|| {}), &["helper"], &[
             "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
         ]);

@@ -1498,8 +1498,9 @@ pub(crate) fn parse_line(
 }
 
 /// [`parse_line`] and the line's `n` (`JOIN-TOTAL`): `Some` for an integer in
-/// 1 ..= `u64::MAX`, `None` for no `n` or any other value. `n` is information
-/// only: it is outside the normal form and never refuses a line.
+/// 1 ..= `i64::MAX`, `None` for no `n` or any other value. `n` is information
+/// only: it is outside the normal form, and its value refuses the line only
+/// outside the file's common domain ([`common_domain`]).
 pub(crate) fn parse_line_n(
     text: &str,
     names: &[String],
@@ -1508,7 +1509,7 @@ pub(crate) fn parse_line_n(
     let Value::Object(m) = v else {
         return Err("the line is not a JSON object".to_string());
     };
-    let n = m.get("n").and_then(Value::as_u64).filter(|&n| n >= 1);
+    let n = m.get("n").and_then(Value::as_i64).filter(|&n| n >= 1).map(|n| n as u64);
     if let Some(k) = m
         .keys()
         .find(|k| !matches!(k.as_str(), "statuses" | "words" | "counts" | "n"))
@@ -1635,9 +1636,10 @@ pub(crate) fn parse_line_n(
 /// form, optionally followed by an `n` member (JMC's execution count) as the
 /// last member, compact. This refuses what a writer never writes: a repeated
 /// key, members or `t`/`f` out of order, whitespace, other spellings of a value.
-/// The value of `n` is not checked here: `n` is information only, and one that
-/// is not a positive integer empties the join's total without refusing the
-/// line. `key` is the line's normal form, `n` its `n` member.
+/// The value of `n` is checked only as every value of the file is
+/// ([`common_domain`]): `n` is information only, and one that is not a positive
+/// integer empties the join's total without refusing the line. `key` is the
+/// line's normal form, `n` its `n` member.
 fn writer_form(text: &str, key: &str, n: Option<&Value>) -> Result<(), String> {
     let expected = match n {
         None => key.to_owned(),
@@ -1647,7 +1649,7 @@ fn writer_form(text: &str, key: &str, n: Option<&Value>) -> Result<(), String> {
             let head = format!("{},\"n\":", &key[..key.len() - 1]);
             if let Some(raw) = text.strip_prefix(&head).and_then(|r| r.strip_suffix('}')) {
                 if compact_json(raw) && serde_json::from_str::<Value>(raw).is_ok() {
-                    return Ok(());
+                    return common_domain(raw);
                 }
             }
             format!("{head}{v}}}")
@@ -1661,6 +1663,80 @@ fn writer_form(text: &str, key: &str, n: Option<&Value>) -> Result<(), String> {
         "the line is not in the form the writers emit (the normal form, then `n` if any; \
          compact, each key once, in order): it differs at byte {at}"
     ))
+}
+
+/// The domain every value of a file shares with JMC's reader, checked on the
+/// text of `raw`, a valid compact JSON value: each number an integer literal
+/// (no fraction or exponent), not `-0`, within signed 64 bits; no object with a
+/// repeated key. The parsed value cannot show these: a fraction and an integer
+/// above `u64::MAX` both parse as floats, and a repeated key keeps its last
+/// value. The messages are JMC's, a repeated key decoded between plain quotes.
+fn common_domain(raw: &str) -> Result<(), String> {
+    let bytes = raw.as_bytes();
+    // One entry per open object (its keys so far) or array (`None`), and
+    // whether the next string in the innermost object is a key.
+    let mut open: Vec<Option<HashSet<String>>> = Vec::new();
+    let mut key_next = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                if key_next {
+                    let key: String = serde_json::from_str(&raw[start..=i])
+                        .map_err(|e| format!("not JSON: {e}"))?;
+                    if let Some(Some(keys)) = open.last_mut() {
+                        if !keys.insert(key.clone()) {
+                            return Err(format!("duplicate key \"{key}\" in an object"));
+                        }
+                    }
+                    key_next = false;
+                }
+                i += 1;
+            }
+            b'{' => {
+                open.push(Some(HashSet::new()));
+                key_next = true;
+                i += 1;
+            }
+            b'[' => {
+                open.push(None);
+                i += 1;
+            }
+            b'}' | b']' => {
+                open.pop();
+                i += 1;
+            }
+            b',' => {
+                key_next = matches!(open.last(), Some(Some(_)));
+                i += 1;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < bytes.len() && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                    i += 1;
+                }
+                let lit = &raw[start..i];
+                if lit.bytes().any(|b| matches!(b, b'.' | b'e' | b'E' | b'+')) {
+                    return Err(format!(
+                        "number {lit} is not an integer literal (the format refuses floating-point values)"
+                    ));
+                }
+                if lit == "-0" {
+                    return Err("number -0 is not the canonical encoding of 0".to_string());
+                }
+                if lit.parse::<i64>().is_err() {
+                    return Err(format!("integer {lit} is outside signed 64 bits"));
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    Ok(())
 }
 
 /// Whether `raw` has no whitespace outside its JSON strings (escapes respected).

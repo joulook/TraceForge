@@ -50,6 +50,11 @@ struct Bad {
     pairing: Option<(&'static str, &'static str)>,
 }
 
+/// A file whose one line is `LINE` with `,"n":<raw>` as its last member.
+fn n_line(raw: &str) -> String {
+    format!("{HEAD}\n{},\"n\":{raw}}}\n", &LINE[..LINE.len() - 1])
+}
+
 fn bads() -> Vec<Bad> {
     let file = |lines: &[&str]| format!("{HEAD}\n{}\n", lines.join("\n"));
     let head = |h: String| format!("{h}\n{LINE}\n");
@@ -60,6 +65,22 @@ fn bads() -> Vec<Bad> {
             "unknown key `x`".into()),
         b("n-not-last", file(&[&format!("{{\"n\":1,{}", &LINE[1..])]), 2, format!("{LINE_FORM}2")),
         b("n-after-a-space", file(&[&LINE.replace("\"counts\":[]}", "\"counts\":[],\"n\": 5}")]), 2, format!("{LINE_FORM}85")),
+        // `n`'s value outside the domain every value of the file shares with JMC's reader: a
+        // number that is not an integer literal, `-0`, an integer outside signed 64 bits, an
+        // object with a repeated key (also nested).
+        b("n-fraction", n_line("1.5"), 2,
+            "number 1.5 is not an integer literal (the format refuses floating-point values)".into()),
+        b("n-exponent", n_line("1e3"), 2,
+            "number 1e3 is not an integer literal (the format refuses floating-point values)".into()),
+        b("n-minus-zero", n_line("-0"), 2, "number -0 is not the canonical encoding of 0".into()),
+        b("n-two-to-64", n_line("18446744073709551616"), 2,
+            "integer 18446744073709551616 is outside signed 64 bits".into()),
+        b("n-i64-max-plus-one", n_line("9223372036854775808"), 2,
+            "integer 9223372036854775808 is outside signed 64 bits".into()),
+        b("n-repeated-key", n_line("{\"x\":1,\"x\":2}"), 2, "duplicate key \"x\" in an object".into()),
+        b("n-nested-repeated-key", n_line("[{\"a\":1,\"a\":2}]"), 2, "duplicate key \"a\" in an object".into()),
+        // A repeated key with an escape: named decoded, between plain quotes (one backslash).
+        b("n-repeated-escaped-key", n_line(r#"{"a\\b":1,"a\\b":2}"#), 2, r#"duplicate key "a\b" in an object"#.into()),
         b("space-after-colon", file(&[&LINE.replace("\"statuses\":", "\"statuses\": ")]), 2, format!("{LINE_FORM}12")),
         b("members-reordered",
             file(&[r#"{"words":{"A":[{"s":{"t":"M","f":["A",1]}}]},"statuses":{"A":"done"},"counts":[]}"#]),
@@ -72,7 +93,7 @@ fn bads() -> Vec<Bad> {
             format!("{LINE_FORM}59")),
         Bad { name: "repeated-line", text: file(&[LINE, LINE]), line: 3,
             what: "the line repeats line 2 (each line is one distinct summary)".into(),
-            pairing: Some(("line 3 repeats an earlier line", "line 3 repeats line 2")) },
+            pairing: Some(("line 3 repeats line 2", "line 3 repeats line 2")) },
         b("header-unknown-key", head(HEAD.replace("\"encoding\":1", "\"x\":1,\"encoding\":1")), 1,
             "unknown header key `x` (neither writer emits it)".into()),
         b("header-minor-0", head(HEAD.replace("\"minor\":1", "\"minor\":0")), 1,
@@ -107,7 +128,7 @@ fn each_rule_refuses_its_file_naming_the_line() {
     let is = imp.to_str().unwrap();
     let mut bad = Vec::new();
     let cases = bads();
-    assert_eq!(cases.len(), 21);
+    assert_eq!(cases.len(), 29);
     for c in cases {
         let spec = write(&dir, &format!("{}.jsonl", c.name), &c.text);
         let ss = spec.to_str().unwrap();
@@ -141,18 +162,22 @@ fn each_rule_refuses_its_file_naming_the_line() {
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
 
-/// `n` is information only: any value in last position is in writer form, and a value other than a
-/// positive integer empties `uncovered_total` instead of refusing the line.
+/// `n` is information only: any value within the file's common domain, in last position, is
+/// accepted, and a value other than a positive integer empties `uncovered_total`.
 #[test]
-fn any_n_in_last_position_is_accepted() {
+fn any_n_within_the_common_domain_is_accepted() {
     let dir = scratch();
     let spec = write(&dir, "spec.jsonl", &format!("{HEAD}\n"));
     let ss = spec.to_str().unwrap();
     for (name, n, total) in [("zero", "0", ""), ("minus", "-1", ""), ("string", "\"x\"", ""),
-        // Numbers with no exact u64 reading: compared by their own text, accepted, the total empty.
-        ("two-to-64", "18446744073709551616", ""), ("1e3", "1e3", ""),
+        // The largest integer within signed 64 bits: a total of it.
+        ("i64-max", "9223372036854775807", "9223372036854775807"),
+        // Objects with distinct keys, and the same key in two distinct objects.
+        ("object", "{\"x\":1,\"y\":2}", ""), ("same-key-in-two-objects", "[{\"a\":1},{\"a\":1}]", ""),
+        // A fraction and a repeated key spelt inside strings are text, not values.
+        ("fraction-in-a-string", "\"a 1.5\"", ""), ("repeated-key-in-a-string", "\"{\\\"x\\\":1,\\\"x\\\":2}\"", ""),
         // Raw text with a space only inside a JSON string, and a nested value: kept as spelt.
-        ("spaced-string", "\"a A\"", ""), ("nested", "{\"a b\":18446744073709551616}", ""),
+        ("spaced-string", "\"a A\"", ""), ("nested", "{\"a b\":5}", ""),
         // A string with an escape and a space, and one with an escaped quote and a space: their
         // raw spelling is kept.
         ("escaped-spaced", "\"\\u0061 A\"", ""), ("escaped-quote", "\"x\\\"y z\"", ""),

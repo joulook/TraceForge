@@ -388,7 +388,9 @@ pub use interchange::{
     JoinError, JoinReport, MergeStats,
 };
 pub use decide::DEFAULT_DECIDE_BUDGET;
-pub use pairing::{check_pairing, PairingItem, PairingOpts, PairingReport};
+pub use pairing::{
+    check_pairing, check_pairing_program, PairingItem, PairingOpts, PairingReport, ProgramSide,
+};
 pub use shape::{declare, Shape, ShapeFn, SummaryShape};
 /// `#[derive(SummaryShape)]`: see [`SummaryShape`].
 pub use traceforge_macros::SummaryShape;

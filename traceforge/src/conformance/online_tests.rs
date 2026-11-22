@@ -780,7 +780,11 @@ fn o5_refusals() {
     let ss_owned = s.to_string_lossy().into_owned();
     let ss: &str = &ss_owned;
     let text = std::fs::read_to_string(&s).unwrap();
-    let mut cases: Vec<(String, Vec<String>, Vec<String>)> = Vec::new();
+    // (what, the arguments, the words named by default, the words named under
+    // `--no-pairing-check`, or `None` for a usage error, which precedes the pairing check).
+    // The pairing check before the run refuses a file it can read without the usage text;
+    // `--no-pairing-check` gives the run's own refusal, with it.
+    let mut cases: Vec<(String, Vec<String>, Vec<String>, Option<Vec<String>>)> = Vec::new();
     for e in ["bounded", "sampled", "aborted"] {
         let f = dir.join(format!("S-{e}.jsonl"));
         std::fs::write(&f, text.replacen("\"complete\"", &format!("\"{e}\""), 1)).unwrap();
@@ -788,7 +792,8 @@ fn o5_refusals() {
         cases.push((
             format!("enumeration {e}"),
             vec!["online".into(), "--spec".into(), fs.clone(), "--".into(), "fixed".into()],
-            vec![fs, format!("`{e}`")],
+            vec![format!("program: pairing: C4: the specification is `{e}`, not `complete`\n")],
+            Some(vec![fs, format!("`{e}`")]),
         ));
     }
     // A valid file over three of the four names.
@@ -808,6 +813,10 @@ fn o5_refusals() {
             format!("{:?}", ["alpha", "beta", "reader"]),
             format!("{:?}", VIS),
         ],
+        Some(vec![
+            format!("{:?}", ["alpha", "beta", "reader"]),
+            format!("{:?}", VIS),
+        ]),
     ));
     let dup = dir.join("S-dup.jsonl");
     let first_body = text.lines().nth(1).unwrap().to_owned();
@@ -824,6 +833,7 @@ fn o5_refusals() {
             what.into(),
             vec!["online".into(), "--spec".into(), file.to_string_lossy().into_owned(), "--".into(), "fixed".into()],
             vec![word.to_owned()],
+            Some(vec![word.to_owned()]),
         ));
     }
     let usage: [(&str, &[&str], &str); 7] = [
@@ -840,16 +850,28 @@ fn o5_refusals() {
             what.into(),
             args.iter().map(|a| (*a).to_owned()).collect(),
             vec![word.to_owned()],
+            None,
         ));
     }
-    for (what, args, words) in cases {
+    for (what, args, words, unchecked) in cases {
         let (out, code) = run_cli(&p.program(), &args);
         assert_eq!(code, 2, "conformance: C: O5: {what}: exit 2: {out}");
         assert!(no_result_block(&out), "conformance: C: O5: {what}: a result block: {out}");
         for w in &words {
             assert!(out.contains(w.as_str()), "conformance: C: O5: {what}: `{w}` not named: {out}");
         }
-        assert!(out.contains("usage:"), "conformance: C: O5: {what}: no usage: {out}");
+        // A usage error has the usage text; the pairing check's refusal has none.
+        assert_eq!(out.contains("usage:"), unchecked.is_none(), "conformance: C: O5: {what}: usage: {out}");
+        let Some(unchecked) = unchecked else { continue };
+        let mut a = args.clone();
+        a.insert(1, "--no-pairing-check".to_owned());
+        let (out, code) = run_cli(&p.program(), &a);
+        assert_eq!(code, 2, "conformance: C: O5: {what}, unchecked: exit 2: {out}");
+        assert!(no_result_block(&out), "conformance: C: O5: {what}, unchecked: a result block: {out}");
+        for w in &unchecked {
+            assert!(out.contains(w.as_str()), "conformance: C: O5: {what}, unchecked: `{w}` not named: {out}");
+        }
+        assert!(out.contains("usage:"), "conformance: C: O5: {what}, unchecked: no usage: {out}");
     }
 }
 

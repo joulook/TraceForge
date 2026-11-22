@@ -61,6 +61,7 @@ struct Case {
 fn cases() -> Vec<Case> {
     let l1 = line("1", "1");
     let l2 = line("2", "2");
+    let l3 = line("3", "3");
     let ok = |h: &str| (h.to_owned(), vec![l1.clone()]);
     vec![
         Case { name: "c2-unsorted-visible",
@@ -86,7 +87,13 @@ fn cases() -> Vec<Case> {
             expected: "pairing: C4: the specification is `bounded`, not `complete`\npairing: failed (1 checks)\n".into(), code: 2 },
         Case { name: "c6-repeated-line",
             spec: ok(HEAD), imp: (HEAD.into(), vec![l1.clone(), l1.clone()]), flags: vec![],
-            expected: "pairing: C6: {I}: line 3 repeats an earlier line\npairing: failed (1 checks)\n".into(), code: 2 },
+            expected: "pairing: C6: {I}: line 3 repeats line 2\npairing: failed (1 checks)\n".into(), code: 2 },
+        // A repeat of a line other than the previous one names the first line it repeats; so does
+        // a second repeat (the first line is kept, not replaced by the repeat).
+        Case { name: "c6-repeat-of-an-earlier-line",
+            spec: ok(HEAD), imp: (HEAD.into(), vec![l1.clone(), l2.clone(), l3.clone(), l1.clone(), l1.clone()]), flags: vec![],
+            expected: concat!("pairing: C6: {I}: line 5 repeats line 2\npairing: C6: {I}: line 6 repeats line 2\n",
+                "pairing: failed (2 checks)\n").into(), code: 2 },
         Case { name: "c6-unsorted-merge",
             spec: ok(HEAD), imp: (HEAD.into(), vec![l2.clone(), l1.clone()]), flags: vec!["--merge"],
             expected: "pairing: C6: {I}: line 3 precedes line 2 in byte order (--merge needs sorted files)\npairing: failed (1 checks)\n".into(), code: 2 },
@@ -113,14 +120,14 @@ fn cases() -> Vec<Case> {
         Case { name: "malformed-count-above-u64",
             spec: ok(HEAD), imp: (HEAD.into(), vec![l1.replace("\"counts\":[0,1]", "\"counts\":[0,18446744073709551616]")]), flags: vec![],
             expected: "pairing: ok\n".into(), code: 0 },
-        // A header the join's reader refuses: the check skips its header rows, the join refuses it.
+        // A header the join's reader refuses stops the check with the reader's own text
+        // (`header_refusal`): nothing on stdout, the refusal on stderr, exit 2.
         Case { name: "malformed-roles-unsorted",
             spec: ok(&head_with(&[("\"roles\":[\"A\",\"B\"]", "\"roles\":[\"B\",\"A\"]")])), imp: ok(HEAD), flags: vec![],
-            expected: "pairing: ok\n".into(), code: 0 },
-        // A malformed header field: the check leaves it to the join.
+            expected: String::new(), code: 2 },
         Case { name: "malformed-role-not-a-string",
             spec: ok(&head_with(&[("\"roles\":[\"A\",\"B\"]", "\"roles\":[\"A\",7]")])), imp: ok(HEAD), flags: vec![],
-            expected: "pairing: ok\n".into(), code: 0 },
+            expected: String::new(), code: 2 },
         Case { name: "c13-arity-mismatch",
             spec: (HEAD.into(), vec![line("{\"t\":\"Req\",\"f\":[1]}", "1")]),
             imp: (HEAD.into(), vec![line("{\"t\":\"Req\",\"f\":[1,2]}", "1")]), flags: vec![],
@@ -170,6 +177,16 @@ fn expected(c: &Case, s: &Path, i: &Path) -> String {
     c.expected.replace("{S}", s.to_str().unwrap()).replace("{I}", i.to_str().unwrap())
 }
 
+/// The reader's refusal of a case's specification header, when it has one: the pairing check
+/// stops with it, as the join would.
+fn header_refusal(name: &str) -> Option<&'static str> {
+    match name {
+        "malformed-roles-unsorted" => Some("the header's `roles` list is not sorted and unique"),
+        "malformed-role-not-a-string" => Some("a `roles` name is not a string"),
+        _ => None,
+    }
+}
+
 #[test]
 fn check_pairing_prints_each_failed_row() {
     let dir = scratch();
@@ -181,8 +198,11 @@ fn check_pairing_prints_each_failed_row() {
         a.extend([s.to_str().unwrap(), i.to_str().unwrap()]);
         let (o, e, code) = conf_join(&a);
         let want = expected(&c, &s, &i);
-        if (o.as_str(), e.as_str(), code) != (want.as_str(), "", c.code) {
-            bad.push(format!("{}: exit {code}\n{o}{e}--- want exit {}\n{want}", c.name, c.code));
+        let want_err = header_refusal(c.name)
+            .map(|r| format!("conf-join: refused: {}: line 1: {r}\n", s.display()))
+            .unwrap_or_default();
+        if (o.as_str(), e.as_str(), code) != (want.as_str(), want_err.as_str(), c.code) {
+            bad.push(format!("{}: exit {code}\n{o}{e}--- want exit {}\n{want}{want_err}", c.name, c.code));
         }
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
@@ -199,7 +219,7 @@ fn a_failing_pair_refuses_the_join() {
     // The refused block's shape, from a join refused for another reason (a missing file).
     let (refused_block, _, _) = conf_join(&[dir.join("none.jsonl").to_str().unwrap(), dir.join("none.jsonl").to_str().unwrap()]);
     let mut bad = Vec::new();
-    for c in cases().into_iter().filter(|c| c.code == 2) {
+    for c in cases().into_iter().filter(|c| c.code == 2 && header_refusal(c.name).is_none()) {
         let (s, i) = files(&dir, &c);
         // The join itself gets the same flags (--decide, --merge) as the check.
         let mut a: Vec<&str> = c.flags.clone();
@@ -399,4 +419,37 @@ fn check_pairing_refusals() {
     // A JSON line that is not a summary is left to the join.
     let odd = write(&dir, "odd.jsonl", HEAD, &["{\"x\":1}".to_owned()]);
     assert_eq!(conf_join(&["--check-pairing", odd.to_str().unwrap(), oks]).0, "pairing: ok\n");
+}
+
+/// A header the join's reader refuses, on either side, with tagged lines on both: the pairing
+/// check stops at once with the reader's refusal, so the join and `--check-pairing` print that
+/// one line and no warning, exit 2, and the text is the join's own (`--no-pairing-check`).
+#[test]
+fn a_refused_header_stops_the_check_with_the_readers_text() {
+    let dir = scratch();
+    let bad = head_with(&[("\"encoding\":1", "\"x\":1,\"encoding\":1")]);
+    let tagged = vec![line("{\"t\":\"Req\",\"f\":[1]}", "{\"t\":\"Ack\",\"f\":[]}")];
+    let other = vec![line("{\"t\":\"Ping\",\"f\":[2]}", "1")];
+    for bad_side in ["spec", "impl"] {
+        let (sh, ih) = if bad_side == "spec" { (bad.as_str(), HEAD) } else { (HEAD, bad.as_str()) };
+        let s = write(&dir, &format!("{bad_side}-s.jsonl"), sh, &tagged);
+        let i = write(&dir, &format!("{bad_side}-i.jsonl"), ih, &other);
+        let (ss, is) = (s.to_str().unwrap(), i.to_str().unwrap());
+        let refused = if bad_side == "spec" { ss } else { is };
+        let want = format!("conf-join: refused: {refused}: line 1: unknown header key `x` (neither writer emits it)\n");
+        for flags in [vec![], vec!["--merge"]] {
+            let mut a: Vec<&str> = flags.clone();
+            a.extend([ss, is]);
+            let (_, e, code) = conf_join(&a);
+            assert_eq!((code, e.as_str()), (2, want.as_str()), "{bad_side} {flags:?}: the join");
+            let mut n = vec!["--no-pairing-check"];
+            n.extend(a.iter());
+            let (_, e2, code2) = conf_join(&n);
+            assert_eq!((code2, e2.as_str()), (2, want.as_str()), "{bad_side} {flags:?}: the join's own refusal");
+            let mut c = vec!["--check-pairing"];
+            c.extend(a.iter());
+            let (o3, e3, code3) = conf_join(&c);
+            assert_eq!((code3, o3.as_str(), e3.as_str()), (2, "", want.as_str()), "{bad_side} {flags:?}: --check-pairing");
+        }
+    }
 }

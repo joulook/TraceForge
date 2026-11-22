@@ -8,8 +8,9 @@
 //!   lists of distinct names, and equal on both sides.
 //! - **C3**: the two `model`s are equal and in the supported set `p2p`, `asyn`.
 //! - **C4**: the specification's `enumeration` is `complete`.
-//! - **C6**: each file's lines are distinct (by their normal form); under
-//!   `--merge` they are also in byte order.
+//! - **C6**: each file's lines are distinct (by their normal form), a repeat
+//!   naming the first line it repeats; under `--merge` they are also in byte
+//!   order.
 //! - **C10**: every count is at most 2^31−1 (the bound both readers accept) and
 //!   every word has at most 2^31−1 events. Under `--decide` a count above 65535
 //!   is a warning: Decide refuses it only in a line it classifies. C10 reads the
@@ -26,15 +27,22 @@
 //!   obligation. A value tagged `ThreadId` or `Tid` (the names of the two tools'
 //!   identity types) is a warning that it may be a raw identity.
 //!
+//! `online --spec` runs the same check with the program in the
+//! implementation file's place ([`check_pairing_program`]): its visible names,
+//! its roles and its model stand for the implementation header's; C3 checks
+//! only that the models are equal, and C13 is not checked.
+//!
 //! A header the join's reader refuses (a missing or ill-typed field, an invalid,
-//! unsorted or repeated role name, `roles` omitting a visible name) or a line
-//! that does not parse as a summary is not a pairing failure: the check skips
-//! the header rows for that file, or the line's tags (C13, C18), and the join
-//! refuses it with its own message. Such a line still counts for C6, by its
-//! text, and for C10. A file that cannot be read, or a header or line that is
-//! not a JSON object, is refused here as in the join.
+//! unsorted or repeated role name, `roles` omitting a visible name, a form no
+//! writer emits) stops the check: it returns the reader's refusal, with the
+//! same text, and checks nothing else, so it is printed once and no warning
+//! precedes it. A line that does not parse as a summary is not a pairing
+//! failure: the check skips its tags (C13, C18), and the join refuses it with
+//! its own message. Such a line still counts for C6, by its text, and for C10.
+//! A file that cannot be read, or a header or line that is not a JSON object,
+//! is refused here as in the join.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -108,38 +116,87 @@ struct Side {
     enumeration: Option<String>,
     /// Tag → the field arities it is used with.
     tags: BTreeMap<String, BTreeSet<usize>>,
+    /// Whether `tags` is the side's: false for a program, whose tags are known
+    /// only from the values it sends.
+    tags_known: bool,
+}
+
+/// The program side of `online --spec`'s pairing check: what the run would
+/// write in its own header.
+#[derive(Clone, Debug)]
+pub struct ProgramSide {
+    /// The visible role names, byte-sorted.
+    pub visible: Vec<String>,
+    /// The visible names and the payload's role names, byte-sorted.
+    pub roles: Vec<String>,
+    /// The run's model, `None` when it has no summary-format name (the run
+    /// refuses that itself).
+    pub model: Option<String>,
 }
 
 /// Verifies the pairing restrictions of `spec` and `imp` (see the module
-/// documentation). `Err` only for a file that cannot be read or whose header or
-/// a line is not a JSON object.
+/// documentation). `Err` for a file that cannot be read, a header or line that
+/// is not a JSON object, or a header the reader refuses (with the reader's text).
 pub fn check_pairing(spec: &Path, imp: &Path, opts: PairingOpts) -> Result<PairingReport, JoinError> {
     let mut report = PairingReport::default();
     let s = read_side(spec, opts, &mut report)?;
     let i = read_side(imp, opts, &mut report)?;
+    compare(&s, &i, true, &mut report);
+    Ok(report)
+}
+
+/// The pairing check of `online --spec`: the specification file against the
+/// program that will run (see the module documentation). The rows are those of
+/// [`check_pairing`] with the program in the implementation's place, except
+/// two: C3 checks only that the models are equal, since the online check runs
+/// under every model it can name (`cd` included), not only a join's; and C13
+/// is not checked and gives no warning, since a program's tags and arities are
+/// known only from the values it sends. `Err` as for [`check_pairing`].
+pub fn check_pairing_program(
+    spec: &Path,
+    program: &ProgramSide,
+    opts: PairingOpts,
+) -> Result<PairingReport, JoinError> {
+    let mut report = PairingReport::default();
+    let s = read_side(spec, opts, &mut report)?;
+    let i = Side {
+        visible: Some(program.visible.clone()),
+        roles: Some(program.roles.clone()),
+        model: program.model.clone(),
+        enumeration: None,
+        tags: BTreeMap::new(),
+        tags_known: false,
+    };
+    compare(&s, &i, false, &mut report);
+    Ok(report)
+}
+
+/// The rows that compare the two sides: C2's equality, C3, C4 and C13. `join`:
+/// the models must also be ones a join supports.
+fn compare(s: &Side, i: &Side, join: bool, report: &mut PairingReport) {
     let fail = |r: &mut PairingReport, row, what: String| r.failures.push(PairingItem { row, what });
 
     // C2: equal lists (each list's own order was checked while reading).
     if let (Some(a), Some(b)) = (&s.visible, &i.visible) {
         if a != b {
-            fail(&mut report, "C2", format!("the two `visible` lists differ: {a:?} and {b:?}"));
+            fail(report, "C2", format!("the two `visible` lists differ: {a:?} and {b:?}"));
         }
     }
     if let (Some(a), Some(b)) = (&s.roles, &i.roles) {
         if a != b {
-            fail(&mut report, "C2", format!("the two `roles` lists differ: {a:?} and {b:?}"));
+            fail(report, "C2", format!("the two `roles` lists differ: {a:?} and {b:?}"));
         }
     }
     // C3.
     match (&s.model, &i.model) {
         (Some(a), Some(b)) => {
             if a != b {
-                fail(&mut report, "C3", format!("the two models differ: {a} and {b}"));
+                fail(report, "C3", format!("the two models differ: {a} and {b}"));
             }
-            for (m, side) in [(a, "specification"), (b, "implementation")] {
+            for (m, side) in [(a, "specification"), (b, "implementation")].into_iter().filter(|_| join) {
                 if m != "p2p" && m != "asyn" {
                     fail(
-                        &mut report,
+                        report,
                         "C3",
                         format!("the {side}'s model `{m}` is not supported for a join (p2p or asyn)"),
                     );
@@ -152,15 +209,18 @@ pub fn check_pairing(spec: &Path, imp: &Path, opts: PairingOpts) -> Result<Pairi
     // C4.
     match s.enumeration.as_deref() {
         Some("complete") => {}
-        Some(e) => fail(&mut report, "C4", format!("the specification is `{e}`, not `complete`")),
+        Some(e) => fail(report, "C4", format!("the specification is `{e}`, not `complete`")),
         // A missing enumeration is the join's refusal.
         None => {}
     }
-    // C13.
+    // C13, when both sides' tags are known.
+    if !s.tags_known || !i.tags_known {
+        return;
+    }
     for (tag, sa) in &s.tags {
         match i.tags.get(tag) {
             Some(ia) if ia != sa => fail(
-                &mut report,
+                report,
                 "C13",
                 format!(
                     "the tag {} has the field arities {sa:?} in the specification and {ia:?} \
@@ -191,7 +251,6 @@ pub fn check_pairing(spec: &Path, imp: &Path, opts: PairingOpts) -> Result<Pairi
             });
         }
     }
-    Ok(report)
 }
 
 fn read_side(
@@ -213,7 +272,7 @@ fn read_side(
     };
     let head: Value =
         serde_json::from_str(&first).map_err(|e| at(Some(1), format!("the header is not JSON: {e}")))?;
-    let Value::Object(mut h) = head else {
+    let Value::Object(h) = head else {
         return Err(at(Some(1), "the header is not a JSON object".into()));
     };
     let fail = |r: &mut PairingReport, row, what: String| {
@@ -222,11 +281,11 @@ fn read_side(
     let warn = |r: &mut PairingReport, row, what: String| {
         r.warnings.push(PairingItem { row, what: format!("{}: {what}", path.display()) })
     };
+    // A header the reader refuses stops the check with the reader's own
+    // refusal: the file's rows and the other file are not checked, so no C13
+    // warning follows from a file whose lines were never read.
+    crate::conformance::interchange::header_of(&first).map_err(|e| at(Some(1), e))?;
     // A list of strings, else `None` (malformed: the join's refusal).
-    // A header the reader refuses contributes nothing to C2, C3 and C4.
-    if crate::conformance::interchange::header_of(&first).is_err() {
-        h.clear();
-    }
     let names = |key: &str, report: &mut PairingReport| -> Option<Vec<String>> {
         let Some(Value::Array(items)) = h.get(key) else {
             return None;
@@ -251,11 +310,13 @@ fn read_side(
         model: string("model"),
         enumeration: string("enumeration"),
         tags: BTreeMap::new(),
+        tags_known: true,
     };
     let sorted = sorted_names(out.visible.as_deref().unwrap_or(&[]));
 
     // The lines: C6, C10, C13, C18.
-    let mut seen: HashSet<String> = HashSet::new();
+    // Each line's key → the number of the first line with it.
+    let mut seen: HashMap<String, usize> = HashMap::new();
     let mut last: Option<(usize, String)> = None;
     for (k, l) in lines.enumerate() {
         let number = k + 2;
@@ -328,8 +389,10 @@ fn read_side(
                 }
             }
             last = Some((number, key));
-        } else if !seen.insert(key) {
-            fail(report, "C6", format!("line {number} repeats an earlier line"));
+        } else if let Some(prev) = seen.get(&key) {
+            fail(report, "C6", format!("line {number} repeats line {prev}"));
+        } else {
+            seen.insert(key, number);
         }
     }
     Ok(out)

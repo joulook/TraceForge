@@ -2,8 +2,9 @@
 //! `log/dev/JOIN-TOTAL.derived.md`).
 //!
 //! `uncovered_total` is Σ `n` over the uncovered implementation lines when each carries an integer
-//! `n` in 1 ..= `u64::MAX`, empty otherwise, 0 with no uncovered line, empty on a refusal; in both
-//! join modes. The files of JT-1.1 are built from one export's lines with `n` appended by text, so
+//! `n` in 1 ..= `i64::MAX`, empty otherwise, 0 with no uncovered line, empty on a refusal; in both
+//! join modes. A value of `n` outside the file's common domain (a number that is not an integer
+//! literal, an integer outside signed 64 bits) refuses the line, as every other value of the file. The files of JT-1.1 are built from one export's lines with `n` appended by text, so
 //! that the reader sees exactly the values the criteria list.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -147,7 +148,7 @@ fn jtt1_the_arithmetic_on_written_files_in_both_modes() {
         sampled, ih,
         "conformance: JOIN-TOTAL: the header names its enumeration"
     );
-    let max = "18446744073709551615";
+    let max = "9223372036854775807";
     let cases: Vec<(&str, String, Vec<(i32, &str)>, &str, &str)> = vec![
         (
             "2 and 5",
@@ -192,10 +193,11 @@ fn jtt1_the_arithmetic_on_written_files_in_both_modes() {
             "no verdict",
         ),
         (
-            "two u64::MAX",
+            // Two `i64::MAX`: 2^64 - 2, above `i64::MAX`, which the total sums exactly.
+            "two i64::MAX",
             ih.clone(),
             vec![(1, max), (2, max)],
-            "36893488147419103230",
+            "18446744073709551614",
             "violation",
         ),
         (
@@ -213,23 +215,9 @@ fn jtt1_the_arithmetic_on_written_files_in_both_modes() {
             "violation",
         ),
         (
-            "n = 1.5",
-            ih.clone(),
-            vec![(1, "1.5"), (2, "5")],
-            "",
-            "violation",
-        ),
-        (
             "n = \"3\"",
             ih.clone(),
             vec![(1, "\"3\""), (2, "5")],
-            "",
-            "violation",
-        ),
-        (
-            "n = 2^64",
-            ih.clone(),
-            vec![(1, "18446744073709551616"), (2, "5")],
             "",
             "violation",
         ),
@@ -257,6 +245,29 @@ fn jtt1_the_arithmetic_on_written_files_in_both_modes() {
                 bad.push(format!(
                     "{what} (merge {merge}): the report differs from the bare file's"
                 ));
+            }
+        }
+    }
+    // A value outside the common domain refuses the line, naming it, in both modes.
+    for (n, why) in [
+        ("18446744073709551615", "integer 18446744073709551615 is outside signed 64 bits"),
+        ("1.5", "number 1.5 is not an integer literal (the format refuses floating-point values)"),
+        ("18446744073709551616", "integer 18446744073709551616 is outside signed 64 bits"),
+    ] {
+        let refused = file(&dir, &format!("impl-domain-{n}.jsonl"), &ih, &iby, &[(1, n)]);
+        for merge in [false, true] {
+            let r = if merge {
+                conf_join_merge(&spec, &refused)
+            } else {
+                conf_join(&spec, &refused)
+            };
+            let want = format!("{}: line 2: {why}", refused.display());
+            match r {
+                Err(e) if e.to_string() == want => {}
+                other => bad.push(format!(
+                    "n = {n} (merge {merge}): {:?}, want {want}",
+                    other.map(|r| r.render()).map_err(|e| e.to_string())
+                )),
             }
         }
     }

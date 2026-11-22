@@ -136,7 +136,7 @@ macro_rules! usage_text {
 ",
             $row,
             "<bin> online --spec FILE [--threads N] [--stop-at-first] [--out FILE [--program S] [--size S]] \
-    [--budget N] [--model …] [--seed N] [--threshold N] [--dump-large-graph] [ARGS…]\n\
+    [--no-pairing-check] [--budget N] [--model …] [--seed N] [--threshold N] [--dump-large-graph] [ARGS…]\n\
     \n--audit-graphs (export or online, any thread count): exact canonical graph audit.\n\
     Retains graphs; diagnostic only, not for timed rows.\n\
     \n--witness PATH (online or conf --engine stateful, --threads 1): write the first\n\
@@ -173,10 +173,14 @@ Stable subcommands:
       Write the side's summary file; with --graphs, also its witness graph store
       (one graph per summary line; --graphs-limit N keeps the first N).
   online --spec FILE [--out FILE [--program S] [--size S] [--graphs PATH [--graphs-limit N]]]
-         [--witness PATH] [--stop-at-first] [--budget N] [--model M] [--seed N] [-- ARGS]
+         [--witness PATH] [--stop-at-first] [--budget N] [--no-pairing-check] [--model M]
+         [--seed N] [-- ARGS]
       Explore the implementation and look every execution up in the specification's
       summary file. --witness writes the first uncovered execution (one per summary if
       PATH ends in /); --out and --graphs write its summary file and graph store.
+      Before the run, the file is checked against the program as the pairing check of
+      the join checks two files, except that C3 only compares the models (cd included)
+      and C13 is not checked; a failure refuses the run, and --no-pairing-check skips it.
   replay --graph FILE [--report FILE] [--allow-source-change] [--allow-tool-change] [-- ARGS]
       Re-run the program once along a witness graph; exit 0 reproduced, 1 a deviation.
   conf [--engine stateful] [--witness PATH] [--stop-at-first] [--distinct] [--model M]
@@ -225,6 +229,8 @@ struct Opts {
     program: Option<String>,
     size: Option<String>,
     spec: Option<String>,
+    /// `online --no-pairing-check`: skip the pairing check before the run.
+    no_pairing_check: bool,
     budget: Option<u64>,
     args: Vec<String>,
 }
@@ -247,6 +253,7 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
         program: None,
         size: None,
         spec: None,
+        no_pairing_check: false,
         budget: None,
         args: Vec::new(),
     };
@@ -304,6 +311,7 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
             "--program" => o.program = Some(value()?),
             "--size" => o.size = Some(value()?),
             "--spec" => o.spec = Some(value()?),
+            "--no-pairing-check" => o.no_pairing_check = true,
             "--budget" => {
                 let b: u64 = value()?.parse().map_err(|_| "--budget needs a number")?;
                 if b == 0 {
@@ -323,6 +331,9 @@ fn parse_opts(args: &[String], default_model: ConsType) -> Result<Opts, String> 
 }
 
 fn check_witness(cmd: &str, o: &Opts) -> Result<(), String> {
+    if o.no_pairing_check && cmd != "online" {
+        return Err("--no-pairing-check requires online".to_owned());
+    }
     if o.graph_audit.is_some() && !matches!(cmd, "export" | "online") {
         return Err("--audit-graphs requires export or online; not for timed rows".to_owned());
     }
@@ -893,7 +904,7 @@ fn run_named_roles(
                 "--graphs",
                 "--graphs-limit",
             ];
-            let flags = ["--stop-at-first", "--dump-large-graph", "--audit-graphs"];
+            let flags = ["--stop-at-first", "--dump-large-graph", "--audit-graphs", "--no-pairing-check"];
             if let Some(a) = foreign_option(&args[1..], &valued, &flags) {
                 return fail(format!("online does not take `{a}`"));
             }
@@ -932,6 +943,40 @@ fn run_named_roles(
                 },
             });
             let visible = (p.visible)(&o.args);
+            // The pairing check, as before `conf-join`: failures refuse the run
+            // (exit 2, no usage text), warnings go to stderr. A program whose
+            // names or model the run would refuse is left to that refusal.
+            if !o.no_pairing_check {
+                let names = crate::conformance::interchange::checked_names(&visible);
+                let roles = crate::conformance::interchange::declared_roles(&visible, &payload_names(&o.args));
+                if let (Ok(names), Ok(roles)) = (names, roles) {
+                    let side = crate::conformance::ProgramSide {
+                        visible: names,
+                        roles,
+                        model: crate::conformance::interchange::model_name(o.model).ok().map(str::to_owned),
+                    };
+                    let opts = crate::conformance::PairingOpts::default();
+                    match crate::conformance::check_pairing_program(Path::new(&spec), &side, opts) {
+                        Ok(r) if r.passed() => {
+                            for w in &r.warnings {
+                                eprintln!("{bin}: pairing: warning: {}: {}", w.row, w.what);
+                            }
+                        }
+                        Ok(r) => {
+                            let mut text = String::new();
+                            for f in &r.failures {
+                                text.push_str(&format!("{bin}: pairing: {}: {}\n", f.row, f.what));
+                            }
+                            text.push_str(&format!(
+                                "{bin}: refused: the pairing check failed ({} checks; --no-pairing-check skips it)\n",
+                                r.failures.len()
+                            ));
+                            return (text, 2);
+                        }
+                        Err(e) => return (format!("{bin}: online refused: {e}\n"), 2),
+                    }
+                }
+            }
             if let (Some(g), Some(out)) = (&o.graphs, &o.out) {
                 if overlapping_paths(Path::new(out), Path::new(g)) {
                     return fail(
