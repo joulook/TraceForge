@@ -1595,7 +1595,7 @@ fn help_exit_codes_are_the_ones_the_code_returns() {
         ("replay panic", &program, "return (format!(\"{bin}: replay failed: the program panicked: {msg}\\n\"), 1);"),
         ("replay report not written", &program, "return (format!(\"{line}{bin}: replay: {path}: {e}\\n\"), 2);"),
         ("export refused", &program, "(Err(e), _) => (format!(\"{bin}: export refused: {e}\\n\"), 2),"),
-        ("online", &online, "if self.refused {\n            2\n        } else if self.end == End::Failed || self.verdict() == Verdict::Reports {\n            1\n        } else {\n            0\n        }"),
+        ("online", &online, "if self.refused {\n            2\n        } else if self.end == End::Failed {\n            1\n        } else {\n            match self.verdict() {\n                Verdict::Reports => 1,\n                Verdict::Partial => 3,\n                Verdict::Conforms => 0,\n                Verdict::Refused => 2,\n            }\n        }"),
     ] {
         assert!(text.contains(needle), "{what}: the source holds {needle:?}");
     }
@@ -1614,7 +1614,7 @@ fn help_exit_codes_are_the_ones_the_code_returns() {
     let ce = line("count, export");
     assert!(has(ce, &["0", "2 refused"]) && !ce.contains(" 1 "), "{ce}");
     let on = line("online");
-    assert!(has(on, &["0 conforms or partial", "1 reports or the run failed", "2 refused"]), "{on}");
+    assert!(has(on, &["0 conforms,", "1 reports or the run failed", "2 refused", "3 partial"]), "{on}");
     let rp = line("replay");
     assert!(has(rp, &["0 reproduced", "1 a deviation or a failed replay", "2 refused", "report not written"]), "{rp}");
     let cf = line("conf");

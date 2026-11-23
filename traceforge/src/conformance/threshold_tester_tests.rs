@@ -352,8 +352,8 @@ fn ett3_a_miss_before_the_crossing_gives_no_verdict() {
         ];
         let (text, code) = cli(&imp, &spec, &visible, &args);
         assert_eq!(
-            code, 0,
-            "conformance: ENG-THRESHOLD: online {threads}: {text}"
+            code, 3,
+            "conformance: ENG-THRESHOLD: online {threads}: partial: {text}"
         );
         for want in [
             "verdict:    partial",

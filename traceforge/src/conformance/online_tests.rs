@@ -921,16 +921,17 @@ fn o5_failures_and_the_budget() {
     }
     assert_eq!(done, 1, "conformance: C: O5: exactly one of ch2/ch3 has p >= 2");
     // The budget.
-    for (b, want) in [
-        ("3", expected_text(&spec_head(&s, 2), (3, 3, 0, 0), "partial", false, None, (0, 0), None)),
+    // `partial` exits 3, `conforms` 0.
+    for (b, want, exit) in [
+        ("3", expected_text(&spec_head(&s, 2), (3, 3, 0, 0), "partial", false, None, (0, 0), None), 3),
         ("13", expected_text(
-            &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None)),
+            &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None), 0),
         // A budget equal to the space (12 executions) leaves no work: exhausted, conforms.
         ("12", expected_text(
-            &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None)),
+            &spec_head(&s, 2), (12, 12, 0, 0), "conforms", false, None, (0, 0), None), 0),
     ] {
         let (text, code) = run_online(&p, &s, &["--budget", b], ConsType::FIFO, Var::Fixed);
-        assert_eq!((text, code), (want, 0), "conformance: C: O5: --budget {b}");
+        assert_eq!((text, code), (want, exit), "conformance: C: O5: --budget {b}");
     }
     let (i1, k1) = first_report(Var::Bug, ConsType::Bag);
     let not_found = class_of(&k1, &[2, 3]) == 'X';
@@ -957,9 +958,9 @@ fn m3_exact_budget_is_complete() {
     let dir = scratch("p5-m3");
     let spec = spec_file(&p, &dir);
     use online::Verdict::{Conforms, Partial};
-    for (budget, end, enumeration, verdict, stop) in [
-        (12, End::Exhausted, "complete", Conforms, "exhausted"),
-        (11, End::Budget, "bounded", Partial, "budget"),
+    for (budget, end, enumeration, verdict, stop, exit) in [
+        (12, End::Exhausted, "complete", Conforms, "exhausted", 0),
+        (11, End::Budget, "bounded", Partial, "budget", 3),
     ] {
         let out = dir.join(format!("b{budget}.jsonl"));
         let out_string = out.to_string_lossy().into_owned();
@@ -968,7 +969,7 @@ fn m3_exact_budget_is_complete() {
             &p, &spec, &["--budget", &budget_string, "--out", &out_string],
             ConsType::FIFO, Var::Fixed,
         );
-        assert_eq!(code, 0, "conformance: M3: {text}");
+        assert_eq!(code, exit, "conformance: M3: {text}");
         let (header, _) = read_out(&out);
         let header: serde_json::Value = serde_json::from_str(&header)
             .expect("conformance: M3: JSON header");
@@ -1167,7 +1168,7 @@ fn o6_out() {
     let f3 = dir.join("b3.jsonl");
     let f3s = f3.to_string_lossy().into_owned();
     let (_, code) = run_online(&p, &s, &["--out", &f3s, "--budget", "3"], ConsType::FIFO, Var::Fixed);
-    assert_eq!(code, 0, "conformance: C: O6: budget 3");
+    assert_eq!(code, 3, "conformance: C: O6: budget 3 (partial)");
     let (h, body) = read_out(&f3);
     assert_eq!(h, out_head("program:impl", "fixed", "p2p", "bounded", (0, 0, 0)), "conformance: C: O6: budget 3 header");
     assert_eq!(body, lines_of(&ks_fix[..3]), "conformance: C: O6: budget 3 body");

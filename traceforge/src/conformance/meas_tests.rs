@@ -900,7 +900,7 @@ fn b_k4_online_blocks() {
     // Bug-finder, a budget, a failure.
     for (args, stop, exit) in [
         (vec!["--stop-at-first", "--model", "bag", "--seed", "0", "--", "bug"], "first-miss", 1u8),
-        (vec!["--budget", "3", "--model", "fifo", "--seed", "0", "--", "fixed"], "budget", 0),
+        (vec!["--budget", "3", "--model", "fifo", "--seed", "0", "--", "fixed"], "budget", 3),
         (vec!["--model", "fifo", "--seed", "0", "--", "ch2"], "error", 1),
     ] {
         let model = if args.windows(2).any(|w| w == ["--model", "bag"]) {

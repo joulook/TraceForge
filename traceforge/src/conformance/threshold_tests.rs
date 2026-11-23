@@ -73,7 +73,7 @@ fn et_sender_cli_matrix() {
             "--threshold",
             "16",
         ]);
-        threshold(&text, code, 0, 16);
+        threshold(&text, code, 3, 16);
         assert!(text.contains("verdict:    partial"), "{text}");
         for engine in ["stateful", "stateless", "gated", "enumerator"] {
             let args = [
@@ -340,7 +340,11 @@ fn assertion_before_crossing(command: &str, threads: &str) {
     };
     args.extend(["--threads", threads, "--threshold", "16", "--seed", "0"]);
     let (text, code) = cli(&imp, &spec, &visible, &args);
-    threshold(&text, code, if command == "export" { 2 } else { 0 }, 16);
+    // The threshold end takes precedence over the assertion: `online` ends `partial` (exit 3).
+    threshold(&text, code, if command == "export" { 2 } else { 3 }, 16);
+    if command == "online" {
+        assert!(text.contains("\nverdict:    partial\n"), "{text}");
+    }
     assert!(text.contains("thread `sender` passed limit 16"), "{text}");
     assert!(!cut.exists());
 }

@@ -145,12 +145,12 @@ format's name, and witness graphs the TraceForge name:
 
 Exit codes (2 is also every usage error):
 
-| subcommand | 0 | 1 | 2 |
-|---|---|---|---|
-| `count`, `export` | done | — | refused |
-| `online` | conforms or partial (printed) | reports (an uncovered summary), or the run failed | refused |
-| `replay` | reproduced | a deviation, or the replay failed | refused, or the report not written |
-| `conf` | conforms | reported | inconclusive or refused |
+| subcommand | 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| `count`, `export` | done | — | refused | — |
+| `online` | conforms | reports (an uncovered summary), or the run failed | refused | partial (bounded or ended early with nothing uncovered, or ended at a threshold, even after an uncovered summary) |
+| `replay` | reproduced | a deviation, or the replay failed | refused, or the report not written | — |
+| `conf` | conforms | reported | inconclusive or refused | — |
 
 The `conf-join` binary (`conf-join [options] spec.jsonl impl.jsonl`) joins two summary files and lists the
 implementation's uncovered lines. Its options (`conf-join --help`):

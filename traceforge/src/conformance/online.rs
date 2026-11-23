@@ -212,15 +212,23 @@ impl OnlineReport {
     }
 
     /// Exit codes: 2 for a refused run, 1 for a failed run or the verdict
-    /// `reports` (an uncovered summary, as `conf-join`'s violation), 0 for
-    /// `conforms` and `partial`.
+    /// `reports` (an uncovered summary, as `conf-join`'s violation), 3 for
+    /// `partial` (as JMC's named `online`), 0 for `conforms`. `partial` is an
+    /// exploration bounded or ended early with no uncovered summary, or any
+    /// run that ends at a threshold, even after a miss (`verdict` puts the
+    /// threshold end before `reports`).
     pub(crate) fn exit_code(&self) -> u8 {
         if self.refused {
             2
-        } else if self.end == End::Failed || self.verdict() == Verdict::Reports {
+        } else if self.end == End::Failed {
             1
         } else {
-            0
+            match self.verdict() {
+                Verdict::Reports => 1,
+                Verdict::Partial => 3,
+                Verdict::Conforms => 0,
+                Verdict::Refused => 2,
+            }
         }
     }
 }

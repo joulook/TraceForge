@@ -195,7 +195,7 @@ Stable options:
 
 Exit codes (2 is also every usage error):
   count, export   0 done, 2 refused.
-  online          0 conforms or partial, 1 reports or the run failed, 2 refused.
+  online          0 conforms, 1 reports or the run failed, 2 refused, 3 partial.
   replay          0 reproduced, 1 a deviation or a failed replay, 2 refused or the report not written.
   conf            0 conforms, 1 reported, 2 inconclusive or refused.
 

@@ -19,9 +19,12 @@
   This differs from JMC, which checks C13 against the tags the program declares. A failure refuses the run
   (exit 2) without the usage text; `--no-pairing-check` skips the check, as in `conf-join` and JMC. The
   reader's own refusals keep their text.
-- **`online` exit codes.** The verdict `reports` (an uncovered summary was found) exits 1, as JMC's named
-  `online`, `conf-join`'s violation and `conf`'s `reports`. Before, it exited 0. `conforms` and `partial` exit 0, a
-  failed run 1, a refusal 2, as before.
+- **`online` exit codes.** They are now JMC's named `online`'s: 0 `conforms`, 1 `reports` or a failed run,
+  2 refused, 3 `partial`. The verdict `reports` (an uncovered summary was found) exits 1, as `conf-join`'s
+  violation and `conf`'s `reports`; before, it exited 0. The verdict `partial` exits 3; before, it exited 0.
+  `partial` is an exploration bounded or ended early with no uncovered summary, or a run that ended at a
+  threshold, even after an uncovered summary (the threshold end takes precedence over `reports`). `conforms`
+  exits 0, a failed run 1 and a refusal 2, as before.
 - **`online` refusals without the usage text.** A refusal of the specification file or of the program's names
   (`online refused: …`) prints only the refusal, as the pairing refusal does and as JMC prints it; before, the
   usage text followed it. Usage errors still print it.
