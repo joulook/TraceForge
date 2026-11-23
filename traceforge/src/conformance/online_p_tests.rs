@@ -603,8 +603,10 @@ fn equal_cli(fixture: &str, name: &str, want: (u64, u64, u64, u64, u64, u64), ve
         ),
         &d.join("b"),
     );
-    assert_eq!(a.code, Some(0), "conformance: PO: sequential: {}", a.say());
-    assert_eq!(b.code, Some(0), "conformance: PO: parallel: {}", b.say());
+    // `reports` exits 1, `conforms` 0.
+    let code = Some(if verdict == "reports" { 1 } else { 0 });
+    assert_eq!(a.code, code, "conformance: PO: sequential: {}", a.say());
+    assert_eq!(b.code, code, "conformance: PO: parallel: {}", b.say());
     assert!(b.a_task_ran(), "conformance: PO: no task ran: {}", b.say());
     assert!(
         b.parallel_banner(),
@@ -754,8 +756,9 @@ fn po2_text_and_block() {
         ),
         &d.join("b"),
     );
-    assert_eq!(a.code, Some(0), "conformance: PO: {}", a.say());
-    assert_eq!(b.code, Some(0), "conformance: PO: {}", b.say());
+    // `bad-all` reports: exit 1.
+    assert_eq!(a.code, Some(1), "conformance: PO: {}", a.say());
+    assert_eq!(b.code, Some(1), "conformance: PO: {}", b.say());
     let body = b.body();
     assert!(
         !body.contains("iteration"),
@@ -1140,7 +1143,7 @@ fn po3_flags_work_at_one() {
         Arc::clone(&runs),
         &s,
     );
-    assert_eq!(code, 0, "conformance: PO: {t}");
+    assert_eq!(code, 1, "conformance: PO: a first miss reports: {t}");
     assert!(t.contains("mode:       bug-finder"), "conformance: PO: {t}");
     assert!(t.contains("first miss: iteration "), "conformance: PO: {t}");
     let n = runs.load(Ordering::SeqCst);
@@ -1161,7 +1164,9 @@ fn po3_flags_work_at_one() {
         Arc::clone(&runs),
         &s,
     );
-    assert_eq!(code, 0, "conformance: PO: {t}");
+    // Four values, only 0 covered: two executions meet a miss, `reports`, exit 1.
+    assert_eq!(code, 1, "conformance: PO: {t}");
+    assert!(t.contains("verdict:    reports\n"), "conformance: PO: {t}");
     assert!(t.contains("stop_reason: budget"), "conformance: PO: {t}");
     assert!(runs.load(Ordering::SeqCst) <= 3, "conformance: PO: {t}");
     // `--threads 0` is refused as ever.
@@ -2067,7 +2072,8 @@ fn po8_threads_one_is_sequential() {
             ),
             &d.join(format!("{n}.res")),
         );
-        assert_eq!(r.code, Some(0), "conformance: PO: {}", r.say());
+        // `bad-all` reports: exit 1.
+        assert_eq!(r.code, Some(1), "conformance: PO: {}", r.say());
         (r, o)
     };
     let (a, ao) = run("a", "");

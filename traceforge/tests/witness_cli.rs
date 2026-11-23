@@ -80,7 +80,7 @@ fn golden_both_paths_and_receive_links() {
             vec!["conf", "--engine", "stateful", "--witness", &path, "--seed", "0"]
         };
         let (out, code) = cli(Arc::new(fixture), &args);
-        assert_eq!(code, if online { 0 } else { 1 }, "{out}");
+        assert_eq!(code, 1, "{out}"); // online `reports`, conf `reported`: both 1
         let mut values = HashSet::new();
         let mut previous_iteration = 0;
         for n in 1..=8 {
@@ -143,7 +143,7 @@ fn distinct_directory_and_first_file() {
                 else { vec!["conf", "--engine", "stateful"] };
             args.extend(["--witness", path, "--seed", "0"]);
             let (out, code) = cli(body.clone(), &args);
-            assert_eq!(code, if online { 0 } else { 1 }, "{out}");
+            assert_eq!(code, 1, "{out}"); // online `reports`, conf `reported`: both 1
             if path == folder.as_str() {
                 assert_eq!(std::fs::read_dir(path).unwrap().count(), 2);
                 first = std::fs::read_to_string(format!("{folder}witness-1.txt")).unwrap();
@@ -273,7 +273,7 @@ fn failed_join_is_a_block_and_main_has_no_end() {
     });
     let (out, code) = cli(body, &["online", "--spec", spec.to_str().unwrap(),
         "--witness", path.to_str().unwrap()]);
-    assert_eq!(code, 0, "{out}");
+    assert_eq!(code, 1, "{out}"); // a witness: `reports`
     assert_eq!(std::fs::read_to_string(path).unwrap(), concat!(
         "uncovered summary (iteration 1): ",
         "{\"statuses\":{\"v\":\"blocked\"},\"words\":{\"v\":[]},\"counts\":[]}\n",
@@ -311,7 +311,7 @@ fn iteration_counts_covered_completions_too() {
             else { vec!["conf", "--engine", "stateful"] };
         args.extend(["--witness", path.to_str().unwrap()]);
         let (out, code) = run(&args);
-        assert_eq!(code, if online { 0 } else { 1 }, "{out}");
+        assert_eq!(code, 1, "{out}"); // online `reports`, conf `reported`: both 1
         assert!(std::fs::read_to_string(&path).unwrap()
             .starts_with("uncovered summary (iteration 2): "));
         if online { assert!(out.contains("first_miss_iteration: 2\n")); }
@@ -362,7 +362,7 @@ fn absent_option_does_no_witness_work() {
         }).join().unwrap();
     });
     let (miss_out, miss_code) = cli(miss, &args);
-    assert_eq!(miss_code, 0, "{miss_out}");
+    assert_eq!(miss_code, 1, "{miss_out}"); // a miss: `reports`
     assert!(miss_out.contains("verdict:    reports\n"));
     assert!(!path.exists());
     // Covered graphs are not rendered even when a destination was requested.

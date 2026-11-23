@@ -571,7 +571,7 @@ fn tmp_of(path: &Path) -> PathBuf {
 
 /// **O1** (violating; derivation §4.3, §5). bug/bag: `lookups: 24 (8 found, 12
 /// signature misses, 4 not found)`, `uncovered: 16 graphs (6 distinct
-/// summaries)`, `reports`, exit 0; the first miss's iteration and witness are
+/// summaries)`, `reports`, exit 1; the first miss's iteration and witness are
 /// the offline engine's first report; U = the offline count, N = `count impl`,
 /// D = `conf_join` on the two exports. bug/fifo (all misses NotFound) and
 /// fixed/bag (all misses NoSig) as O1b, O1c. Failing directions: F1–F6.
@@ -634,7 +634,7 @@ fn o1_violating_full_mode() {
         let not_found = class_of(&k1, &[2, 3]) == 'X';
         // C.
         let (text, code) = run_online(&p, &s, &[], m, var);
-        assert_eq!(code, 0, "conformance: C: O1 {tag}: exit 0 with a verdict: {text}");
+        assert_eq!(code, 1, "conformance: C: O1 {tag}: exit 1 on `reports`: {text}");
         let (i, t) = first_miss_of(&text).unwrap_or_else(|| panic!("conformance: C: O1 {tag}: no first miss: {text}"));
         assert_eq!(i, i1, "conformance: C: O1 {tag}: the first miss's iteration");
         let w = line_k(&k1);
@@ -674,7 +674,7 @@ fn o2_conforming() {
 
 /// **O3** (bug-finder). bug/bag `--stop-at-first`: stops at O1's first miss,
 /// `lookups: I1 (I1−1 found, …)`, `uncovered: 1 graphs (1 distinct
-/// summaries)`, O1's witness and `at:`, `reports`, exit 0; fixed/fifo with
+/// summaries)`, O1's witness and `at:`, `reports`, exit 1; fixed/fifo with
 /// the flag never stops (O2's counts, the bug-finder `mode:`). Failing
 /// directions: F4, F7.
 #[test]
@@ -685,7 +685,7 @@ fn o3_bug_finder() {
     let (i1, k1) = first_report(Var::Bug, ConsType::Bag);
     let not_found = class_of(&k1, &[2, 3]) == 'X';
     let (text, code) = run_online(&p, &s, &["--stop-at-first"], ConsType::Bag, Var::Bug);
-    assert_eq!(code, 0, "conformance: C: O3: exit 0: {text}");
+    assert_eq!(code, 1, "conformance: C: O3: exit 1 on `reports`: {text}");
     let (i, t) = first_miss_of(&text).unwrap_or_else(|| panic!("conformance: C: O3: no first miss: {text}"));
     assert_eq!(i, i1, "conformance: C: O3: the first miss's iteration");
     let (sm, x) = if not_found { (0, 1) } else { (1, 0) };
@@ -746,7 +746,7 @@ fn o4_a_later_first_miss() {
         .expect("conformance: C: O4: write the reduced file");
     let head = spec_head(&s4, 1);
     let (text, code) = run_online(&p, &s4, &[], ConsType::FIFO, Var::Fixed);
-    assert_eq!(code, 0, "conformance: C: O4: exit 0: {text}");
+    assert_eq!(code, 1, "conformance: C: O4: exit 1 on `reports`: {text}");
     let (i, t) = first_miss_of(&text).unwrap_or_else(|| panic!("conformance: C: O4: no first miss: {text}"));
     assert_eq!(i, i4, "conformance: C: O4: the first miss's iteration");
     assert_eq!(
@@ -756,7 +756,7 @@ fn o4_a_later_first_miss() {
     );
     let (text, code) = run_online(&p, &s4, &["--stop-at-first"], ConsType::FIFO, Var::Fixed);
     let (i, t) = first_miss_of(&text).unwrap_or_else(|| panic!("conformance: C: O4: bug-finder: {text}"));
-    assert_eq!((i, code), (i4, 0), "conformance: C: O4: bug-finder");
+    assert_eq!((i, code), (i4, 1), "conformance: C: O4: bug-finder");
     assert_eq!(
         text,
         expected_text(&head, (i4, i4 - 1, 1, 0), "reports", true, Some((i4, t, removed.as_str(), false)), (1, 1), None),
@@ -783,7 +783,7 @@ fn o5_refusals() {
     // (what, the arguments, the words named by default, the words named under
     // `--no-pairing-check`, or `None` for a usage error, which precedes the pairing check).
     // The pairing check before the run refuses a file it can read without the usage text;
-    // `--no-pairing-check` gives the run's own refusal, with it.
+    // `--no-pairing-check` gives the run's own refusal, also without it.
     let mut cases: Vec<(String, Vec<String>, Vec<String>, Option<Vec<String>>)> = Vec::new();
     for e in ["bounded", "sampled", "aborted"] {
         let f = dir.join(format!("S-{e}.jsonl"));
@@ -871,7 +871,7 @@ fn o5_refusals() {
         for w in &unchecked {
             assert!(out.contains(w.as_str()), "conformance: C: O5: {what}, unchecked: `{w}` not named: {out}");
         }
-        assert!(out.contains("usage:"), "conformance: C: O5: {what}, unchecked: no usage: {out}");
+        assert!(!out.contains("usage:"), "conformance: C: O5: {what}, unchecked: the usage text: {out}");
     }
 }
 
@@ -944,7 +944,7 @@ fn o5_failures_and_the_budget() {
             expected_text(
                 &spec_head(&s, 2), (i1, i1 - 1, sm, x), "reports", false,
                 Some((i1, t, line_k(&k1).as_str(), not_found)), (1, 1), None),
-            0
+            1
         ),
         "conformance: C: O5: --budget I1"
     );
@@ -1137,7 +1137,7 @@ fn o6_out() {
     let f = dir.join("full.jsonl");
     let fs = f.to_string_lossy().into_owned();
     let (text, code) = run_online(&p, &s, &["--out", &fs], ConsType::Bag, Var::Bug);
-    assert_eq!(code, 0, "conformance: C: O6: full: {text}");
+    assert_eq!(code, 1, "conformance: C: O6: full (`reports`): {text}");
     let (_, t) = first_miss_of(&text).expect("conformance: C: O6: a first miss");
     let (h, body) = read_out(&f);
     assert_eq!(h, out_head("program:impl", "bug", "asyn", "complete", (i1, t, 16)), "conformance: C: O6: full header");
@@ -1212,7 +1212,7 @@ fn o6_out() {
     // No --out: nothing written.
     let before: BTreeSet<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
     let (_, code) = run_online(&p, &s, &[], ConsType::Bag, Var::Bug);
-    assert_eq!(code, 0, "conformance: C: O6: without --out");
+    assert_eq!(code, 1, "conformance: C: O6: without --out (`reports`)");
     let after: BTreeSet<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
     assert_eq!(before, after, "conformance: C: O6: no file without --out");
 }

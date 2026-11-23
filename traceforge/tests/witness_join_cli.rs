@@ -566,7 +566,8 @@ fn online_store_and_its_join() {
     let dir = scratch();
     let spec = export(&dir, "spec", "spec", "wait", true, &[]);
     let (t, c, f, g) = online(&dir, &spec, "on", "mix", &[]);
-    assert_eq!(c, 0, "{t}");
+    assert_eq!(c, 1, "{t}"); // `reports`
+    assert!(t.contains("verdict:    reports\n"), "{t}");
     let flines = read_lines(&f);
     // The header without the online fields, key order kept.
     let hj = parse(&flines[0]);
@@ -637,7 +638,8 @@ fn online_store_refusals_and_parallel_identity_line() {
     assert_eq!(c, 2, "{t}");
     assert!(!f.exists() && !g.exists());
     let (t, c, f, g) = online(&dir, &spec, "par", "mix", &["--threads", "2", "--graphs-limit", "0"]);
-    assert_eq!(c, 0, "{t}");
+    assert_eq!(c, 1, "{t}"); // `reports`
+    assert!(t.contains("verdict:    reports\n"), "{t}");
     let st = read_lines(&g);
     assert_eq!(st.len(), 1, "identity line only");
     let head = parse(&st[0]);
@@ -661,7 +663,8 @@ fn online_store_time_is_not_exploration() {
         if store { args.extend(["--graphs", g.to_str().unwrap()]); }
         args.extend(["--", "heavy"]);
         let (t, c) = cli(&args);
-        assert_eq!(c, 0, "{t}");
+        assert_eq!(c, 1, "{t}"); // `reports`
+        assert!(t.contains("verdict:    reports\n"), "{t}");
         t
     };
     let _ = run("warm", false);

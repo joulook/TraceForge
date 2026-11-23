@@ -211,11 +211,13 @@ impl OnlineReport {
         }
     }
 
-    /// Exit codes: 2 for a refused run, 1 for other failures, 0 with a verdict.
+    /// Exit codes: 2 for a refused run, 1 for a failed run or the verdict
+    /// `reports` (an uncovered summary, as `conf-join`'s violation), 0 for
+    /// `conforms` and `partial`.
     pub(crate) fn exit_code(&self) -> u8 {
         if self.refused {
             2
-        } else if self.end == End::Failed {
+        } else if self.end == End::Failed || self.verdict() == Verdict::Reports {
             1
         } else {
             0

@@ -881,7 +881,7 @@ fn text_witness_events_are_the_graph_events() {
     let wdir = format!("{}/w/", dir.display());
     let (t, code) = cli("rich-printable",
         &["online", "--spec", spec.to_str().unwrap(), "--witness", &wdir, "--seed", "0"]);
-    assert_eq!(code, 0, "{t}");
+    assert_eq!(code, 1, "{t}"); // covers nothing: `reports`
     let mut texts: BTreeMap<String, (usize, String)> = BTreeMap::new();
     for n in 1..=6 {
         let text = std::fs::read_to_string(format!("{wdir}witness-{n}.txt")).unwrap();
@@ -1595,7 +1595,7 @@ fn help_exit_codes_are_the_ones_the_code_returns() {
         ("replay panic", &program, "return (format!(\"{bin}: replay failed: the program panicked: {msg}\\n\"), 1);"),
         ("replay report not written", &program, "return (format!(\"{line}{bin}: replay: {path}: {e}\\n\"), 2);"),
         ("export refused", &program, "(Err(e), _) => (format!(\"{bin}: export refused: {e}\\n\"), 2),"),
-        ("online", &online, "if self.refused {\n            2\n        } else if self.end == End::Failed {\n            1\n        } else {\n            0\n        }"),
+        ("online", &online, "if self.refused {\n            2\n        } else if self.end == End::Failed || self.verdict() == Verdict::Reports {\n            1\n        } else {\n            0\n        }"),
     ] {
         assert!(text.contains(needle), "{what}: the source holds {needle:?}");
     }
@@ -1614,7 +1614,7 @@ fn help_exit_codes_are_the_ones_the_code_returns() {
     let ce = line("count, export");
     assert!(has(ce, &["0", "2 refused"]) && !ce.contains(" 1 "), "{ce}");
     let on = line("online");
-    assert!(has(on, &["0 a verdict", "conforms", "reports", "partial", "1 the run failed", "2 refused"]), "{on}");
+    assert!(has(on, &["0 conforms or partial", "1 reports or the run failed", "2 refused"]), "{on}");
     let rp = line("replay");
     assert!(has(rp, &["0 reproduced", "1 a deviation or a failed replay", "2 refused", "report not written"]), "{rp}");
     let cf = line("conf");
@@ -1691,7 +1691,9 @@ fn model_aliases_behave_as_their_canonical_names() {
             let spec = dir.join(format!("{tag}-spec.jsonl"));
             assert_eq!(cli("models", &["export", "spec", "--model", m, "--out", spec.to_str().unwrap()]).1, 0);
             let (on, c) = cli("models", &["online", "--spec", spec.to_str().unwrap(), "--model", m, "--seed", "0"]);
-            assert_eq!(c, 0, "{on}");
+            // The specification's visible threads do nothing: every model reports.
+            assert_eq!(c, 1, "{on}");
+            assert!(on.contains("verdict:    reports\n"), "{on}");
             let (conf, c) = cli("models", &["conf", "--engine", "stateful", "--model", m, "--seed", "0"]);
             assert!(c == 0 || c == 1, "{conf}");
             let text = format!("{}\n{}\n{}\n{}", untimed(&count), untimed(&ex).replace(&tag, "T"),

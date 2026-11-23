@@ -1967,10 +1967,11 @@ pub(crate) fn read_file(path: &Path) -> Result<ReadFile, JoinError> {
         let number = i + 2;
         let (key, summary, n) = parse_line_n(l, &names).map_err(|e| at(Some(number), e))?;
         if let Some(earlier) = seen.insert(key.clone(), number) {
-            return Err(at(
-                Some(number),
-                format!("the line repeats line {earlier} (each line is one distinct summary)"),
-            ));
+            // As the pairing check and JMC's reader print it (C6).
+            return Err(JoinError(format!(
+                "{}: line {number} repeats line {earlier}",
+                path.display()
+            )));
         }
         lines.push((number, key, summary));
         ns.push(n);
@@ -2193,8 +2194,10 @@ impl SortedReader {
         if let Some(prev) = &self.last_key {
             match key.as_str().cmp(prev.as_str()) {
                 std::cmp::Ordering::Equal => {
-                    return Err(self.at(format!(
-                        "the line repeats line {} (each line is one distinct summary)",
+                    return Err(JoinError(format!(
+                        "{}: line {} repeats line {}",
+                        self.path.display(),
+                        self.number,
                         self.number - 1
                     )));
                 }

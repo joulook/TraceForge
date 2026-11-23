@@ -242,9 +242,11 @@ fn md_online() {
         let a = with_model(&["online", "--spec", &s], model, &["--seed", "0"]);
         let (text, code) = cli(declared, &a);
         let (own, block) = split(&text, &what);
+        // `reports` (bag) exits 1, `conforms` 0.
         assert_eq!(
-            code, 0,
-            "conformance: MD: {what}: exit 0 with a verdict: {own}"
+            code,
+            u8::from(bag),
+            "conformance: MD: {what}: the exit for the verdict: {own}"
         );
         let (lookups, verdict, unc, n) = if bag {
             (

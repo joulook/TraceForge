@@ -252,7 +252,8 @@ fn graphs_written_by_conf_join_and_online_replay() {
     let g = dir.join("on.g");
     let (t, c) = cli(&["online", "--spec", spec.to_str().unwrap(), "--out", f.to_str().unwrap(),
         "--graphs", g.to_str().unwrap(), "--", "fifo2"]);
-    assert_eq!(c, 0, "{t}");
+    assert_eq!(c, 1, "{t}"); // `reports`
+    assert!(t.contains("verdict:    reports\n"), "{t}");
     let lines: Vec<String> = read_lines(&g).into_iter().skip(1).collect();
     assert!(!lines.is_empty());
     for (i, l) in lines.iter().enumerate() {

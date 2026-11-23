@@ -4,8 +4,9 @@
 
 ### Changed
 
-- **Pairing check, C6.** A repeated line without `--merge` names the line it repeats: `line N repeats line M`, as
-  under `--merge`, in the reader's refusal and in JMC.
+- **Pairing check and reader, C6.** A repeated line names the line it repeats: `line N repeats line M`, in the
+  pairing check (with and without `--merge`), in both readers' refusals (`<file>: line N repeats line M`; before:
+  `<file>: line N: the line repeats line M (each line is one distinct summary)`) and in JMC.
 - **Reader, `n`.** The value of a line's `n` is held to the domain of every other value in the file, as JMC's
   reader holds it: a number that is not an integer literal (`1.5`), an integer outside signed 64 bits
   (`18446744073709551616`, and from `9223372036854775808` on) and an object with a repeated key
@@ -17,7 +18,13 @@
   since `online` also runs under `cd`. C13 is not checked: a program's tags are known only from what it sends.
   This differs from JMC, which checks C13 against the tags the program declares. A failure refuses the run
   (exit 2) without the usage text; `--no-pairing-check` skips the check, as in `conf-join` and JMC. The
-  reader's own refusals are unchanged.
+  reader's own refusals keep their text.
+- **`online` exit codes.** The verdict `reports` (an uncovered summary was found) exits 1, as JMC's named
+  `online`, `conf-join`'s violation and `conf`'s `reports`. Before, it exited 0. `conforms` and `partial` exit 0, a
+  failed run 1, a refusal 2, as before.
+- **`online` refusals without the usage text.** A refusal of the specification file or of the program's names
+  (`online refused: …`) prints only the refusal, as the pairing refusal does and as JMC prints it; before, the
+  usage text followed it. Usage errors still print it.
 - **Pairing check, refused header.** A header the reader refuses stops the pairing check: the reader's refusal
   is printed once, and the one-sided C13 warnings that used to precede it are gone.
 

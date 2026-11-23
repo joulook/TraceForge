@@ -92,7 +92,7 @@ fn bads() -> Vec<Bad> {
         b("non-canonical-escape", file(&[&LINE.replace(r#"["A",1]"#, r#"["\u0041",1]"#)]), 2,
             format!("{LINE_FORM}59")),
         Bad { name: "repeated-line", text: file(&[LINE, LINE]), line: 3,
-            what: "the line repeats line 2 (each line is one distinct summary)".into(),
+            what: "repeats line 2".into(),
             pairing: Some(("line 3 repeats line 2", "line 3 repeats line 2")) },
         b("header-unknown-key", head(HEAD.replace("\"encoding\":1", "\"x\":1,\"encoding\":1")), 1,
             "unknown header key `x` (neither writer emits it)".into()),
@@ -132,7 +132,9 @@ fn each_rule_refuses_its_file_naming_the_line() {
     for c in cases {
         let spec = write(&dir, &format!("{}.jsonl", c.name), &c.text);
         let ss = spec.to_str().unwrap();
-        let want = format!("conf-join: refused: {ss}: line {}: {}\n", c.line, c.what);
+        // `line N repeats line M` (C6) has no colon after the line number.
+        let sep = if c.what.starts_with("repeats line ") { " " } else { ": " };
+        let want = format!("conf-join: refused: {ss}: line {}{sep}{}\n", c.line, c.what);
         for merge in [false, true] {
             let flags: Vec<&str> = if merge { vec!["--merge"] } else { vec![] };
             let mut n = vec!["--no-pairing-check"];

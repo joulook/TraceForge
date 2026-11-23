@@ -148,7 +148,7 @@ Exit codes (2 is also every usage error):
 | subcommand | 0 | 1 | 2 |
 |---|---|---|---|
 | `count`, `export` | done | — | refused |
-| `online` | a verdict: conforms, reports or partial (printed) | the run failed | refused |
+| `online` | conforms or partial (printed) | reports (an uncovered summary), or the run failed | refused |
 | `replay` | reproduced | a deviation, or the replay failed | refused, or the report not written |
 | `conf` | conforms | reported | inconclusive or refused |
 

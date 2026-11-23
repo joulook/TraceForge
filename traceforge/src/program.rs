@@ -195,7 +195,7 @@ Stable options:
 
 Exit codes (2 is also every usage error):
   count, export   0 done, 2 refused.
-  online          0 a verdict (conforms, reports or partial, as printed), 1 the run failed, 2 refused.
+  online          0 conforms or partial, 1 reports or the run failed, 2 refused.
   replay          0 reproduced, 1 a deviation or a failed replay, 2 refused or the report not written.
   conf            0 conforms, 1 reported, 2 inconclusive or refused.
 
@@ -1076,7 +1076,8 @@ fn run_named_roles(
                     }
                     (text, r.exit_code())
                 }
-                Err(e) => fail(format!("online refused: {e}")),
+                // A refusal of the specification or of the program's names: no usage text.
+                Err(e) => (format!("{bin}: online refused: {e}\n"), 2),
             }
         }
         "replay" => replay_command(p, bin, &args[1..], block),

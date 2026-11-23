@@ -74,11 +74,13 @@ fn model_online() {
         unchecked.push("--no-pairing-check");
         let (text, code) = cli(&[], Arc::new(|| {}), &unchecked);
         assert_eq!(code, 2, "conformance: online model exit, unchecked");
-        assert_eq!(text.lines().next().unwrap(),
-            "program: online refused: the two models differ: asyn and p2p",
+        // The refusal only, without the usage text.
+        assert_eq!(text.as_str(),
+            "program: online refused: the two models differ: asyn and p2p\n",
             "conformance: online model diagnostic, unchecked");
         std::fs::write(&spec, header("p2p")).unwrap();
-        assert_eq!(cli(&[], Arc::new(|| {}), &args).1, 0,
+        // The header-only specification covers nothing: `reports`, exit 1.
+        assert_eq!(cli(&[], Arc::new(|| {}), &args).1, 1,
             "conformance: online same model");
     }
 }
@@ -376,13 +378,15 @@ fn roles_joins_and_online() {
             "online", "--spec", spec.to_str().unwrap(), "--threads", threads, "--no-pairing-check",
         ]);
         assert_eq!(code, 2, "conformance: roles online exit, unchecked");
-        assert_eq!(text.lines().next().unwrap(),
-            "program: online refused: the two roles lists differ: [\"helper\"] and []",
+        // The refusal only, without the usage text.
+        assert_eq!(text.as_str(),
+            "program: online refused: the two roles lists differ: [\"helper\"] and []\n",
             "conformance: roles online diagnostic, unchecked");
         let (text, code) = cli_roles(&[], Arc::new(|| {}), &["helper"], &[
             "online", "--spec", spec.to_str().unwrap(), "--threads", threads,
         ]);
-        assert_eq!(code, 0, "conformance: roles online neighbour: {text}");
+        // The header-only specification covers nothing: `reports`, exit 1.
+        assert_eq!(code, 1, "conformance: roles online neighbour: {text}");
     }
 }
 
@@ -580,7 +584,8 @@ fn legacy_warning_stays_on_stderr() {
             .args(["--exact", "legacy_online_child", "--nocapture"])
             .env("P5_LEGACY_SPEC", &spec).env("P5_LEGACY_THREADS", threads)
             .output().unwrap();
-        assert_eq!(out.status.code(), Some(0), "conformance: legacy online exit");
+        // The header-only specification covers nothing: `reports`, exit 1.
+        assert_eq!(out.status.code(), Some(1), "conformance: legacy online exit");
         assert_eq!(String::from_utf8(out.stderr).unwrap(), warning,
             "conformance: legacy online stderr");
         assert!(!String::from_utf8(out.stdout).unwrap().contains("warning"),

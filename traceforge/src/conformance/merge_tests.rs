@@ -653,7 +653,7 @@ fn sj4_the_drain_and_the_rest() {
         &s,
         &imp,
         "a repeat in the drain",
-        "line 4: the line repeats line 3",
+        "line 4 repeats line 3",
     );
     // With an implementation of a header only.
     let none = file(&d, "none", AB, &[] as &[String]);

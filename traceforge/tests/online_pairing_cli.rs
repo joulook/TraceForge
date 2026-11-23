@@ -103,12 +103,6 @@ fn online<'a>(spec: &'a Path, variant: &'a str, flags: &[&'a str]) -> Vec<&'a st
     a
 }
 
-/// The usage text the CLI appends to its own refusals.
-fn usage(env: &Env) -> String {
-    let (t, _, c) = env.run(&[]);
-    assert_eq!(c, 2);
-    t.split_once('\n').unwrap().1.to_owned()
-}
 
 /// A text with every measured value masked: the clocks, the memory, the first miss's time.
 fn unmeasured(t: &str) -> String {
@@ -129,7 +123,7 @@ fn edit(text: &str, old: &str, new: &str) -> String {
 const REFUSED_TAIL: &str = "checks; --no-pairing-check skips it)\n";
 
 /// Each failing row: the refusal (rows, then the summary line, exit 2, no usage, no warning),
-/// and with `--no-pairing-check` the run's own refusal, as before the check (its text and usage).
+/// and with `--no-pairing-check` the run's own refusal, as before the check (its text, no usage).
 #[test]
 fn each_failing_row_refuses_the_run_and_the_flag_restores_the_runs_own_refusal() {
     let env = Env::new("tf_online_pairing_rows");
@@ -138,7 +132,6 @@ fn each_failing_row_refuses_the_run_and_the_flag_restores_the_runs_own_refusal()
     let (head, body) = text.split_once('\n').unwrap();
     let lines: Vec<&str> = body.lines().collect();
     assert_eq!(lines.len(), 2, "two summary lines: {text}");
-    let usage = usage(&env);
     let file = |h: &str, ls: &[&str]| format!("{h}\n{}\n", ls.join("\n"));
     let c10 = edit(lines[0], "\"counts\":[", "\"counts\":[2147483648,");
     let c10 = c10.replacen("[2147483648,0,", "[2147483648,", 1).replacen("[2147483648,1,", "[2147483648,", 1);
@@ -159,7 +152,7 @@ fn each_failing_row_refuses_the_run_and_the_flag_restores_the_runs_own_refusal()
             "{S}: the specification is `bounded`, not `complete`".into()),
         ("repeat", file(head, &[lines[0], lines[1], lines[0]]), "two",
             vec!["C6: {S}: line 4 repeats line 2".into()],
-            "{S}: line 4: the line repeats line 2 (each line is one distinct summary)".into()),
+            "{S}: line 4 repeats line 2".into()),
         ("count", file(head, &[&c10, lines[1]]), "two",
             vec!["C10: {S}: line 2: the count 2147483648 is out of bounds (both readers accept counts up to 2^31-1)".into()],
             "{S}: line 2: a count 2147483648 exceeds the length 1 of `b`'s word".into()),
@@ -174,7 +167,7 @@ fn each_failing_row_refuses_the_run_and_the_flag_restores_the_runs_own_refusal()
         if (code, got.as_str(), warn.is_empty()) != (2, want.as_str(), true) {
             bad.push(format!("{name}: exit {code} {warn:?}\n{got}--- want\n{want}"));
         }
-        let own_want = format!("program: online refused: {}\n{usage}", own.replace("{S}", ss));
+        let own_want = format!("program: online refused: {}\n", own.replace("{S}", ss));
         let (got, warn, code) = env.run(&online(&s, variant, &["--no-pairing-check"]));
         if (code, got.as_str(), warn.is_empty()) != (2, own_want.as_str(), true) {
             bad.push(format!("{name} --no-pairing-check: exit {code} {warn:?}\n{got}--- want\n{own_want}"));
@@ -190,7 +183,7 @@ fn each_failing_row_refuses_the_run_and_the_flag_restores_the_runs_own_refusal()
 }
 
 /// A header the reader refuses: the reader's refusal once, exit 2, no warning and no usage; with
-/// `--no-pairing-check`, the run's own refusal of the same header, with the usage text.
+/// `--no-pairing-check`, the run's own refusal of the same header, also without the usage text.
 #[test]
 fn a_refused_header_is_one_line() {
     let env = Env::new("tf_online_pairing_header");
@@ -201,7 +194,7 @@ fn a_refused_header_is_one_line() {
     let (got, warn, code) = env.run(&online(&s, "two", &[]));
     assert_eq!((code, got.as_str(), warn), (2, refusal.as_str(), vec![]));
     let (got, warn, code) = env.run(&online(&s, "two", &["--no-pairing-check"]));
-    assert_eq!((code, got, warn), (2, format!("{refusal}{}", usage(&env)), vec![]));
+    assert_eq!((code, got.as_str(), warn), (2, refusal.as_str(), vec![]));
 }
 
 /// Warnings go to stderr and the run proceeds with the same result as without the check: a value

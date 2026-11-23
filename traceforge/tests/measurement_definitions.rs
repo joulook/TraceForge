@@ -135,7 +135,7 @@ fn witness_file_agrees_with_measurement() {
     });
     let (out, code) = cli(body, &["online", "--spec", spec.to_str().unwrap(),
         "--witness", witness.to_str().unwrap()]);
-    assert_eq!(code, 0, "conformance: {out}");
+    assert_eq!(code, 1, "conformance: a witness is a miss, `reports`: {out}");
     let text = std::fs::read_to_string(witness).unwrap();
     let lines = text.lines().filter(|l| l.starts_with('\t')).count();
     assert_eq!(lines, 8, "conformance: hand-derived event lines");
@@ -221,7 +221,7 @@ fn unrenderable_witness_still_has_defined_counts() {
             expect(&out, &values);
             let (out, code) = cli(body.clone(), &["online", "--spec",
                 empty.to_str().unwrap(), "--threads", threads]);
-            assert_eq!(code, 0, "conformance: {out}");
+            assert_eq!(code, 1, "conformance: the empty specification: `reports`: {out}");
             expect(&out, &values);
         }
         let (out, code) = cli(body, &["online", "--spec", empty.to_str().unwrap(),

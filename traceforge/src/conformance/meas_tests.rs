@@ -836,8 +836,9 @@ fn b_k4_online_blocks() {
     let fix_graphs = reference(Var::Fixed, ConsType::FIFO, false).kept_impl_graphs;
     // (args, graphs, iterations, distinct, uncovered, stop, exit)
     let cases: Vec<(Vec<&str>, &[ExecutionGraph], usize, usize, usize, &str, u8)> = vec![
-        (vec!["--model", "bag", "--seed", "0", "--", "bug"], bug_graphs.as_slice(), 24, 8, 16, "exhausted", 0),
-        (vec!["--out", outs.as_str(), "--model", "bag", "--seed", "0", "--", "bug"], bug_graphs.as_slice(), 24, 8, 16, "exhausted", 0),
+        // 16 uncovered: `reports`, exit 1.
+        (vec!["--model", "bag", "--seed", "0", "--", "bug"], bug_graphs.as_slice(), 24, 8, 16, "exhausted", 1),
+        (vec!["--out", outs.as_str(), "--model", "bag", "--seed", "0", "--", "bug"], bug_graphs.as_slice(), 24, 8, 16, "exhausted", 1),
         (vec!["--model", "fifo", "--seed", "0", "--", "fixed"], fix_graphs.as_slice(), 12, 2, 0, "exhausted", 0),
     ];
     for (args, gs, n, d, u, stop, exit) in cases {
@@ -898,7 +899,7 @@ fn b_k4_online_blocks() {
     }
     // Bug-finder, a budget, a failure.
     for (args, stop, exit) in [
-        (vec!["--stop-at-first", "--model", "bag", "--seed", "0", "--", "bug"], "first-miss", 0u8),
+        (vec!["--stop-at-first", "--model", "bag", "--seed", "0", "--", "bug"], "first-miss", 1u8),
         (vec!["--budget", "3", "--model", "fifo", "--seed", "0", "--", "fixed"], "budget", 0),
         (vec!["--model", "fifo", "--seed", "0", "--", "ch2"], "error", 1),
     ] {
